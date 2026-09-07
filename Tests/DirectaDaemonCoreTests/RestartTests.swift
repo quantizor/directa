@@ -136,7 +136,7 @@ import Testing
         let acquired = try await handle(
             router, .lockAcquire,
             LockParams(
-                holderPid: Int(getpid()), project: env.project, resource: "data",
+                holderPid: Int(getpid()), pause: true, project: env.project, resource: "data",
                 resumeTimeoutSeconds: 10), LockResult.self)
         #expect(acquired.paused == ["db"])
 

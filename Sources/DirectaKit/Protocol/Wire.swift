@@ -355,8 +355,9 @@ public struct LockParams: Codable, Equatable, Sendable {
     /** The lock auto-releases when this pid dies (a crashed harness never
         wedges the resource). */
     public var holderPid: Int
-    /** When false, acquire the mutex without stopping servers that declare the
-        resource. Optional so older clients keep decoding (default: pause). */
+    /** When false (the default), acquire the mutex without stopping servers that
+        declare the resource; when true, stop them for the hold and resume on
+        release. Optional so older clients keep decoding. */
     public var pause: Bool?
     public var project: String
     public var resource: String
@@ -382,8 +383,8 @@ public struct LockParams: Codable, Equatable, Sendable {
 /** In-memory and on-disk lock record. `paused` is who the daemon stopped for
     this hold so a crash mid-lock can resume them when the holder is gone. */
 public struct LockHolder: Codable, Equatable, Sendable {
-    /** Declaring servers this hold left running (`--no-pause`). Absent under the
-        default paused mode, and on files written before this field existed. */
+    /** Declaring servers this hold left running (the default). Absent when
+        `--pause` stopped them, and on files written before this field existed. */
     public var live: [String]?
     /** Whether this hold paused declarers. An empty `paused` is ambiguous on its
         own: nothing was running, or nothing was asked to stop. */
@@ -429,7 +430,7 @@ public struct LockStatusResult: Codable, Equatable, Sendable {
 
 /** Result of lock.acquire / lock.release: which servers were paused or resumed. */
 public struct LockResult: Codable, Equatable, Sendable {
-    /** Declaring servers this hold left running, under `--no-pause`. */
+    /** Declaring servers this hold left running (the default). */
     public var live: [String]?
     public var paused: [String]
     /** Absolute path to the resource's declared state, when a declarer names

@@ -22,13 +22,18 @@ import Testing
         #expect(lock.command == ["somecmd"])
     }
 
-    @Test func noPauseIsAFlagRatherThanAScrapedToken() throws {
-        let after = try Lock.parse(["d1", "--no-pause", "--", "cmd"])
-        #expect(after.noPause)
+    @Test func pauseIsAFlagRatherThanAScrapedToken() throws {
+        let after = try Lock.parse(["d1", "--pause", "--", "cmd"])
+        #expect(after.pause)
         #expect(after.command == ["cmd"])
-        let before = try Lock.parse(["--no-pause", "d1", "--", "cmd"])
-        #expect(before.noPause)
+        let before = try Lock.parse(["--pause", "d1", "--", "cmd"])
+        #expect(before.pause)
         #expect(before.command == ["cmd"])
+    }
+
+    /** The default leaves declaring servers running. */
+    @Test func pauseDefaultsOff() throws {
+        #expect(try Lock.parse(["d1", "--", "cmd"]).pause == false)
     }
 
     /** Everything after the terminator is a value, so a nested `--`, a dash
@@ -57,7 +62,7 @@ import Testing
         let help = Lock.helpMessage()
         #expect(help.contains("--"))
         #expect(help.contains("--acquire-timeout"))
-        #expect(help.contains("--no-pause"))
+        #expect(help.contains("--pause"))
         #expect(help.contains("--timeout"))
     }
 

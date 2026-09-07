@@ -27,16 +27,16 @@ import Testing
         let holder = LockHolder(live: ["db"], pause: false, paused: [], pid: 77, since: since)
         let text = LockNotice.contended(
             budgetSeconds: 300, holder: holder, now: now, resource: "d1")
-        #expect(text.contains("(it left db running, --no-pause)"))
+        #expect(text.contains("(it left db running)"))
     }
 
-    /** --no-pause with nothing running left no servers up, so saying it did
+    /** The default hold with nothing running left no servers up, so saying it did
         would mislead whoever is debugging the contention. */
     @Test func contendedNoticeDoesNotClaimServersWereLeftRunningWhenNoneWere() {
         let holder = LockHolder(pause: false, paused: [], pid: 77, since: since)
         let text = LockNotice.contended(
             budgetSeconds: 300, holder: holder, now: now, resource: "d1")
-        #expect(text.contains("(nothing was running, so --no-pause stopped nothing)"))
+        #expect(text.contains("(nothing was running to leave up)"))
         #expect(!text.contains("left declaring servers running"))
     }
 
@@ -55,6 +55,29 @@ import Testing
         let text = LockNotice.contended(
             budgetSeconds: 300, holder: holder, now: now, resource: "d1")
         #expect(text.contains("(it paused db)"))
+    }
+
+    /** A bare-named lock (no state path) left over live declarers has no
+        fingerprint fallback for the pause that no longer runs by default, so the
+        hold warns that the corruption guard is off. */
+    @Test func unguardedWarnsWhenNoStatePathAndDeclarersStayLive() {
+        let text = LockNotice.unguarded(resource: "d1", live: ["web", "db"], statePath: nil)
+        #expect(
+            text
+                == "directa lock: note: 'd1' declares no state path, so a change made while db, web stay running cannot be detected. Add a `path` to the lock declaration or use --pause.")
+    }
+
+    @Test func unguardedIsSilentWhenAStatePathCanBeFingerprinted() {
+        #expect(LockNotice.unguarded(resource: "d1", live: ["db"], statePath: "/p/state") == nil)
+    }
+
+    @Test func unguardedIsSilentWhenNoDeclarerStayedLive() {
+        #expect(LockNotice.unguarded(resource: "d1", live: [], statePath: nil) == nil)
+    }
+
+    @Test func unguardedUsesSingularForOneServer() {
+        let text = LockNotice.unguarded(resource: "d1", live: ["db"], statePath: nil)
+        #expect(text?.contains("while db stays running") == true)
     }
 
     @Test func stillWaitingCountsElapsedAndRemaining() {

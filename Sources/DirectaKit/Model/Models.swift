@@ -186,9 +186,10 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         project-relative path); used for Spotlight thumbnails. */
     public var icon: String?
     /** Named mutable resources this server holds while running (a local
-        database, a fixture directory). `directa lock <resource> -- cmd` stops
-        holders for the command's duration, and starts are refused while a live
-        external holder owns the resource. */
+        database, a fixture directory). `directa lock <resource> -- cmd` takes
+        exclusive access without stopping holders; `--pause` stops them for the
+        command's duration. Starts are refused while a live external holder owns
+        the resource. */
     public var locks: [LockDeclaration]?
     public var name: String
     public var port: Int?

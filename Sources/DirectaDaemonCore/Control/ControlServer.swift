@@ -1187,8 +1187,9 @@ public actor Router {
         return view
     }
 
-    /** Acquire: refuse if another live holder owns it, pause active declarers
-        without retiring boot intent, persist the hold, return who was paused. */
+    /** Acquire: refuse if another live holder owns it; when `pause` is set, stop
+        active declarers without retiring boot intent; persist the hold and return
+        who was paused and who was left running. */
     private func acquireLock(_ params: LockParams) async throws -> LockResult {
         let key = Self.lockKey(project: params.project, resource: params.resource)
         await releaseOrphanedLock(key: key)
@@ -1218,7 +1219,7 @@ public actor Router {
         }
         var live: [String] = []
         var paused: [String] = []
-        let shouldPause = params.pause ?? true
+        let shouldPause = params.pause ?? false
         /** Not `try?`. Swallowing the merge failure left `specs` empty, so no
             declarer was found, nothing was paused, and the lock reported success:
             the caller then ran its migration against a live server holding the
