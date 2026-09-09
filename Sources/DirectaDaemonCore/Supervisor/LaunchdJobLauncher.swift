@@ -9,7 +9,7 @@ import Foundation
     the SMAppService agent (`XPC_SERVICE_NAME` matches the agent label). Tests
     and `ddirecta --foreground` keep `SubprocessLauncher`. */
 public struct LaunchdJobLauncher: ProcessLauncher {
-    public static let labelPrefix = "dev.quantizor.directa.job."
+    public static let labelPrefix = LaunchdJobs.childLabelPrefix
 
     public init() {}
 

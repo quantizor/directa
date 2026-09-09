@@ -585,6 +585,22 @@ public actor Router {
                 try? await registry.removeState(serverID: id)
             }
         }
+        /** SIGKILL of the agent (jetsam) skips LaunchdJobLauncher's defer
+            bootout, so one-shot child labels accumulate in the gui domain.
+            Reap only when this process is that agent: tests and `--foreground`
+            never registered those jobs, and must not bootout the user's. */
+        if LaunchdJobLauncher.runningAsAgent {
+            var keepingPids: Set<pid_t> = []
+            for supervisor in supervisors.values {
+                if let pid = await supervisor.status().pid.flatMap(ProcessTree.narrowed) {
+                    keepingPids.insert(pid)
+                }
+            }
+            let reaped = LaunchdJobs.reapStaleChildJobs(keepingPids: keepingPids)
+            if reaped > 0 {
+                DirectaLog.daemon.info("reaped \(reaped) leftover child launchd job(s)")
+            }
+        }
     }
 
     /** Group-kill a live non-child left over from a prior daemon (or a prune that

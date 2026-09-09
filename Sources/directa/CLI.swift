@@ -1,4 +1,5 @@
 import ArgumentParser
+import Darwin
 import DirectaKit
 import Foundation
 
@@ -1482,6 +1483,14 @@ struct Doctor: AsyncParsableCommand {
         }
         findings.append(
             Finding(detail: LaunchdAdmin.launchdState(), kind: "launchd", severity: "info"))
+        if let agent = LaunchdJobs.loadAgentStatus(), agent.jetsammed {
+            let runs = agent.runs.map { " (\($0) runs)" } ?? ""
+            findings.append(
+                Finding(
+                    detail:
+                        "ddirecta last exited \(agent.lastExitReason ?? "OS_REASON_JETSAM")\(runs); memory pressure killed the daemon, not a crash dump. Check: launchctl print \(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)",
+                    kind: "jetsam", severity: "warning"))
+        }
         if let all = try? await client.request(
             .serverStatus, params: ProjectParams(project: ""), expecting: ServerListResult.self) {
             var signatureHolders: [String: String] = [:]
@@ -1495,6 +1504,23 @@ struct Doctor: AsyncParsableCommand {
             {
                 findings.append(
                     Finding(detail: collision.detail, kind: "port-collision", severity: "warning"))
+            }
+            let livePids = Set(
+                all.servers.compactMap { server -> pid_t? in
+                    guard let raw = server.pid, let pid = pid_t(exactly: raw), pid > 0 else {
+                        return nil
+                    }
+                    return pid
+                })
+            let leftover = LaunchdJobs.stale(LaunchdJobs.loadChildJobs(), keepingPids: livePids)
+                .sorted { $0.label < $1.label }
+            if !leftover.isEmpty {
+                let example = leftover[0].label
+                findings.append(
+                    Finding(
+                        detail:
+                            "\(leftover.count) leftover directa child job\(leftover.count == 1 ? "" : "s") with no live server (a jetsammed daemon never boots them out). Recover reaps them; to clear one now: launchctl bootout \(LaunchdJobs.guiDomain)/\(example)",
+                        kind: "leftover-job", severity: "warning"))
             }
             if let daemonPid = info.flatMap({ pid_t(exactly: $0.pid) }),
                 let daemonJetsam = CoalitionIDs.read(of: daemonPid)?.jetsam

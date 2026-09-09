@@ -367,6 +367,117 @@ import Testing
         #expect(await registry.project(mainProject) != nil)
     }
 
+    /** Nested Claude layout (`<main>/.claude/worktrees/<name>`). A prefix filter
+        that used the checkout path without a `::` terminator would treat the
+        worktree as the same project and `restart` would take both down. */
+    @Test func nestedWorktreeRestartLeavesTheSiblingRunning() async throws {
+        let env = try makeNestedEnv(port: 45310)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.main)
+        try await registry.setTrusted(project: env.worktree)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        let mainFirst = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "web", project: env.main, timeoutSeconds: 10), EnsureResult.self)
+        #expect(mainFirst.server.phase == .running)
+        let wtFirst = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
+        #expect(wtFirst.server.phase == .running)
+        let wtPid = try #require(wtFirst.server.pid)
+        let mainPid = try #require(mainFirst.server.pid)
+        #expect(wtPid != mainPid)
+
+        let restartedMain = try await handle(
+            router, .serverRestart,
+            RestartParams(names: ["web"], project: env.main, timeoutSeconds: 10), GroupResult.self)
+        #expect(restartedMain.results.count == 1)
+        #expect(try #require(restartedMain.results.first?.server.pid) != mainPid)
+        let wtAfterMain = try await handle(
+            router, .serverStatus, ProjectParams(name: "web", project: env.worktree),
+            ServerListResult.self)
+        let wtStill = try #require(wtAfterMain.servers.first)
+        #expect(wtStill.phase == .running)
+        #expect(wtStill.pid == wtPid)
+
+        let mainAfter = try await handle(
+            router, .serverStatus, ProjectParams(name: "web", project: env.main),
+            ServerListResult.self)
+        let mainNowPid = try #require(mainAfter.servers.first?.pid)
+
+        let restartedWt = try await handle(
+            router, .serverRestart,
+            RestartParams(names: ["web"], project: env.worktree, timeoutSeconds: 10),
+            GroupResult.self)
+        let wtNowPid = try #require(restartedWt.results.first?.server.pid)
+        #expect(wtNowPid != wtPid)
+        let mainAfterWt = try await handle(
+            router, .serverStatus, ProjectParams(name: "web", project: env.main),
+            ServerListResult.self)
+        #expect(mainAfterWt.servers.first?.phase == .running)
+        #expect(mainAfterWt.servers.first?.pid == mainNowPid)
+
+        let restartedAll = try await handle(
+            router, .serverRestart,
+            RestartParams(names: nil, project: env.main, timeoutSeconds: 10), GroupResult.self)
+        #expect(restartedAll.results.count == 1)
+        let wtAfterAll = try await handle(
+            router, .serverStatus, ProjectParams(name: "web", project: env.worktree),
+            ServerListResult.self)
+        #expect(wtAfterAll.servers.first?.phase == .running)
+        #expect(wtAfterAll.servers.first?.pid == wtNowPid)
+
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "web", project: env.worktree),
+            ServerResult.self)
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "web", project: env.main),
+            ServerResult.self)
+    }
+
+    private func makeNestedEnv(port: Int) throws -> Env {
+        let base = FileManager.default.temporaryDirectory
+            .appending(path: "directa-wt-nested-\(UUID().uuidString)")
+        let main = base.appending(path: "main")
+        let worktree = main.appending(path: ".claude/worktrees/review")
+        try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
+        try run(in: main.path, "/usr/bin/git", "init", "-b", "main")
+        try run(in: main.path, "/usr/bin/git", "config", "user.email", "directa@test")
+        try run(in: main.path, "/usr/bin/git", "config", "user.name", "directa")
+        try Data("ok\n".utf8).write(to: main.appending(path: "README"))
+        try run(in: main.path, "/usr/bin/git", "add", "README")
+        try run(in: main.path, "/usr/bin/git", "commit", "-m", "init")
+        try FileManager.default.createDirectory(
+            at: worktree.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try run(
+            in: main.path, "/usr/bin/git", "worktree", "add", "-b", "review", worktree.path)
+        let fixture = try #require(Self.fixtureServerPath())
+        let body = """
+            {
+              "host": "app.localhost",
+              "servers": {
+                "web": {
+                  "command": ["\(fixture)", "--listen-tcp", "{port}"],
+                  "healthcheck": { "type": "tcp", "port": \(port) },
+                  "port": \(port),
+                  "url": "http://app.localhost:\(port)/"
+                }
+              },
+              "version": 1
+            }
+            """
+        for root in [main, worktree] {
+            try Data(body.utf8).write(to: root.appending(path: "devservers.json"))
+        }
+        return Env(
+            fixture: fixture,
+            main: main.path,
+            paths: DirectaPaths(
+                dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
+            worktree: worktree.path)
+    }
+
     private func run(in cwd: String, _ exe: String, _ args: String...) throws {
         let proc = Process()
         proc.currentDirectoryURL = URL(fileURLWithPath: cwd)
