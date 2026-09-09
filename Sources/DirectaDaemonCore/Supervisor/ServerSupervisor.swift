@@ -27,6 +27,9 @@ public actor ServerSupervisor {
     private var lastExit: LastExit?
     private var lastHealthAt: Date?
     private var lastDescendantSnapshot: [ProcessIdentity] = []
+    /** Invalidates an in-flight listen scan when this run dies or a new one
+        starts, so a late lsof cannot write observedPort onto the next spawn. */
+    private var listenScanGeneration: UInt64 = 0
     /** Keeps the descendant snapshot fresh across the startup window; see
         startDescendantWatch. */
     private var descendantTask: Task<Void, Never>?
@@ -242,6 +245,7 @@ public actor ServerSupervisor {
         case .crashed, .failed, .stopped:
             break
         }
+        listenScanGeneration += 1
         phase = .starting
         stopRequested = false
         spawnError = nil
@@ -544,6 +548,7 @@ public actor ServerSupervisor {
                 }
             } else if phase == .unhealthy {
                 phase = .running
+                scanObservedPort()
                 postHealthEvent(.healthy)
             }
         } else {
@@ -568,15 +573,24 @@ public actor ServerSupervisor {
     private func scanObservedPort() {
         guard let rootPid = pid else { return }
         let expected = effectivePort ?? spec.port
+        let generation = listenScanGeneration
         Task { [weak self] in
             let pids = [rootPid] + ProcessTree.descendants(of: rootPid).pids
             let ports = PortGuard.listeningPorts(pids: pids)
-            await self?.recordObservedPort(ports: ports)
-            guard let expected else { return }
-            let owners = PortGuard.listenerPids(port: expected)
-            await self?.recordPortOwnership(
-                expected: expected, owners: owners, ours: pids.map(Int.init))
+            await self?.applyListenScan(
+                expected: expected, generation: generation, ours: pids.map(Int.init),
+                ports: ports)
         }
+    }
+
+    private func applyListenScan(
+        expected: Int?, generation: UInt64, ours: [Int], ports: [Int]
+    ) async {
+        guard generation == listenScanGeneration else { return }
+        await recordObservedPort(ports: ports)
+        guard let expected else { return }
+        let owners = PortGuard.listenerPids(port: expected)
+        await recordPortOwnership(expected: expected, owners: owners, ours: ours)
     }
 
     /** The managed server whose recorded pid holds one of these listeners, if
@@ -914,6 +928,7 @@ public actor ServerSupervisor {
         let capturedPid = pid
         let capturedSessionID = rootSessionID
         let capturedSnapshot = lastDescendantSnapshot
+        listenScanGeneration += 1
         healthTask?.cancel()
         healthTask = nil
         switch outcome {
@@ -987,9 +1002,11 @@ public actor ServerSupervisor {
         }
         phase = finalPhase
         settleSpawnWaiters()
-        await escalateCrashDescendants(
-            id: id, rootPid: capturedPid, sessionID: capturedSessionID,
-            snapshot: capturedSnapshot)
+        if finalPhase == .crashed {
+            await escalateCrashDescendants(
+                rootPid: capturedPid, sessionID: capturedSessionID,
+                snapshot: capturedSnapshot)
+        }
     }
 
     /** The crash path's counterpart to stop()'s SIGKILL escalation, and the one
@@ -1006,9 +1023,9 @@ public actor ServerSupervisor {
         answer, and the SIGKILL pass rides the prior pass's union so a
         descendant every live source has since lost is still re-signaled. */
     private func escalateCrashDescendants(
-        id: String, rootPid: pid_t?, sessionID: pid_t?, snapshot: [ProcessIdentity]
+        rootPid: pid_t?, sessionID: pid_t?, snapshot: [ProcessIdentity]
     ) async {
-        guard let rootPid, !stopRequested else { return }
+        guard let rootPid else { return }
         let signaled = signalRun(
             target: rootPid, rootIdentity: nil, sessionID: sessionID,
             snapshot: snapshot, signal: SIGTERM)

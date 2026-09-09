@@ -1513,7 +1513,6 @@ public actor Router {
         var prepared: [(spec: ServerSpec, supervisor: ServerSupervisor)] = []
         for spec in wanted {
             try await lockGate(project: params.project, spec: spec)
-            try await refuseIfPaused(project: params.project, spec: spec)
             prepared.append((spec: spec, supervisor: await supervisor(project: params.project, spec: spec)))
         }
         /** The whole resolution pass runs before any server stops, the way
@@ -1593,26 +1592,6 @@ public actor Router {
             name: String(id[separator.upperBound...]),
             project: String(id[id.startIndex..<separator.lowerBound])
         )
-    }
-
-    /** A server sitting in a live holder's paused set must not be resurrected
-        behind the lock's back. lockGate covers an external holder of a resource
-        this server declares; this covers the case where the hold already stopped
-        it. */
-    private func refuseIfPaused(project: String, spec: ServerSpec) async throws {
-        for declaration in spec.locks ?? [] {
-            let key = Self.lockKey(project: project, resource: declaration.name)
-            await releaseOrphanedLock(key: key)
-            guard let holder = resourceLocks[key], holder.paused.contains(spec.name) else {
-                continue
-            }
-            throw WireError(
-                code: .resourceLocked,
-                hint: "wait for pid \(holder.pid) to finish, or verify it: ps -p \(holder.pid)",
-                message:
-                    "'\(spec.name)' is paused by the hold on '\(declaration.name)' (pid \(holder.pid)); it comes back when that run releases"
-            )
-        }
     }
 
     /** Wave-parallel group start honoring the dependency graph: a wave holds
