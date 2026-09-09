@@ -33,7 +33,7 @@ Ad-hoc signing has consequences for launchd spawn under the BTM constraint; see 
 Two paths, two commands:
 
 - `make dmg` is the contributor path: a TEST DMG, signed with whatever identity is present (ad-hoc when none), not notarized. Fast, no credentials needed.
-- `make release-dmg` is the maintainer path: Developer ID signed, notarized, stapled, `com.apple.quarantine`-stamped. It sets `DIRECTA_REQUIRE_SIGNING=1` (fails the build rather than signing ad-hoc when no Developer ID cert is present) and `DIRECTA_NOTARIZE=1` (fails loudly if the notary credentials are unreachable), so it never silently degrades to a test image. Use it for anything a user will install or launch. Credentials live where the release is built: the `devctl-notary` keychain profile locally, App Store Connect API key env in CI.
+- `make release-dmg` is the maintainer path: Developer ID signed, notarized, stapled, `com.apple.quarantine`-stamped. It sets `DIRECTA_REQUIRE_SIGNING=1` (fails the build rather than signing ad-hoc when no Developer ID cert is present) and `DIRECTA_NOTARIZE=1` (fails loudly if the notary credentials are unreachable), so it never silently degrades to a test image. Use it for anything a user will install or launch. Credentials live where the release is built: the `devctl-notary` keychain profile locally (the stored credential kept the old product name), App Store Connect API key env in CI.
 
 Why a dedicated target rather than trusting `make dmg` to auto-notarize: on macOS 26 a GUI app must be notarized to launch at all (Developer ID signing plus a cleared quarantine is not enough, and Gatekeeper blocks the app), so a TEST DMG's app is unlaunchable on a modern Mac. `make release-dmg` is the only path that yields something a user can actually open.
 

@@ -17,9 +17,10 @@
 # notarized, so Gatekeeper blocks it on other machines, which is fine for local
 # testing. A REAL image is notarized and stapled, and is reserved for where the
 # notarytool credentials live: the maintainer's machine (the `devctl-notary`
-# keychain profile) or CI (App Store Connect API key env). make dmg notarizes
-# automatically when those credentials are reachable; DIRECTA_NOTARIZE=1 demands
-# the real path (failing if they are missing) and the release build sets
+# keychain profile, which kept the old product name) or CI (App Store Connect
+# API key env). make dmg notarizes automatically when those credentials are
+# reachable; DIRECTA_NOTARIZE=1 demands the real path (failing if they are
+# missing) and the release build sets
 # DIRECTA_REQUIRE_SIGNING=1, which implies it. SKIP_NOTARIZE=1 forces the fast
 # local loop; DIRECTA_DMG_QUARANTINE=0 drops the download stamp.
 set -euo pipefail
@@ -127,9 +128,10 @@ rm -f "$RW_DMG"
 rm -rf "$STAGE"
 
 # Whether notarytool credentials are reachable. Real (notarized) images are built
-# where these live: this machine's `devctl-notary` keychain profile, or CI's App
-# Store Connect API key env. A contributor without them still gets a signed TEST
-# image and a clear note, never a hard failure. A false negative here costs the
+# where these live: this machine's `devctl-notary` keychain profile (the stored
+# credential kept the old product name), or CI's App Store Connect API key env.
+# A contributor without them still gets a signed TEST image and a clear note,
+# never a hard failure. A false negative here costs the
 # maintainer only a `DIRECTA_NOTARIZE=1`; it never blocks a contributor.
 notary_creds_available() {
   if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER:-}" \
