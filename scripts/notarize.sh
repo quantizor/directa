@@ -3,7 +3,7 @@
 # the environment / keychain; never commit secrets.
 #
 # Auth (one of):
-#   NOTARY_KEYCHAIN_PROFILE  (default: devctl-notary) — local notarytool store-credentials
+#   NOTARY_KEYCHAIN_PROFILE  (default: devctl-notary, the stored credential name)
 #   APPLE_API_KEY_ID + APPLE_API_ISSUER + (APPLE_API_KEY_PATH | APPLE_API_KEY_BASE64) — CI
 # Optional:
 #   NOTARIZE_TARGET    (path to .dmg or .app; default: newest dist/directa-*.dmg)
@@ -31,7 +31,7 @@ if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER:-}" ]]; then
     # The private key lands in a 0700 directory of its own: mktemp only
     # randomizes trailing Xs, so a template like AuthKey.XXXXXX.p8 would be a
     # fixed, world-readable path, and chmod after the write leaves a window.
-    KEY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/devctl-notary.XXXXXX")"
+    KEY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/directa-notary.XXXXXX")"
     KEY_PATH="$KEY_DIR/AuthKey.p8"
     CLEANUP_KEY="$KEY_DIR"
     print -r -- "$APPLE_API_KEY_BASE64" | base64 -D > "$KEY_PATH"
