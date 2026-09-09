@@ -78,6 +78,20 @@ import Testing
         #expect(ProjectConfigLoader.validate(config: ok, project: "/p").errors.isEmpty)
     }
 
+    @Test func aMonorepoSizedFileStillValidates() {
+        var servers: [String: ProjectFileServer] = [
+            "s00": ProjectFileServer(command: ["x"], port: 3000)
+        ]
+        for index in 1..<24 {
+            servers["s\(String(format: "%02d", index))"] = ProjectFileServer(
+                command: ["x"], dependsOn: ["s00"], port: 3000 + index)
+        }
+        let view = ProjectConfigLoader.validate(
+            config: ProjectFileConfig(servers: servers), project: "/p")
+        #expect(view.errors.isEmpty)
+        #expect(view.specs.count == 24)
+    }
+
     @Test func serverSpecValidationMirrorsFileChecks() {
         /** The register path validates through ServerSpec.validationErrors; it must
             catch the same per-spec problems the file validator does, plus a name
@@ -327,5 +341,18 @@ import Testing
         /** Validation reports the unknown name; ordering just skips it. */
         let result = DependencyGraph.waves(specs: [spec("web", deps: ["ghost"])])
         #expect(result == .success([["web"]]))
+    }
+
+    @Test func aMonorepoSizedGraphStillWaves() {
+        /** A 24-server file is a normal monorepo; the suite otherwise uses 2–4.
+            One root and 23 dependents must stay two waves, not a cycle or a
+            flattened single wave that would start everything at once. */
+        let root = spec("s00")
+        let dependents = (1..<24).map {
+            spec("s\(String(format: "%02d", $0))", deps: ["s00"])
+        }
+        let result = DependencyGraph.waves(specs: [root] + dependents)
+        let rest = (1..<24).map { "s\(String(format: "%02d", $0))" }
+        #expect(result == .success([["s00"], rest]))
     }
 }

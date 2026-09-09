@@ -128,6 +128,50 @@ import Testing
         #expect(first == second)
     }
 
+    @Test func aChangeInsideACrowdedDirectoryIsStillNoticed() throws {
+        /** Wrangler-shaped: hundreds of small sqlite files, well under the
+            8 MiB / 4096-entry caps, with the edit in the middle of the sorted
+            walk so a head-and-tail sample of the tree would miss it. */
+        let dir = try scratch()
+        for index in 0..<240 {
+            try Data("body-\(index)".utf8)
+                .write(to: dir.appending(path: String(format: "f%04d.sqlite", index)))
+        }
+        let before = ResourceFingerprint.capture(path: dir.path)
+        #expect(before.exact)
+        #expect(!before.truncated)
+        #expect(before.entryCount == 240)
+        /** Same byte length so the comparison cannot exit on size and skip the
+            digest, which is the only signal a middle-of-tree rewrite has. */
+        try Data("BODY-120".utf8)
+            .write(to: dir.appending(path: "f0120.sqlite"))
+        let after = ResourceFingerprint.capture(path: dir.path)
+        #expect(after.bytes == before.bytes)
+        #expect(ResourceFingerprint.compare(after: after, before: before) == .changed(.content))
+    }
+
+    @Test func aFilePastMaxDepthDoesNotChangeTheFingerprint() throws {
+        let dir = try scratch()
+        func nest(_ levels: Int) throws -> URL {
+            var url = dir
+            for index in 1...levels { url.append(path: "d\(index)") }
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            return url
+        }
+        let shallow = try nest(3)
+        let deep = try nest(8)
+        try Data("kept".utf8).write(to: shallow.appending(path: "kept.sqlite"))
+        let before = ResourceFingerprint.capture(path: dir.path)
+        try Data("deep".utf8).write(to: deep.appending(path: "too-deep.sqlite"))
+        #expect(
+            ResourceFingerprint.compare(
+                after: ResourceFingerprint.capture(path: dir.path), before: before) == .unchanged)
+        try Data("sib".utf8).write(to: shallow.appending(path: "sibling.sqlite"))
+        #expect(
+            ResourceFingerprint.compare(
+                after: ResourceFingerprint.capture(path: dir.path), before: before) != .unchanged)
+    }
+
     @Test func missingThenPresentIsAppearedAndTheReverseIsDisappeared() throws {
         let dir = try scratch()
         let file = dir.appending(path: "later.sqlite")

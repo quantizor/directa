@@ -121,4 +121,17 @@ import Testing
         #expect(claim.named["api"] == 65_535)
         #expect(claim.named["fixed"] == 1)
     }
+
+    @Test func aWideSpanResolvesEveryPortInTheBlock() throws {
+        /** Config allows 1...65535; real apps use tens, not 4. Resolve has to
+            emit the whole consecutive block without trapping or dropping the
+            tail, and `allPorts` has to list each one once. */
+        let spec = ServerSpec(command: ["serve"], name: "web", port: 45_000, portSpan: 64)
+        #expect(PortClaim.configErrors(spec: spec).isEmpty)
+        let claim = try #require(PortClaim.resolve(spec: spec, effectivePort: 45_000).claim)
+        #expect(claim.relative.count == 64)
+        #expect(claim.relative.first == 45_000)
+        #expect(claim.relative.last == 45_063)
+        #expect(claim.allPorts == Array(45_000...45_063))
+    }
 }

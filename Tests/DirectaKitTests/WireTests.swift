@@ -80,6 +80,32 @@ import Testing
         )
     }
 
+    @Test func aMachineWideStatusListIsOneNDJSONLine() throws {
+        /** `status --all` of a 24-server monorepo is one JSON array on one
+            line. Interior newlines would break NDJSON framing; a failed
+            round-trip would mean the client timed out on a frame it could not
+            parse. */
+        let servers = (0..<24).map { index in
+            ServerStatus(
+                declaredPort: 3000 + index,
+                healthcheck: .tcp,
+                logPath: "/logs/s\(index)/current.log",
+                phase: .running,
+                project: "/p",
+                server: "s\(String(format: "%02d", index))",
+                url: "http://p.localhost:\(3000 + index)/")
+        }
+        let line = try NDJSON.encodeLine(ServerListResult(servers: servers, trusted: true))
+        #expect(line.last == 0x0A)
+        #expect(line.dropLast().contains(0x0A) == false)
+        let decoded = try JSONCoding.decoder().decode(
+            ServerListResult.self, from: line.dropLast())
+        #expect(decoded.servers.count == 24)
+        #expect(decoded.servers.first?.server == "s00")
+        #expect(decoded.servers.last?.server == "s23")
+        #expect(decoded.trusted == true)
+    }
+
     @Test func errorSummarySchemaGolden() throws {
         let status = ServerStatus(
             declaredPort: 3000,

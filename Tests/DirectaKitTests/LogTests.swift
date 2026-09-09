@@ -164,4 +164,39 @@ import Testing
         #expect(summary?.firstAt == Date(timeIntervalSince1970: 1_700_000_050))
         #expect(summary?.lastAt == Date(timeIntervalSince1970: 1_700_000_059))
     }
+
+    @Test func aCapSizedFamilyStillAnswersTailSinceAndGrep() throws {
+        /** 30k lines across one rotate is still under the 10 MB file cap, but
+            two orders past the 200-line queries this suite used. Whole-file
+            parse, `since` skip of the rotated file, tail-after-filter, and a
+            literal grep all have to stay correct and return; a hang here is
+            the log actor wedging on a real noisy server. */
+        func stream(for offset: Int) -> LogStream { offset % 500 == 0 ? .err : .out }
+        let rotated = (0..<10_000).map {
+            record(Double($0), stream(for: $0), "old \($0)")
+        }
+        var recent = (10_000..<30_000).map {
+            record(Double($0), stream(for: $0), "new \($0)")
+        }
+        recent[5_000] = record(15_000, .out, "NEEDLE-MID")
+        let current = try writeFamily([rotated, recent])
+        let started = ContinuousClock.now
+
+        let tail = LogQuery.run(current: current, options: LogQueryOptions(tail: 5))
+        #expect(tail.map(\.text) == ["new 29995", "new 29996", "new 29997", "new 29998", "new 29999"])
+
+        let since = Date(timeIntervalSince1970: 1_700_000_000 + 25_000)
+        let window = LogQuery.run(current: current, options: LogQueryOptions(since: since))
+        #expect(window.count == 5_000)
+        #expect(window.first?.text == "new 25000")
+        #expect(window.last?.text == "new 29999")
+
+        let hits = LogQuery.run(current: current, options: LogQueryOptions(grep: "NEEDLE-MID"))
+        #expect(hits.map(\.text) == ["NEEDLE-MID"])
+
+        let summary = LogQuery.summarize(current: current, streams: [.err], since: since)
+        #expect(summary?.count == 10)
+
+        #expect(ContinuousClock.now - started < Duration.seconds(2))
+    }
 }

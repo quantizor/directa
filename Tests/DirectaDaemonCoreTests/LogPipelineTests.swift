@@ -244,6 +244,60 @@ private func tempDir() throws -> URL {
         let tail = await store.query(tail: 1)
         #expect(tail.first?.server == "api")
     }
+
+    @Test func aForcedRotateKeepsTheNewestAndTheRotatedFile() async throws {
+        let url = try tempDir().appending(path: "events.log")
+        let store = EventStore(url: url, maxBytes: 4_096)
+        for index in 0..<80 {
+            await store.post(
+                kind: .started, project: "/p", server: "web-\(index)",
+                detail: String(repeating: "x", count: 80))
+        }
+        #expect(FileManager.default.fileExists(atPath: url.appendingPathExtension("1").path))
+        let all = await store.query()
+        #expect(!all.isEmpty)
+        #expect(all.last?.server == "web-79")
+    }
+
+    @Test func aCapSizedFamilyStillAnswersSinceAndTail() async throws {
+        /** Pre-written NDJSON, not 5 MB of actor posts: the query path reads
+            both files whole, then tails, which is the same shape as a days-old
+            events.log at the 5 MB rotate cap. */
+        let dir = try tempDir()
+        let current = dir.appending(path: "events.log")
+        func event(_ offset: Int, project: String) throws -> Data {
+            try NDJSON.encodeLine(
+                EventRecord(
+                    at: Date(timeIntervalSince1970: 1_700_000_000 + Double(offset)),
+                    kind: offset % 3 == 0 ? .crashed : .started,
+                    project: project, server: "web"))
+        }
+        var rotated = Data()
+        rotated.reserveCapacity(8_000 * 120)
+        for index in 0..<8_000 {
+            rotated.append(try event(index, project: index < 100 ? "/other" : "/p"))
+        }
+        var live = Data()
+        live.reserveCapacity(500 * 120)
+        for index in 8_000..<8_500 {
+            live.append(try event(index, project: "/p"))
+        }
+        try rotated.write(to: current.appendingPathExtension("1"))
+        try live.write(to: current)
+        let store = EventStore(url: current)
+        let started = ContinuousClock.now
+        let tail = await store.query(tail: 3)
+        #expect(tail.map(\.at) == [
+            Date(timeIntervalSince1970: 1_700_000_000 + 8_497),
+            Date(timeIntervalSince1970: 1_700_000_000 + 8_498),
+            Date(timeIntervalSince1970: 1_700_000_000 + 8_499),
+        ])
+        let window = await store.query(since: Date(timeIntervalSince1970: 1_700_000_000 + 8_400))
+        #expect(window.count == 100)
+        let other = await store.query(project: "/other")
+        #expect(other.count == 100)
+        #expect(ContinuousClock.now - started < Duration.seconds(2))
+    }
 }
 
 @Suite struct WhyEngineTests {
