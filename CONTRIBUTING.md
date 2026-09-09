@@ -40,6 +40,8 @@ User-facing: what changed for a person running directa, migration if any, how it
 
 User-facing changes get a Changeset (`npm run changeset`); see `.changeset/README.md`. Internal-only work (CI, agent docs, no-behavior refactors) never gets a changeset. A breaking subject (`type(scope)!:`) still needs a major changeset: the `!` is for git log, Changesets own the version.
 
+The body is changelog text for someone using directa. Lead with what changed for them. No function names, internal file paths, or launchd labels. A term of art (jetsam, lock resource) gets a short plain-English gloss on first use.
+
 Product version lives in `package.json`. `npm run version` (used by the Release workflow) syncs `DirectaVersion.version` in `Sources/DirectaKit/Model/Models.swift`.
 
 ## Releases
