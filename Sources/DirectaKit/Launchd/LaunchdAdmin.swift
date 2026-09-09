@@ -105,7 +105,7 @@ public enum LaunchdAdmin {
     /** True when launchd has the job but is waiting out ThrottleInterval
         (`minimum runtime` defaults to 10s) after a failed spawn. */
     public static func agentSpawnScheduled() -> Bool {
-        launchdState().contains("spawn scheduled")
+        LaunchdJobs.loadAgentStatus()?.state?.contains("spawn scheduled") == true
     }
 
     public static func pollHello(paths: DirectaPaths, timeoutSeconds: Double = 5) async throws {

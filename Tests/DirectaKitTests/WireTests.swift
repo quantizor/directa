@@ -204,6 +204,14 @@ import Testing
 
     @Test func serverIDShape() {
         #expect(serverID(project: "/a/b", name: "web") == "/a/b::web")
+        #expect(parseServerID("/a/b::web")?.project == "/a/b")
+        #expect(parseServerID("/a/b::web")?.name == "web")
+        /** Last `::` wins, so a project path carrying the separator still
+            round-trips. Front-split would call the project `/a` and the name
+            `b::web`. */
+        #expect(parseServerID("/a::b::web")?.project == "/a::b")
+        #expect(parseServerID("/a::b::web")?.name == "web")
+        #expect(parseServerID("no-separator") == nil)
     }
 
     /** The menu bar logs and displays failures through `localizedDescription`,

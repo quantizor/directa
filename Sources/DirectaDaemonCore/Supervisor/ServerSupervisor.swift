@@ -616,13 +616,8 @@ public actor ServerSupervisor {
             else { continue }
             let processStart = Date(timeIntervalSince1970: TimeInterval(identity.startSeconds))
             guard processStart <= startedAt.addingTimeInterval(1) else { continue }
-            /** Split from the back: the project is an absolute path and the name
-                never contains the separator. */
-            guard let separator = id.range(of: "::", options: .backwards) else { continue }
-            return (
-                name: String(id[separator.upperBound...]),
-                project: String(id[id.startIndex..<separator.lowerBound])
-            )
+            guard let parsed = parseServerID(id) else { continue }
+            return parsed
         }
         return nil
     }

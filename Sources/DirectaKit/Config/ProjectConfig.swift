@@ -147,9 +147,6 @@ public enum ProjectConfigLoader {
         var declaredPorts: [Int: String] = [:]
         var specs: [ServerSpec] = []
         for (name, entry) in config.servers.sorted(by: { $0.key < $1.key }) {
-            if entry.command.isEmpty {
-                view.errors.append("server '\(name)': command is empty")
-            }
             /** `type: http` with no url silently falls back to a TCP probe on
                 the declared port, so a mistyped `url` key yields a server that
                 reports healthy while its HTTP layer was never checked. A warning
@@ -159,9 +156,6 @@ public enum ProjectConfigLoader {
             if entry.healthcheck?.type == .http, entry.healthcheck?.url == nil {
                 warnings.append(
                     "server '\(name)': healthcheck type is http but no url is set, so it will be probed over TCP instead; add a url or set type to tcp")
-            }
-            for error in entry.healthcheck?.validationErrors() ?? [] {
-                view.errors.append("server '\(name)': \(error)")
             }
             if let explicitHost = entry.host, isBareLoopback(explicitHost) {
                 warnings.append(
@@ -250,7 +244,7 @@ public enum ProjectConfigLoader {
                 waitFor: entry.waitFor,
                 watch: watchEntries
             )
-            view.errors.append(contentsOf: PortClaim.configErrors(spec: draft))
+            view.errors.append(contentsOf: draft.validationErrors())
             specs.append(draft)
         }
         switch DependencyGraph.waves(specs: specs) {

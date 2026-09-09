@@ -314,6 +314,25 @@ private func phaseOf(router: Router, project: String, name: String) async throws
         #expect(acquired.paused.isEmpty)
         let phase = try await phaseOf(router: router, project: env.projectPath, name: "db")
         #expect(phase == .starting || phase == .running)
+        /** Already-up under a default lock is not a start: groupUp no-ops. */
+        _ = try await handle(
+            router: router, method: .groupUp,
+            params: GroupParams(project: env.projectPath, timeoutSeconds: 5),
+            expecting: GroupResult.self)
+        let stillUp = try await phaseOf(router: router, project: env.projectPath, name: "db")
+        #expect(stillUp == .starting || stillUp == .running)
+        _ = try await handle(
+            router: router, method: .serverStop,
+            params: ServerTargetParams(name: "db", project: env.projectPath),
+            expecting: ServerResult.self)
+        let upLine = try NDJSON.encodeLine(
+            WireRequest(
+                id: "u", method: WireMethod.groupUp.rawValue,
+                params: GroupParams(project: env.projectPath, timeoutSeconds: 2)))
+        let upData = await router.handle(line: upLine)
+        let upResponse = try JSONCoding.decoder().decode(
+            WireResponse<GroupResult>.self, from: upData)
+        #expect(upResponse.error?.code == .resourceLocked)
         _ = try await handle(
             router: router, method: .lockRelease,
             params: LockParams(

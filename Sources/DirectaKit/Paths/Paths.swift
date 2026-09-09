@@ -171,6 +171,16 @@ public func serverID(project: String, name: String) -> String {
     "\(project)::\(name)"
 }
 
+/** Inverse of `serverID`. Splits on the last `::` so a project path that
+    itself contains `::` still round-trips. */
+public func parseServerID(_ id: String) -> (name: String, project: String)? {
+    guard let separator = id.range(of: "::", options: .backwards) else { return nil }
+    return (
+        name: String(id[separator.upperBound...]),
+        project: String(id[id.startIndex..<separator.lowerBound])
+    )
+}
+
 /** Atomic file persistence: temp + fsync + rename. Loads are defensive: a parse
     failure quarantines the file to `.corrupt-<timestamp>` and returns nil rather
     than crashing (a startup parse crash under launchd KeepAlive loops forever). */

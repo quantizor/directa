@@ -7,3 +7,5 @@
 Stopping the declaring servers is now opt-in with `--pause`, which stops them for the command and resumes them on release. The old `--no-pause` flag is removed: it was the previous non-default and is now the default, so a plain `directa lock <resource> -- <command>` behaves as `--no-pause` used to. Scripts passing `--no-pause` should drop it; scripts that relied on the servers being stopped should add `--pause`.
 
 A bare-named lock (one with no declared state `path`) has nothing to fingerprint, so a default hold that leaves a declaring server running now warns on stderr that the corruption guard is off, pointing to a `path` declaration or `--pause`.
+
+`directa up` and boot recover will not start a stopped declarer while a live holder owns the resource. An already-running declarer is left running.
