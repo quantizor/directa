@@ -1,4 +1,5 @@
 import ArgumentParser
+import Darwin
 import DirectaKit
 import Foundation
 
@@ -89,6 +90,10 @@ struct GlobalOptions: ParsableArguments {
 enum CLIRunner {
     static func client() -> DaemonClient {
         DaemonClient(socketPath: DirectaPaths().socketPath)
+    }
+
+    static func stdinData() -> Data {
+        (try? FileHandle.standardInput.readToEnd()) ?? Data()
     }
 
     static func emit<T: Codable>(_ value: T, json: Bool, human: (T) -> String) {
@@ -917,7 +922,7 @@ struct HookAntigravitySessionStart: AsyncParsableCommand {
         commandName: "antigravity-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let stdin = CLIRunner.stdinData()
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         FileManager.default.changeCurrentDirectoryPath(cwd)
         let project = GlobalOptions.resolveProject(from: cwd)
@@ -947,7 +952,7 @@ struct HookClaudeSessionStart: AsyncParsableCommand {
         commandName: "claude-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let stdin = CLIRunner.stdinData()
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         /** Project resolution without --project: reuse the CLI's walk from the
             hook cwd by chdir-ing there first. */
@@ -973,7 +978,7 @@ struct HookCursorSessionStart: AsyncParsableCommand {
         commandName: "cursor-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let stdin = CLIRunner.stdinData()
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         FileManager.default.changeCurrentDirectoryPath(cwd)
         let project = GlobalOptions.resolveProject(from: cwd)
@@ -1000,7 +1005,7 @@ struct HookGrokSessionStart: AsyncParsableCommand {
         guard event != .leftover else { return }
 
         if event == .unspecified {
-            let stdin = FileHandle.standardInput.readDataToEndOfFile()
+            let stdin = CLIRunner.stdinData()
             _ = await emit(stdin: stdin)
             return
         }
@@ -1019,7 +1024,7 @@ struct HookGrokSessionStart: AsyncParsableCommand {
             break
         }
 
-        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let stdin = CLIRunner.stdinData()
         guard await emit(stdin: stdin) else { return }
         if action == .emitAndMark {
             GrokSessionHook.markEmitted(&state)
@@ -1053,7 +1058,7 @@ struct Statusline: AsyncParsableCommand {
         abstract: "Compact server presence for a statusline; reads harness stdin JSON.")
 
     func run() async throws {
-        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let stdin = CLIRunner.stdinData()
         var cwd = FileManager.default.currentDirectoryPath
         if let payload = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] {
             if let workspace = payload["workspace"] as? [String: Any],
@@ -1480,8 +1485,23 @@ struct Doctor: AsyncParsableCommand {
             findings.append(
                 Finding(detail: "daemon not responding (run: directa daemon status)", kind: "daemon", severity: "error"))
         }
+        let printed = LaunchdAdmin.shell(
+            "/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)"])
         findings.append(
-            Finding(detail: LaunchdAdmin.launchdState(), kind: "launchd", severity: "info"))
+            Finding(
+                detail: LaunchdAdmin.launchdState(from: printed), kind: "launchd",
+                severity: "info"))
+        if printed.status == 0 {
+            let agent = LaunchdJobs.parseAgentPrint(printed.output)
+            if agent.jetsammed {
+                let runs = agent.runs.map { " (\($0) runs)" } ?? ""
+                findings.append(
+                    Finding(
+                        detail:
+                            "ddirecta last exited \(agent.lastExitReason ?? "OS_REASON_JETSAM")\(runs); memory pressure killed the daemon, not a crash dump. Check: launchctl print \(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)",
+                        kind: "jetsam", severity: "warning"))
+            }
+        }
         if let all = try? await client.request(
             .serverStatus, params: ProjectParams(project: ""), expecting: ServerListResult.self) {
             var signatureHolders: [String: String] = [:]
@@ -1495,6 +1515,23 @@ struct Doctor: AsyncParsableCommand {
             {
                 findings.append(
                     Finding(detail: collision.detail, kind: "port-collision", severity: "warning"))
+            }
+            let livePids = Set(
+                all.servers.compactMap { server -> pid_t? in
+                    guard let raw = server.pid, let pid = pid_t(exactly: raw), pid > 0 else {
+                        return nil
+                    }
+                    return pid
+                })
+            let leftover = LaunchdJobs.stale(LaunchdJobs.loadChildJobs(), keepingPids: livePids)
+                .sorted { $0.label < $1.label }
+            if !leftover.isEmpty {
+                let example = leftover[0].label
+                findings.append(
+                    Finding(
+                        detail:
+                            "\(leftover.count) leftover directa child job\(leftover.count == 1 ? "" : "s") with no live server (a jetsammed daemon never boots them out). Daemon recovery reaps them; to clear one now: launchctl bootout \(LaunchdJobs.guiDomain)/\(example)",
+                        kind: "leftover-job", severity: "warning"))
             }
             if let daemonPid = info.flatMap({ pid_t(exactly: $0.pid) }),
                 let daemonJetsam = CoalitionIDs.read(of: daemonPid)?.jetsam
@@ -2104,13 +2141,27 @@ enum LockNotice {
         "directa lock: still waiting on '\(resource)' (pid \(holder.pid)), \(DurationText.brief(seconds: elapsedSeconds)) elapsed, \(DurationText.brief(seconds: remainingSeconds)) left."
     }
 
+    /** A default hold leaves declarers running, and the fingerprint guard is the
+        substitute for the pause that used to stop them. That guard needs a
+        declared state `path`; a bare-named lock has none, so a change made while
+        a live server holds the state open cannot be detected. Say the guard is
+        off rather than leave the exposure silent. Nil when there is nothing to
+        protect: no live declarer, or a path to fingerprint (`--pause` empties
+        `live`, so the safe path never nags). */
+    static func unguarded(resource: String, live: [String], statePath: String?) -> String? {
+        guard statePath == nil, !live.isEmpty else { return nil }
+        let servers = live.sorted()
+        return
+            "directa lock: note: '\(resource)' declares no state path, so a change made while \(servers.joined(separator: ", ")) \(servers.count == 1 ? "stays" : "stay") running cannot be detected. Add a `path` to the lock declaration or use --pause."
+    }
+
     private static func pauseClause(_ holder: LockHolder) -> String {
         if holder.pause == false {
             guard let live = holder.live, !live.isEmpty else {
-                /** --no-pause with nothing running is not "it left servers up". */
-                return " (nothing was running, so --no-pause stopped nothing)"
+                /** The default hold with nothing running is not "it left servers up". */
+                return " (nothing was running to leave up)"
             }
-            return " (it left \(live.joined(separator: ", ")) running, --no-pause)"
+            return " (it left \(live.joined(separator: ", ")) running)"
         }
         guard !holder.paused.isEmpty else { return " (nothing was running to pause)" }
         return " (it paused \(holder.paused.joined(separator: ", ")))"
@@ -2133,10 +2184,10 @@ enum LockIdentityVerdict: Equatable {
     case note(String)
     case silent
 
-    /** Under `--no-pause` a live declarer holds the old file open, so any change
-        to the locked state during the hold is not durable whatever the command
-        reported. Under the default paused mode the same change is the entire
-        point, so it is a note. */
+    /** A declarer left running (the default) holds the old file open, so any
+        change to the locked state during the hold is not durable whatever the
+        command reported. Under `--pause`, with the declarers stopped, the same
+        change is the entire point, so it is a note. */
     static func of(
         after: ResourceIdentity, before: ResourceIdentity, live: [String], resource: String,
         statePath: String
@@ -2166,9 +2217,9 @@ enum LockIdentityVerdict: Equatable {
         return .fault(
             WireError(
                 code: .resourceMutated,
-                hint: "directa stop \(servers.joined(separator: " && directa stop ")) && directa lock \(resource) -- <command> && directa ensure \(servers.joined(separator: " && directa ensure "))",
+                hint: "directa lock \(resource) --pause -- <command>",
                 message:
-                    "resource '\(resource)' state at \(statePath) changed (\(described)) while \(servers.joined(separator: ", ")) stayed running under --no-pause. \(servers.count == 1 ? "That server holds" : "Those servers hold") the old state open and can write cached pages back over the change, so what is on disk is not what the command wrote."
+                    "resource '\(resource)' state at \(statePath) changed (\(described)) while \(servers.joined(separator: ", ")) stayed running. \(servers.count == 1 ? "That server holds" : "Those servers hold") the old state open and can write cached pages back over the change, so what is on disk is not what the command wrote."
             ))
     }
 
@@ -2204,11 +2255,13 @@ enum DurationText {
 }
 
 /** Runs a command while holding a named resource exclusively. By default the
-    daemon pauses managed servers that declare the resource; `--no-pause` takes
-    the mutex without stopping them (for harnesses that reuse the live server). */
+    servers that declare the resource keep running: the mutex serializes access
+    against other holders and a fingerprint guard flags a live server corrupting
+    the state. `--pause` stops those declarers for the command and re-ensures
+    them on release, for state a running server holds open (a local database). */
 struct Lock: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Run a command holding a project resource; conflicting servers pause and return.")
+        abstract: "Run a command holding a project resource exclusively; declaring servers stay up unless --pause.")
 
     @OptionGroup var global: GlobalOptions
 
@@ -2223,13 +2276,11 @@ struct Lock: AsyncParsableCommand {
     @Option(help: "Seconds to wait for the resource if another holder has it.")
     var acquireTimeout: Double = 300
 
-    /** Spelled as an explicit opt-out rather than `@Flag(inversion: .prefixedNo)`
-        on a default-true `pause`: the contract documents this spelling, and the
-        inverted form would also mint a `--pause` that does nothing. The symptom
-        that first blamed inversion was the passthrough parse below swallowing the
-        flag into the command. */
-    @Flag(name: .customLong("no-pause"), help: "Hold the mutex without stopping servers that declare the resource.")
-    var noPause = false
+    /** Explicit opt-in to stopping declarers; the default leaves them running.
+        A bare `@Flag` (default false), not an inversion pair, so there is exactly
+        one spelling and no `--no-pause` that does nothing. */
+    @Flag(name: .customLong("pause"), help: "Stop servers that declare the resource for the command, then resume them.")
+    var pause = false
 
     @Option(help: "Per-server seconds to wait for health when servers return.")
     var timeout: Double = 120
@@ -2250,12 +2301,12 @@ struct Lock: AsyncParsableCommand {
         return WireError(
             code: .usage,
             hint: "directa lock \(resource) -- <command>",
-            message: "directa lock needs a command after `--`; its own options go before it (directa lock \(resource) [--no-pause] [--acquire-timeout <seconds>] [--timeout <seconds>] -- <command…>)")
+            message: "directa lock needs a command after `--`; its own options go before it (directa lock \(resource) [--pause] [--acquire-timeout <seconds>] [--timeout <seconds>] -- <command…>)")
     }
 
     func run() async throws {
         let command = command
-        let noPause = noPause
+        let pause = pause
         if let usage = Self.usageError(command: command, resource: resource) {
             CLIRunner.fail(usage, json: global.json)
         }
@@ -2274,7 +2325,7 @@ struct Lock: AsyncParsableCommand {
                 acquired = try await client.request(
                     .lockAcquire,
                     params: LockParams(
-                        holderPid: holderPid, pause: !noPause, project: project, resource: resource,
+                        holderPid: holderPid, pause: pause, project: project, resource: resource,
                         resumeTimeoutSeconds: timeout),
                     expecting: LockResult.self)
                 break
@@ -2324,6 +2375,11 @@ struct Lock: AsyncParsableCommand {
             --json governs stdout schemas. */
         for name in acquired.paused {
             Self.note("directa lock: paused \(name) (holds \(resource))")
+        }
+        if let warning = LockNotice.unguarded(
+            resource: resource, live: acquired.live ?? [], statePath: acquired.statePath)
+        {
+            Self.note(warning)
         }
         /** Identity is taken before the command and again before release, so a
             resumed server's first writes are never blamed on the command. */

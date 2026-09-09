@@ -185,7 +185,10 @@ struct SetupPanel: View {
                     bundle first, then re-registering, is what produced the
                     Launch Constraint Violation crashes. */
                 if replacingApplicationsApp {
-                    _ = LaunchdAdmin.requestAppAgentUnregister()
+                    /** Record the stand-down first so a recovery poll cannot
+                        re-register while we wait for launchd to drop the job. */
+                    try? AtomicFile.write(Data(), to: DirectaPaths().stoppedIntentFile)
+                    await SetupPerformer.requestApplicationsDaemonControl(.unregister)
                     let unloaded = await LaunchdAdmin.waitUntilAgentUnloaded()
                     if !unloaded {
                         errorText =

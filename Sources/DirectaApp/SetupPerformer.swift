@@ -50,8 +50,8 @@ enum SetupPerformer: Sendable {
     }
 
     nonisolated static func resourceURLs(bundle: Bundle = .main) -> (cli: URL, daemon: URL)? {
-        guard let cli = bundle.url(forResource: SetupPlanner.resourceCLIName, withExtension: nil),
-            let daemon = bundle.url(forResource: SetupPlanner.resourceDaemonName, withExtension: nil),
+        guard let cli = bundle.url(forResource: SetupPlanner.cliBinaryName, withExtension: nil),
+            let daemon = bundle.url(forResource: SetupPlanner.daemonBinaryName, withExtension: nil),
             FileManager.default.isExecutableFile(atPath: cli.path),
             FileManager.default.isExecutableFile(atPath: daemon.path)
         else { return nil }
@@ -98,7 +98,7 @@ enum SetupPerformer: Sendable {
             installAppToApplications: outside,
             migration: migration,
             offers: offers,
-            replacingApplicationsApp: outside && SetupPlanner.applicationsAppExists(),
+            replacingApplicationsApp: outside && LaunchdAdmin.applicationsAppPresent(),
             shouldPresent: should)
     }
 
@@ -178,7 +178,6 @@ enum SetupPerformer: Sendable {
             here (and reregister on upgrade so the helper/plist swap sticks). */
         if !relocated {
             do {
-                try LaunchdAdmin.writeAgentPath(paths: paths)
                 if migration {
                     try await AgentService.reregister()
                 } else {
@@ -303,6 +302,34 @@ enum SetupPerformer: Sendable {
         return peerInstances().isEmpty
     }
 
+    /** Deliver a daemon-control URL to `/Applications/directa.app` by bundle
+        path, not bundle id. The DMG copy shares `dev.quantizor.directa.app`, so
+        `open -a` without a path target hands the URL to this process, which is
+        not the SMAppService owner and cannot unregister the running agent. */
+    @MainActor
+    static func requestApplicationsDaemonControl(_ action: DaemonControlAction) async {
+        guard LaunchdAdmin.applicationsAppPresent() else {
+            switch action {
+            case .ensure: _ = LaunchdAdmin.requestAppAgentEnsure()
+            case .unregister: _ = LaunchdAdmin.requestAppAgentUnregister()
+            case .unregisterAll: _ = LaunchdAdmin.requestAppLaunchItemsUnregister()
+            }
+            return
+        }
+        guard let url = URL(string: action.urlString) else { return }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        do {
+            _ = try await NSWorkspace.shared.open(
+                [url], withApplicationAt: LaunchdAdmin.applicationsAppURL,
+                configuration: configuration)
+        } catch {
+            DirectaLog.app.error(
+                "could not deliver \(action.urlString) to \(LaunchdAdmin.applicationsAppURL.path): \(error.localizedDescription)"
+            )
+        }
+    }
+
     @MainActor
     private static func peerInstances() -> [NSRunningApplication] {
         NSWorkspace.shared.runningApplications.filter {
@@ -310,51 +337,77 @@ enum SetupPerformer: Sendable {
         }
     }
 
-    /** Open the Applications copy and quit this (DMG/Downloads) process. Quitting
-        is conditional: Launch Services treats the DMG and Applications copies as
-        the same app (shared bundle id), so `openApplication` can return *this*
-        process as a "success". We only quit once a different pid is running from
-        the Applications path. */
+    /** Open the Applications copy, then leave the mounted volume.
+
+        Called only after a successful copy to `/Applications`. Staying alive
+        from `/Volumes/...` pins the DMG (disk in use) and, if the user ejects
+        anyway, SIGBUS: the kernel force-unmounts the vnode this process is
+        mapped from. Setup is already on disk, so quitting is always correct;
+        a missing menu bar extra is recoverable with a click on the installed
+        app. Launch Services treats the DMG and Applications copies as the
+        same bundle id, so `openApplication` can return this process as a
+        "success": we still quit. */
     @MainActor
     static func relaunchFromApplicationsAndQuit() {
         let url = URL(fileURLWithPath: SetupPlanner.applicationsAppPath)
         let appsPath = canonicalPath(url)
         let selfPID = ProcessInfo.processInfo.processIdentifier
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        /** Force a new instance: without this, openApplication often "succeeds"
-            by activating the already-running DMG copy (same bundle id). */
-        configuration.createsNewApplicationInstance = true
-        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { app, error in
-            Task { @MainActor in
-                if let error {
-                    DirectaLog.app.error(
-                        "relaunch from \(SetupPlanner.applicationsAppPath) failed: \(error.localizedDescription)")
-                    return
-                }
-                let launchedPath = canonicalPath(app?.bundleURL)
-                let differentProcess = (app?.processIdentifier).map { $0 != selfPID } ?? false
-                if differentProcess, launchedPath == appsPath {
-                    NSApp.terminate(nil)
-                    return
-                }
-                DirectaLog.app.info(
-                    "openApplication returned self or wrong path; waiting for Applications peer")
-                if await waitForPeer(atPath: appsPath, otherThan: selfPID, seconds: 8) {
-                    NSApp.terminate(nil)
-                    return
-                }
-                /** Last resort: `open(1)` bypasses some LS same-bundle shortcuts. */
-                let open = LaunchdAdmin.shell("/usr/bin/open", [SetupPlanner.applicationsAppPath])
-                if open.status == 0,
-                    await waitForPeer(atPath: appsPath, otherThan: selfPID, seconds: 5)
-                {
-                    NSApp.terminate(nil)
-                    return
-                }
-                DirectaLog.app.error(
-                    "could not hand off to \(SetupPlanner.applicationsAppPath); staying alive so setup is not lost")
+        Task { @MainActor in
+            if applicationsPeerRunning(atPath: appsPath, otherThan: selfPID) {
+                leaveMountedVolume()
+                return
             }
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            /** Force a new instance: without this, openApplication often
+                "succeeds" by activating the already-running DMG copy. */
+            configuration.createsNewApplicationInstance = true
+            do {
+                let app = try await NSWorkspace.shared.openApplication(
+                    at: url, configuration: configuration)
+                let launchedPath = canonicalPath(app.bundleURL)
+                if app.processIdentifier != selfPID, launchedPath == appsPath {
+                    leaveMountedVolume()
+                    return
+                }
+            } catch {
+                DirectaLog.app.error(
+                    "relaunch from \(SetupPlanner.applicationsAppPath) failed: \(error.localizedDescription)")
+            }
+            DirectaLog.app.info(
+                "openApplication returned self or wrong path; waiting for Applications peer")
+            if await waitForPeer(atPath: appsPath, otherThan: selfPID, seconds: 8) {
+                leaveMountedVolume()
+                return
+            }
+            let open = LaunchdAdmin.shell("/usr/bin/open", [SetupPlanner.applicationsAppPath])
+            if open.status == 0 {
+                _ = await waitForPeer(atPath: appsPath, otherThan: selfPID, seconds: 5)
+            }
+            /** Copy already succeeded. Quit even if the handoff did not, so
+                this process cannot pin or crash on an ejected DMG. */
+            leaveMountedVolume()
+        }
+    }
+
+    /** Terminate, then exit if AppKit is still running: an accessory installer
+        can ignore terminate and keep the volume mapped. */
+    @MainActor
+    private static func leaveMountedVolume() {
+        NSApp.terminate(nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            exit(0)
+        }
+    }
+
+    @MainActor
+    private static func applicationsPeerRunning(atPath path: String?, otherThan selfPID: Int32)
+        -> Bool
+    {
+        NSWorkspace.shared.runningApplications.contains { running in
+            running.bundleIdentifier == appBundleIdentifier
+                && running.processIdentifier != selfPID
+                && canonicalPath(running.bundleURL) == path
         }
     }
 
@@ -365,12 +418,7 @@ enum SetupPerformer: Sendable {
     ) async -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
-            let found = NSWorkspace.shared.runningApplications.contains { running in
-                running.bundleIdentifier == appBundleIdentifier
-                    && running.processIdentifier != selfPID
-                    && canonicalPath(running.bundleURL) == path
-            }
-            if found { return true }
+            if applicationsPeerRunning(atPath: path, otherThan: selfPID) { return true }
             try? await Task.sleep(for: .milliseconds(100))
         }
         return false
@@ -391,7 +439,7 @@ enum SetupPerformer: Sendable {
             return nil
         }
         guard proc.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
         let text = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return (text?.isEmpty == false) ? text : nil
@@ -414,9 +462,11 @@ enum SetupPerformer: Sendable {
                 status: -1,
                 output: error.localizedDescription)
         }
-        let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        let stdout = String(
+            data: (try? out.fileHandleForReading.readToEnd()) ?? Data(), encoding: .utf8)
             ?? ""
-        let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        let stderr = String(
+            data: (try? err.fileHandleForReading.readToEnd()) ?? Data(), encoding: .utf8)
             ?? ""
         let combined = (stdout + stderr).trimmingCharacters(in: .whitespacesAndNewlines)
         guard proc.terminationStatus == 0 else {

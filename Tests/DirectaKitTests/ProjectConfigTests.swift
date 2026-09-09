@@ -91,6 +91,12 @@ import Testing
         #expect(errors.contains { $0.contains("command is empty") })
         #expect(errors.contains { $0.contains("healthcheck.port") })
         #expect(ServerSpec(command: ["x"], name: "web").validationErrors().isEmpty)
+        let file = ProjectFileConfig(
+            servers: ["a::b": ProjectFileServer(command: ["x"])])
+        #expect(
+            ProjectConfigLoader.validate(config: file, project: "/p").errors.contains {
+                $0.contains("must not contain '::'")
+            })
     }
 
     @Test func bareLoopbackHostsWarnButDoNotFail() {

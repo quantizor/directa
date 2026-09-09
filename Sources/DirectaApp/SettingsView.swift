@@ -4,7 +4,7 @@ import ServiceManagement
 import SwiftUI
 
 /** Whether the app checks for a newer release in the background. Read by the
-    update poll (Phase 4) and toggled in Settings; defaults on. */
+    update poll and toggled in Settings; defaults on. */
 enum UpdatePreference {
     static let key = "check for updates"
 
@@ -23,8 +23,6 @@ enum UpdatePreference {
     links DirectaKit but not the CLI target, and directa never edits a harness's
     settings without a deliberate click here. */
 struct SettingsView: View {
-    var model: DaemonModel
-
     @State private var offers: [HarnessOffer] = []
     @State private var busyHarness: String?
     @State private var hookError: String?

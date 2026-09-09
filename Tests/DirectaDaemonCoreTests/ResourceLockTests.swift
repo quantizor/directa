@@ -82,7 +82,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
         let acquired = try await handle(
             router: router, method: .lockAcquire,
             params: LockParams(
-                holderPid: Int(getpid()), project: env.projectPath, resource: "data",
+                holderPid: Int(getpid()), pause: true, project: env.projectPath, resource: "data",
                 resumeTimeoutSeconds: 15),
             expecting: LockResult.self)
         #expect(acquired.paused == ["db"])
@@ -134,7 +134,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
         _ = try await handle(
             router: router, method: .lockAcquire,
             params: LockParams(
-                holderPid: Int(getpid()), project: env.projectPath, resource: "data",
+                holderPid: Int(getpid()), pause: true, project: env.projectPath, resource: "data",
                 resumeTimeoutSeconds: 15),
             expecting: LockResult.self)
         let held = try await handle(
@@ -164,9 +164,10 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             expecting: ServerResult.self)
     }
 
-    /** Under --no-pause the declarers stay up, and which ones is exactly what a
-        waiting run needs to be told. */
-    @Test func noPauseAcquireRecordsTheServersItLeftRunning() async throws {
+    /** By default (no pause) the declarers stay up, and which ones is exactly
+        what a waiting run needs to be told. Omitting `pause` here also guards the
+        daemon default: an absent flag must not stop a declarer. */
+    @Test func defaultAcquireRecordsTheServersItLeftRunning() async throws {
         let env = try makeLockEnv()
         try writeLockDevservers(project: env.projectPath)
         let registry = Registry(paths: env.paths)
@@ -177,7 +178,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
         let acquired = try await handle(
             router: router, method: .lockAcquire,
             params: LockParams(
-                holderPid: Int(getpid()), pause: false, project: env.projectPath,
+                holderPid: Int(getpid()), project: env.projectPath,
                 resource: "data", resumeTimeoutSeconds: 15),
             expecting: LockResult.self)
         #expect(acquired.live == ["db"])
@@ -298,7 +299,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             expecting: ServerResult.self)
     }
 
-    @Test func noPauseLeavesDeclarerRunning() async throws {
+    @Test func defaultLeavesDeclarerRunning() async throws {
         let env = try makeLockEnv()
         try writeLockDevservers(project: env.projectPath)
         let registry = Registry(paths: env.paths)
@@ -308,11 +309,30 @@ private func phaseOf(router: Router, project: String, name: String) async throws
         let acquired = try await handle(
             router: router, method: .lockAcquire,
             params: LockParams(
-                holderPid: Int(getpid()), pause: false, project: env.projectPath, resource: "data"),
+                holderPid: Int(getpid()), project: env.projectPath, resource: "data"),
             expecting: LockResult.self)
         #expect(acquired.paused.isEmpty)
         let phase = try await phaseOf(router: router, project: env.projectPath, name: "db")
         #expect(phase == .starting || phase == .running)
+        /** Already-up under a default lock is not a start: groupUp no-ops. */
+        _ = try await handle(
+            router: router, method: .groupUp,
+            params: GroupParams(project: env.projectPath, timeoutSeconds: 5),
+            expecting: GroupResult.self)
+        let stillUp = try await phaseOf(router: router, project: env.projectPath, name: "db")
+        #expect(stillUp == .starting || stillUp == .running)
+        _ = try await handle(
+            router: router, method: .serverStop,
+            params: ServerTargetParams(name: "db", project: env.projectPath),
+            expecting: ServerResult.self)
+        let upLine = try NDJSON.encodeLine(
+            WireRequest(
+                id: "u", method: WireMethod.groupUp.rawValue,
+                params: GroupParams(project: env.projectPath, timeoutSeconds: 2)))
+        let upData = await router.handle(line: upLine)
+        let upResponse = try JSONCoding.decoder().decode(
+            WireResponse<GroupResult>.self, from: upData)
+        #expect(upResponse.error?.code == .resourceLocked)
         _ = try await handle(
             router: router, method: .lockRelease,
             params: LockParams(
@@ -363,7 +383,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             _ = try await handle(
                 router: router, method: .lockAcquire,
                 params: LockParams(
-                    holderPid: holder, project: env.projectPath, resource: "data",
+                    holderPid: holder, pause: true, project: env.projectPath, resource: "data",
                     resumeTimeoutSeconds: 15),
                 expecting: LockResult.self)
             #expect(try await phaseOf(router: router, project: env.projectPath, name: "db") == .stopped)
@@ -433,7 +453,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             _ = try await handle(
                 router: router, method: .lockAcquire,
                 params: LockParams(
-                    holderPid: holder, project: env.projectPath, resource: "data",
+                    holderPid: holder, pause: true, project: env.projectPath, resource: "data",
                     resumeTimeoutSeconds: 15),
                 expecting: LockResult.self)
             _ = try await handle(

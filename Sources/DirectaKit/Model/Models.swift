@@ -45,19 +45,19 @@ public struct HealthCheckSpec: Codable, Equatable, Sendable {
     public func validationErrors() -> [String] {
         var errors: [String] = []
         if let healthyAfter, !Self.countRange.contains(healthyAfter) {
-            errors.append("healthcheck.healthyAfter must be 1...255")
+            errors.append("healthcheck.healthyAfter must be \(Self.countRange)")
         }
         if let intervalMs, !Self.durationRange.contains(intervalMs) {
-            errors.append("healthcheck.intervalMs must be 1...600000")
+            errors.append("healthcheck.intervalMs must be \(Self.durationRange)")
         }
         if let port, !PortClaim.portRange.contains(port) {
             errors.append("healthcheck.port must be 1...65535")
         }
         if let timeoutMs, !Self.durationRange.contains(timeoutMs) {
-            errors.append("healthcheck.timeoutMs must be 1...600000")
+            errors.append("healthcheck.timeoutMs must be \(Self.durationRange)")
         }
         if let unhealthyAfter, !Self.countRange.contains(unhealthyAfter) {
-            errors.append("healthcheck.unhealthyAfter must be 1...255")
+            errors.append("healthcheck.unhealthyAfter must be \(Self.countRange)")
         }
         return errors
     }
@@ -186,9 +186,10 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         project-relative path); used for Spotlight thumbnails. */
     public var icon: String?
     /** Named mutable resources this server holds while running (a local
-        database, a fixture directory). `directa lock <resource> -- cmd` stops
-        holders for the command's duration, and starts are refused while a live
-        external holder owns the resource. */
+        database, a fixture directory). `directa lock <resource> -- cmd` takes
+        exclusive access without stopping holders; `--pause` stops them for the
+        command's duration. Starts are refused while a live external holder owns
+        the resource. */
     public var locks: [LockDeclaration]?
     public var name: String
     public var port: Int?

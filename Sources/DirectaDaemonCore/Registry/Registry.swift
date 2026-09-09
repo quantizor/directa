@@ -192,10 +192,8 @@ public actor Registry {
     }
 
     private static func normalizeServerID(_ id: String) -> String {
-        guard let separator = id.range(of: "::") else { return id }
-        let project = String(id[id.startIndex..<separator.lowerBound])
-        let name = String(id[separator.upperBound...])
-        return serverID(project: canonicalProjectPath(project), name: name)
+        guard let parsed = parseServerID(id) else { return id }
+        return serverID(project: canonicalProjectPath(parsed.project), name: parsed.name)
     }
 
     private func persistRegistry() throws {

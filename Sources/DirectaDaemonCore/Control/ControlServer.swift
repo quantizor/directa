@@ -89,7 +89,7 @@ public actor Router {
             return (try? NDJSON.encodeLine(
                 WireResponse<WireEmpty>(
                     error: WireError(code: .usage, message: "unparseable request frame"),
-                    id: "?", ok: false))) ?? Data("{\"id\":\"?\",\"ok\":false}\n".utf8)
+                    id: "?", ok: false))) ?? Data()
         }
         do {
             guard let method = WireMethod(rawValue: head.method) else {
@@ -119,10 +119,8 @@ public actor Router {
             case .serverRegister:
                 let request = try decoder.decode(WireRequest<RegisterParams>.self, from: line)
                 let project = canonicalProjectPath(request.params.project)
-                /** register is the second way a spec enters the daemon, and until
-                    now the only unchecked one: the committed-file path runs the
-                    validator, so a spec `config check` would reject could still be
-                    registered directly and then spawned. Refuse it at the seam. */
+                /** register validates like a committed spec: a spec `config check`
+                    would reject must not be spawnable through this seam. */
                 let specErrors = request.params.spec.validationErrors()
                 guard specErrors.isEmpty else {
                     throw WireError(
@@ -140,11 +138,7 @@ public actor Router {
                 let project = canonicalProjectPath(request.params.project)
                 let target = ServerTargetParams(
                     name: request.params.name, port: request.params.port, project: project)
-                let merged = try await mergedSpecs(project: project)
                 let supervisor = try await resolvedSupervisor(target)
-                if let spec = merged.specs.first(where: { $0.name == target.name }) {
-                    try await lockGate(project: project, spec: spec)
-                }
                 try await prepareSpawn(
                     target: target, supervisor: supervisor, portOverride: request.params.port,
                     userInitiated: true)
@@ -157,11 +151,7 @@ public actor Router {
                 let project = canonicalProjectPath(request.params.project)
                 let target = ServerTargetParams(
                     name: request.params.name, port: request.params.port, project: project)
-                let merged = try await mergedSpecs(project: project)
                 let supervisor = try await resolvedSupervisor(target)
-                if let spec = merged.specs.first(where: { $0.name == target.name }) {
-                    try await lockGate(project: project, spec: spec)
-                }
                 try await prepareSpawn(
                     target: target, supervisor: supervisor, portOverride: request.params.port,
                     userInitiated: true)
@@ -514,9 +504,9 @@ public actor Router {
         await reconcileLocksAtStartup()
         var toStart: [(project: String, spec: ServerSpec)] = []
         for (id, persisted) in await registry.allPersistedState() {
-            guard let separator = id.range(of: "::") else { continue }
-            let project = String(id[id.startIndex..<separator.lowerBound])
-            let name = String(id[separator.upperBound...])
+            guard let parsed = parseServerID(id) else { continue }
+            let project = parsed.project
+            let name = parsed.name
             let leftActive = persisted.phase == .running || persisted.phase == .starting
             let wantsRestore = persisted.resumeOnBoot ?? false
             guard persisted.pid != nil || leftActive || wantsRestore else { continue }
@@ -577,12 +567,28 @@ public actor Router {
             name). Only when the config is readable so a parse blip cannot wipe
             state. */
         for (id, _) in await registry.allPersistedState() {
-            guard let separator = id.range(of: "::") else { continue }
-            let project = String(id[id.startIndex..<separator.lowerBound])
-            let name = String(id[separator.upperBound...])
+            guard let parsed = parseServerID(id) else { continue }
+            let project = parsed.project
+            let name = parsed.name
             if case .missing = await resolveSpecForRecover(project: project, name: name) {
                 DirectaLog.daemon.info("recover prune \(name)@\(project): orphaned state row")
                 try? await registry.removeState(serverID: id)
+            }
+        }
+        /** SIGKILL of the agent (jetsam) skips LaunchdJobLauncher's defer
+            bootout, so one-shot child labels accumulate in the gui domain.
+            Reap only when this process is that agent: tests and `--foreground`
+            never registered those jobs, and must not bootout the user's. */
+        if LaunchdJobLauncher.runningAsAgent {
+            var keepingPids: Set<pid_t> = []
+            for supervisor in supervisors.values {
+                if let pid = await supervisor.status().pid.flatMap(ProcessTree.narrowed) {
+                    keepingPids.insert(pid)
+                }
+            }
+            let reaped = LaunchdJobs.reapStaleChildJobs(keepingPids: keepingPids)
+            if reaped > 0 {
+                DirectaLog.daemon.info("reaped \(reaped) leftover child launchd job(s)")
             }
         }
     }
@@ -649,8 +655,7 @@ public actor Router {
         var liveRoots: [(identity: ProcessIdentity, name: String)] = []
         var names = Set(await registry.specs(project: project).map(\.name))
         for (id, supervisor) in supervisors where id.hasPrefix(prefix) {
-            guard let separator = id.range(of: "::") else { continue }
-            let name = String(id[separator.upperBound...])
+            guard let name = parseServerID(id)?.name else { continue }
             names.insert(name)
             let status = await supervisor.status()
             if let pid = status.pid.flatMap(ProcessTree.narrowed),
@@ -660,8 +665,7 @@ public actor Router {
             }
         }
         for (id, persisted) in await registry.allPersistedState() where id.hasPrefix(prefix) {
-            guard let separator = id.range(of: "::") else { continue }
-            let name = String(id[separator.upperBound...])
+            guard let name = parseServerID(id)?.name else { continue }
             names.insert(name)
             if let pid = persisted.pid.flatMap(ProcessTree.narrowed),
                 let identity = ProcessTree.identity(of: pid),
@@ -938,6 +942,7 @@ public actor Router {
         let overlay = LocalOverlay.load(project: target.project)
         let overlayServer = overlay?.servers?[target.name]
         spec = LocalOverlay.apply(spec: spec, overlay: overlayServer, project: target.project)
+        try await lockGate(project: target.project, spec: spec)
         /** The declared host stays the spawn host: a linked worktree keeps it
             (its name surfaces as a display label, never a subdomain), so URLs
             already carry the right host and only the port can differ. */
@@ -1123,9 +1128,9 @@ public actor Router {
                 persisted.phase == .running || persisted.phase == .starting
                 || persisted.phase == .unhealthy
             guard active, let pid = persisted.pid, ProcessTree.isAlive(pid) else { continue }
-            guard let separator = id.range(of: "::") else { continue }
-            let project = String(id[id.startIndex..<separator.lowerBound])
-            let name = String(id[separator.upperBound...])
+            guard let parsed = parseServerID(id) else { continue }
+            let project = parsed.project
+            let name = parsed.name
             guard let merged = try? await mergedSpecs(project: project),
                 let spec = merged.specs.first(where: { $0.name == name })
             else { continue }
@@ -1187,8 +1192,9 @@ public actor Router {
         return view
     }
 
-    /** Acquire: refuse if another live holder owns it, pause active declarers
-        without retiring boot intent, persist the hold, return who was paused. */
+    /** Acquire: refuse if another live holder owns it; when `pause` is set, stop
+        active declarers without retiring boot intent; persist the hold and return
+        who was paused and who was left running. */
     private func acquireLock(_ params: LockParams) async throws -> LockResult {
         let key = Self.lockKey(project: params.project, resource: params.resource)
         await releaseOrphanedLock(key: key)
@@ -1218,7 +1224,7 @@ public actor Router {
         }
         var live: [String] = []
         var paused: [String] = []
-        let shouldPause = params.pause ?? true
+        let shouldPause = params.pause ?? false
         /** Not `try?`. Swallowing the merge failure left `specs` empty, so no
             declarer was found, nothing was paused, and the lock reported success:
             the caller then ran its migration against a live server holding the
@@ -1497,8 +1503,6 @@ public actor Router {
         }
         var prepared: [(spec: ServerSpec, supervisor: ServerSupervisor)] = []
         for spec in wanted {
-            try await lockGate(project: params.project, spec: spec)
-            try await refuseIfPaused(project: params.project, spec: spec)
             prepared.append((spec: spec, supervisor: await supervisor(project: params.project, spec: spec)))
         }
         /** The whole resolution pass runs before any server stops, the way
@@ -1540,13 +1544,7 @@ public actor Router {
             guard let changed = await supervisor.evaluateWatch(now: now), !changed.isEmpty else {
                 continue
             }
-            guard let split = Self.splitServerID(id) else { continue }
-            /** The daemon never acts on a project's committed config before trust
-                is recorded. `restartServers` runs autonomously here (userInitiated
-                defaults to false), so `prepareSpawn` enforces the same gate; this
-                skips the work early and cleanly for an untrusted project rather
-                than letting the restart raise and defer. */
-            guard await registry.isTrusted(project: split.project) else { continue }
+            guard let split = parseServerID(id) else { continue }
             let relative = changed.map {
                 $0.replacingOccurrences(of: split.project + "/", with: "")
             }
@@ -1570,34 +1568,6 @@ public actor Router {
             }
         }
         return restarted.sorted()
-    }
-
-    static func splitServerID(_ id: String) -> (name: String, project: String)? {
-        guard let separator = id.range(of: "::", options: .backwards) else { return nil }
-        return (
-            name: String(id[separator.upperBound...]),
-            project: String(id[id.startIndex..<separator.lowerBound])
-        )
-    }
-
-    /** A server sitting in a live holder's paused set must not be resurrected
-        behind the lock's back. lockGate covers an external holder of a resource
-        this server declares; this covers the case where the hold already stopped
-        it. */
-    private func refuseIfPaused(project: String, spec: ServerSpec) async throws {
-        for declaration in spec.locks ?? [] {
-            let key = Self.lockKey(project: project, resource: declaration.name)
-            await releaseOrphanedLock(key: key)
-            guard let holder = resourceLocks[key], holder.paused.contains(spec.name) else {
-                continue
-            }
-            throw WireError(
-                code: .resourceLocked,
-                hint: "wait for pid \(holder.pid) to finish, or verify it: ps -p \(holder.pid)",
-                message:
-                    "'\(spec.name)' is paused by the hold on '\(declaration.name)' (pid \(holder.pid)); it comes back when that run releases"
-            )
-        }
     }
 
     /** Wave-parallel group start honoring the dependency graph: a wave holds

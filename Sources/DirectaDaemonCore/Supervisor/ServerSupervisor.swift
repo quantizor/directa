@@ -27,6 +27,9 @@ public actor ServerSupervisor {
     private var lastExit: LastExit?
     private var lastHealthAt: Date?
     private var lastDescendantSnapshot: [ProcessIdentity] = []
+    /** Invalidates an in-flight listen scan when this run dies or a new one
+        starts, so a late lsof cannot write observedPort onto the next spawn. */
+    private var listenScanGeneration: UInt64 = 0
     /** Keeps the descendant snapshot fresh across the startup window; see
         startDescendantWatch. */
     private var descendantTask: Task<Void, Never>?
@@ -182,15 +185,7 @@ public actor ServerSupervisor {
     /** The Router refused this restart (a held resource, a held port). Keeps the
         change armed against the same observed stamp and only pushes its
         timestamp forward, so the next attempt waits out one more quiet window
-        instead of retrying on every sweep for as long as the hold lasts.
-
-        Clearing the stamp instead reached the same place by accident: the
-        baseline is untouched by a refusal, so the difference is seen again and
-        re-arms from scratch. The edit was never actually dropped, which is why
-        `aWatchHitUnderALiveLockIsDeferredNotDropped` passed either way. Keeping
-        it is still what this should do, because the version that reads the
-        pending state and the version that discards it are one edit apart, and
-        only one of them matches what every other line here promises. */
+        instead of retrying on every sweep for as long as the hold lasts. */
     public func deferWatchRestart(now: Date) {
         guard let pending = watchPending else { return }
         watchPending = (at: now, stamp: pending.stamp)
@@ -250,6 +245,7 @@ public actor ServerSupervisor {
         case .crashed, .failed, .stopped:
             break
         }
+        listenScanGeneration += 1
         phase = .starting
         stopRequested = false
         spawnError = nil
@@ -552,6 +548,7 @@ public actor ServerSupervisor {
                 }
             } else if phase == .unhealthy {
                 phase = .running
+                scanObservedPort()
                 postHealthEvent(.healthy)
             }
         } else {
@@ -576,15 +573,24 @@ public actor ServerSupervisor {
     private func scanObservedPort() {
         guard let rootPid = pid else { return }
         let expected = effectivePort ?? spec.port
+        let generation = listenScanGeneration
         Task { [weak self] in
             let pids = [rootPid] + ProcessTree.descendants(of: rootPid).pids
             let ports = PortGuard.listeningPorts(pids: pids)
-            await self?.recordObservedPort(ports: ports)
-            guard let expected else { return }
-            let owners = PortGuard.listenerPids(port: expected)
-            await self?.recordPortOwnership(
-                expected: expected, owners: owners, ours: pids.map(Int.init))
+            await self?.applyListenScan(
+                expected: expected, generation: generation, ours: pids.map(Int.init),
+                ports: ports)
         }
+    }
+
+    private func applyListenScan(
+        expected: Int?, generation: UInt64, ours: [Int], ports: [Int]
+    ) async {
+        guard generation == listenScanGeneration else { return }
+        await recordObservedPort(ports: ports)
+        guard let expected else { return }
+        let owners = PortGuard.listenerPids(port: expected)
+        await recordPortOwnership(expected: expected, owners: owners, ours: ours)
     }
 
     /** The managed server whose recorded pid holds one of these listeners, if
@@ -610,13 +616,8 @@ public actor ServerSupervisor {
             else { continue }
             let processStart = Date(timeIntervalSince1970: TimeInterval(identity.startSeconds))
             guard processStart <= startedAt.addingTimeInterval(1) else { continue }
-            /** Split from the back: the project is an absolute path and the name
-                never contains the separator. */
-            guard let separator = id.range(of: "::", options: .backwards) else { continue }
-            return (
-                name: String(id[separator.upperBound...]),
-                project: String(id[id.startIndex..<separator.lowerBound])
-            )
+            guard let parsed = parseServerID(id) else { continue }
+            return parsed
         }
         return nil
     }
@@ -922,6 +923,7 @@ public actor ServerSupervisor {
         let capturedPid = pid
         let capturedSessionID = rootSessionID
         let capturedSnapshot = lastDescendantSnapshot
+        listenScanGeneration += 1
         healthTask?.cancel()
         healthTask = nil
         switch outcome {
@@ -995,9 +997,11 @@ public actor ServerSupervisor {
         }
         phase = finalPhase
         settleSpawnWaiters()
-        await escalateCrashDescendants(
-            id: id, rootPid: capturedPid, sessionID: capturedSessionID,
-            snapshot: capturedSnapshot)
+        if finalPhase == .crashed {
+            await escalateCrashDescendants(
+                rootPid: capturedPid, sessionID: capturedSessionID,
+                snapshot: capturedSnapshot)
+        }
     }
 
     /** The crash path's counterpart to stop()'s SIGKILL escalation, and the one
@@ -1014,9 +1018,9 @@ public actor ServerSupervisor {
         answer, and the SIGKILL pass rides the prior pass's union so a
         descendant every live source has since lost is still re-signaled. */
     private func escalateCrashDescendants(
-        id: String, rootPid: pid_t?, sessionID: pid_t?, snapshot: [ProcessIdentity]
+        rootPid: pid_t?, sessionID: pid_t?, snapshot: [ProcessIdentity]
     ) async {
-        guard let rootPid, !stopRequested else { return }
+        guard let rootPid else { return }
         let signaled = signalRun(
             target: rootPid, rootIdentity: nil, sessionID: sessionID,
             snapshot: snapshot, signal: SIGTERM)

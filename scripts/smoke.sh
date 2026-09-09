@@ -308,7 +308,7 @@ fi
 pass "context recommends directa why and never leaks raw child output"
 cd "$PROJECT3"
 
-# Resource locks: db declares the resource; lock pauses it, refuses ensure, resumes after.
+# Resource locks: db declares the resource; lock --pause stops it, refuses ensure, resumes after.
 /usr/bin/python3 - "$PROJECT3/devservers.json" <<'PY'
 import json, sys
 p = sys.argv[1]
@@ -317,12 +317,12 @@ cfg["servers"]["db"]["locks"] = ["data"]
 json.dump(cfg, open(p, "w"))
 PY
 "$DIRECTA" up --timeout 15 --json > /dev/null || fail "up before lock test"
-LOCK_OUT="$("$DIRECTA" lock data -- sh -c "sleep 1; $DIRECTA status db --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin)[\"servers\"][0]; assert d[\"phase\"]==\"stopped\", d[\"phase\"]' && $DIRECTA ensure db --timeout 3 --json > /dev/null 2>&1 && exit 44 || exit 0")"
+LOCK_OUT="$("$DIRECTA" lock data --pause -- sh -c "sleep 1; $DIRECTA status db --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin)[\"servers\"][0]; assert d[\"phase\"]==\"stopped\", d[\"phase\"]' && $DIRECTA ensure db --timeout 3 --json > /dev/null 2>&1 && exit 44 || exit 0")"
 LOCK_EXIT=$?
 [[ "$LOCK_EXIT" -eq 0 ]] || fail "lock run failed ($LOCK_EXIT): db not paused or ensure not refused"
 PHASE_AFTER="$("$DIRECTA" wait db --healthy --timeout 15 --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["server"]["phase"])')"
 [[ "$PHASE_AFTER" == "running" ]] || fail "db did not resume after lock (phase $PHASE_AFTER)"
-pass "resource lock pauses holder, refuses ensure, resumes after"
+pass "resource lock --pause stops holder, refuses ensure, resumes after"
 
 # Stopping a server to get exclusive access to something it holds is the heavy
 # way there. The hint says so in human mode and stays out of --json stdout,
@@ -337,7 +337,7 @@ pass "stop hints toward lock in human mode and keeps --json stdout clean"
 
 "$DIRECTA" down --json > /dev/null
 
-# Deep-link and lock --no-pause coverage stay below; worktree coexistence first.
+# Deep-link and default/`--pause` lock coverage stay below; worktree coexistence first.
 
 # Sibling worktree coexistence: shared git common-dir auto-rebinds the linked
 # checkout onto a free port while main keeps the declared origin, and the host
@@ -437,20 +437,23 @@ set -e
 /usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["ok"] is False and d["error"]["code"]=="usage", d' "$WORK/phantom.json" || fail "phantom --project error shape: $(cat "$WORK/phantom.json")"
 pass "--project name-as-path is refused instead of phantom success"
 
-# lock --no-pause: holder stays up while the lock is held.
+# lock (default): holder stays up while the lock is held.
 cd "$PROJECT3"
-"$DIRECTA" up --timeout 15 --json > /dev/null || fail "up before --no-pause"
-NO_PAUSE_STATUS="$WORK/no-pause-status.json"
+"$DIRECTA" up --timeout 15 --json > /dev/null || fail "up before default-hold test"
+DEFAULT_HOLD_STATUS="$WORK/default-hold-status.json"
 set +e
-"$DIRECTA" lock data --no-pause -- "$DIRECTA" status db --json > "$NO_PAUSE_STATUS" 2>"$WORK/no-pause.err"
-NO_PAUSE_EXIT=$?
+"$DIRECTA" lock data -- "$DIRECTA" status db --json > "$DEFAULT_HOLD_STATUS" 2>"$WORK/default-hold.err"
+DEFAULT_HOLD_EXIT=$?
 set -e
-[[ "$NO_PAUSE_EXIT" -eq 0 ]] || fail "lock --no-pause failed ($NO_PAUSE_EXIT): $(head -c 400 "$NO_PAUSE_STATUS" 2>/dev/null) $(cat "$WORK/no-pause.err" 2>/dev/null)"
+[[ "$DEFAULT_HOLD_EXIT" -eq 0 ]] || fail "default lock hold failed ($DEFAULT_HOLD_EXIT): $(head -c 400 "$DEFAULT_HOLD_STATUS" 2>/dev/null) $(cat "$WORK/default-hold.err" 2>/dev/null)"
 # stdout belongs to the guarded command: lock's own chatter is on stderr, so
 # this parses as plain JSON with nothing filtered out.
-NO_PAUSE_PHASE="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["servers"][0]["phase"])' "$NO_PAUSE_STATUS")"
-[[ "$NO_PAUSE_PHASE" == "running" ]] || fail "lock --no-pause paused db (phase $NO_PAUSE_PHASE; out=$(cat "$NO_PAUSE_STATUS"))"
-pass "lock --no-pause leaves declarer running"
+DEFAULT_HOLD_PHASE="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["servers"][0]["phase"])' "$DEFAULT_HOLD_STATUS")"
+[[ "$DEFAULT_HOLD_PHASE" == "running" ]] || fail "default lock hold stopped db (phase $DEFAULT_HOLD_PHASE; out=$(cat "$DEFAULT_HOLD_STATUS"))"
+# The lock is bare-named (no state path), so the default hold cannot fingerprint
+# the change and must warn on stderr that the corruption guard is off.
+grep -q "declares no state path" "$WORK/default-hold.err" || fail "default hold over an unguarded lock did not warn: $(cat "$WORK/default-hold.err")"
+pass "lock leaves declarer running by default and warns when it cannot guard the state"
 
 # The parse defect: lock's own options after the resource joined the guarded
 # command, so `env --timeout 20 -- sh` died with `env: illegal option -- t`.
@@ -503,24 +506,24 @@ json.dump(cfg, open(p, "w"))
 PY
 "$DIRECTA" up --timeout 15 --json > /dev/null || fail "up before identity checks"
 
-# Paused mode: the change is the point, so it is a note on stderr and exit 0.
-"$DIRECTA" lock data -- sh -c 'echo v2 > state/db.sqlite' 2>"$WORK/note.err" >/dev/null || fail "paused-mode lock failed"
+# --pause mode: declarers stopped, so the change is the point: a note on stderr, exit 0.
+"$DIRECTA" lock data --pause -- sh -c 'echo v2 > state/db.sqlite' 2>"$WORK/note.err" >/dev/null || fail "paused-mode lock failed"
 grep -qE "note: 'data' state at .* changed" "$WORK/note.err" || fail "paused-mode change was not noted: $(cat "$WORK/note.err")"
-pass "a change under a paused lock is reported as a note"
+pass "a change under a --pause lock is reported as a note"
 
-# --no-pause with a live declarer: the server holds the old state open, so this
+# Default hold with a live declarer: the server holds the old state open, so this
 # is a loud failure rather than a silent success.
 set +e
-"$DIRECTA" lock data --no-pause --json -- sh -c 'rm -rf state && mkdir state && echo v3 > state/db.sqlite' > "$WORK/mutated.json" 2>/dev/null
+"$DIRECTA" lock data --json -- sh -c 'rm -rf state && mkdir state && echo v3 > state/db.sqlite' > "$WORK/mutated.json" 2>/dev/null
 MUTATED_EXIT=$?
 set -e
-[[ "$MUTATED_EXIT" -ne 0 ]] || fail "--no-pause accepted a command that replaced the locked state"
-/usr/bin/python3 -c "import json;d=json.load(open('$WORK/mutated.json'));assert d['error']['code']=='resource-mutated', d; assert d['error']['hint'].startswith('directa stop db'), d" || fail "resource-mutated envelope wrong: $(cat "$WORK/mutated.json")"
-pass "--no-pause over changed state fails loudly with resource-mutated"
+[[ "$MUTATED_EXIT" -ne 0 ]] || fail "default hold accepted a command that replaced the locked state"
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/mutated.json'));assert d['error']['code']=='resource-mutated', d; assert d['error']['hint']=='directa lock data --pause -- <command>', d" || fail "resource-mutated envelope wrong: $(cat "$WORK/mutated.json")"
+pass "a default-hold command over changed state fails loudly with resource-mutated"
 
 # And an untouched resource stays quiet, so the check cannot fire on everything.
-"$DIRECTA" lock data --no-pause -- true 2>"$WORK/quiet.err" >/dev/null || fail "--no-pause over untouched state failed"
-[[ ! -s "$WORK/quiet.err" ]] || fail "--no-pause over untouched state was noisy: $(cat "$WORK/quiet.err")"
+"$DIRECTA" lock data -- true 2>"$WORK/quiet.err" >/dev/null || fail "default hold over untouched state failed"
+[[ ! -s "$WORK/quiet.err" ]] || fail "default hold over untouched state was noisy: $(cat "$WORK/quiet.err")"
 pass "an untouched locked resource stays silent"
 
 # restart is one daemon-side transition: a client-side stop-then-ensure takes the
@@ -532,7 +535,7 @@ RESTART_PID_BEFORE="$("$DIRECTA" status db --json | /usr/bin/python3 -c 'import 
 pass "restart replaces the process and comes back healthy"
 
 set +e
-"$DIRECTA" lock data --no-pause -- "$DIRECTA" restart db --timeout 5 --json > "$WORK/restart-locked.json" 2>/dev/null
+"$DIRECTA" lock data -- "$DIRECTA" restart db --timeout 5 --json > "$WORK/restart-locked.json" 2>/dev/null
 set -e
 /usr/bin/python3 -c "import json;d=json.load(open('$WORK/restart-locked.json'));assert d['error']['code']=='resource-locked', d" || fail "restart under a live lock was not refused"
 "$DIRECTA" status db --json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin)["servers"][0]; assert d["phase"]=="running", d' || fail "a refused restart left the server down"

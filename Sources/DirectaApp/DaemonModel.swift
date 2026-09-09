@@ -374,7 +374,7 @@ final class DaemonModel {
     private static func bundledDaemonCandidates() -> [URL] {
         guard
             let url = Bundle.main.url(
-                forResource: SetupPlanner.resourceDaemonName, withExtension: nil)
+                forResource: SetupPlanner.daemonBinaryName, withExtension: nil)
         else { return [] }
         return [url]
     }

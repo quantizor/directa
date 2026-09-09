@@ -127,9 +127,7 @@ extension HarnessAdapter {
     func writeSettings(_ settings: [String: Any]) throws {
         let data = try JSONSerialization.data(
             withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
-        try FileManager.default.createDirectory(
-            at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try data.write(to: settingsURL)
+        try AtomicFile.write(data, to: settingsURL)
     }
 
     /** The harness is "present" when its settings directory exists, which is how
@@ -727,7 +725,7 @@ struct GrokAdapter: HarnessAdapter {
         guard var hooks = settings["hooks"] as? [String: Any] else {
             return "Grok Build hook not present (\(settingsURL.path))"
         }
-        let removed = removeDevctlHandlers(from: &hooks, events: Array(hooks.keys))
+        let removed = removeDirectaHandlers(from: &hooks, events: Array(hooks.keys))
         guard removed else {
             return "Grok Build hook not present (\(settingsURL.path))"
         }
@@ -827,10 +825,10 @@ struct GrokAdapter: HarnessAdapter {
         SessionStart with a stale path is deleted rather than rewritten. */
     private func stripUnregisteredHooks(hooks: inout [String: Any]) -> Bool {
         let leftover = Array(hooks.keys).filter { !Set(Self.registeredEvents).contains($0) }
-        return removeDevctlHandlers(from: &hooks, events: leftover)
+        return removeDirectaHandlers(from: &hooks, events: leftover)
     }
 
-    private func removeDevctlHandlers(from hooks: inout [String: Any], events: [String]) -> Bool {
+    private func removeDirectaHandlers(from hooks: inout [String: Any], events: [String]) -> Bool {
         var removed = false
         let needle = "directa\(GrokWiring.commandSuffix)"
         for event in events {

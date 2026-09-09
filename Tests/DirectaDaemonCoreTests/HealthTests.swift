@@ -180,7 +180,7 @@ private func pollPhase(
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(sock, $0, &len) }
         }
         let port = Int(UInt16(bigEndian: bound.sin_port))
-        #expect(NetworkHealthProber.tcpConnects(port: port, timeoutMs: 500))
+        #expect(LoopbackProbe.isListening(port: port, timeoutMs: 500))
         close(sock)
 
         /** The negative uses a port this test holds and never listens on, so no
@@ -207,7 +207,7 @@ private func pollPhase(
             }
         }
         let quietPort = Int(UInt16(bigEndian: quietBound.sin_port))
-        #expect(!NetworkHealthProber.tcpConnects(port: quietPort, timeoutMs: 200))
+        #expect(!LoopbackProbe.isListening(port: quietPort, timeoutMs: 200))
     }
 
     @Test func tcpProbeAgainstIPv6OnlyListener() throws {
@@ -230,6 +230,6 @@ private func pollPhase(
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(sock, $0, &len) }
         }
         let port = Int(UInt16(bigEndian: bound.sin6_port))
-        #expect(NetworkHealthProber.tcpConnects(port: port, timeoutMs: 500))
+        #expect(LoopbackProbe.isListening(port: port, timeoutMs: 500))
     }
 }

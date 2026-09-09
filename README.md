@@ -51,7 +51,7 @@ Commit that file where the whole team runs the same servers. Keep it gitignored 
 ## The parts
 
 - `ddirecta`: the daemon. Spool-file output capture (children survive daemon restarts without SIGPIPE), process-group plus descendant-sweep teardown, health-gated phases, crash forensics, structured logs with correlation marks, a unified event feed.
-- `directa`: the CLI. `ensure`, `wait`, `up`/`down`, `logs --since-mark`, `mark`, `events`, `restart`, `why`, `open`, `switch`, `lock` (pause servers sharing a resource while a test harness runs, and report when a command changed that resource while a server still held it open), `config init`, `doctor`, and launchd management. A server can list the config files it reads at boot and directa restarts it when one changes. Agents are the first-class consumer.
+- `directa`: the CLI. `ensure`, `wait`, `up`/`down`, `logs --since-mark`, `mark`, `events`, `restart`, `why`, `open`, `switch`, `lock` (take exclusive access to a resource a server holds while a harness runs, leaving the server up by default or stopping it with `--pause`, and report when a command changed that resource while a server still held it open), `config init`, `doctor`, and launchd management. A server can list the config files it reads at boot and directa restarts it when one changes. Agents are the first-class consumer.
 - `directa.app`: the menu bar. Presence dots with counts, per-project rows with click-to-open heads (pinnable), crash notifications, a dashboard with live logs, an event timeline, and a validating config editor. Every server and head is Spotlight-searchable.
 
 ## Building

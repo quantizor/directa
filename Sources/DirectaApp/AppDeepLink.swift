@@ -60,6 +60,14 @@ enum AppDeepLinkDispatch {
 
     private static func executeDaemonControl(_ url: URL) async {
         guard let action = DaemonControlAction.parse(url: url) else { return }
+        /** The volume installer shares this bundle id. A daemon-control URL that
+            lands here cannot unregister the Applications-owned SMAppService
+            agent (`Bundle.main` is the DMG copy, and status reads notRegistered).
+            Forward by path so the owner handles it. */
+        if SetupPerformer.runningFromMountedVolume(), LaunchdAdmin.applicationsAppPresent() {
+            await SetupPerformer.requestApplicationsDaemonControl(action)
+            return
+        }
         do {
             switch action {
             case .ensure:
