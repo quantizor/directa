@@ -20,7 +20,7 @@ public enum EffectiveHealthcheck: Equatable, Sendable {
             if let port = spec.healthcheck?.port ?? spec.port {
                 return .tcp(port: port, timeoutMs: timeoutMs)
             }
-        case .none?:
+        case .some(.none):
             return .none(stabilizationMs: 2000)
         case nil:
             break
@@ -76,8 +76,9 @@ public struct NetworkHealthProber: HealthProber {
                 knowable ahead (Vite 5+ binds `::1` only), so IPv6 loopback is
                 retried when IPv4 refuses. */
             let originalHost = parsed.host
-            if let host = originalHost, host != "127.0.0.1", host != "localhost",
-                host.hasSuffix(".localhost"), var components = URLComponents(url: parsed, resolvingAgainstBaseURL: false) {
+            if let host = originalHost, host.hasSuffix(".localhost"),
+                var components = URLComponents(url: parsed, resolvingAgainstBaseURL: false)
+            {
                 components.host = "127.0.0.1"
                 if let rewritten = components.url {
                     request.url = rewritten
@@ -99,7 +100,7 @@ public struct NetworkHealthProber: HealthProber {
                 return (try? await Self.httpResponds(v6)) ?? false
             }
         case .tcp(let port, let timeoutMs):
-            return Self.tcpConnects(port: port, timeoutMs: timeoutMs)
+            return LoopbackProbe.isListening(port: port, timeoutMs: timeoutMs)
         }
     }
 
@@ -127,9 +128,6 @@ public struct NetworkHealthProber: HealthProber {
         }
     }
 
-    static func tcpConnects(port: Int, timeoutMs: Int) -> Bool {
-        LoopbackProbe.isListening(port: port, timeoutMs: timeoutMs)
-    }
 }
 
 /** Port ownership diagnostics: best-effort lsof shell-outs. These inform errors
@@ -201,7 +199,7 @@ public enum PortGuard {
         } catch {
             return nil
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
         process.waitUntilExit()
         return String(data: data, encoding: .utf8)
     }

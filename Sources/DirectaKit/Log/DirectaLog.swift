@@ -75,15 +75,6 @@ public final class RecordingBackend: DirectaLogBackend {
     public func reset() {
         state.withLock { $0.removeAll() }
     }
-
-    /** Swaps this recorder in as the active backend and returns it, so a test can
-        `let log = RecordingBackend.install()` in one line. */
-    @discardableResult
-    public static func install() -> RecordingBackend {
-        let backend = RecordingBackend()
-        DirectaLog.backend = backend
-        return backend
-    }
 }
 
 /** The logging front door. Call the ergonomic per-category members

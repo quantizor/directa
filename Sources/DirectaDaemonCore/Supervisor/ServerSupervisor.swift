@@ -182,15 +182,7 @@ public actor ServerSupervisor {
     /** The Router refused this restart (a held resource, a held port). Keeps the
         change armed against the same observed stamp and only pushes its
         timestamp forward, so the next attempt waits out one more quiet window
-        instead of retrying on every sweep for as long as the hold lasts.
-
-        Clearing the stamp instead reached the same place by accident: the
-        baseline is untouched by a refusal, so the difference is seen again and
-        re-arms from scratch. The edit was never actually dropped, which is why
-        `aWatchHitUnderALiveLockIsDeferredNotDropped` passed either way. Keeping
-        it is still what this should do, because the version that reads the
-        pending state and the version that discards it are one edit apart, and
-        only one of them matches what every other line here promises. */
+        instead of retrying on every sweep for as long as the hold lasts. */
     public func deferWatchRestart(now: Date) {
         guard let pending = watchPending else { return }
         watchPending = (at: now, stamp: pending.stamp)

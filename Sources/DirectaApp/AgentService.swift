@@ -296,7 +296,7 @@ enum AgentService {
         let plist = LaunchdAdmin.plistURL
         guard FileManager.default.fileExists(atPath: plist.path) else { return }
         _ = LaunchdAdmin.shell(
-            "/bin/launchctl", ["bootout", "gui/\(getuid())/\(LaunchdAdmin.label)"])
+            "/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)"])
         try? FileManager.default.removeItem(at: plist)
         DirectaLog.app.info("migrated away from legacy home LaunchAgent")
     }

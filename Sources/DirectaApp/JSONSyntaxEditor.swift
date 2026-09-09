@@ -121,15 +121,9 @@ enum JSONTokenizer {
             }
 
             /** Keywords: true / false / null */
-            if matchKeyword(utf16, at: i, word: "true")
-                || matchKeyword(utf16, at: i, word: "false")
-                || matchKeyword(utf16, at: i, word: "null")
-            {
-                let word: String = {
-                    if matchKeyword(utf16, at: i, word: "true") { return "true" }
-                    if matchKeyword(utf16, at: i, word: "false") { return "false" }
-                    return "null"
-                }()
+            if let word = ["false", "null", "true"].first(where: {
+                matchKeyword(utf16, at: i, word: $0)
+            }) {
                 let end = i + word.utf16.count
                 tokens.append(JSONToken(kind: .keyword, utf16Range: i..<end))
                 i = end

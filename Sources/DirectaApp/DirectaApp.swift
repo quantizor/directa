@@ -327,7 +327,7 @@ struct DirectaApp: App {
         .defaultSize(width: 860, height: 560)
 
         Window("directa Settings", id: "settings") {
-            SettingsView(model: model)
+            SettingsView()
         }
         .windowResizability(.contentSize)
         .defaultSize(width: 460, height: 520)

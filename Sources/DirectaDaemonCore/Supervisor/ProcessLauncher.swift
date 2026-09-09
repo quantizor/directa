@@ -67,10 +67,14 @@ public struct SubprocessLauncher: ProcessLauncher {
         let outFD = FileDescriptor(rawValue: capture.stdoutFD)
         let errFD = FileDescriptor(rawValue: capture.stderrFD)
         do {
+            var inherited: [Subprocess.Environment.Key: String?] = [:]
+            for (key, value) in environment {
+                inherited[Subprocess.Environment.Key(stringLiteral: key)] = value
+            }
             let result = try await Subprocess.run(
                 executable,
                 arguments: Arguments(Array(argv.dropFirst())),
-                environment: .inherit.updating(Dictionary(uniqueKeysWithValues: environment.map { (Subprocess.Environment.Key(stringLiteral: $0.key), Optional($0.value)) })),
+                environment: .inherit.updating(inherited),
                 workingDirectory: cwd.map { FilePath($0) },
                 platformOptions: options,
                 input: .none,

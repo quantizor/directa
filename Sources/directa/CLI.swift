@@ -92,6 +92,10 @@ enum CLIRunner {
         DaemonClient(socketPath: DirectaPaths().socketPath)
     }
 
+    static func stdinData() -> Data {
+        (try? FileHandle.standardInput.readToEnd()) ?? Data()
+    }
+
     static func emit<T: Codable>(_ value: T, json: Bool, human: (T) -> String) {
         if json {
             let payload = (try? JSONCoding.encoder().encode(value)).flatMap { String(data: $0, encoding: .utf8) }
@@ -918,7 +922,7 @@ struct HookAntigravitySessionStart: AsyncParsableCommand {
         commandName: "antigravity-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let stdin = CLIRunner.stdinData()
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         FileManager.default.changeCurrentDirectoryPath(cwd)
         let project = GlobalOptions.resolveProject(from: cwd)
@@ -948,7 +952,7 @@ struct HookClaudeSessionStart: AsyncParsableCommand {
         commandName: "claude-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let stdin = CLIRunner.stdinData()
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         /** Project resolution without --project: reuse the CLI's walk from the
             hook cwd by chdir-ing there first. */
@@ -974,7 +978,7 @@ struct HookCursorSessionStart: AsyncParsableCommand {
         commandName: "cursor-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let stdin = CLIRunner.stdinData()
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         FileManager.default.changeCurrentDirectoryPath(cwd)
         let project = GlobalOptions.resolveProject(from: cwd)
@@ -1001,7 +1005,7 @@ struct HookGrokSessionStart: AsyncParsableCommand {
         guard event != .leftover else { return }
 
         if event == .unspecified {
-            let stdin = FileHandle.standardInput.readDataToEndOfFile()
+            let stdin = CLIRunner.stdinData()
             _ = await emit(stdin: stdin)
             return
         }
@@ -1020,7 +1024,7 @@ struct HookGrokSessionStart: AsyncParsableCommand {
             break
         }
 
-        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let stdin = CLIRunner.stdinData()
         guard await emit(stdin: stdin) else { return }
         if action == .emitAndMark {
             GrokSessionHook.markEmitted(&state)
@@ -1054,7 +1058,7 @@ struct Statusline: AsyncParsableCommand {
         abstract: "Compact server presence for a statusline; reads harness stdin JSON.")
 
     func run() async throws {
-        let stdin = FileHandle.standardInput.readDataToEndOfFile()
+        let stdin = CLIRunner.stdinData()
         var cwd = FileManager.default.currentDirectoryPath
         if let payload = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] {
             if let workspace = payload["workspace"] as? [String: Any],
@@ -1481,15 +1485,22 @@ struct Doctor: AsyncParsableCommand {
             findings.append(
                 Finding(detail: "daemon not responding (run: directa daemon status)", kind: "daemon", severity: "error"))
         }
+        let printed = LaunchdAdmin.shell(
+            "/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)"])
         findings.append(
-            Finding(detail: LaunchdAdmin.launchdState(), kind: "launchd", severity: "info"))
-        if let agent = LaunchdJobs.loadAgentStatus(), agent.jetsammed {
-            let runs = agent.runs.map { " (\($0) runs)" } ?? ""
-            findings.append(
-                Finding(
-                    detail:
-                        "ddirecta last exited \(agent.lastExitReason ?? "OS_REASON_JETSAM")\(runs); memory pressure killed the daemon, not a crash dump. Check: launchctl print \(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)",
-                    kind: "jetsam", severity: "warning"))
+            Finding(
+                detail: LaunchdAdmin.launchdState(from: printed), kind: "launchd",
+                severity: "info"))
+        if printed.status == 0 {
+            let agent = LaunchdJobs.parseAgentPrint(printed.output)
+            if agent.jetsammed {
+                let runs = agent.runs.map { " (\($0) runs)" } ?? ""
+                findings.append(
+                    Finding(
+                        detail:
+                            "ddirecta last exited \(agent.lastExitReason ?? "OS_REASON_JETSAM")\(runs); memory pressure killed the daemon, not a crash dump. Check: launchctl print \(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)",
+                        kind: "jetsam", severity: "warning"))
+            }
         }
         if let all = try? await client.request(
             .serverStatus, params: ProjectParams(project: ""), expecting: ServerListResult.self) {
@@ -1519,7 +1530,7 @@ struct Doctor: AsyncParsableCommand {
                 findings.append(
                     Finding(
                         detail:
-                            "\(leftover.count) leftover directa child job\(leftover.count == 1 ? "" : "s") with no live server (a jetsammed daemon never boots them out). Recover reaps them; to clear one now: launchctl bootout \(LaunchdJobs.guiDomain)/\(example)",
+                            "\(leftover.count) leftover directa child job\(leftover.count == 1 ? "" : "s") with no live server (a jetsammed daemon never boots them out). Daemon recovery reaps them; to clear one now: launchctl bootout \(LaunchdJobs.guiDomain)/\(example)",
                         kind: "leftover-job", severity: "warning"))
             }
             if let daemonPid = info.flatMap({ pid_t(exactly: $0.pid) }),

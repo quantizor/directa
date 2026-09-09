@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 /** On-disk layout: single home for every path the three products share. */
@@ -40,9 +41,9 @@ public struct DirectaPaths: Sendable {
         return Self.fitsSunPath(preferred) ? preferred : "/tmp/directa-\(getuid())/daemon.sock"
     }
 
-    /** sun_path on Darwin is 104 bytes including the NUL terminator. */
+    /** sun_path includes the NUL terminator. */
     public static func fitsSunPath(_ path: String) -> Bool {
-        path.utf8.count < 104
+        path.utf8.count < MemoryLayout.size(ofValue: sockaddr_un().sun_path)
     }
 
     /** One path component for a server name, safe to append.

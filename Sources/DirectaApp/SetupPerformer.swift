@@ -50,8 +50,8 @@ enum SetupPerformer: Sendable {
     }
 
     nonisolated static func resourceURLs(bundle: Bundle = .main) -> (cli: URL, daemon: URL)? {
-        guard let cli = bundle.url(forResource: SetupPlanner.resourceCLIName, withExtension: nil),
-            let daemon = bundle.url(forResource: SetupPlanner.resourceDaemonName, withExtension: nil),
+        guard let cli = bundle.url(forResource: SetupPlanner.cliBinaryName, withExtension: nil),
+            let daemon = bundle.url(forResource: SetupPlanner.daemonBinaryName, withExtension: nil),
             FileManager.default.isExecutableFile(atPath: cli.path),
             FileManager.default.isExecutableFile(atPath: daemon.path)
         else { return nil }
@@ -98,7 +98,7 @@ enum SetupPerformer: Sendable {
             installAppToApplications: outside,
             migration: migration,
             offers: offers,
-            replacingApplicationsApp: outside && SetupPlanner.applicationsAppExists(),
+            replacingApplicationsApp: outside && LaunchdAdmin.applicationsAppPresent(),
             shouldPresent: should)
     }
 
@@ -178,7 +178,6 @@ enum SetupPerformer: Sendable {
             here (and reregister on upgrade so the helper/plist swap sticks). */
         if !relocated {
             do {
-                try LaunchdAdmin.writeAgentPath(paths: paths)
                 if migration {
                     try await AgentService.reregister()
                 } else {
@@ -309,12 +308,15 @@ enum SetupPerformer: Sendable {
         not the SMAppService owner and cannot unregister the running agent. */
     @MainActor
     static func requestApplicationsDaemonControl(_ action: DaemonControlAction) async {
-        guard LaunchdAdmin.applicationsAppPresent(),
-            let url = URL(string: action.urlString)
-        else {
-            _ = LaunchdAdmin.requestAppAgentUnregister()
+        guard LaunchdAdmin.applicationsAppPresent() else {
+            switch action {
+            case .ensure: _ = LaunchdAdmin.requestAppAgentEnsure()
+            case .unregister: _ = LaunchdAdmin.requestAppAgentUnregister()
+            case .unregisterAll: _ = LaunchdAdmin.requestAppLaunchItemsUnregister()
+            }
             return
         }
+        guard let url = URL(string: action.urlString) else { return }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = false
         do {
@@ -437,7 +439,7 @@ enum SetupPerformer: Sendable {
             return nil
         }
         guard proc.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
         let text = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return (text?.isEmpty == false) ? text : nil
@@ -460,9 +462,11 @@ enum SetupPerformer: Sendable {
                 status: -1,
                 output: error.localizedDescription)
         }
-        let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        let stdout = String(
+            data: (try? out.fileHandleForReading.readToEnd()) ?? Data(), encoding: .utf8)
             ?? ""
-        let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        let stderr = String(
+            data: (try? err.fileHandleForReading.readToEnd()) ?? Data(), encoding: .utf8)
             ?? ""
         let combined = (stdout + stderr).trimmingCharacters(in: .whitespacesAndNewlines)
         guard proc.terminationStatus == 0 else {

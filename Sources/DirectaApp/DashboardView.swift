@@ -76,23 +76,21 @@ struct ServerDetail: View {
                     Spacer(minLength: 8)
                     ServerLifecycleControls(
                         model: model, reserveSlot: false, server: server, size: 16)
-                    if server.url != nil {
+                    if let url = server.url {
                         Button {
                             SpotlightIndexer.noteOpened(identifier: "\(server.project)::\(server.server)")
-                            openURL(server.url)
+                            openURL(url)
                         } label: {
                             Image(systemName: "safari")
                                 .font(.system(size: 13, weight: .semibold))
                                 .frame(width: 16, height: 16)
                         }
                         .buttonStyle(.borderless)
-                        .help(server.url ?? "Open URL")
+                        .help(url)
                         .accessibilityLabel(Text("Open URL"))
                         Button {
-                            if let url = server.url {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(url, forType: .string)
-                            }
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(url, forType: .string)
                         } label: {
                             Image(systemName: "doc.on.doc")
                                 .font(.system(size: 12, weight: .semibold))

@@ -419,7 +419,7 @@ import Testing
         }
     }
 
-    @Test func grokUninstallDeletesAFileThatHeldOnlyDevctlHooks() throws {
+    @Test func grokUninstallDeletesAFileThatHeldOnlyDirectaHooks() throws {
         try inScratchDir { dir in
             let settings = dir.appending(path: "hooks/directa.json")
             try FileManager.default.createDirectory(
@@ -841,7 +841,7 @@ import Testing
         }
     }
 
-    @Test func opencodeUninstallDropsTheKeyAndAFileThatHeldOnlyDevctl() throws {
+    @Test func opencodeUninstallDropsTheKeyAndAFileThatHeldOnlyDirecta() throws {
         try inScratchDir { dir in
             let settings = dir.appending(path: "opencode.jsonc")
             let adapter = OpenCodeAdapter(settingsURLOverride: settings)

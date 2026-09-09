@@ -167,12 +167,10 @@ public struct WireResponseHead: Codable, Sendable {
 public struct WireEvent<Params: Codable & Sendable>: Codable, Sendable {
     public var event: String
     public var params: Params
-    public var sub: String?
 
-    public init(event: String, params: Params, sub: String? = nil) {
+    public init(event: String, params: Params) {
         self.event = event
         self.params = params
-        self.sub = sub
     }
 }
 
@@ -222,7 +220,7 @@ public enum WireMethod: String, CaseIterable, Sendable {
     case serverWhy = "server.why"
 }
 
-// MARK: - Method payloads (phase 1 surface)
+// MARK: - Method payloads
 
 public struct ServerTargetParams: Codable, Equatable, Sendable {
     public var name: String

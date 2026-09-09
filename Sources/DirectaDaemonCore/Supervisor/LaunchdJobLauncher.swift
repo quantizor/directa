@@ -32,7 +32,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         let stdoutPath = capture.stdoutPath
         let stderrPath = capture.stderrPath
         let label = Self.labelPrefix + UUID().uuidString.lowercased()
-        let domain = "gui/\(getuid())"
+        let domain = LaunchdJobs.guiDomain
         let plistURL = FileManager.default.temporaryDirectory.appending(
             path: "\(label).plist")
         do {
@@ -50,7 +50,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
             try? FileManager.default.removeItem(at: plistURL)
             return .spawnFailed(
                 SpawnError(
-                    errno: Int(bootstrap.status),
+                    errno: nil,
                     message: "launchctl bootstrap failed: \(bootstrap.output)"))
         }
         defer {
@@ -148,13 +148,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
     private static func publishedPid(domain: String, label: String) -> pid_t? {
         let printed = LaunchdAdmin.shell("/bin/launchctl", ["print", "\(domain)/\(label)"])
         guard printed.status == 0 else { return nil }
-        for line in printed.output.split(separator: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard trimmed.hasPrefix("pid = ") else { continue }
-            let number = trimmed.dropFirst("pid = ".count)
-            if let parsed = pid_t(number), parsed > 0 { return parsed }
-        }
-        return nil
+        return LaunchdJobs.parseAgentPrint(printed.output).pid
     }
 
     /** Non-child wait: kqueue `NOTE_EXIT` carries the wait(2) status in `data`.

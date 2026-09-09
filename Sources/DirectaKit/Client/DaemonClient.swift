@@ -2,17 +2,12 @@ import Foundation
 
 /** Thin blocking-POSIX unix-socket client wrapped in an actor. Used unchanged by
     the CLI and the menu bar app. Request/response is correlated by id; the daemon
-    may interleave push frames, which phase 1 ignores beyond the hello handshake. */
+    may interleave push frames, which this client ignores beyond the hello handshake. */
 public actor DaemonClient {
-    public struct Hello: Sendable {
-        public let daemonVersion: String
-        public let proto: Int
-    }
-
     private var buffer = NDJSONBuffer()
     private var fd: Int32 = -1
     private var nextID = 0
-    public private(set) var hello: Hello?
+    public private(set) var hello: HelloParams?
 
     private let socketPath: String
 
@@ -43,7 +38,7 @@ public actor DaemonClient {
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = Array(socketPath.utf8)
-        guard pathBytes.count < MemoryLayout.size(ofValue: addr.sun_path) else {
+        guard DirectaPaths.fitsSunPath(socketPath) else {
             close(sock)
             throw WireError(code: .daemonUnreachable, message: "socket path exceeds sun_path limit: \(socketPath)")
         }
@@ -91,7 +86,7 @@ public actor DaemonClient {
                     message: "daemon speaks protocol \(frame.params.proto) (v\(frame.params.daemonVersion)); this client speaks \(DirectaVersion.proto) (v\(DirectaVersion.version))"
                 )
             }
-            hello = Hello(daemonVersion: frame.params.daemonVersion, proto: frame.params.proto)
+            hello = frame.params
         } catch {
             disconnect()
             throw error

@@ -56,7 +56,7 @@ public enum LaunchdAdmin {
 
     /** True when launchd currently has our agent in the gui domain. */
     public static func isAgentLoaded() -> Bool {
-        shell("/bin/launchctl", ["print", "gui/\(getuid())/\(label)"]).status == 0
+        shell("/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(label)"]).status == 0
     }
 
     /** Wait until launchd drops the agent after an unregister, then idle so BTM
@@ -73,7 +73,7 @@ public enum LaunchdAdmin {
             try? await Task.sleep(for: .milliseconds(50))
         }
         if isAgentLoaded() {
-            _ = shell("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
+            _ = shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
             let bootoutDeadline = Date().addingTimeInterval(3)
             while Date() < bootoutDeadline, isAgentLoaded() {
                 try? await Task.sleep(for: .milliseconds(50))
@@ -268,8 +268,8 @@ public enum LaunchdAdmin {
         try fm.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(plist.utf8).write(to: plistURL)
         try? fm.removeItem(at: paths.stoppedIntentFile)
-        _ = shell("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
-        let bootstrap = shell("/bin/launchctl", ["bootstrap", "gui/\(getuid())", plistURL.path])
+        _ = shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
+        let bootstrap = shell("/bin/launchctl", ["bootstrap", "\(LaunchdJobs.guiDomain)", plistURL.path])
         /** A concurrent session bootstrapping first reports already-bootstrapped;
             the socket poll below is the actual success signal. */
         if bootstrap.status != 0, !bootstrap.output.contains("already bootstrapped"),
@@ -277,7 +277,7 @@ public enum LaunchdAdmin {
         {
             throw WireError(
                 code: .internalError,
-                hint: "run: launchctl bootstrap gui/\(getuid()) \(plistURL.path)",
+                hint: "run: launchctl bootstrap \(LaunchdJobs.guiDomain) \(plistURL.path)",
                 message: "launchctl bootstrap failed (\(bootstrap.status)): \(bootstrap.output)")
         }
         try await pollHello(paths: paths)
@@ -300,7 +300,7 @@ public enum LaunchdAdmin {
             }
             _ = await waitUntilAgentUnloaded()
         }
-        _ = shell("/bin/launchctl", ["bootout", "gui/\(getuid())/\(label)"])
+        _ = shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
         try? FileManager.default.removeItem(at: plistURL)
         if purge {
             try? FileManager.default.removeItem(at: paths.dataDir)
@@ -317,9 +317,9 @@ public enum LaunchdAdmin {
                 hint: "run: directa daemon install",
                 message: "no LaunchAgent installed at \(plistURL.path)")
         }
-        let result = shell("/bin/launchctl", ["kickstart", "gui/\(getuid())/\(label)"])
+        let result = shell("/bin/launchctl", ["kickstart", "\(LaunchdJobs.guiDomain)/\(label)"])
         if result.status != 0 {
-            _ = shell("/bin/launchctl", ["bootstrap", "gui/\(getuid())", plistURL.path])
+            _ = shell("/bin/launchctl", ["bootstrap", "\(LaunchdJobs.guiDomain)", plistURL.path])
         }
         try await pollHello(paths: paths)
     }
@@ -331,7 +331,7 @@ public enum LaunchdAdmin {
         let client = DaemonClient(socketPath: paths.socketPath)
         let runningServers = await captureActiveServers(client: client)
         try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
-        let result = shell("/bin/launchctl", ["kickstart", "-k", "gui/\(getuid())/\(label)"])
+        let result = shell("/bin/launchctl", ["kickstart", "-k", "\(LaunchdJobs.guiDomain)/\(label)"])
         if result.status != 0 {
             throw WireError(
                 code: .internalError,
@@ -368,14 +368,15 @@ public enum LaunchdAdmin {
     }
 
     public static func launchdState() -> String {
-        let result = shell("/bin/launchctl", ["print", "gui/\(getuid())/\(label)"])
+        launchdState(
+            from: shell("/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(label)"]))
+    }
+
+    public static func launchdState(from result: (status: Int32, output: String)) -> String {
         if result.status != 0 { return "not bootstrapped" }
-        for line in result.output.split(separator: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("state =") || trimmed.hasPrefix("pid =") {
-                return trimmed
-            }
-        }
+        let status = LaunchdJobs.parseAgentPrint(result.output)
+        if let state = status.state { return "state = \(state)" }
+        if let pid = status.pid { return "pid = \(pid)" }
         return "bootstrapped"
     }
 
@@ -560,7 +561,7 @@ public enum LaunchdAdmin {
         let collected = OSAllocatedUnfairLock(initialState: Data())
         let drained = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .userInitiated).async {
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
             collected.withLock { $0 = data }
             drained.signal()
         }

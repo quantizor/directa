@@ -7,8 +7,6 @@ public enum SetupPlanner {
     public static let applicationsAppPath = "/Applications/directa.app"
     public static let cliBinaryName = "directa"
     public static let daemonBinaryName = "ddirecta"
-    public static let resourceCLIName = "directa"
-    public static let resourceDaemonName = "ddirecta"
     public static let stampFileName = "setup.stamp"
 
     /** Canonical CLI directory shared with `make install` (`PREFIX/bin`). */
@@ -159,13 +157,6 @@ public enum SetupPlanner {
         installedCLIExists || stampExists || launchAgentExists
     }
 
-    /** True when /Applications already has a copy (replace vs first place). */
-    public static func applicationsAppExists(
-        fileManager: FileManager = .default
-    ) -> Bool {
-        fileManager.fileExists(atPath: applicationsAppPath)
-    }
-
     /** Detect agent harnesses and whether their hooks still need installing. */
     public static func harnessOffers(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
@@ -249,12 +240,6 @@ public enum SetupPlanner {
         shell is closer but still skips `.zshrc`, which is where the directory is
         usually added, so it warned everyone too, for a different reason.
         `capturedPath` is the one home for the right answer. */
-    public static func cliDirectoryOnUserPATH(
-        cliDirectory: URL = defaultCLIDirectory()
-    ) -> Bool {
-        cliDirectoryOnPATH(pathEnv: LaunchdAdmin.capturedPath(), cliDirectory: cliDirectory)
-    }
-
     /** The PATH check for a specific owner: brew's bin is put on PATH by
         `brew shellenv`, so a brew-owned CLI never warrants the warning, while a
         `~/.local/bin` install still does until the user adds it. */

@@ -45,19 +45,19 @@ public struct HealthCheckSpec: Codable, Equatable, Sendable {
     public func validationErrors() -> [String] {
         var errors: [String] = []
         if let healthyAfter, !Self.countRange.contains(healthyAfter) {
-            errors.append("healthcheck.healthyAfter must be 1...255")
+            errors.append("healthcheck.healthyAfter must be \(Self.countRange)")
         }
         if let intervalMs, !Self.durationRange.contains(intervalMs) {
-            errors.append("healthcheck.intervalMs must be 1...600000")
+            errors.append("healthcheck.intervalMs must be \(Self.durationRange)")
         }
         if let port, !PortClaim.portRange.contains(port) {
             errors.append("healthcheck.port must be 1...65535")
         }
         if let timeoutMs, !Self.durationRange.contains(timeoutMs) {
-            errors.append("healthcheck.timeoutMs must be 1...600000")
+            errors.append("healthcheck.timeoutMs must be \(Self.durationRange)")
         }
         if let unhealthyAfter, !Self.countRange.contains(unhealthyAfter) {
-            errors.append("healthcheck.unhealthyAfter must be 1...255")
+            errors.append("healthcheck.unhealthyAfter must be \(Self.countRange)")
         }
         return errors
     }

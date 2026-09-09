@@ -89,7 +89,7 @@ public actor Router {
             return (try? NDJSON.encodeLine(
                 WireResponse<WireEmpty>(
                     error: WireError(code: .usage, message: "unparseable request frame"),
-                    id: "?", ok: false))) ?? Data("{\"id\":\"?\",\"ok\":false}\n".utf8)
+                    id: "?", ok: false))) ?? Data()
         }
         do {
             guard let method = WireMethod(rawValue: head.method) else {
@@ -119,10 +119,8 @@ public actor Router {
             case .serverRegister:
                 let request = try decoder.decode(WireRequest<RegisterParams>.self, from: line)
                 let project = canonicalProjectPath(request.params.project)
-                /** register is the second way a spec enters the daemon, and until
-                    now the only unchecked one: the committed-file path runs the
-                    validator, so a spec `config check` would reject could still be
-                    registered directly and then spawned. Refuse it at the seam. */
+                /** register validates like a committed spec: a spec `config check`
+                    would reject must not be spawnable through this seam. */
                 let specErrors = request.params.spec.validationErrors()
                 guard specErrors.isEmpty else {
                     throw WireError(

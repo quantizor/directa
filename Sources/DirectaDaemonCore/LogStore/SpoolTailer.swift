@@ -31,8 +31,8 @@ enum SpoolLineSplit {
 }
 
 /** Tails one raw spool file (the fd the child writes; survives daemon death)
-    into the structured LogStore. Polling keeps it simple and restart-safe; the
-    interval is far below human perception and costs one stat when idle. */
+    into the structured LogStore. Polling keeps it simple and restart-safe; an
+    idle tick still opens the file and seeks to the end, not a cheap stat. */
 actor SpoolTailer {
     private let intervalMs: Int
     /** Unread bytes above this are skipped to the recent tail. Replaying a
