@@ -4,10 +4,43 @@ directa is a personal tool first; issues and patches are welcome all the same. R
 
 ## Commit and changeset hygiene
 
-- Commits focus on why, not a file list; American English; no em-dashes; no attribution footers.
-- Never `git stash` (use temp commits). Agents never bump versions or publish.
-- User-facing changes get a Changeset (`npm run changeset`); see `.changeset/README.md`. Internal-only work (CI, agent docs, no-behavior refactors) never gets a changeset.
-- Product version lives in `package.json`. `npm run version` (used by the Release workflow) syncs `DirectaVersion.version` in `Sources/DirectaKit/Model/Models.swift`.
+Commit subjects and PR titles are Conventional Commits. The type/scope list and subject grammar live in `AGENTS.md` (Engineering rules / Git). GitHub squash uses the PR title as the `main` subject, so the PR title is a conventional commit subject, not a headline sentence.
+
+Never `git stash` (use temp commits). Agents never bump versions or publish.
+
+### Subject examples
+
+Good:
+
+```
+feat(cli): add Grok Build session hook so sessions rediscover servers
+fix(app): keep the menu bar extra from quitting after memory pressure
+fix(supervisor): spawn agent-managed servers outside the daemon's jetsam coalition
+feat(cli)!: leave lock holders running by default
+docs: adopt conventional commits for PR and commit titles
+```
+
+Bad:
+
+```
+lock: hold the resource without stopping servers by default
+Lock leaves servers up; doctor reports jetsam leftovers; DMG installer can replace the app
+Update SetupPerformer.swift
+WIP
+fix stuff
+```
+
+The first is missing a type. The second is a semicolon laundry list: title the primary change (`!` then feat then fix) and name the rest in the body. The others are a file list or a placeholder.
+
+### PR body
+
+User-facing: what changed for a person running directa, migration if any, how it was verified. Not a restatement of the subject, not a file list. Version Packages PRs keep the title the Changesets bot writes.
+
+### Changesets
+
+User-facing changes get a Changeset (`npm run changeset`); see `.changeset/README.md`. Internal-only work (CI, agent docs, no-behavior refactors) never gets a changeset. A breaking subject (`type(scope)!:`) still needs a major changeset: the `!` is for git log, Changesets own the version.
+
+Product version lives in `package.json`. `npm run version` (used by the Release workflow) syncs `DirectaVersion.version` in `Sources/DirectaKit/Model/Models.swift`.
 
 ## Releases
 
