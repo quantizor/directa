@@ -1,5 +1,28 @@
 # Changelog
 
+## 3.0.0
+### Major Changes
+
+
+
+- [#34](https://github.com/quantizor/directa/pull/34) [`e6bd7b6`](https://github.com/quantizor/directa/commit/e6bd7b6894844af8f1e406c29069eda7001bf7fe) - `directa lock` now leaves the project's servers running by default, instead of stopping them for the duration of the command. Other commands still wait their turn for the named resource. If a running server has the locked files open, and the command changes those files, lock reports the mismatch (and by default fails) so the server cannot quietly write the old data back.
+  
+  Stopping those servers is now opt-in with `--pause`, which stops them for the command and starts them again when the lock is released. The old `--no-pause` flag is gone: a plain `directa lock <resource> -- <command>` now does what `--no-pause` used to. Drop `--no-pause` from scripts. Add `--pause` if the servers really need to be down.
+  
+  A lock that is only a name, with no `path` to the files it protects, cannot detect those changes. In that case lock warns on stderr and points to adding a `path` or using `--pause`.
+  
+  `directa up` will not start a stopped server that uses the locked resource while another command still holds the lock. Servers that are already running stay running. The same is true when the background daemon comes back after a crash.
+
+### Patch Changes
+
+
+
+- [#34](https://github.com/quantizor/directa/pull/34) [`e6bd7b6`](https://github.com/quantizor/directa/commit/e6bd7b6894844af8f1e406c29069eda7001bf7fe) - Replacing `/Applications/directa.app` from a mounted DMG now stops the background agent (the installer used to hang on that step) and quits after a successful copy, so the disk can be ejected.
+
+
+
+- [#34](https://github.com/quantizor/directa/pull/34) [`e6bd7b6`](https://github.com/quantizor/directa/commit/e6bd7b6894844af8f1e406c29069eda7001bf7fe) - `directa doctor` now warns when macOS killed the background daemon to free memory (jetsam), and when leftover server-process entries are still registered after that death. The daemon also cleans those leftovers up when it comes back, so they do not pile up across automatic restarts.
+
 ## 2.0.0
 ### Major Changes
 
