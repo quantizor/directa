@@ -177,12 +177,19 @@ final class KeyNavModel {
     Spotlight launches us. */
 final class AppActivationDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        /** First, before anything claims the menu bar or the notification
-            center: a second copy of the same bundle doubles every menu bar item,
-            poll and crash notification the user sees. */
+        /** GetURL first, even on the volume copy: the installer and
+            `/Applications/directa.app` share a bundle id, so Launch Services can
+            deliver `directa://daemon/unregister` here. The handler forwards that
+            URL to the Applications copy, which owns SMAppService. A second copy
+            of the same bundle path still stands down immediately after. */
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL))
         guard !SetupPerformer.quitIfTwinIsRunning() else { return }
-        /** The volume copy is a headless installer: no menu bar item, no deep
-            links or notifications, just the setup window shown here. SwiftUI still
+        /** The volume copy is a headless installer: no menu bar item, no
+            notifications, just the setup window shown here. SwiftUI still
             renders the MenuBarExtra label view even with the item hidden, so the
             label-hosted opener would also fire; it guards itself against the volume
             copy (SetupWindowOpener) so setup is not presented twice. */
@@ -200,13 +207,6 @@ final class AppActivationDelegate: NSObject, NSApplicationDelegate, UNUserNotifi
         AppFocus.installObservers()
         AppDeepLinkDispatch.registerNotificationCategories()
         UNUserNotificationCenter.current().delegate = self
-        /** MenuBarExtra / LSUIElement apps do not always receive
-            application(_:open:); the GetURL Apple Event is the reliable path. */
-        NSAppleEventManager.shared().setEventHandler(
-            self,
-            andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
-            forEventClass: AEEventClass(kInternetEventClass),
-            andEventID: AEEventID(kAEGetURL))
     }
 
     @objc private func handleGetURLEvent(
