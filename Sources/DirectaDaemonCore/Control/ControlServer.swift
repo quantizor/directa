@@ -21,6 +21,11 @@ public actor Router {
         their server to stop bouncing right now. An init parameter so tests can
         set it without touching the environment. */
     private let watchEnabled: Bool
+    /** Server ids whose start-shaped request is still in `prepareSpawn` or the
+        supervisor `start` that follows. `handle` is re-entrant at every `await`,
+        so a second ensure can otherwise observe the first child's bind as an
+        unmanaged listener and fail `port-held` instead of joining. */
+    private var preparing: Set<String> = []
     /** True from before the listener accepts until boot restore has finished.
         Defaults to false so a directly constructed Router (every test, and any
         embedder) serves immediately; only the daemon's boot sequence raises it. */
@@ -139,10 +144,13 @@ public actor Router {
                 let target = ServerTargetParams(
                     name: request.params.name, port: request.params.port, project: project)
                 let supervisor = try await resolvedSupervisor(target)
-                try await prepareSpawn(
-                    target: target, supervisor: supervisor, portOverride: request.params.port,
-                    userInitiated: true)
-                let result = await supervisor.ensure(timeoutSeconds: request.params.timeoutSeconds)
+                let result = try await withSpawnGate(id: serverID(project: project, name: target.name))
+                {
+                    try await prepareSpawn(
+                        target: target, supervisor: supervisor, portOverride: request.params.port,
+                        userInitiated: true)
+                    return await supervisor.ensure(timeoutSeconds: request.params.timeoutSeconds)
+                }
                 DirectaLog.daemon.info(
                     "ensure \(target.name)@\(project) -> \(result.server.phase.rawValue)")
                 return try respond(id: head.id, result: result)
@@ -152,10 +160,14 @@ public actor Router {
                 let target = ServerTargetParams(
                     name: request.params.name, port: request.params.port, project: project)
                 let supervisor = try await resolvedSupervisor(target)
-                try await prepareSpawn(
-                    target: target, supervisor: supervisor, portOverride: request.params.port,
-                    userInitiated: true)
-                return try respond(id: head.id, result: ServerResult(server: await supervisor.start()))
+                let status = try await withSpawnGate(id: serverID(project: project, name: target.name))
+                {
+                    try await prepareSpawn(
+                        target: target, supervisor: supervisor, portOverride: request.params.port,
+                        userInitiated: true)
+                    return await supervisor.start()
+                }
+                return try respond(id: head.id, result: ServerResult(server: status))
             case .serverStatus:
                 let request = try decoder.decode(WireRequest<ProjectParams>.self, from: line)
                 /** Empty project means machine-wide; do not canonicalize it or it
@@ -876,6 +888,26 @@ public actor Router {
                 overlayHost: overlay?.servers?[spec.name]?.host,
                 server: spec.name, specHost: spec.host)
             return resolved.effective == declaredHost ? nil : resolved
+        }
+    }
+
+    /** Serializes `prepareSpawn` plus the supervisor start/ensure that follows
+        for one server. Without this, a re-entrant `handle` runs a second port
+        claim while the first child's socket is up and the phase is still
+        `stopped`, which is the `port-held` after rebind that
+        `simultaneousEnsuresProduceOneProcess` caught. */
+    private func withSpawnGate<T>(id: String, _ body: () async throws -> T) async throws -> T {
+        while preparing.contains(id) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        preparing.insert(id)
+        do {
+            let result = try await body()
+            preparing.remove(id)
+            return result
+        } catch {
+            preparing.remove(id)
+            throw error
         }
     }
 
