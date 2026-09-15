@@ -204,6 +204,13 @@ final class AppActivationDelegate: NSObject, NSApplicationDelegate, UNUserNotifi
             Launch Services; these calls refuse it in-process. */
         ProcessInfo.processInfo.disableAutomaticTermination("menu bar extra")
         ProcessInfo.processInfo.disableSuddenTermination()
+        /** Belt and suspenders for the in-session TAL case above: this also
+            covers the jetsam SIGKILL the opt-out cannot touch. Off the main
+            thread: SMAppService's register call is a synchronous XPC
+            round-trip, and launch has no reason to wait on it. */
+        Task.detached(priority: .utility) {
+            AppAgentService.ensureRegisteredAtLaunch()
+        }
         AppFocus.installObservers()
         AppDeepLinkDispatch.registerNotificationCategories()
         UNUserNotificationCenter.current().delegate = self

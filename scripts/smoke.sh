@@ -658,6 +658,17 @@ AGENT_EXIT_TIMEOUT="$(/usr/libexec/PlistBuddy -c 'Print :ExitTimeOut' "$AGENT_PL
 [[ "$AGENT_EXIT_TIMEOUT" -le 60 ]] || fail "ExitTimeOut was '$AGENT_EXIT_TIMEOUT'; launchd caps it at 60"
 pass "assembled app ships Helpers/ddirecta + in-bundle LaunchAgent"
 
+# The app's own KeepAlive agent: same bundle-layout shape as the daemon's, but
+# BundleProgram points at the app binary itself and there is no PATH floor to
+# check (the app never spawns dev servers).
+APP_AGENT_PLIST="$ROOT/directa.app/Contents/Library/LaunchAgents/dev.quantizor.directa.app.plist"
+[[ -f "$APP_AGENT_PLIST" ]] || fail "bundle missing Library/LaunchAgents/dev.quantizor.directa.app.plist"
+APP_BUNDLE_PROG="$(/usr/libexec/PlistBuddy -c 'Print :BundleProgram' "$APP_AGENT_PLIST")"
+[[ "$APP_BUNDLE_PROG" == "Contents/MacOS/directa-app" ]] || fail "app agent BundleProgram was '$APP_BUNDLE_PROG'"
+APP_KEEPALIVE="$(/usr/libexec/PlistBuddy -c 'Print :KeepAlive:SuccessfulExit' "$APP_AGENT_PLIST")"
+[[ "$APP_KEEPALIVE" == "false" ]] || fail "app agent KeepAlive:SuccessfulExit was '$APP_KEEPALIVE'"
+pass "assembled app ships its own KeepAlive LaunchAgent (dev.quantizor.directa.app)"
+
 kill -9 "$DAEMON_PID" 2>/dev/null || true
 DAEMON_PID=""
 

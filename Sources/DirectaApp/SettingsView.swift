@@ -1,6 +1,5 @@
 import AppKit
 import DirectaKit
-import ServiceManagement
 import SwiftUI
 
 /** Whether the app checks for a newer release in the background. Read by the
@@ -26,7 +25,7 @@ struct SettingsView: View {
     @State private var offers: [HarnessOffer] = []
     @State private var busyHarness: String?
     @State private var hookError: String?
-    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var launchAtLogin = AppAgentService.status == .enabled
     @State private var checkForUpdates = UpdatePreference.enabled
     @State private var confirmingUninstall = false
 
@@ -99,17 +98,22 @@ struct SettingsView: View {
     private var generalSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             sectionTitle("General")
+            /** Backed by the app's own KeepAlive agent (AppAgentService), not
+                the plain SMAppService.mainApp login item it replaced: a login
+                item does not relaunch mid-session after a TAL idle-cull or a
+                jetsam kill, so "Start at login" now also means "and stay
+                running." The user-facing label and meaning are unchanged. */
             Toggle("Start at login", isOn: $launchAtLogin)
                 .toggleStyle(.checkbox)
                 .onChange(of: launchAtLogin) { _, wanted in
                     do {
                         if wanted {
-                            try SMAppService.mainApp.register()
+                            try AppAgentService.enableAtUserRequest()
                         } else {
-                            try SMAppService.mainApp.unregister()
+                            AppAgentService.disableAtUserRequest()
                         }
                     } catch {
-                        launchAtLogin = SMAppService.mainApp.status == .enabled
+                        launchAtLogin = AppAgentService.status == .enabled
                     }
                 }
             Toggle("Check for updates in the background", isOn: $checkForUpdates)

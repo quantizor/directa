@@ -2,8 +2,11 @@
 # Assembles directa.app from the SPM-built products. No Xcode: the bundle is
 # directory layout + Info.plist + signature. Contents/Resources carries the CLI
 # (and a Resources copy of the daemon for setup); Contents/Helpers/ddirecta is the
-# SMAppService BundleProgram target; Contents/Library/LaunchAgents holds the
-# in-bundle agent plist. $1 is the signing identity; the Makefile resolves it
+# daemon SMAppService BundleProgram target; Contents/Library/LaunchAgents holds
+# two in-bundle agent plists: the daemon's (dev.quantizor.directa, BundleProgram
+# Contents/Helpers/ddirecta) and the app's own (dev.quantizor.directa.app,
+# BundleProgram Contents/MacOS/directa-app, the app's KeepAlive resilience
+# against TAL and jetsam). $1 is the signing identity; the Makefile resolves it
 # through scripts/signing-identity.sh, which prefers a Developer ID certificate
 # and falls back to "-" (ad-hoc) when the keychain has none.
 set -euo pipefail
@@ -67,6 +70,36 @@ cat > "$APP/Contents/Library/LaunchAgents/${LABEL}.plist" <<PLIST
 	</dict>
 	<key>Label</key>
 	<string>${LABEL}</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>RunAtLoad</key>
+	<true/>
+</dict>
+</plist>
+PLIST
+
+# The app's own resilience: KeepAlive on any exit but a clean Quit
+# (NSApp.terminate exits 0), so a Transparent Application Lifecycle idle-cull
+# or a memory-pressure jetsam kill relaunches within launchd's throttle
+# instead of leaving a login item dead for the rest of the session, and this
+# process moves from the login-item jetsam band (100) to the daemon band (40).
+# No PATH floor: the GUI app never spawns dev servers, only Terminal logins
+# (TerminalRunner) for brew, which get a real login shell's PATH already.
+APP_LABEL="dev.quantizor.directa.app"
+cat > "$APP/Contents/Library/LaunchAgents/${APP_LABEL}.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/directa-app</string>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>Label</key>
+	<string>${APP_LABEL}</string>
 	<key>ProcessType</key>
 	<string>Interactive</string>
 	<key>RunAtLoad</key>

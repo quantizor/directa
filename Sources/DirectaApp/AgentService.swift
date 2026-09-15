@@ -114,12 +114,18 @@ enum AgentService {
         DirectaLog.app.info("agent unregistered on request")
     }
 
-    /** Drop Start at Login. Idempotent when it was never on. */
+    /** Drop Start at Login: both the legacy `SMAppService.mainApp` login item
+        (idempotent when it was never on) and the app's own KeepAlive agent
+        (AppAgentService.unregister, equally idempotent), so a full uninstall
+        or `directa://daemon/unregister-all` never leaves either mechanism
+        behind regardless of which one this install migrated through. */
     nonisolated static func unregisterLoginItem() {
         let item = SMAppService.mainApp
-        guard item.status != .notRegistered else { return }
-        try? item.unregister()
-        DirectaLog.app.info("Start at Login unregistered on request")
+        if item.status != .notRegistered {
+            try? item.unregister()
+            DirectaLog.app.info("Start at Login unregistered on request")
+        }
+        AppAgentService.unregister()
     }
 
     /** Agent plus Start at Login. Full uninstall uses this; `--agent-only` does
