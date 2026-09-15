@@ -26,6 +26,7 @@ Codebase map
   - Update/: UpdateCheck (GitHub releases/latest, one ETag-cached poll, every failure silent, never fed into AgentContext), DirectaDistribution (the one home for the tap token, releases URL, and brew commands).
   - Logs/: LogFormat + LogQuery (the since-query binary search that the monotonic-timestamp rule protects).
   - Log/DirectaLog.swift: OSLog facade with a recording backend for tests.
+  - Events/DaemonRestartBurstCounter.swift: collapses clustered daemon-restart events into one burst per restart, for doctor's jetsam finding.
 - Sources/DirectaDaemonCore: daemon logic as a library.
   - Supervisor/ServerSupervisor.swift: per-server actor (spawn, spool capture, health-gated phase machine, ensure/wait, teardown). signalRun is the one signalling path; it runs over ProcessTree.liveDescendants, revalidated against ProcessIdentity start time so a recycled pid is never signaled.
   - Supervisor/ProcessTree.swift: QA1123 sysctl sweep; liveDescendants is the one home for the snapshot + parent-chain + session union; narrowed/isAlive is the one home for turning a pid read off disk or the wire into a kernel call (a trapping conversion here is a crash loop under KeepAlive).

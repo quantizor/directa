@@ -1449,6 +1449,9 @@ struct Doctor: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Health report: daemon, launchd, PATH staleness, signatures, stale registrations.")
 
+    /** Lookback for the jetsam finding's restart-burst count. */
+    private static let restartBurstWindowSeconds: TimeInterval = 24 * 60 * 60
+
     @Flag(help: "Prune registry entries whose project directories no longer exist.")
     var fix = false
 
@@ -1495,10 +1498,13 @@ struct Doctor: AsyncParsableCommand {
             let agent = LaunchdJobs.parseAgentPrint(printed.output)
             if agent.jetsammed {
                 let runs = agent.runs.map { " (\($0) runs)" } ?? ""
+                let burstDetail = await Self.recentRestartBurstCount(client: client).map {
+                    ", \($0) daemon restart\($0 == 1 ? "" : "s") in the last 24h"
+                } ?? ""
                 findings.append(
                     Finding(
                         detail:
-                            "ddirecta last exited \(agent.lastExitReason ?? "OS_REASON_JETSAM")\(runs); memory pressure killed the daemon, not a crash dump. Check: launchctl print \(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)",
+                            "ddirecta last exited \(agent.lastExitReason ?? "OS_REASON_JETSAM")\(runs)\(burstDetail); memory pressure killed the daemon, not a crash dump. Check: launchctl print \(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)",
                         kind: "jetsam", severity: "warning"))
             }
         }
@@ -1672,6 +1678,23 @@ struct Doctor: AsyncParsableCommand {
         if findings.contains(where: { $0.severity == "error" }) {
             Foundation.exit(1)
         }
+    }
+
+    /** Nil when events.query itself fails (daemon unreachable, though `launchctl
+        print` on the agent registration can still succeed then); the caller
+        renders the jetsam finding's original text unchanged in that case. An
+        empty or missing events.log still answers 0, which is a real count, not
+        a failure. */
+    private static func recentRestartBurstCount(client: DaemonClient) async -> Int? {
+        let now = Date()
+        guard
+            let result = try? await client.request(
+                .eventsQuery,
+                params: EventsQueryParams(since: now.addingTimeInterval(-restartBurstWindowSeconds)),
+                expecting: EventsQueryResult.self)
+        else { return nil }
+        return DaemonRestartBurstCounter.count(
+            events: result.events, window: restartBurstWindowSeconds, now: now)
     }
 }
 
