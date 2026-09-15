@@ -42,6 +42,15 @@ public protocol ProcessLauncher: Sendable {
         environment: [String: String],
         onSpawn: @escaping @Sendable (pid_t) async -> Void
     ) async -> ProcessOutcome
+
+    /** Re-watches a process this launcher did not spawn: a launchd child job
+        (`label`) that survived a jetsam SIGKILL of the daemon. Returns only when
+        the process terminates, exactly like `run`, but with no `onSpawn` call
+        since the pid is already known. Returns nil when the watch could not be
+        armed (an implementation with no way to watch a non-child, or a race
+        where the pid is already gone); the caller then falls back to bouncing
+        the process instead of adopting it. */
+    func adopt(pid: pid_t, label: String) async -> ProcessOutcome?
 }
 
 public struct SubprocessLauncher: ProcessLauncher {
@@ -92,6 +101,12 @@ public struct SubprocessLauncher: ProcessLauncher {
         } catch {
             return .spawnFailed(Self.spawnError(from: error))
         }
+    }
+
+    /** Never adopts: a foreground/test run has no launchd job to re-watch, so
+        the caller falls back to bouncing the orphan. */
+    public func adopt(pid: pid_t, label: String) async -> ProcessOutcome? {
+        nil
     }
 
     /** Best-effort errno extraction from SubprocessError; the message always

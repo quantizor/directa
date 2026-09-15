@@ -6,10 +6,21 @@ import os
 /** Routes decoded requests to the registry and supervisor pool. One instance per
     daemon; connection handling fans out but every method lands here. */
 public actor Router {
+    /** Live launchd child jobs, keyed for the adoption pid match in
+        `recoverAtStartup`. An injectable seam over `LaunchdJobs.loadChildJobs()`
+        (a `launchctl list` shell-out) so a test can hand recovery a synthetic
+        surviving job without a real SMAppService agent. */
+    private let childJobsProvider: @Sendable () -> [LaunchdJobs.ChildJob]
     private let events: EventStore
     private let launcher: any ProcessLauncher
     private let paths: DirectaPaths
     private let registry: Registry
+    /** An injectable seam over `LaunchdJobLauncher.runningAsAgent` (an
+        `XPC_SERVICE_NAME` environment check), for the same reason as
+        `childJobsProvider`: a test process is never the SMAppService agent, so
+        the adoption gate and the leftover-job reap need a way to say "yes"
+        without one. */
+    private let runningAsAgent: @Sendable () -> Bool
     private var supervisors: [String: ServerSupervisor] = [:]
     /** devservers.json views cached by mtime; a save invalidates naturally. */
     private var configCache: [String: (mtime: Date, view: ProjectConfigView)] = [:]
@@ -27,14 +38,18 @@ public actor Router {
     private var restoring = false
 
     public init(
+        childJobsProvider: @escaping @Sendable () -> [LaunchdJobs.ChildJob] = LaunchdJobs.loadChildJobs,
         launcher: any ProcessLauncher, paths: DirectaPaths, registry: Registry,
+        runningAsAgent: @escaping @Sendable () -> Bool = { LaunchdJobLauncher.runningAsAgent },
         watchEnabled: Bool = ProcessInfo.processInfo.environment["DIRECTA_NO_WATCH"] != "1"
     ) {
+        self.childJobsProvider = childJobsProvider
         self.watchEnabled = watchEnabled
         self.events = EventStore(url: paths.eventsFile)
         self.launcher = launcher
         self.paths = paths
         self.registry = registry
+        self.runningAsAgent = runningAsAgent
         self.resourceLocks =
             Self.normalizedLocks(
                 AtomicFile.loadDefensively(LocksFile.self, from: paths.locksFile)?.locks ?? [:])
@@ -484,10 +499,15 @@ public actor Router {
     }
 
     /** Startup recovery: prune vanished checkouts first, reconcile persisted
-        locks, then restore servers with boot intent. A recorded pid that is gone
-        becomes crashed(daemon-restart); a live orphan (its spool fd kept it
-        healthy while the daemon was away) is group-killed, since exit forensics
-        are unknowable for non-children. Never adopted silently. What comes back:
+        locks, then restore servers with boot intent. A recorded pid that is
+        still a registered launchd child job (agent mode only) is adopted: its
+        exit is re-watched via kqueue `NOTE_EXIT` feeding `recordOutcome`, and
+        its health is re-monitored, so a jetsam SIGKILL of the daemon no longer
+        bounces a dev server that never actually died. A recorded pid that is
+        gone becomes crashed(daemon-restart); a live orphan that is not a
+        matching launchd child job (foreground/test mode, or a pid launchd never
+        knew about) is group-killed as before, since exit forensics are
+        unknowable for a process this daemon cannot re-watch. What comes back:
         any server whose start intent survives (resumeOnBoot), which a machine
         shutdown's drain leaves set, plus the classic daemon-crash case of a
         phase left running/starting. A deliberate stop clears the flag, so only
@@ -498,10 +518,28 @@ public actor Router {
         the same path ensure/status use. Config-defined servers are never written
         into registry.json, so a registry-only lookup would silently skip every
         committed server on boot. A rename/delete with no matching spec drops the
-        orphaned state row instead of retrying forever. */
+        orphaned state row instead of retrying forever.
+
+        Adoption bypasses `prepareSpawn`'s trust gate deliberately: it re-attaches
+        to a process a prior *trusted* daemon already spawned, acting on
+        `state.json` rather than re-materializing a project's committed config,
+        so it never opens the untrusted-config surface `userInitiated` guards.
+        `reconcileLocksAtStartup` above does not assume a supervised child is
+        dead: it only reconciles locks held by external harness processes, a
+        different identity than the server pid adoption re-attaches to. */
     public func recoverAtStartup() async {
         await pruneMissingProjects()
         await reconcileLocksAtStartup()
+        /** Loaded once per boot restore, not per server: `launchctl list` is a
+            shell-out, and every server's adoption check needs the same
+            snapshot. Empty outside agent mode, which is what makes every match
+            below fail closed to the pre-existing bounce+respawn path. */
+        let adoptableChildJobs: [pid_t: LaunchdJobs.ChildJob] =
+            runningAsAgent()
+            ? Dictionary(
+                childJobsProvider().compactMap { job in job.pid.map { ($0, job) } },
+                uniquingKeysWith: { first, _ in first })
+            : [:]
         var toStart: [(project: String, spec: ServerSpec)] = []
         for (id, persisted) in await registry.allPersistedState() {
             guard let parsed = parseServerID(id) else { continue }
@@ -529,6 +567,26 @@ public actor Router {
                 if let pid = persisted.pid.flatMap(ProcessTree.narrowed),
                     let identity = ProcessTree.identity(of: pid)
                 {
+                    /** A bare pid match is not proof: a launchd child job
+                        holding this pid could be a different, later run if the
+                        number was recycled during the daemon-down window (the
+                        pid space is only ~100k wide). Adoption is mutative
+                        (rewrites state.json, attaches supervision), so it needs
+                        the same identity proof `bounceOrphan`/`stop` require
+                        before signaling: the kernel start time must be
+                        consistent with the moment this pid was last recorded
+                        running. A mismatch falls through to the ordinary
+                        bounce. */
+                    if let job = adoptableChildJobs[pid],
+                        ProcessTree.startTimeConsistent(
+                            processStart: identity.wallClockStart,
+                            persistedStartedAt: persisted.startedAt)
+                    {
+                        await adoptSurvivor(
+                            boundPort: persisted.boundPort, job: job, name: name, pid: pid,
+                            project: project, spec: spec, startedAt: persisted.startedAt)
+                        continue
+                    }
                     await bounceOrphan(identity, project: project, name: name)
                 } else if leftActive {
                     await events.post(
@@ -579,7 +637,7 @@ public actor Router {
             bootout, so one-shot child labels accumulate in the gui domain.
             Reap only when this process is that agent: tests and `--foreground`
             never registered those jobs, and must not bootout the user's. */
-        if LaunchdJobLauncher.runningAsAgent {
+        if runningAsAgent() {
             var keepingPids: Set<pid_t> = []
             for supervisor in supervisors.values {
                 if let pid = await supervisor.status().pid.flatMap(ProcessTree.narrowed) {
@@ -591,6 +649,34 @@ public actor Router {
                 DirectaLog.daemon.info("reaped \(reaped) leftover child launchd job(s)")
             }
         }
+    }
+
+    /** Attaches a fresh supervisor to a launchd child job (`job`) that survived
+        the daemon's own jetsam SIGKILL, instead of the bounce+respawn
+        `recoverAtStartup` falls back to when nothing matches. Materializes the
+        spec exactly as `prepareSpawn` would for a fresh spawn (overlay, then
+        effective port, then `PortMaterializer`) but never claims or binds the
+        port: the live child already holds it. `boundPort`/`startedAt` come from
+        the persisted state so the adopted run keeps its rebind and its uptime. */
+    private func adoptSurvivor(
+        boundPort: Int?, job: LaunchdJobs.ChildJob, name: String, pid: pid_t, project: String,
+        spec: ServerSpec, startedAt: Date?
+    ) async {
+        let supervisor = await self.supervisor(project: project, spec: spec)
+        let overlay = LocalOverlay.load(project: project)
+        let overlayServer = overlay?.servers?[name]
+        let overlaid = LocalOverlay.apply(spec: spec, overlay: overlayServer, project: project)
+        let declaredPort = overlaid.port
+        let effective = overlayServer?.port ?? boundPort ?? declaredPort
+        let resolved = PortClaim.resolve(spec: overlaid, effectivePort: effective)
+        let materialized = PortMaterializer.materialize(spec: overlaid, effectivePort: effective)
+        await supervisor.updateSpec(materialized)
+        await supervisor.setPortMeta(
+            claim: resolved.claim, declaredPort: declaredPort, effectivePort: effective)
+        _ = await supervisor.adopt(
+            pid: pid, label: job.label, boundPort: boundPort, startedAt: startedAt)
+        DirectaLog.daemon.info(
+            "recover adopt \(name)@\(project): pid \(pid) still alive as \(job.label)")
     }
 
     /** Group-kill a live non-child left over from a prior daemon (or a prune that

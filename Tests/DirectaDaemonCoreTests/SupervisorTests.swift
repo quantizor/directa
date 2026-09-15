@@ -538,6 +538,154 @@ private func makeEnv() throws -> TestEnv {
         #expect(first.pid == second.pid)
         _ = await supervisor.stop(graceSeconds: 1)
     }
+
+    /** `startedAt` carried into `adopt` is what the persisted state and the
+        run's own uptime clock use, not the moment adoption ran: a jetsam
+        restart must not reset a server's reported uptime back to zero. */
+    @Test func adoptCarriesStartedAtForwardWithoutResettingUptime() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
+        let supervisor = ServerSupervisor(
+            launcher: LaunchdJobLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        let survivor = try spawnSurvivor()
+        defer { kill(survivor, SIGKILL) }
+        let priorStartedAt = Date().addingTimeInterval(-500)
+        let status = await supervisor.adopt(
+            pid: survivor, label: "dev.quantizor.directa.job.uptime-test", boundPort: nil,
+            startedAt: priorStartedAt)
+        #expect(status.pid == Int(survivor))
+        #expect((status.uptimeSec ?? 0) >= 495)
+        let persisted = await registry.persistedState(
+            serverID: serverID(project: env.projectPath, name: "web"))
+        #expect(persisted?.startedAt == priorStartedAt)
+        _ = await supervisor.stop(graceSeconds: 2)
+    }
+
+    /** A `startedAt` the caller never had (pre-feature state, or a persisted
+        row with no timestamp) still produces a usable run: adoption falls back
+        to now rather than leaving the clock unset. */
+    @Test func adoptFallsBackToNowWhenStartedAtIsMissing() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
+        let supervisor = ServerSupervisor(
+            launcher: LaunchdJobLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        let survivor = try spawnSurvivor()
+        defer { kill(survivor, SIGKILL) }
+        let status = await supervisor.adopt(
+            pid: survivor, label: "dev.quantizor.directa.job.uptime-fallback", boundPort: nil,
+            startedAt: nil)
+        #expect((status.uptimeSec ?? -1) >= 0)
+        #expect((status.uptimeSec ?? .max) < 5)
+        _ = await supervisor.stop(graceSeconds: 2)
+    }
+
+    /** The hole this feature closes: an adopted child that later dies must
+        still reach `recordOutcome`, exactly as a spawned one does through
+        `runTask`. The fake launcher's `adopt()` is signalled directly, with
+        the real process left running throughout, which proves the phase
+        transition is driven by the exit-watch task and not by the process
+        actually dying. */
+    @Test func adoptedChildExitReachesRecordOutcomeThroughTheExitWatch() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
+        let gate = AdoptGate()
+        let supervisor = ServerSupervisor(
+            launcher: FakeAdoptLauncher(gate: gate), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        let survivor = try spawnSurvivor()
+        defer { kill(survivor, SIGKILL) }
+        let adopted = await supervisor.adopt(
+            pid: survivor, label: "dev.quantizor.directa.job.exit-test", boundPort: nil,
+            startedAt: nil)
+        #expect(adopted.phase == .starting)
+        #expect(adopted.pid == Int(survivor))
+        /** The exit-watch task's first `await` races this assertion; poll
+            briefly rather than asserting the instant `adopt()` returns. */
+        for _ in 0..<50 where await gate.callCount == 0 {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(await gate.callCount == 1)
+        /** The real process is untouched; only the exit-watch fake fires. */
+        #expect(kill(survivor, 0) == 0)
+        await gate.signal(.signaled(signal: Int(SIGTERM)))
+        let crashed = try await waitForPhase(supervisor, .crashed)
+        #expect(crashed.phase == .crashed)
+        #expect(crashed.lastExit?.signal == Int(SIGTERM))
+        #expect(crashed.pid == nil)
+        let persisted = await registry.persistedState(
+            serverID: serverID(project: env.projectPath, name: "web"))
+        #expect(persisted?.phase == .crashed)
+        #expect(persisted?.lastExit?.signal == Int(SIGTERM))
+    }
+
+    /** Group teardown after adoption must reach the same escaped session
+        grandchild a spawned run's teardown reaches: adoption's
+        `refreshDescendantSnapshot` and `startDescendantWatch` populate the same
+        fields `recordSpawn` does, so `stop`'s session-sweep-plus-snapshot union
+        has what it needs even though this supervisor never spawned the root.
+        Uses the real `LaunchdJobLauncher` for the adopting supervisor so the
+        exit-watch that unblocks `stop`'s wait is the genuine kqueue mechanism,
+        not a stand-in. */
+    @Test func groupTeardownAfterAdoptSweepsTheWholeSessionTree() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(command: [fixture, "--orphan-grandchild"], name: "web")
+        /** Stands in for the prior daemon: spawns the tree, then is abandoned
+            without stopping it, exactly as a jetsam SIGKILL of the daemon would
+            leave it. */
+        let priorDaemon = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        let started = await priorDaemon.start()
+        let root = try #require(started.pid.flatMap { pid_t(exactly: $0) })
+        var grandchild: pid_t?
+        for _ in 0..<40 {
+            let spool =
+                (try? String(
+                    contentsOf: paths.structuredLogFile(project: env.projectPath, server: "web"),
+                    encoding: .utf8)) ?? ""
+            if let match = spool.range(of: #"grandchild pid (\d+)"#, options: .regularExpression) {
+                grandchild = String(spool[match]).split(separator: " ").last.flatMap { pid_t($0) }
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let child = try #require(grandchild)
+        #expect(kill(child, 0) == 0)
+        let supervisor = ServerSupervisor(
+            launcher: LaunchdJobLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        let adopted = await supervisor.adopt(
+            pid: root, label: "dev.quantizor.directa.job.teardown-test", boundPort: nil,
+            startedAt: nil)
+        #expect(adopted.pid == Int(root))
+        /** Same precondition as the spawned-run session test: no longer a
+            parent-chain descendant of the root, so only the session sweep
+            (seeded by `adopt`'s own `refreshDescendantSnapshot`) finds it. */
+        #expect(!ProcessTree.descendants(of: root).identities.contains { $0.pid == child })
+        let stopped = await supervisor.stop(graceSeconds: 2)
+        #expect(stopped.phase == .stopped)
+        #expect(kill(root, 0) != 0)
+        var reaped = false
+        for _ in 0..<100 where !reaped {
+            if kill(child, 0) != 0 { reaped = true; break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(
+            reaped,
+            "grandchild \(child) survived group teardown after adopt (state: \(processState(of: child)))")
+        if !reaped { kill(child, SIGKILL) }
+    }
 }
 
 @Suite struct RegistryTests {

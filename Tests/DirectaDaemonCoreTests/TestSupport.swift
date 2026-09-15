@@ -1,10 +1,94 @@
 import Darwin
 import Foundation
 
+@testable import DirectaDaemonCore
+
 /** Shared test support. The fixture-server lookup lived in six copies that had
     already drifted apart (one checked existence rather than executability, and
     looked in one location instead of two), so a suite could fail to find a
     binary its neighbour found. */
+
+/** Spawns a bare, throwaway long-lived process to stand in for "a server pid a
+    prior daemon recorded", independent of any supervisor or registry (a test
+    that adopts it owns the only bookkeeping). `POSIX_SPAWN_SETSID` makes the
+    returned pid a session leader, `pgid == pid`, the same property
+    `SubprocessLauncher`'s `createSession` gives a real spawn: a group-directed
+    teardown in a test can then never reach outside this one process, in
+    particular never the test runner's own group. The process's lifetime is
+    not tied to the test process, so every caller must kill it explicitly. */
+func spawnSurvivor() throws -> pid_t {
+    var pid: pid_t = 0
+    var attr: posix_spawnattr_t?
+    posix_spawnattr_init(&attr)
+    defer { posix_spawnattr_destroy(&attr) }
+    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
+    let argv: [UnsafeMutablePointer<CChar>?] = [
+        strdup("/bin/sh"), strdup("-c"), strdup("sleep 30"), nil,
+    ]
+    defer { for arg in argv where arg != nil { free(arg) } }
+    let status = posix_spawn(&pid, "/bin/sh", nil, &attr, argv, environ)
+    guard status == 0 else {
+        throw NSError(
+            domain: "directa.test", code: Int(status),
+            userInfo: [NSLocalizedDescriptionKey: "posix_spawn failed: \(String(cString: strerror(status)))"])
+    }
+    /** `swift-subprocess` reaps its own children as part of awaiting their
+        termination status; a bare `posix_spawn` here has no one else doing
+        that. Without a reaper, a test's `kill(pid, 0)` liveness check can
+        never observe the teardown it exists to prove: a zombie still answers
+        that call with success until something calls `waitpid` on it. */
+    let spawned = pid
+    let reaper = Thread {
+        var reapedStatus: Int32 = 0
+        waitpid(spawned, &reapedStatus, 0)
+    }
+    reaper.start()
+    return spawned
+}
+
+/** Resolves once `signal(_:)` is called (or immediately, if it already was),
+    so a test controls exactly when a fake adopted child "exits" without tying
+    that to a real process death. */
+actor AdoptGate {
+    private(set) var callCount = 0
+    private var continuation: CheckedContinuation<ProcessOutcome, Never>?
+    private var pending: ProcessOutcome?
+
+    func outcome() async -> ProcessOutcome {
+        callCount += 1
+        if let pending { return pending }
+        return await withCheckedContinuation { continuation = $0 }
+    }
+
+    func signal(_ outcome: ProcessOutcome) {
+        if let continuation {
+            continuation.resume(returning: outcome)
+            self.continuation = nil
+        } else {
+            pending = outcome
+        }
+    }
+}
+
+/** `run` delegates to a real launcher so the bounce+respawn fallback still
+    spawns for real; `adopt` is fully test-controlled through `gate`, which is
+    what lets a test observe "adopted, not yet exited" independent of the real
+    process the adopted pid names. */
+struct FakeAdoptLauncher: ProcessLauncher {
+    let gate: AdoptGate
+    private let inner: any ProcessLauncher = SubprocessLauncher()
+
+    func run(
+        argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
+        onSpawn: @escaping @Sendable (pid_t) async -> Void
+    ) async -> ProcessOutcome {
+        await inner.run(argv: argv, capture: capture, cwd: cwd, environment: environment, onSpawn: onSpawn)
+    }
+
+    func adopt(pid: pid_t, label: String) async -> ProcessOutcome? {
+        await gate.outcome()
+    }
+}
 
 /** Ports the unit suites allocate from. Reserved as a block so the stray reaper
     below can tell this suite's leftovers from any other directa process on the

@@ -123,6 +123,56 @@ import Testing
         #expect(ProcessTree.shouldSignal(snapshotted: snap, live: snap) == true)
     }
 
+    /** The adoption identity guard: a nil baseline (pre-feature state) always
+        passes, a process that started at or slightly before the recorded
+        moment (the normal pid-publish-to-timestamp gap) passes, and a process
+        that started well after is a recycled pid and must be rejected. */
+    @Test func startTimeConsistentAcceptsNilBaselineAndCloseStarts() {
+        let recordedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        #expect(
+            ProcessTree.startTimeConsistent(processStart: Date(), persistedStartedAt: nil))
+        /** A process that started a moment before the timestamp was stamped:
+            the ordinary case (spawn, then record). */
+        #expect(
+            ProcessTree.startTimeConsistent(
+                processStart: recordedAt.addingTimeInterval(-1), persistedStartedAt: recordedAt))
+        /** Exactly at the recorded moment. */
+        #expect(
+            ProcessTree.startTimeConsistent(processStart: recordedAt, persistedStartedAt: recordedAt))
+        /** Within tolerance after the recorded moment: still accepted, since
+            the default tolerance exists precisely to absorb this gap. */
+        #expect(
+            ProcessTree.startTimeConsistent(
+                processStart: recordedAt.addingTimeInterval(9), persistedStartedAt: recordedAt))
+    }
+
+    @Test func startTimeConsistentRejectsAProcessThatStartedWellAfter() {
+        let recordedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        /** A pid recycled during the daemon-down window: this daemon never
+            recorded a process starting minutes after the moment it stamped. */
+        #expect(
+            ProcessTree.startTimeConsistent(
+                processStart: recordedAt.addingTimeInterval(300), persistedStartedAt: recordedAt)
+                == false)
+        /** Just past the default tolerance boundary. */
+        #expect(
+            ProcessTree.startTimeConsistent(
+                processStart: recordedAt.addingTimeInterval(11), persistedStartedAt: recordedAt)
+                == false)
+    }
+
+    @Test func startTimeConsistentHonorsACustomTolerance() {
+        let recordedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        #expect(
+            ProcessTree.startTimeConsistent(
+                processStart: recordedAt.addingTimeInterval(2), persistedStartedAt: recordedAt,
+                tolerance: 1) == false)
+        #expect(
+            ProcessTree.startTimeConsistent(
+                processStart: recordedAt.addingTimeInterval(2), persistedStartedAt: recordedAt,
+                tolerance: 3))
+    }
+
     @Test func identityOfSelfMatchesLiveProcess() throws {
         let pid = getpid()
         let identity = try #require(ProcessTree.identity(of: pid))

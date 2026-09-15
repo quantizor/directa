@@ -20,6 +20,12 @@ public struct ProcessIdentity: Hashable, Sendable, Equatable {
         self.startMicroseconds = info.kp_proc.p_starttime.tv_usec
         self.startSeconds = info.kp_proc.p_starttime.tv_sec
     }
+
+    /** The kernel start time as a wall-clock `Date`, for comparison against a
+        wall-clock timestamp like `PersistedServerState.startedAt`. */
+    public var wallClockStart: Date {
+        Date(timeIntervalSince1970: TimeInterval(startSeconds) + TimeInterval(startMicroseconds) / 1_000_000)
+    }
 }
 
 /** Result of a descendant sweep. Failure must not look like "no children": a
@@ -107,6 +113,25 @@ public enum ProcessTree {
     public static func shouldSignal(snapshotted: ProcessIdentity, live: ProcessIdentity?) -> Bool {
         guard let live else { return false }
         return snapshotted == live
+    }
+
+    /** Whether a live process's kernel start time is consistent with being the
+        same run `persistedStartedAt` recorded, the identity check adoption needs
+        before it re-attaches supervision to a bare pid match. A nil
+        `persistedStartedAt` is pre-feature state with no baseline to check
+        against, so it passes. Otherwise the process must not have started
+        meaningfully *after* the moment it was recorded running: `recordSpawn`
+        stamps `startedAt` a hair after the real kernel start (so a genuine
+        survivor's `processStart` is at or slightly before `persistedStartedAt`,
+        a small negative delta is normal), while a pid recycled during the
+        daemon-down window started tens of seconds to minutes later. `tolerance`
+        absorbs the pid-publish-to-timestamp gap without opening a window wide
+        enough to accept a genuinely recycled pid. */
+    public static func startTimeConsistent(
+        processStart: Date, persistedStartedAt: Date?, tolerance: TimeInterval = 10
+    ) -> Bool {
+        guard let persistedStartedAt else { return true }
+        return processStart <= persistedStartedAt.addingTimeInterval(tolerance)
     }
 
     /** Round a probed byte count up to whole `kinfo_proc` entries with 12.5%

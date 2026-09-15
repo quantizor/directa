@@ -69,9 +69,58 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         }
         /** Arm `NOTE_EXIT` before advertising the pid so a kqueue failure is
             `spawnFailed` rather than a fake `_exit(0)` after `onSpawn`. */
+        let queue: Int32
+        switch Self.armExitWatch(pid: pid, label: label) {
+        case .armed(let armed): queue = armed
+        case .failed(let error): return .spawnFailed(error)
+        }
+        await onSpawn(pid)
+        return await Task.detached(priority: .userInitiated) {
+            Self.waitForExit(pid: pid, queue: queue)
+        }.value
+    }
+
+    /** Re-watches a launchd child job this process did not spawn: the surviving
+        half of a jetsam SIGKILL, where `run`'s defer bootout never ran. `label`
+        is the job's existing registration, discovered by the caller through
+        `LaunchdJobs.loadChildJobs()` matching on pid; nothing is bootstrapped
+        here. Arms the same `NOTE_EXIT` watch `run` does, so an adopted child
+        that later dies reaches `recordOutcome` exactly like a spawned one, then
+        replicates `run`'s defer cleanup once the process exits: `launchctl
+        bootout` the label and best-effort remove its temp plist (already gone
+        in the common case, since the daemon that spawned it wrote and removed
+        that file itself; the removal here only covers a plist a crashed prior
+        daemon left behind). Returns nil only when the watch could not be armed,
+        which the caller reads as "adopt failed, bounce it instead". */
+    public func adopt(pid: pid_t, label: String) async -> ProcessOutcome? {
+        let queue: Int32
+        switch Self.armExitWatch(pid: pid, label: label) {
+        case .armed(let armed): queue = armed
+        case .failed: return nil
+        }
+        defer {
+            let domain = LaunchdJobs.guiDomain
+            _ = LaunchdAdmin.shell("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
+            let plistURL = FileManager.default.temporaryDirectory.appending(path: "\(label).plist")
+            try? FileManager.default.removeItem(at: plistURL)
+        }
+        return await Task.detached(priority: .userInitiated) {
+            Self.waitForExit(pid: pid, queue: queue)
+        }.value
+    }
+
+    /** Outcome of arming the exit watch: the open kqueue fd, or why it failed. */
+    private enum ExitWatchArm {
+        case armed(Int32)
+        case failed(SpawnError)
+    }
+
+    /** One home for arming `NOTE_EXIT` on a pid, shared by `run` (a job this
+        launcher just bootstrapped) and `adopt` (a job it did not). */
+    private static func armExitWatch(pid: pid_t, label: String) -> ExitWatchArm {
         let queue = kqueue()
         guard queue >= 0 else {
-            return .spawnFailed(
+            return .failed(
                 SpawnError(errno: Int(errno), message: "kqueue failed for launchd job \(label)"))
         }
         var change = kevent(
@@ -80,15 +129,12 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         if kevent(queue, &change, 1, nil, 0, nil) == -1 {
             let err = errno
             close(queue)
-            return .spawnFailed(
+            return .failed(
                 SpawnError(
                     errno: Int(err),
                     message: "cannot watch launchd job \(label) pid \(pid)"))
         }
-        await onSpawn(pid)
-        return await Task.detached(priority: .userInitiated) {
-            Self.waitForExit(pid: pid, queue: queue)
-        }.value
+        return .armed(queue)
     }
 
     private static func writePlist(

@@ -220,6 +220,31 @@ private func tempDir() throws -> URL {
         #expect(sys.contains { $0.hasPrefix("spool catch-up skipped ") })
     }
 
+    /** Re-attach to a spool a prior run already wrote into (adoption's use
+        case): the seed-to-end drain must ingest nothing that predates it, and
+        only bytes appended after that point. */
+    @Test func startAtEndIngestsOnlyBytesAppendedAfterAttach() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data("preexisting line\n".utf8).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(
+            intervalMs: 20, startAtEnd: true, store: store, stream: .out, url: spool)
+        await tailer.start()
+        await tailer.stop()
+        var texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
+        #expect(texts.isEmpty)
+        let handle = try FileHandle(forWritingTo: spool)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("appended after attach\n".utf8))
+        try handle.close()
+        await tailer.start()
+        try await Task.sleep(for: .milliseconds(200))
+        await tailer.stop()
+        texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
+        #expect(texts == ["appended after attach"])
+    }
+
     @Test func fileHandleReadUpToCountHonorsTheLimit() throws {
         let dir = try tempDir()
         let url = dir.appending(path: "blob")

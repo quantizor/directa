@@ -301,6 +301,81 @@ public actor ServerSupervisor {
         return status()
     }
 
+    /** Attaches to a live process a prior daemon spawned, instead of spawning a
+        new one: the agent-mode survivor of a jetsam SIGKILL, still registered as
+        launchd child job `label` (`ControlServer.recoverAtStartup` found the
+        match). Mirrors `recordSpawn` but does not spawn: `pid` is already
+        running and its spool files already exist, so the tailers seed their
+        offset to end-of-file instead of re-ingesting what a prior run already
+        logged. `startedAt` is carried forward from the persisted state rather
+        than stamped now, so uptime is not reset by the adoption itself; a
+        missing value (pre-feature state) falls back to now.
+
+        The exit-watch task below is what closes the adoption hole: without it,
+        a process this attaches to and later loses (the common second-jetsam-
+        wave case, or an ordinary crash) would become an undetected zombie,
+        since nothing else calls `recordOutcome` for a pid this instance never
+        spawned. */
+    public func adopt(
+        pid childPid: pid_t, label: String, boundPort: Int?, startedAt runStartedAt: Date?
+    ) async -> ServerStatus {
+        listenScanGeneration += 1
+        phase = .starting
+        stopRequested = false
+        spawnError = nil
+        errorSummary = nil
+        terminalEvidence = nil
+        everHealthy = false
+        observedPort = nil
+        recentLogTail = nil
+        lastDescendantSnapshot = []
+        consecutiveFailures = 0
+        consecutiveSuccesses = 0
+        runningSpecHash = Self.specHash(spec)
+        let id = serverID(project: projectPath, name: spec.name)
+        pid = childPid
+        /** Same rationale as `recordSpawn`: read now, since `getsid` on a
+            reaped pid answers -1 once the process is gone. */
+        let session = getsid(childPid)
+        rootSessionID = session > 0 ? session : nil
+        refreshDescendantSnapshot()
+        let spawnedAt = runStartedAt ?? Date()
+        startedAt = spawnedAt
+        let out = SpoolTailer(
+            startAtEnd: true, store: logStore, stream: .out,
+            url: paths.spoolOutFile(project: projectPath, server: spec.name))
+        let err = SpoolTailer(
+            startAtEnd: true, store: logStore, stream: .err,
+            url: paths.spoolErrFile(project: projectPath, server: spec.name))
+        outTailer = out
+        errTailer = err
+        await out.start()
+        await err.start()
+        await logStore.append(stream: .sys, text: "adopted pid=\(childPid)")
+        await events?.post(
+            kind: .started, project: projectPath, server: spec.name,
+            detail: "adopted pid \(childPid) across daemon-restart")
+        startHealthMonitor()
+        startDescendantWatch()
+        await registryUpdate(id: id) { entry in
+            entry.boundPort = boundPort
+            entry.lastExit = nil
+            entry.phase = .starting
+            entry.pid = Int(childPid)
+            entry.resumeOnBoot = true
+            entry.spawnError = nil
+            entry.startedAt = spawnedAt
+        }
+        runTask = Task { [launcher] in
+            let outcome =
+                await launcher.adopt(pid: childPid, label: label)
+                ?? .spawnFailed(SpawnError(message: "adopt exit-watch failed"))
+            await self.recordOutcome(outcome, id: id)
+        }
+        settleSpawnWaiters()
+        return status()
+    }
+
     /** The ensure state matrix: stopped/crashed/failed start fresh; starting joins
         the in-flight attempt; running and unhealthy are no-ops (unhealthy is
         reported, not restarted). Blocks until healthy, terminal, or timeout. */

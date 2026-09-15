@@ -48,18 +48,31 @@ actor SpoolTailer {
         of that `Data` copies the remainder once per line and keeps the original
         allocation alive for the whole drain. */
     private let readChunkBytes: Int
+    /** True until the first drain has run: gates the end-of-file seed so it
+        applies once, at attach, and never again on a later drain. */
+    private var seedingAtEnd: Bool
     private let store: LogStore
     private let stream: LogStream
     private var task: Task<Void, Never>?
     private let url: URL
 
+    /** `startAtEnd` seeds `offset` to the file's current size before the first
+        drain reads anything, so re-attaching to a spool a prior run already
+        wrote into (a jetsam-surviving child being adopted) ingests only bytes
+        appended from this point forward. Lines written while no daemon was
+        tailing the file stay in the raw spool only, never reaching the
+        structured log; the alternative, back-reading from offset 0, would
+        duplicate every line the prior run's tailer already ingested. Defaults
+        to false, which preserves ingesting from the start for an ordinary
+        spawn. */
     init(
         intervalMs: Int = 100, maxCatchUpBytes: Int = 1_048_576, readChunkBytes: Int = 64 * 1024,
-        store: LogStore, stream: LogStream, url: URL
+        startAtEnd: Bool = false, store: LogStore, stream: LogStream, url: URL
     ) {
         self.intervalMs = intervalMs
         self.maxCatchUpBytes = max(0, maxCatchUpBytes)
         self.readChunkBytes = max(1, readChunkBytes)
+        self.seedingAtEnd = startAtEnd
         self.store = store
         self.stream = stream
         self.url = url
@@ -87,6 +100,11 @@ actor SpoolTailer {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()) ?? 0
+        if seedingAtEnd {
+            offset = size
+            partial.removeAll()
+            seedingAtEnd = false
+        }
         /** Truncation (a fresh start reuses the path) resets the cursor. */
         if size < offset { offset = 0; partial.removeAll() }
         guard size > offset else { return }

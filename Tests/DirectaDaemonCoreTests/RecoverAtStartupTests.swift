@@ -51,6 +51,33 @@ private func stopServer(router: Router, project: String, name: String) async {
     _ = await router.handle(line: line)
 }
 
+private func eventsList(router: Router, project: String) async throws -> [EventRecord] {
+    let line = try NDJSON.encodeLine(
+        WireRequest(
+            id: "events", method: WireMethod.eventsQuery.rawValue,
+            params: EventsQueryParams(project: project)))
+    let data = await router.handle(line: line)
+    let response = try JSONCoding.decoder().decode(WireResponse<EventsQueryResult>.self, from: data)
+    guard response.ok, let result = response.result else {
+        throw WireError(code: .internalError, message: response.error?.message ?? "events failed")
+    }
+    return result.events
+}
+
+private func logTexts(router: Router, project: String, name: String) async throws -> [String] {
+    let line = try NDJSON.encodeLine(
+        WireRequest(
+            id: "logs", method: WireMethod.logsQuery.rawValue,
+            params: LogsQueryParams(name: name, project: project, streams: [.out])))
+    let data = await router.handle(line: line)
+    let response = try JSONCoding.decoder().decode(WireResponse<LogsQueryResult>.self, from: data)
+    guard response.ok, let result = response.result else {
+        throw WireError(code: .internalError, message: response.error?.message ?? "logs failed")
+    }
+    return result.lines.map(\.text)
+}
+
+
 @Suite struct RecoverAtStartupTests {
     /** Config-defined servers live only in devservers.json (registry.servers is
         empty for them). Boot restore must still find the spec and bring them up. */
@@ -242,5 +269,223 @@ private func stopServer(router: Router, project: String, name: String) async {
         #expect(whyResponse.result?.findings.isEmpty == false)
         #expect(whyResponse.result?.findings.first?.server == "web")
         #expect(whyResponse.result?.rootCause?.contains("crashed") == true)
+    }
+
+    /** The core adoption path: a persisted running server whose pid still
+        matches a registered launchd child job is re-attached, not bounced. Pid
+        stays the same, health promotes it to running, no "daemon-restart"
+        orphan-bounce event lands (only the distinct adopt one does), and a
+        spool line written before the adopt does not get duplicated into the
+        structured log once the tailer re-attaches at end-of-file. Trust is
+        neither required nor granted: adoption never touches `prepareSpawn`. */
+    @Test func adoptsASurvivingChildInsteadOfBouncingIt() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath,
+            serversJSON: """
+            {
+              "web": {
+                "command": ["/bin/sh", "-c", "sleep 30"]
+              }
+            }
+            """)
+        let registry = Registry(paths: env.paths)
+        /** Captured right before the spawn, matching how `recordSpawn` stamps
+            `startedAt`: it must sit at or within a few seconds of the real
+            process's kernel start time, or the identity guard added alongside
+            this test (`ProcessTree.startTimeConsistent`) correctly refuses the
+            adopt as a would-be recycled-pid mismatch. */
+        let startedAt = Date()
+        let survivor = try spawnSurvivor()
+        defer { kill(survivor, SIGKILL) }
+        let id = serverID(project: env.projectPath, name: "web")
+        try await registry.updateState(serverID: id) { entry in
+            entry.phase = .running
+            entry.pid = Int(survivor)
+            entry.resumeOnBoot = true
+            entry.startedAt = startedAt
+        }
+        try FileManager.default.createDirectory(
+            at: env.paths.spoolOutFile(project: env.projectPath, server: "web")
+                .deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try Data("preexisting line\n".utf8).write(
+            to: env.paths.spoolOutFile(project: env.projectPath, server: "web"))
+        let gate = AdoptGate()
+        let router = Router(
+            childJobsProvider: {
+                [LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-adopt", pid: survivor)]
+            },
+            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry,
+            runningAsAgent: { true })
+        await router.recoverAtStartup()
+        var web = try await statusList(router: router, project: env.projectPath)
+            .first { $0.server == "web" }
+        /** Pid is unchanged: adoption attaches, it never spawns. */
+        #expect(web?.pid == Int(survivor))
+        for _ in 0..<50 where web?.phase != .running {
+            try await Task.sleep(for: .milliseconds(100))
+            web = try await statusList(router: router, project: env.projectPath)
+                .first { $0.server == "web" }
+        }
+        #expect(web?.phase == .running)
+        #expect(web?.pid == Int(survivor))
+        #expect(await gate.callCount == 1)
+        #expect(await registry.isTrusted(project: env.projectPath) == false)
+        let events = try await eventsList(router: router, project: env.projectPath)
+        #expect(events.contains { $0.kind == .crashed && ($0.detail ?? "").hasPrefix("daemon-restart") } == false)
+        #expect(
+            events.contains { $0.kind == .started && ($0.detail ?? "").contains("adopted pid") } == true)
+        let handle = try FileHandle(forWritingTo: env.paths.spoolOutFile(project: env.projectPath, server: "web"))
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("post-adopt line\n".utf8))
+        try handle.close()
+        var texts: [String] = []
+        for _ in 0..<50 where !texts.contains("post-adopt line") {
+            try await Task.sleep(for: .milliseconds(100))
+            texts = try await logTexts(router: router, project: env.projectPath, name: "web")
+        }
+        #expect(texts.contains("post-adopt line"))
+        #expect(!texts.contains("preexisting line"))
+    }
+
+    /** A pid match alone is not proof of identity: `persisted.startedAt` set an
+        hour in the past, well outside the tolerance, while the live process
+        backing the matching child job actually started moments ago (a
+        recycled-pid stand-in, since forcing a real pid collision is not
+        reproducible in a test). The guard must reject the match and fall
+        through to the ordinary bounce+respawn, not cross-wire this server's
+        supervision onto a process it never spawned. */
+    @Test func doesNotAdoptWhenTheProcessStartTimeContradictsThePersistedRecord() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath,
+            serversJSON: """
+            {
+              "web": {
+                "command": ["/bin/sh", "-c", "sleep 30"]
+              }
+            }
+            """)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let survivor = try spawnSurvivor()
+        defer { kill(survivor, SIGKILL) }
+        let id = serverID(project: env.projectPath, name: "web")
+        try await registry.updateState(serverID: id) { entry in
+            entry.phase = .running
+            entry.pid = Int(survivor)
+            entry.resumeOnBoot = true
+            entry.startedAt = Date().addingTimeInterval(-3600)
+        }
+        let gate = AdoptGate()
+        let router = Router(
+            childJobsProvider: {
+                [LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-recycled", pid: survivor)]
+            },
+            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry,
+            runningAsAgent: { true })
+        await router.recoverAtStartup()
+        let web = try await statusList(router: router, project: env.projectPath)
+            .first { $0.server == "web" }
+        #expect(web?.pid != Int(survivor))
+        #expect(web?.phase == .starting || web?.phase == .running)
+        #expect(await gate.callCount == 0)
+        let events = try await eventsList(router: router, project: env.projectPath)
+        #expect(
+            events.contains { $0.kind == .crashed && ($0.detail ?? "").hasPrefix("daemon-restart") })
+        #expect(
+            events.contains { $0.kind == .started && ($0.detail ?? "").contains("adopted pid") } == false)
+        var reaped = false
+        for _ in 0..<50 where !reaped {
+            if kill(survivor, 0) != 0 { reaped = true; break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(reaped, "recycled-pid stand-in \(survivor) survived the bounce")
+        await stopServer(router: router, project: env.projectPath, name: "web")
+    }
+
+    /** No launchd child job matches the persisted pid (the common case outside
+        a jetsam restart, or when the surviving job was already reaped): the
+        pre-existing bounce+respawn path still runs, with a fresh pid and the
+        usual "daemon-restart" orphan event. */
+    @Test func fallsBackToBounceAndRespawnWithNoMatchingChildJob() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath,
+            serversJSON: """
+            {
+              "web": {
+                "command": ["/bin/sh", "-c", "sleep 30"]
+              }
+            }
+            """)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let orphan = try spawnSurvivor()
+        defer { if kill(orphan, 0) == 0 { kill(orphan, SIGKILL) } }
+        let id = serverID(project: env.projectPath, name: "web")
+        try await registry.updateState(serverID: id) { entry in
+            entry.phase = .running
+            entry.pid = Int(orphan)
+            entry.resumeOnBoot = true
+        }
+        let router = Router(
+            childJobsProvider: { [] }, launcher: SubprocessLauncher(), paths: env.paths,
+            registry: registry, runningAsAgent: { true })
+        await router.recoverAtStartup()
+        let web = try await statusList(router: router, project: env.projectPath)
+            .first { $0.server == "web" }
+        #expect(web?.pid != Int(orphan))
+        #expect(web?.phase == .starting || web?.phase == .running)
+        let events = try await eventsList(router: router, project: env.projectPath)
+        #expect(
+            events.contains { $0.kind == .crashed && ($0.detail ?? "").hasPrefix("daemon-restart") })
+        var reaped = false
+        for _ in 0..<50 where !reaped {
+            if kill(orphan, 0) != 0 { reaped = true; break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(reaped, "orphan pid \(orphan) survived the bounce")
+        await stopServer(router: router, project: env.projectPath, name: "web")
+    }
+
+    /** Outside agent mode (the daemon's own `ddirecta --foreground` and every
+        unit suite), adoption never runs even when a child job would otherwise
+        match: bounce+respawn is the only path a non-agent daemon has. */
+    @Test func neverAdoptsOutsideAgentMode() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath,
+            serversJSON: """
+            {
+              "web": {
+                "command": ["/bin/sh", "-c", "sleep 30"]
+              }
+            }
+            """)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let orphan = try spawnSurvivor()
+        defer { if kill(orphan, 0) == 0 { kill(orphan, SIGKILL) } }
+        let id = serverID(project: env.projectPath, name: "web")
+        try await registry.updateState(serverID: id) { entry in
+            entry.phase = .running
+            entry.pid = Int(orphan)
+            entry.resumeOnBoot = true
+        }
+        let router = Router(
+            childJobsProvider: {
+                [LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-adopt", pid: orphan)]
+            },
+            launcher: SubprocessLauncher(), paths: env.paths, registry: registry,
+            runningAsAgent: { false })
+        await router.recoverAtStartup()
+        let web = try await statusList(router: router, project: env.projectPath)
+            .first { $0.server == "web" }
+        /** A matching child job existed; the gate alone decided this. */
+        #expect(web?.pid != Int(orphan))
+        #expect(web?.phase == .starting || web?.phase == .running)
+        await stopServer(router: router, project: env.projectPath, name: "web")
     }
 }
