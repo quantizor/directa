@@ -38,24 +38,27 @@ struct LaunchdJobLauncherTests {
         )
         try #require(spawned.withLock { $0 } > 0)
         /** The launchd job is not a child of this test process (launchd forked
-            it), so this is the empirical case the kqueue man page's "valid only
-            on child processes" caveat is about: `NOTE_EXITSTATUS` still carries
-            the real wait(2) status here. Without it, `waitForExit` decodes
-            every exit as `.exited(code: 0)`, which this exact signal (15, not
-            0) would not catch if the decode were wrong. */
+            it), so this pins the actual `NOTE_EXITSTATUS` gate: the kqueue man
+            page calls it "valid only on child processes", but the real check is
+            whether this process may signal the target (same user, or root), and
+            a launchd job run as the same user passes that check despite never
+            being a child. Without `NOTE_EXITSTATUS`, `ExitWatcher.decode` would
+            read a `data` of 0 on every exit and report `.exited(code: 0)`,
+            which this exact signal (15, not 0) would not catch if the decode
+            were wrong. */
         switch outcome {
         case .signaled(let signal):
             #expect(signal == Int(SIGTERM))
-        case .exited, .spawnFailed:
+        case .exited, .exitedStatusUnknown, .spawnFailed:
             Issue.record("expected .signaled(signal: \(SIGTERM)), got \(outcome)")
         }
     }
 
-    /** The other half of the same empirical case: a launchd job (not a child
-        of this process) that exits on its own with a nonzero code. Before
-        `NOTE_EXITSTATUS` this always decoded as `.exited(code: 0)` regardless
-        of the real status, masking every real failure a launchd-run dev server
-        reported. */
+    /** The other half of the same permission case: a launchd job (not a child
+        of this process) that exits on its own with a nonzero code. Without
+        `NOTE_EXITSTATUS`, this would decode as `.exited(code: 0)` regardless of
+        the real status, masking every real failure a launchd-run dev server
+        reports. */
     @Test func launchdJobReportsItsRealExitCode() async throws {
         let (outFD, outURL) = try openSpool()
         let (errFD, errURL) = try openSpool()
@@ -81,7 +84,7 @@ struct LaunchdJobLauncherTests {
         switch outcome {
         case .exited(let code):
             #expect(code == 3)
-        case .signaled, .spawnFailed:
+        case .exitedStatusUnknown, .signaled, .spawnFailed:
             Issue.record("expected .exited(code: 3), got \(outcome)")
         }
     }

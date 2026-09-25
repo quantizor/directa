@@ -6,6 +6,11 @@ import System
 /** Outcome of a completed (or never-started) child process. */
 public enum ProcessOutcome: Sendable {
     case exited(code: Int)
+    /** The process exited, but its wait(2) status could not be read: the
+        kernel refused `NOTE_EXITSTATUS` (EACCES) because the daemon may not
+        signal it, the permission `EVFILT_PROC` gates the note on. Neither a
+        code nor a signal is known. */
+    case exitedStatusUnknown
     case signaled(signal: Int)
     case spawnFailed(SpawnError)
 }

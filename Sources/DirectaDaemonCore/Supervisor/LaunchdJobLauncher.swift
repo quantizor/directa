@@ -7,7 +7,9 @@ import Foundation
     `responsibility_spawnattrs_setdisclaim` does not split it; `launchctl
     bootstrap` of a `KeepAlive=false` job does. Used only when this process is
     the SMAppService agent (`XPC_SERVICE_NAME` matches the agent label). Tests
-    and `ddirecta --foreground` keep `SubprocessLauncher`. */
+    and `ddirecta --foreground` keep `SubprocessLauncher`. Exit tracking for
+    every pid this launches or adopts goes through the shared `ExitWatcher`,
+    never a launcher-owned kqueue. */
 public struct LaunchdJobLauncher: ProcessLauncher {
     public static let labelPrefix = LaunchdJobs.childLabelPrefix
 
@@ -67,17 +69,14 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                     errno: nil,
                     message: "launchd job \(label) pid \(pid) never became a session leader"))
         }
-        /** Arm the exit watch before advertising the pid so a kqueue failure is
-            `spawnFailed` rather than a fake `_exit(0)` after `onSpawn`. */
-        let queue: Int32
-        switch Self.armExitWatch(pid: pid, label: label) {
-        case .armed(let armed): queue = armed
+        /** Arm the exit watch before advertising the pid so a failure to watch
+            is `spawnFailed` rather than a fake `_exit(0)` after `onSpawn`. */
+        switch ExitWatcher.shared.arm(pid: pid) {
+        case .armed: break
         case .failed(let error): return .spawnFailed(error)
         }
         await onSpawn(pid)
-        return await Task.detached(priority: .userInitiated) {
-            Self.waitForExit(pid: pid, queue: queue)
-        }.value
+        return await ExitWatcher.shared.wait(pid: pid)
     }
 
     /** Re-watches a launchd child job this process did not spawn: the surviving
@@ -93,9 +92,8 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         daemon left behind). Returns nil only when the watch could not be armed,
         which the caller reads as "adopt failed, bounce it instead". */
     public func adopt(pid: pid_t, label: String) async -> ProcessOutcome? {
-        let queue: Int32
-        switch Self.armExitWatch(pid: pid, label: label) {
-        case .armed(let armed): queue = armed
+        switch ExitWatcher.shared.arm(pid: pid) {
+        case .armed: break
         case .failed: return nil
         }
         defer {
@@ -104,45 +102,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
             let plistURL = FileManager.default.temporaryDirectory.appending(path: "\(label).plist")
             try? FileManager.default.removeItem(at: plistURL)
         }
-        return await Task.detached(priority: .userInitiated) {
-            Self.waitForExit(pid: pid, queue: queue)
-        }.value
-    }
-
-    /** Outcome of arming the exit watch: the open kqueue fd, or why it failed. */
-    private enum ExitWatchArm {
-        case armed(Int32)
-        case failed(SpawnError)
-    }
-
-    /** One home for arming the exit watch on a pid, shared by `run` (a job this
-        launcher just bootstrapped) and `adopt` (a job it did not). `NOTE_EXIT`
-        alone leaves kqueue's `data` at 0 on every exit, which `waitForExit`
-        would then decode as `.exited(code: 0)` regardless of the real status.
-        `NOTE_EXITSTATUS` carries the real wait(2) status in `data`; the kqueue
-        man page calls it "valid only on child processes", but a launchd job is
-        never this process's child (launchd forks it), and
-        `LaunchdJobLauncherTests.launchdJobReportsItsRealExitCode` and
-        `launchdJobGetsItsOwnJetsamCoalition` both pin the real status arriving
-        anyway on this Darwin version. */
-    private static func armExitWatch(pid: pid_t, label: String) -> ExitWatchArm {
-        let queue = kqueue()
-        guard queue >= 0 else {
-            return .failed(
-                SpawnError(errno: Int(errno), message: "kqueue failed for launchd job \(label)"))
-        }
-        var change = kevent(
-            ident: UInt(pid), filter: Int16(EVFILT_PROC), flags: UInt16(EV_ADD | EV_ONESHOT),
-            fflags: NOTE_EXIT | UInt32(NOTE_EXITSTATUS), data: 0, udata: nil)
-        if kevent(queue, &change, 1, nil, 0, nil) == -1 {
-            let err = errno
-            close(queue)
-            return .failed(
-                SpawnError(
-                    errno: Int(err),
-                    message: "cannot watch launchd job \(label) pid \(pid)"))
-        }
-        return .armed(queue)
+        return await ExitWatcher.shared.wait(pid: pid)
     }
 
     private static func writePlist(
@@ -203,32 +163,5 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         let printed = LaunchdAdmin.shell("/bin/launchctl", ["print", "\(domain)/\(label)"])
         guard printed.status == 0 else { return nil }
         return LaunchdJobs.parseAgentPrint(printed.output).pid
-    }
-
-    /** Non-child wait: kqueue `NOTE_EXITSTATUS` (armed alongside `NOTE_EXIT` in
-        `armExitWatch`) carries the wait(2) status in `data`. The queue is
-        already armed; Darwin does not export the `WIFEXITED` macros as Swift
-        functions, so the wait(2) layout is decoded here. */
-    private static func waitForExit(pid: pid_t, queue: Int32) -> ProcessOutcome {
-        defer { close(queue) }
-        var event = kevent()
-        let n = kevent(queue, nil, 0, &event, 1, nil)
-        guard n > 0 else {
-            return .spawnFailed(
-                SpawnError(errno: Int(errno), message: "lost exit watch on pid \(pid)"))
-        }
-        guard let status = Int32(exactly: event.data) else {
-            return .spawnFailed(
-                SpawnError(
-                    errno: nil, message: "exit status for pid \(pid) does not fit wait(2)"))
-        }
-        if (status & 0o177) == 0 {
-            return .exited(code: Int((status >> 8) & 0xff))
-        }
-        let signal = status & 0o177
-        if signal != 0, signal != 0o177 {
-            return .signaled(signal: Int(signal))
-        }
-        return .exited(code: Int((status >> 8) & 0xff))
     }
 }

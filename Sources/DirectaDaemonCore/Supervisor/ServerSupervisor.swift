@@ -1007,6 +1007,8 @@ public actor ServerSupervisor {
             return
         case .exited(let code):
             lastExit = LastExit(at: Date(), code: code, signal: nil)
+        case .exitedStatusUnknown:
+            lastExit = LastExit(at: Date(), code: nil, signal: nil)
         case .signaled(let signal):
             lastExit = LastExit(at: Date(), code: nil, signal: signal)
         }
