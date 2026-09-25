@@ -67,7 +67,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                     errno: nil,
                     message: "launchd job \(label) pid \(pid) never became a session leader"))
         }
-        /** Arm `NOTE_EXIT` before advertising the pid so a kqueue failure is
+        /** Arm the exit watch before advertising the pid so a kqueue failure is
             `spawnFailed` rather than a fake `_exit(0)` after `onSpawn`. */
         let queue: Int32
         switch Self.armExitWatch(pid: pid, label: label) {
@@ -84,8 +84,8 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         half of a jetsam SIGKILL, where `run`'s defer bootout never ran. `label`
         is the job's existing registration, discovered by the caller through
         `LaunchdJobs.loadChildJobs()` matching on pid; nothing is bootstrapped
-        here. Arms the same `NOTE_EXIT` watch `run` does, so an adopted child
-        that later dies reaches `recordOutcome` exactly like a spawned one, then
+        here. Arms the same exit watch `run` does, so an adopted child that
+        later dies reaches `recordOutcome` exactly like a spawned one, then
         replicates `run`'s defer cleanup once the process exits: `launchctl
         bootout` the label and best-effort remove its temp plist (already gone
         in the common case, since the daemon that spawned it wrote and removed
@@ -115,8 +115,16 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         case failed(SpawnError)
     }
 
-    /** One home for arming `NOTE_EXIT` on a pid, shared by `run` (a job this
-        launcher just bootstrapped) and `adopt` (a job it did not). */
+    /** One home for arming the exit watch on a pid, shared by `run` (a job this
+        launcher just bootstrapped) and `adopt` (a job it did not). `NOTE_EXIT`
+        alone leaves kqueue's `data` at 0 on every exit, which `waitForExit`
+        would then decode as `.exited(code: 0)` regardless of the real status.
+        `NOTE_EXITSTATUS` carries the real wait(2) status in `data`; the kqueue
+        man page calls it "valid only on child processes", but a launchd job is
+        never this process's child (launchd forks it), and
+        `LaunchdJobLauncherTests.launchdJobReportsItsRealExitCode` and
+        `launchdJobGetsItsOwnJetsamCoalition` both pin the real status arriving
+        anyway on this Darwin version. */
     private static func armExitWatch(pid: pid_t, label: String) -> ExitWatchArm {
         let queue = kqueue()
         guard queue >= 0 else {
@@ -125,7 +133,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         }
         var change = kevent(
             ident: UInt(pid), filter: Int16(EVFILT_PROC), flags: UInt16(EV_ADD | EV_ONESHOT),
-            fflags: UInt32(NOTE_EXIT), data: 0, udata: nil)
+            fflags: NOTE_EXIT | UInt32(NOTE_EXITSTATUS), data: 0, udata: nil)
         if kevent(queue, &change, 1, nil, 0, nil) == -1 {
             let err = errno
             close(queue)
@@ -197,9 +205,10 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         return LaunchdJobs.parseAgentPrint(printed.output).pid
     }
 
-    /** Non-child wait: kqueue `NOTE_EXIT` carries the wait(2) status in `data`.
-        The queue is already armed; Darwin does not export the `WIFEXITED`
-        macros as Swift functions, so the wait(2) layout is decoded here. */
+    /** Non-child wait: kqueue `NOTE_EXITSTATUS` (armed alongside `NOTE_EXIT` in
+        `armExitWatch`) carries the wait(2) status in `data`. The queue is
+        already armed; Darwin does not export the `WIFEXITED` macros as Swift
+        functions, so the wait(2) layout is decoded here. */
     private static func waitForExit(pid: pid_t, queue: Int32) -> ProcessOutcome {
         defer { close(queue) }
         var event = kevent()
