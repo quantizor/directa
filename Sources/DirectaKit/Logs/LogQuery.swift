@@ -152,6 +152,16 @@ public enum LogQuery {
     }
 
     public static func run(current: URL, options: LogQueryOptions) -> [LogRecord] {
+        /** A tail with no grep and no since is answerable from the end of the
+            family backward, without materializing older files a caller never
+            asked to see: `directa logs <name> --tail 50` must not read a whole
+            10 MB rotation to hand back 50 lines. `since` already skips whole
+            files via `lastLineTimestamp`, and `grep` must scan forward for
+            correctness, so this fast path is scoped to the one shape that has
+            no reason to touch bytes it will discard. */
+        if let tail = options.tail, options.since == nil, options.grep == nil {
+            return tailOnly(current: current, tail: tail, streams: options.streams)
+        }
         /** A pattern that will not compile filters nothing out, so it would
             answer with the whole log. Fail closed and say so instead: callers
             screen user input with grepRejection first. */
@@ -189,6 +199,68 @@ public enum LogQuery {
             records.removeFirst(records.count - tail)
         }
         return records
+    }
+
+    /** Newest-file-first tail: pulls just enough lines off the end of the
+        family to answer `tail`, oldest file only once a newer one runs dry.
+        Reproduces `run`'s trim-to-tail result exactly (same records, same
+        order) without reading a file whose contribution to the tail is zero. */
+    private static func tailOnly(current: URL, tail: Int, streams: Set<LogStream>?) -> [LogRecord] {
+        guard tail > 0 else { return [] }
+        var collected: [LogRecord] = []
+        for file in familyFiles(current: current).reversed() {
+            guard collected.count < tail else { break }
+            let fromThisFile = tailRecords(of: file, needed: tail - collected.count, streams: streams)
+            collected = fromThisFile + collected
+        }
+        return collected
+    }
+
+    /** Up to `needed` records off the end of one file, oldest-first. Reads a
+        doubling window from the end (64 KB, 128 KB, ...) so a file far larger
+        than the requested tail is never read past the bytes that satisfy it;
+        the window only grows past `needed` lines when a `streams` filter
+        thins the tail out. Growth is geometric, so total bytes read stay
+        within roughly twice whatever window finally satisfied the request. */
+    private static func tailRecords(of url: URL, needed: Int, streams: Set<LogStream>?) -> [LogRecord] {
+        guard needed > 0, let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd(), size > 0 else { return [] }
+        var window: UInt64 = 64 * 1024
+        while true {
+            let start = size > window ? size - window : 0
+            let clean = start == 0 || startsAtLineBoundary(start, handle: handle)
+            guard (try? handle.seek(toOffset: start)) != nil, let data = try? handle.readToEnd()
+            else { return [] }
+            var lines = Array(String(decoding: data, as: UTF8.self).split(
+                separator: "\n", omittingEmptySubsequences: true))
+            /** A window boundary that does not land on a newline cuts a line in
+                half; the half inside this window is missing its earlier bytes
+                and must not be parsed, or a partial line would masquerade as a
+                real (and wrong) record. The next-older window recovers it whole. */
+            if !clean, !lines.isEmpty { lines.removeFirst() }
+            var matched: [LogRecord] = []
+            for line in lines.reversed() {
+                guard let record = LogRecord.parse(line) else { continue }
+                if let streams, !streams.contains(record.stream) { continue }
+                matched.append(record)
+                if matched.count == needed { break }
+            }
+            if matched.count >= needed || start == 0 {
+                return matched.reversed()
+            }
+            window *= 2
+        }
+    }
+
+    /** True when the byte immediately before `offset` is a newline, i.e.
+        `offset` itself opens a new line rather than landing mid-line. */
+    private static func startsAtLineBoundary(_ offset: UInt64, handle: FileHandle) -> Bool {
+        guard offset > 0 else { return true }
+        guard (try? handle.seek(toOffset: offset - 1)) != nil,
+            let byte = try? handle.read(upToCount: 1), byte.first == 0x0A
+        else { return false }
+        return true
     }
 
     /** Timestamp of a mark record whose payload starts with `<id>\t`. */

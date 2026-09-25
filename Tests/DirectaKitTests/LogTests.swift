@@ -199,4 +199,75 @@ import Testing
 
         #expect(ContinuousClock.now - started < Duration.seconds(2))
     }
+
+    @Test func tailCrossesARotationBoundary() throws {
+        /** The newest file alone does not cover the tail window, so the reader
+            must fall back to the end of the older file for the remainder:
+            `directa logs <name> --tail 5` against 4 lines in current.log needs
+            one more line, which sits at the end of current.log.1. */
+        let old = (0..<5).map { record(Double($0), .out, "old \($0)") }
+        let recent = (5..<9).map { record(Double($0), .out, "new \($0)") }
+        let current = try writeFamily([old, recent])
+        let tail = LogQuery.run(current: current, options: LogQueryOptions(tail: 5))
+        #expect(tail.map(\.text) == ["old 4", "new 5", "new 6", "new 7", "new 8"])
+    }
+
+    @Test func tailIgnoresATrailingPartialLine() throws {
+        /** A line with no trailing newline (a crash mid-write, or a read
+            racing an in-flight append) must not surface as a phantom record:
+            LogRecord.parse rejects it for lacking a full timestamp/stream/
+            payload shape, the same as the full-parse path already does. */
+        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-logq-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let current = dir.appending(path: "current.log")
+        let complete = (0..<3).map { record(Double($0), .out, "line \($0)") }
+        let text = complete.map { $0.formatted() }.joined(separator: "\n")
+            + "\n2026-01-01T00:00:00.00partial-garbage-no-tabs"
+        try Data(text.utf8).write(to: current)
+        let tail = LogQuery.run(current: current, options: LogQueryOptions(tail: 5))
+        #expect(tail.map(\.text) == ["line 0", "line 1", "line 2"])
+    }
+
+    @Test func tailLargerThanTheWholeFamilyReturnsEverything() throws {
+        let old = [record(0, .out, "old 0"), record(1, .out, "old 1")]
+        let recent = [record(2, .out, "new 0")]
+        let current = try writeFamily([old, recent])
+        let tail = LogQuery.run(current: current, options: LogQueryOptions(tail: 100))
+        #expect(tail.map(\.text) == ["old 0", "old 1", "new 0"])
+    }
+
+    @Test func tailAfterStreamsFilterMatchesFilterThenSuffix() throws {
+        /** Spec for `tail` combined with `streams`: filter first, then keep
+            the last `n` of what remains, in original chronological order.
+            The expected value is computed independently of LogQuery (filter
+            + suffix on the fixture records this test built), so it pins the
+            documented behavior rather than whatever the code happens to do. */
+        func stream(for offset: Int) -> LogStream { offset % 7 == 0 ? .err : .out }
+        let old = (0..<40).map { record(Double($0), stream(for: $0), "old \($0)") }
+        let recent = (40..<70).map { record(Double($0), stream(for: $0), "new \($0)") }
+        let current = try writeFamily([old, recent])
+        let all = old + recent
+        for tailSize in [1, 3, 10, 25] {
+            let expected = all.filter { $0.stream == .err }.suffix(tailSize)
+            let got = LogQuery.run(
+                current: current, options: LogQueryOptions(streams: [.err], tail: tailSize))
+            #expect(got.map(\.text) == expected.map(\.text), "tail \(tailSize)")
+        }
+    }
+
+    @Test func tailOnlyStaysFastOnAFarLargerFamilyThanRequested() throws {
+        /** 150k lines across a rotation, asking for the last 50: the fast
+            path reads a handful of kilobytes off the end of current.log, so
+            this must complete far under the whole-family-parse budget the
+            aCapSizedFamily test above needs for its combined grep/since/tail
+            workload. A regression back to full-family parsing would blow
+            well past this bound long before it got as slow as that budget. */
+        let old = (0..<100_000).map { record(Double($0), .out, "old \($0)") }
+        let recent = (100_000..<150_000).map { record(Double($0), .out, "new \($0)") }
+        let current = try writeFamily([old, recent])
+        let started = ContinuousClock.now
+        let tail = LogQuery.run(current: current, options: LogQueryOptions(tail: 50))
+        #expect(tail.map(\.text) == (149_950..<150_000).map { "new \($0)" })
+        #expect(ContinuousClock.now - started < Duration.milliseconds(100))
+    }
 }
