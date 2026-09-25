@@ -426,53 +426,19 @@ enum SetupPerformer: Sendable {
 
     nonisolated private static func readCLIVersion(at url: URL) -> String? {
         guard FileManager.default.isExecutableFile(atPath: url.path) else { return nil }
-        let proc = Process()
-        proc.executableURL = url
-        proc.arguments = ["--version"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-        } catch {
-            return nil
-        }
-        guard proc.terminationStatus == 0 else { return nil }
-        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
-        let text = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return (text?.isEmpty == false) ? text : nil
+        let result = LaunchdAdmin.shell(url.path, ["--version"])
+        guard result.status == 0 else { return nil }
+        let text = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 
     nonisolated private static func runCLI(_ cli: URL, arguments: [String]) throws -> String {
-        let proc = Process()
-        proc.executableURL = cli
-        proc.arguments = arguments
-        let out = Pipe()
-        let err = Pipe()
-        proc.standardOutput = out
-        proc.standardError = err
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-        } catch {
+        let result = LaunchdAdmin.shell(cli.path, arguments)
+        let combined = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard result.status == 0 else {
             throw Failure.commandFailed(
                 command: ([cli.path] + arguments).joined(separator: " "),
-                status: -1,
-                output: error.localizedDescription)
-        }
-        let stdout = String(
-            data: (try? out.fileHandleForReading.readToEnd()) ?? Data(), encoding: .utf8)
-            ?? ""
-        let stderr = String(
-            data: (try? err.fileHandleForReading.readToEnd()) ?? Data(), encoding: .utf8)
-            ?? ""
-        let combined = (stdout + stderr).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard proc.terminationStatus == 0 else {
-            throw Failure.commandFailed(
-                command: ([cli.path] + arguments).joined(separator: " "),
-                status: proc.terminationStatus,
+                status: result.status,
                 output: combined)
         }
         return combined
