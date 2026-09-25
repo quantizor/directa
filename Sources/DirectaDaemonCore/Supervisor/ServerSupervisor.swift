@@ -51,10 +51,17 @@ public actor ServerSupervisor {
     private var portClaim: PortClaim?
     private var portConflict: PortConflict?
     private let prober: any HealthProber
-    /** Captured when the phase turns terminal, not recomputed per status call:
+    /** Captured once the phase turns terminal, not recomputed per status call:
         the log stops growing once the process is gone, so one read at the
-        transition is both cheaper and a truer snapshot of the failure. */
-    private var recentLogTail: [String]?
+        transition is both cheaper and a truer snapshot of the failure. The
+        extra layer of Optional tells "not read since the last spawn" (outer
+        nil) apart from "read, and the log family had nothing to show" (outer
+        some, inner nil); collapsing those into one nil would make the second
+        case look uncached and reread the whole log family on every status()
+        call, which is exactly what a server rehydrated as crashed after a
+        daemon restart does today (only errorSummary and terminalEvidence are
+        persisted, so this starts uncached every time). */
+    private var recentLogTail: [String]??
     private let registry: Registry
     private var runningSpecHash: String?
     private var runTask: Task<Void, Never>?
@@ -517,9 +524,22 @@ public actor ServerSupervisor {
         let terminal = phase == .crashed || phase == .failed
         /** The tail is captured once at the transition and served from memory. A
             server rehydrated as crashed after a daemon restart has none in memory
-            (only errorSummary is persisted), so fall back to a live read there,
-            which matches the pre-capture behavior for that narrow case. */
-        let tail = terminal ? (recentLogTail ?? spoolTail()) : nil
+            (only errorSummary and terminalEvidence are persisted), so the first
+            status() call after rehydrate reads the log family and every later
+            call serves the cached result; start()/adopt() clear the cache at the
+            next spawn. */
+        let tail: [String]?
+        if terminal {
+            if let cached = recentLogTail {
+                tail = cached
+            } else {
+                let read = spoolTail()
+                recentLogTail = read
+                tail = read
+            }
+        } else {
+            tail = nil
+        }
         let evidence = terminal ? (terminalEvidence ?? tail) : nil
         return ServerStatus(
             blockedOn: stallStreak >= 2 && phase == .crashed ? "interactive-auth" : nil,
@@ -765,8 +785,9 @@ public actor ServerSupervisor {
         spawnError = SpawnError(
             message: "port \(expected) is owned by managed server '\(thief.name)' in \(thief.project), so the healthcheck was answered by another directa server")
         errorSummary = captureErrorSummary(since: startedAt)
-        recentLogTail = spoolTail()
-        terminalEvidence = recentLogTail
+        let tail = spoolTail()
+        recentLogTail = tail
+        terminalEvidence = tail
         healthTask?.cancel()
         DirectaLog.supervisor.error(
             "port-foreign \(spec.name)@\(projectPath) port \(expected) owned by \(thief.name)@\(thief.project)")
@@ -816,8 +837,9 @@ public actor ServerSupervisor {
         phase = .failed
         spawnError = SpawnError(message: "port drift: expected \(expected), observed \(observed)")
         errorSummary = captureErrorSummary(since: startedAt)
-        recentLogTail = spoolTail()
-        terminalEvidence = recentLogTail
+        let tail = spoolTail()
+        recentLogTail = tail
+        terminalEvidence = tail
         healthTask?.cancel()
         DirectaLog.supervisor.error(
             "port-drift \(spec.name)@\(projectPath) expected \(expected) observed \(observed)")
@@ -975,8 +997,9 @@ public actor ServerSupervisor {
         runTask = nil
         healthTask?.cancel()
         healthTask = nil
-        recentLogTail = spoolTail()
-        terminalEvidence = recentLogTail
+        let tail = spoolTail()
+        recentLogTail = tail
+        terminalEvidence = tail
         let evidence = terminalEvidence
         await registryUpdate(id: id) { entry in
             entry.phase = .failed
@@ -1019,8 +1042,9 @@ public actor ServerSupervisor {
         errTailer = nil
         /** After the final drain, so the lines that explain the exit are in the
             log before the snapshots are taken. */
-        recentLogTail = spoolTail()
-        terminalEvidence = recentLogTail
+        let tail = spoolTail()
+        recentLogTail = tail
+        terminalEvidence = tail
         errorSummary = captureErrorSummary(since: windowStart)
         descendantTask?.cancel()
         descendantTask = nil

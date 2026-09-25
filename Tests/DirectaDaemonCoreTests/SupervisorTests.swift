@@ -524,6 +524,38 @@ private func makeEnv() throws -> TestEnv {
         #expect(status.errorSummary?.count == 4)
     }
 
+    /** A rehydrated crashed server has no `recentLogTail` in memory (only
+        `errorSummary` and `terminalEvidence` are persisted), so status() must
+        read the log family once and serve every later call from that cache.
+        Proven without a stopwatch: the family is appended to between the two
+        status() calls, so a second read (the bug) would surface the new line
+        while the cached answer (the fix) would not. */
+    @Test func statusCachesTheLogTailAfterRehydrate() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let id = serverID(project: env.projectPath, name: "web")
+        let logURL = paths.structuredLogFile(project: env.projectPath, server: "web")
+        let seedLog = LogStore(currentURL: logURL)
+        await seedLog.append(stream: .out, text: "rehydrate-marker-original")
+        let seed = Registry(paths: paths)
+        try await seed.updateState(serverID: id) { entry in
+            entry.phase = .crashed
+        }
+        let registry = Registry(paths: paths)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web"))
+        let first = await supervisor.status()
+        #expect(first.phase == .crashed)
+        #expect(first.recentLogTail?.contains { $0.contains("rehydrate-marker-original") } == true)
+        /** A second, independent writer appends after the first status() call;
+            a live reread would pick this line up, a cached answer would not. */
+        let laterLog = LogStore(currentURL: logURL)
+        await laterLog.append(stream: .out, text: "rehydrate-marker-appended-after-first-read")
+        let second = await supervisor.status()
+        #expect(second.recentLogTail == first.recentLogTail)
+    }
+
     @Test func concurrentStartsSingleFlight() async throws {
         let env = try makeEnv()
         let paths = env.paths
