@@ -6,21 +6,17 @@ import os
 /** Routes decoded requests to the registry and supervisor pool. One instance per
     daemon; connection handling fans out but every method lands here. */
 public actor Router {
-    /** Live launchd child jobs, keyed for the adoption pid match in
-        `recoverAtStartup`. An injectable seam over `LaunchdJobs.loadChildJobs()`
-        (a `launchctl list` shell-out) so a test can hand recovery a synthetic
-        surviving job without a real SMAppService agent. */
-    private let childJobsProvider: @Sendable () -> [LaunchdJobs.ChildJob]
+    /** Live launchd job control, present only when this process is the
+        SMAppService agent. Its absence is what makes the adoption pid match
+        and the leftover-job reap in `recoverAtStartup` fail closed to a plain
+        bounce+respawn: a test or `ddirecta --foreground` never gets real
+        launchd side effects, no matter what it injects, because there is
+        nothing to call. See `AgentJobs`. */
+    private let agentJobs: AgentJobs?
     private let events: EventStore
     private let launcher: any ProcessLauncher
     private let paths: DirectaPaths
     private let registry: Registry
-    /** An injectable seam over `LaunchdJobLauncher.runningAsAgent` (an
-        `XPC_SERVICE_NAME` environment check), for the same reason as
-        `childJobsProvider`: a test process is never the SMAppService agent, so
-        the adoption gate and the leftover-job reap need a way to say "yes"
-        without one. */
-    private let runningAsAgent: @Sendable () -> Bool
     private var supervisors: [String: ServerSupervisor] = [:]
     /** devservers.json views cached by mtime; a save invalidates naturally. */
     private var configCache: [String: (mtime: Date, view: ProjectConfigView)] = [:]
@@ -38,18 +34,16 @@ public actor Router {
     private var restoring = false
 
     public init(
-        childJobsProvider: @escaping @Sendable () -> [LaunchdJobs.ChildJob] = LaunchdJobs.loadChildJobs,
+        agentJobs: AgentJobs? = LaunchdJobLauncher.runningAsAgent ? .live : nil,
         launcher: any ProcessLauncher, paths: DirectaPaths, registry: Registry,
-        runningAsAgent: @escaping @Sendable () -> Bool = { LaunchdJobLauncher.runningAsAgent },
         watchEnabled: Bool = ProcessInfo.processInfo.environment["DIRECTA_NO_WATCH"] != "1"
     ) {
-        self.childJobsProvider = childJobsProvider
+        self.agentJobs = agentJobs
         self.watchEnabled = watchEnabled
         self.events = EventStore(url: paths.eventsFile)
         self.launcher = launcher
         self.paths = paths
         self.registry = registry
-        self.runningAsAgent = runningAsAgent
         self.resourceLocks =
             Self.normalizedLocks(
                 AtomicFile.loadDefensively(LocksFile.self, from: paths.locksFile)?.locks ?? [:])
@@ -532,14 +526,15 @@ public actor Router {
         await reconcileLocksAtStartup()
         /** Loaded once per boot restore, not per server: `launchctl list` is a
             shell-out, and every server's adoption check needs the same
-            snapshot. Empty outside agent mode, which is what makes every match
-            below fail closed to the pre-existing bounce+respawn path. */
+            snapshot. Empty outside agent mode (`agentJobs == nil`), which is
+            what makes every match below fail closed to the pre-existing
+            bounce+respawn path. */
         let adoptableChildJobs: [pid_t: LaunchdJobs.ChildJob] =
-            runningAsAgent()
-            ? Dictionary(
-                childJobsProvider().compactMap { job in job.pid.map { ($0, job) } },
-                uniquingKeysWith: { first, _ in first })
-            : [:]
+            agentJobs.map { jobs in
+                Dictionary(
+                    jobs.listChildJobs().compactMap { job in job.pid.map { ($0, job) } },
+                    uniquingKeysWith: { first, _ in first })
+            } ?? [:]
         var toStart: [(project: String, spec: ServerSpec)] = []
         for (id, persisted) in await registry.allPersistedState() {
             guard let parsed = parseServerID(id) else { continue }
@@ -635,18 +630,23 @@ public actor Router {
         }
         /** SIGKILL of the agent (jetsam) skips LaunchdJobLauncher's defer
             bootout, so one-shot child labels accumulate in the gui domain.
-            Reap only when this process is that agent: tests and `--foreground`
-            never registered those jobs, and must not bootout the user's. */
-        if runningAsAgent() {
+            Reap only when `agentJobs` is set: tests and `--foreground` never
+            registered those jobs and have no `AgentJobs` value to reap
+            through, so they never touch a real launchd domain, the user's
+            included. */
+        if let agentJobs {
             var keepingPids: Set<pid_t> = []
             for supervisor in supervisors.values {
                 if let pid = await supervisor.status().pid.flatMap(ProcessTree.narrowed) {
                     keepingPids.insert(pid)
                 }
             }
-            let reaped = LaunchdJobs.reapStaleChildJobs(keepingPids: keepingPids)
-            if reaped > 0 {
-                DirectaLog.daemon.info("reaped \(reaped) leftover child launchd job(s)")
+            let staleJobs = LaunchdJobs.stale(agentJobs.listChildJobs(), keepingPids: keepingPids)
+            for job in staleJobs {
+                agentJobs.bootOut(job)
+            }
+            if !staleJobs.isEmpty {
+                DirectaLog.daemon.info("reaped \(staleJobs.count) leftover child launchd job(s)")
             }
         }
     }

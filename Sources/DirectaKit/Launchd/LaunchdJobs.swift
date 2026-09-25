@@ -112,19 +112,12 @@ public enum LaunchdJobs {
         return parseChildJobs(fromList: listed.output)
     }
 
-    /** Boot out leftover child jobs. Returns how many bootouts ran. Never
-        touches the agent label. Caller must pass the live supervisor pids so a
-        running server is not torn down. */
-    @discardableResult
-    public static func reapStaleChildJobs(keepingPids: Set<pid_t>) -> Int {
-        let staleJobs = stale(loadChildJobs(), keepingPids: keepingPids)
-        guard !staleJobs.isEmpty else { return 0 }
-        let domain = guiDomain
-        var reaped = 0
-        for job in staleJobs {
-            _ = LaunchdAdmin.shell("/bin/launchctl", ["bootout", "\(domain)/\(job.label)"])
-            reaped += 1
-        }
-        return reaped
+    /** Boot out one child job. Never called for the agent label itself; the
+        caller decides which jobs qualify (see `stale`). Production code must
+        reach this only through `AgentJobs`, whose optionality on `Router` is
+        what keeps a non-agent process (every unit test, `ddirecta
+        --foreground`) from ever running a real `launchctl bootout`. */
+    public static func bootOut(_ job: ChildJob) {
+        _ = LaunchdAdmin.shell("/bin/launchctl", ["bootout", "\(guiDomain)/\(job.label)"])
     }
 }

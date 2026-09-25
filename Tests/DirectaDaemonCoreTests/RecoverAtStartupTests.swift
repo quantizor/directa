@@ -1,6 +1,7 @@
 import DirectaKit
 import Foundation
 import Testing
+import os
 
 @testable import DirectaDaemonCore
 
@@ -62,6 +63,22 @@ private func eventsList(router: Router, project: String) async throws -> [EventR
         throw WireError(code: .internalError, message: response.error?.message ?? "events failed")
     }
     return result.events
+}
+
+/** Records `AgentJobs.bootOut` calls instead of shelling out, so a test can
+    prove a stale child job was reaped (or a live one was not) through the
+    injected fake, never against the real gui launchd domain the daemon and the
+    user's own dev servers run in. */
+private final class RecordingAgentJobs: Sendable {
+    private let bootedOutLabels = OSAllocatedUnfairLock(initialState: [String]())
+
+    var labels: [String] { bootedOutLabels.withLock { $0 } }
+
+    func agentJobs(listing jobs: [LaunchdJobs.ChildJob]) -> AgentJobs {
+        AgentJobs(
+            bootOut: { [bootedOutLabels] job in bootedOutLabels.withLock { $0.append(job.label) } },
+            listChildJobs: { jobs })
+    }
 }
 
 private func logTexts(router: Router, project: String, name: String) async throws -> [String] {
@@ -312,12 +329,12 @@ private func logTexts(router: Router, project: String, name: String) async throw
         try Data("preexisting line\n".utf8).write(
             to: env.paths.spoolOutFile(project: env.projectPath, server: "web"))
         let gate = AdoptGate()
+        let recorder = RecordingAgentJobs()
         let router = Router(
-            childJobsProvider: {
-                [LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-adopt", pid: survivor)]
-            },
-            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry,
-            runningAsAgent: { true })
+            agentJobs: recorder.agentJobs(listing: [
+                LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-adopt", pid: survivor)
+            ]),
+            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
         await router.recoverAtStartup()
         var web = try await statusList(router: router, project: env.projectPath)
             .first { $0.server == "web" }
@@ -332,6 +349,10 @@ private func logTexts(router: Router, project: String, name: String) async throw
         #expect(web?.pid == Int(survivor))
         #expect(await gate.callCount == 1)
         #expect(await registry.isTrusted(project: env.projectPath) == false)
+        /** The same job the adoption check matched is still alive under the
+            supervisor it adopted; the leftover-job reap that runs at the end
+            of `recoverAtStartup` must not boot it out. */
+        #expect(recorder.labels.isEmpty)
         let events = try await eventsList(router: router, project: env.projectPath)
         #expect(events.contains { $0.kind == .crashed && ($0.detail ?? "").hasPrefix("daemon-restart") } == false)
         #expect(
@@ -379,12 +400,12 @@ private func logTexts(router: Router, project: String, name: String) async throw
             entry.startedAt = Date().addingTimeInterval(-3600)
         }
         let gate = AdoptGate()
+        let recorder = RecordingAgentJobs()
         let router = Router(
-            childJobsProvider: {
-                [LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-recycled", pid: survivor)]
-            },
-            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry,
-            runningAsAgent: { true })
+            agentJobs: recorder.agentJobs(listing: [
+                LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-recycled", pid: survivor)
+            ]),
+            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
         await router.recoverAtStartup()
         let web = try await statusList(router: router, project: env.projectPath)
             .first { $0.server == "web" }
@@ -430,9 +451,10 @@ private func logTexts(router: Router, project: String, name: String) async throw
             entry.pid = Int(orphan)
             entry.resumeOnBoot = true
         }
+        let recorder = RecordingAgentJobs()
         let router = Router(
-            childJobsProvider: { [] }, launcher: SubprocessLauncher(), paths: env.paths,
-            registry: registry, runningAsAgent: { true })
+            agentJobs: recorder.agentJobs(listing: []), launcher: SubprocessLauncher(),
+            paths: env.paths, registry: registry)
         await router.recoverAtStartup()
         let web = try await statusList(router: router, project: env.projectPath)
             .first { $0.server == "web" }
@@ -451,8 +473,9 @@ private func logTexts(router: Router, project: String, name: String) async throw
     }
 
     /** Outside agent mode (the daemon's own `ddirecta --foreground` and every
-        unit suite), adoption never runs even when a child job would otherwise
-        match: bounce+respawn is the only path a non-agent daemon has. */
+        unit suite) there is no `AgentJobs` value at all, so adoption has
+        nothing to match against and never runs: bounce+respawn is the only
+        path a non-agent daemon has. */
     @Test func neverAdoptsOutsideAgentMode() async throws {
         let env = try makeRecoverEnv()
         try writeDevservers(
@@ -475,17 +498,33 @@ private func logTexts(router: Router, project: String, name: String) async throw
             entry.resumeOnBoot = true
         }
         let router = Router(
-            childJobsProvider: {
-                [LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-adopt", pid: orphan)]
-            },
-            launcher: SubprocessLauncher(), paths: env.paths, registry: registry,
-            runningAsAgent: { false })
+            agentJobs: nil, launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
         await router.recoverAtStartup()
         let web = try await statusList(router: router, project: env.projectPath)
             .first { $0.server == "web" }
-        /** A matching child job existed; the gate alone decided this. */
+        /** `agentJobs: nil` alone decided this: there was no way to also hand
+            recovery a job matching `orphan`'s pid, because that seam and the
+            agent-mode gate are now the same value. */
         #expect(web?.pid != Int(orphan))
         #expect(web?.phase == .starting || web?.phase == .running)
         await stopServer(router: router, project: env.projectPath, name: "web")
+    }
+
+    /** The leftover-job reap must boot a stale child job (no supervised server
+        holds its pid) out through the injected `AgentJobs` value, never by
+        shelling directly to the real gui launchd domain. No project or
+        supervised server is needed to observe this: the reap runs
+        unconditionally in agent mode at the end of `recoverAtStartup`. */
+    @Test func reapsAStaleChildJobThroughTheInjectedAgentJobsValue() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let recorder = RecordingAgentJobs()
+        let router = Router(
+            agentJobs: recorder.agentJobs(listing: [
+                LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.leftover", pid: 999_999)
+            ]),
+            launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+        #expect(recorder.labels == ["dev.quantizor.directa.job.leftover"])
     }
 }
