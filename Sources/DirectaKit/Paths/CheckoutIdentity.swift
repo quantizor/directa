@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /** Git checkout identity helpers for sibling port rebind and the worktree
     display label. Shells out to `git`; failures return nil so non-git
@@ -85,15 +86,34 @@ public enum CheckoutIdentity {
         let err = Pipe()
         process.standardOutput = out
         process.standardError = err
+        /** Both pipes are drained on background threads started before
+            `waitUntilExit`, not read from afterward: a git that fills either
+            buffer (a long "detached HEAD" or "unsafe repository" warning on
+            stderr counts) would block on a write nothing is reading, and this
+            call would then block forever waiting for an exit that write can
+            no longer reach. stderr's bytes are discarded once drained; only
+            stdout answers the caller, unlike a git warning mixed in. */
+        let stdout = OSAllocatedUnfairLock(initialState: Data())
+        let drained = DispatchGroup()
+        drained.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            stdout.withLock { $0 = (try? out.fileHandleForReading.readToEnd()) ?? Data() }
+            drained.leave()
+        }
+        drained.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = try? err.fileHandleForReading.readToEnd()
+            drained.leave()
+        }
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
             return nil
         }
+        process.waitUntilExit()
+        drained.wait()
         guard process.terminationStatus == 0 else { return nil }
-        let data = (try? out.fileHandleForReading.readToEnd()) ?? Data()
-        guard let text = String(data: data, encoding: .utf8)?
+        guard let text = String(data: stdout.withLock { $0 }, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty
         else { return nil }
         return text
