@@ -13,14 +13,12 @@ enum ExitArm {
 
 /** One process-wide `EVFILT_PROC` exit watcher: a single kqueue serviced by
     exactly one dedicated thread, so watching every launchd-run dev server
-    costs one thread total, never one per server. Swift's cooperative thread
-    pool sizes to `ProcessInfo.processInfo.activeProcessorCount`; a design that
-    blocks one pool thread per watched pid (`Task.detached` in a per-pid
-    `kevent` call) starves every other actor's work once the watched-pid count
-    reaches that many, since the pool never grows past its core count and the
-    daemon's own launchd jetsam thread limit caps it further still.
+    costs one thread and one kqueue fd total, never one per server. A blocking
+    `kevent` wait per pid would park a thread (and hold an fd) for each
+    server's whole life, against Swift's cooperative pool sized to the core
+    count and the daemon's launchd jetsam thread limit of 32.
     `ExitWatcherTests.watchingMoreProcessesThanCoresNeverOpensASecondKqueue`
-    pins the fix's fd cost against the old per-pid-kqueue shape.
+    pins the single shared kqueue.
 
     `arm(pid:)` is synchronous: it records this watcher's own bookkeeping slot
     for the pid before the kernel registration call, so an exit that fires the
