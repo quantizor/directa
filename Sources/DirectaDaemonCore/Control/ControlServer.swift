@@ -495,13 +495,14 @@ public actor Router {
     /** Startup recovery: prune vanished checkouts first, reconcile persisted
         locks, then restore servers with boot intent. A recorded pid that is
         still a registered launchd child job (agent mode only) is adopted: its
-        exit is re-watched via kqueue `NOTE_EXIT` feeding `recordOutcome`, and
-        its health is re-monitored, so a jetsam SIGKILL of the daemon no longer
-        bounces a dev server that never actually died. A recorded pid that is
-        gone becomes crashed(daemon-restart); a live orphan that is not a
-        matching launchd child job (foreground/test mode, or a pid launchd never
-        knew about) is group-killed as before, since exit forensics are
-        unknowable for a process this daemon cannot re-watch. What comes back:
+        exit is re-watched through the shared `ExitWatcher` feeding
+        `recordOutcome`, and its health is re-monitored, so a jetsam SIGKILL of
+        the daemon no longer bounces a dev server that never actually died. A
+        recorded pid that is gone becomes crashed(daemon-restart); a live
+        orphan that is not a matching launchd child job (foreground/test mode,
+        or a pid launchd never knew about) is group-killed instead, since
+        there is no launchd job label to bootout once a fresh watch on it
+        fires. What comes back:
         any server whose start intent survives (resumeOnBoot), which a machine
         shutdown's drain leaves set, plus the classic daemon-crash case of a
         phase left running/starting. A deliberate stop clears the flag, so only

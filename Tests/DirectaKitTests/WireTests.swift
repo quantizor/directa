@@ -37,9 +37,10 @@ import Testing
         #expect(abs(parsed!.timeIntervalSince(date)) < 0.001)
     }
 
-    /** The formatter builds its fractional digits from a millisecond integer,
-        and Swift's `/` and `%` round toward zero, so a date before the epoch
-        used to render as `.-500Z`: the formatter's own parser rejects that, and
+    /** The formatter builds its fractional digits from a millisecond integer.
+        Flooring that division, rather than Swift's default `/` and `%`
+        truncation toward zero, keeps a pre-epoch date's negative remainder
+        from rendering as `.-500Z`, which the formatter's own parser rejects;
         a timestamp that will not parse is a log line that cannot be queried.
         Nothing in directa formats a pre-1970 date today, so this pins a property
         of the formatter rather than a live path. */
@@ -62,11 +63,11 @@ import Testing
     }
 
     /** A single very long line (an unbounded `directa logs` response) fed in
-        fixed-size chunks comes out as exactly one identical line. This is the
-        shape `NDJSONBuffer.feed` used to rescan from the start of the buffer on
-        every chunk, quadratic in the line's length; feeding several thousand
-        chunks here pins correctness across that many `feed` calls, not just
-        performance (covered separately by a microbenchmark, not this suite). */
+        fixed-size chunks comes out as exactly one identical line. `NDJSONBuffer`
+        tracks how far it has already scanned for a newline (`scanned`) so each
+        chunk resumes from there instead of rescanning the whole buffer; feeding
+        several thousand chunks here pins correctness across that many `feed`
+        calls without asserting on timing. */
     @Test func ndjsonBufferFramesAMultiMegabyteLineSplitAcrossManyChunks() {
         var buffer = NDJSONBuffer()
         let payload = Data(repeating: UInt8(ascii: "x"), count: 2_000_000)

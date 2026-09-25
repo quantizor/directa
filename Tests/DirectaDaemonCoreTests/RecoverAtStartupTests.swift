@@ -504,7 +504,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
             .first { $0.server == "web" }
         /** `agentJobs: nil` alone decided this: there was no way to also hand
             recovery a job matching `orphan`'s pid, because that seam and the
-            agent-mode gate are now the same value. */
+            agent-mode gate are the same value, `agentJobs` itself. */
         #expect(web?.pid != Int(orphan))
         #expect(web?.phase == .starting || web?.phase == .running)
         await stopServer(router: router, project: env.projectPath, name: "web")
