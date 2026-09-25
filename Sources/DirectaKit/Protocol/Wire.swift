@@ -676,18 +676,41 @@ public struct EventsQueryResult: Codable, Equatable, Sendable {
     0x0A is safe. */
 public struct NDJSONBuffer: Sendable {
     private var buffer = Data()
+    /** Count of leading bytes in `buffer` already scanned for a newline with
+        none found. Resuming from here on the next `feed` keeps framing one very
+        long line (a `directa logs` response with no bound) linear in its
+        length: without it, every appended chunk rescans the whole buffer
+        accumulated so far, which is quadratic in the line's length. */
+    private var scanned = 0
 
     public init() {}
 
-    /** Appends bytes and returns any newly completed lines (without the newline). */
+    /** Appends bytes and returns any newly completed lines (without the
+        newline). Scans only the bytes appended since the previous call, and
+        drops every consumed line with one `removeSubrange` rather than one per
+        line. */
     public mutating func feed(_ data: Data) -> [Data] {
+        guard !data.isEmpty else { return [] }
         buffer.append(data)
         var lines: [Data] = []
-        while let newline = buffer.firstIndex(of: 0x0A) {
-            let line = buffer.subdata(in: buffer.startIndex..<newline)
-            buffer.removeSubrange(buffer.startIndex...newline)
-            if !line.isEmpty { lines.append(line) }
+        var lineStart = buffer.startIndex
+        var searchFrom = buffer.index(buffer.startIndex, offsetBy: scanned)
+        while let newline = buffer[searchFrom...].firstIndex(of: 0x0A) {
+            let line = buffer[lineStart..<newline]
+            if !line.isEmpty { lines.append(Data(line)) }
+            lineStart = buffer.index(after: newline)
+            searchFrom = lineStart
         }
+        if lineStart > buffer.startIndex {
+            buffer.removeSubrange(buffer.startIndex..<lineStart)
+        }
+        /** Whether or not a line was consumed above, everything now in `buffer`
+            has just been scanned end to end with no newline in it (the `while`
+            condition that exited the loop confirmed exactly that range), so the
+            whole remaining buffer is clean; `buffer.count` alone, not the
+            pre-removal `searchFrom` position, is what the next `feed` must skip
+            past. */
+        scanned = buffer.count
         return lines
     }
 }

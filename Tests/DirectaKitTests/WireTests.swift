@@ -61,6 +61,73 @@ import Testing
         #expect(String(data: second[0], encoding: .utf8) == "{\"b\":2}")
     }
 
+    /** A single very long line (an unbounded `directa logs` response) fed in
+        fixed-size chunks comes out as exactly one identical line. This is the
+        shape `NDJSONBuffer.feed` used to rescan from the start of the buffer on
+        every chunk, quadratic in the line's length; feeding several thousand
+        chunks here pins correctness across that many `feed` calls, not just
+        performance (covered separately by a microbenchmark, not this suite). */
+    @Test func ndjsonBufferFramesAMultiMegabyteLineSplitAcrossManyChunks() {
+        var buffer = NDJSONBuffer()
+        let payload = Data(repeating: UInt8(ascii: "x"), count: 2_000_000)
+        var line = payload
+        line.append(0x0A)
+        var framed: [Data] = []
+        var offset = line.startIndex
+        let chunkSize = 8192
+        while offset < line.endIndex {
+            let end = line.index(offset, offsetBy: chunkSize, limitedBy: line.endIndex) ?? line.endIndex
+            framed.append(contentsOf: buffer.feed(line[offset..<end]))
+            offset = end
+        }
+        #expect(framed.count == 1)
+        #expect(framed[0] == payload)
+    }
+
+    /** Several complete lines delivered in one chunk all come back from the
+        same `feed` call, in order. */
+    @Test func ndjsonBufferFramesSeveralLinesInOneChunk() {
+        var buffer = NDJSONBuffer()
+        let lines = buffer.feed(Data("{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n".utf8))
+        #expect(lines.map { String(data: $0, encoding: .utf8) } == ["{\"a\":1}", "{\"b\":2}", "{\"c\":3}"])
+    }
+
+    /** A chunk boundary that lands exactly on the newline byte: the first
+        `feed` call ends with `\n` and nothing else, the second starts a fresh
+        line with no leftover partial data from the first. */
+    @Test func ndjsonBufferHandlesAChunkBoundaryOnTheNewlineByte() {
+        var buffer = NDJSONBuffer()
+        let first = buffer.feed(Data("{\"a\":1}\n".utf8))
+        #expect(first.map { String(data: $0, encoding: .utf8) } == ["{\"a\":1}"])
+        let second = buffer.feed(Data("{\"b\":2}\n".utf8))
+        #expect(second.map { String(data: $0, encoding: .utf8) } == ["{\"b\":2}"])
+    }
+
+    /** Empty lines (a bare `\n`) are dropped rather than surfaced as
+        zero-length frames. */
+    @Test func ndjsonBufferSkipsEmptyLines() {
+        var buffer = NDJSONBuffer()
+        let lines = buffer.feed(Data("\n\n{\"a\":1}\n\n".utf8))
+        #expect(lines.map { String(data: $0, encoding: .utf8) } == ["{\"a\":1}"])
+    }
+
+    /** A trailing partial line with no newline yet returns nothing and stays
+        buffered until the newline arrives on a later `feed`. A third feed with
+        two more lines, one of them starting well within the byte count the
+        earlier partial line advanced the internal scan position by, catches a
+        buffer that forgets to reset that position once a line drains: a stale
+        position past a later chunk's first newline would skip it and merge two
+        lines into one. */
+    @Test func ndjsonBufferRetainsAPartialTailAcrossFeeds() {
+        var buffer = NDJSONBuffer()
+        let first = buffer.feed(Data("{\"a\":1".utf8))
+        #expect(first.isEmpty)
+        let second = buffer.feed(Data("}\n{\"b\":2}\n".utf8))
+        #expect(second.map { String(data: $0, encoding: .utf8) } == ["{\"a\":1}", "{\"b\":2}"])
+        let third = buffer.feed(Data("{}\n123\n".utf8))
+        #expect(third.map { String(data: $0, encoding: .utf8) } == ["{}", "123"])
+    }
+
     @Test func statusSchemaGolden() throws {
         let status = ServerStatus(
             declaredPort: 3000,
