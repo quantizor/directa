@@ -3,16 +3,11 @@ import Foundation
 
 /** Live launchd job control for one running agent process, bundling the two
     things `Router.recoverAtStartup` needs from it: listing directa's child
-    jobs and booting one out. Its presence on `Router` IS the agent-mode flag:
-    the two were previously separate seams (`childJobsProvider` for listing,
-    `runningAsAgent` for the gate), so a test enabling one without the other
-    left the reap path free to call the real `LaunchdJobs.reapStaleChildJobs`
-    (a real `launchctl list` plus real `launchctl bootout` against the gui
-    domain) instead of the fake it had injected for adoption. Folding both into
-    one optional value makes that combination unrepresentable: nil means "not
-    the agent", full stop, and every launchd side effect recovery can take
-    (adoption's job match, the leftover-job reap) goes through the same
-    closures a test controls. */
+    jobs and booting one out. Its presence on `Router` is the agent-mode flag,
+    so agent mode cannot be switched on without also supplying the job control
+    it acts through: nil means "not the agent", and every launchd side effect
+    recovery takes (adoption's job match, the leftover-job reap) goes through
+    closures a test controls, never the user's real gui domain. */
 public struct AgentJobs: Sendable {
     /** `launchctl bootout` for one child-job label. */
     public var bootOut: @Sendable (LaunchdJobs.ChildJob) -> Void
