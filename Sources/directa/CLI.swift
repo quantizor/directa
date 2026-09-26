@@ -1137,8 +1137,8 @@ struct HookUninstall: AsyncParsableCommand {
 }
 
 /** Invoked by Antigravity's PreInvocation hook. Reads the hook's stdin JSON for
-    the workspace directory, emits {"injectSteps": [{"ephemeralMessage": ...}]},
-    and always exits 0 quickly. */
+    the workspace directory, emits {"injectSteps": [{"ephemeralMessage": ...}]}
+    on the first model call only (HookPayloadGate), and always exits 0 quickly. */
 struct HookAntigravitySessionStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "antigravity-session-start", shouldDisplay: false)
@@ -1148,7 +1148,10 @@ struct HookAntigravitySessionStart: AsyncParsableCommand {
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         FileManager.default.changeCurrentDirectoryPath(cwd)
         let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await HookContext.render(project: project, harness: .antigravity) else {
+        let text: String? =
+            HookPayloadGate.antigravityHookShouldEmit(stdin: stdin)
+            ? await HookContext.render(project: project, harness: .antigravity) : nil
+        guard let text else {
             let empty: [String: Any] = ["injectSteps": []]
             if let data = try? JSONSerialization.data(withJSONObject: empty) {
                 FileHandle.standardOutput.write(data)
@@ -1168,13 +1171,25 @@ struct HookAntigravitySessionStart: AsyncParsableCommand {
 
 /** Invoked by Claude Code's SessionStart hook. Reads the hook's stdin JSON for
     the session cwd, emits hookSpecificOutput.additionalContext, and always exits
-    0 quickly: a session start must never stall or fail on directa's account. */
+    0 quickly: a session start must never stall or fail on directa's account.
+    Silent when Cursor runs it (HookPayloadGate), since Cursor's own hook
+    already carries the block. */
 struct HookClaudeSessionStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "claude-session-start", shouldDisplay: false)
 
     func run() async throws {
         let stdin = CLIRunner.stdinData()
+        let cursorHookInstalled: Bool
+        if case .installed(_, pathExists: true) = CursorAdapter().hookState() {
+            cursorHookInstalled = true
+        } else {
+            cursorHookInstalled = false
+        }
+        guard
+            HookPayloadGate.claudeHookShouldEmit(
+                stdin: stdin, cursorHookInstalled: cursorHookInstalled)
+        else { return }
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         /** Project resolution without --project: reuse the CLI's walk from the
             hook cwd by chdir-ing there first. */

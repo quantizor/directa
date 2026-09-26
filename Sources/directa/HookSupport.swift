@@ -190,6 +190,41 @@ enum HookSessionCwd {
     }
 }
 
+/** Whether a session hook speaks for this invocation, decided from the stdin
+    payload alone. Anything unparseable or unexpected answers true: a missing
+    context block costs the agent more than a duplicate one. */
+enum HookPayloadGate {
+    /** Cursor runs the hooks in `~/.claude/settings.json` as well as its own
+        (its third-party hooks setting, on by default), so a machine with both
+        the claude and cursor hooks installed would inject the block twice into
+        a Cursor session. `cursor_version` is in the base of every Cursor hook
+        payload and in no Claude Code payload, so it is the stand-down signal.
+        The `CURSOR_VERSION` environment variable is not used: a Claude Code
+        session started from Cursor's integrated terminal can inherit Cursor's
+        environment, and would then lose its only context block. The hook
+        stands down only while directa's own Cursor hook is installed, so a
+        machine with just the claude hook still gets the block in Cursor. */
+    static func claudeHookShouldEmit(stdin: Data, cursorHookInstalled: Bool) -> Bool {
+        guard cursorHookInstalled, let payload = object(stdin) else { return true }
+        return payload["cursor_version"] == nil
+    }
+
+    /** Antigravity has no session-start event, so its hook is registered on
+        PreInvocation, which fires before every model call; `invocationNum` is
+        the 0-indexed number of that call. Only the first call carries the
+        block. */
+    static func antigravityHookShouldEmit(stdin: Data) -> Bool {
+        guard let number = object(stdin)?["invocationNum"] as? NSNumber,
+            CFGetTypeID(number) != CFBooleanGetTypeID()
+        else { return true }
+        return number.intValue == 0
+    }
+
+    private static func object(_ stdin: Data) -> [String: Any]? {
+        (try? JSONSerialization.jsonObject(with: stdin)) as? [String: Any]
+    }
+}
+
 /** Antigravity: PreInvocation hook merged into ~/.gemini/config/hooks.json without
     clobbering existing entries. Emits {"injectSteps": [{"ephemeralMessage": ...}]}. */
 struct AntigravityAdapter: HarnessAdapter {

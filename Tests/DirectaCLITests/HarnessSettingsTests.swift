@@ -527,6 +527,62 @@ import Testing
         #expect(GrokHookEvent.parse("post_tool_use") == .leftover)
     }
 
+    /** Payload shapes copied from the vendor docs: Claude Code's SessionStart
+        example (code.claude.com/docs/en/hooks, "SessionStart input") and
+        Cursor's sessionStart input over its common base
+        (cursor.com/docs/hooks, "Common schema" and "sessionStart"). */
+    @Test(arguments: [
+        (
+            #"{"session_id":"abc123","transcript_path":"/Users/me/.claude/projects/x/abc123.jsonl","cwd":"/Users/me/code/app","hook_event_name":"SessionStart","source":"startup","model":"claude-opus-5"}"#,
+            true
+        ),
+        (
+            #"{"session_id":"abc123","transcript_path":"/t.jsonl","cwd":"/p","hook_event_name":"SessionStart","source":"compact"}"#,
+            true
+        ),
+        (
+            #"{"conversation_id":"c1","generation_id":"g1","model":"claude-opus-5","model_id":"claude-opus-5","model_params":[],"hook_event_name":"sessionStart","cursor_version":"3.14.2","workspace_roots":["/Users/me/code/app"],"user_email":null,"transcript_path":null,"session_id":"c1","is_background_agent":false,"composer_mode":"agent"}"#,
+            false
+        ),
+        (#"{"cursor_version":"1.7.2"}"#, false),
+        ("", true),
+        ("not json", true),
+        ("[1,2]", true),
+    ])
+    func claudeHookStandsDownOnlyUnderCursor(payload: String, emits: Bool) {
+        #expect(
+            HookPayloadGate.claudeHookShouldEmit(stdin: Data(payload.utf8), cursorHookInstalled: true)
+                == emits)
+        /** Without directa's own Cursor hook, the claude hook is the only
+            source of the block in a Cursor session, so it always speaks. */
+        #expect(
+            HookPayloadGate.claudeHookShouldEmit(stdin: Data(payload.utf8), cursorHookInstalled: false))
+    }
+
+    /** PreInvocation input copied from antigravity.google/docs/hooks (the
+        example carries `invocationNum: 3`), with the number varied. */
+    @Test(arguments: [
+        (0, true), (1, false), (3, false),
+    ])
+    func antigravityHookEmitsOnlyOnTheFirstModelCall(invocation: Int, emits: Bool) {
+        let payload = """
+            {"invocationNum": \(invocation), "initialNumSteps": 10, \
+            "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587", \
+            "workspacePaths": ["/workspace/project"], \
+            "transcriptPath": "~/.gemini/antigravity/brain/ec33ebf9-0cba-4100-8142-c61503f6c587/.system_generated/logs/transcript.jsonl", \
+            "artifactDirectoryPath": "~/.gemini/antigravity/brain/ec33ebf9-0cba-4100-8142-c61503f6c587", \
+            "modelName": "gemini-3.6-flash-medium"}
+            """
+        #expect(HookPayloadGate.antigravityHookShouldEmit(stdin: Data(payload.utf8)) == emits)
+    }
+
+    @Test(arguments: [
+        #"{"workspacePaths":["/p"]}"#, #"{"invocationNum":"2"}"#, #"{"invocationNum":null}"#, "", "garbage",
+    ])
+    func antigravityHookEmitsWhenTheInvocationNumberIsMissingOrUnreadable(payload: String) {
+        #expect(HookPayloadGate.antigravityHookShouldEmit(stdin: Data(payload.utf8)))
+    }
+
     @Test func grokSessionHookActionMatrix() {
         var state = GrokSessionHook.TurnState(emittedThisTurn: false, turn: 0)
         #expect(GrokSessionHook.action(for: .leftover, state: &state) == .silent)
