@@ -44,6 +44,46 @@ import Testing
                 == LaunchdJobs.AgentStatus(lastExitCode: 7, runs: 1, state: "not running"))
     }
 
+    /** For an exit code with a sysexits.h name, launchd appends it after the
+        number. Every line here is verbatim from a real `launchctl print` of a
+        `/bin/sh -c "exit N"` job. */
+    @Test(arguments: [
+        ("last exit code = 0", 0),
+        ("last exit code = 64: EX_USAGE", 64),
+        ("last exit code = 69: EX_UNAVAILABLE", 69),
+        ("last exit code = 77: EX_NOPERM", 77),
+        ("last exit code = 78: EX_CONFIG", 78),
+        ("last exit code = 127", 127),
+    ])
+    func parseAgentPrintReadsTheLeadingExitCodeNumber(line: String, code: Int) {
+        let printed = """
+            state = not running
+            runs = 1
+            \(line)
+            """
+        #expect(
+            LaunchdJobs.parseAgentPrint(printed)
+                == LaunchdJobs.AgentStatus(lastExitCode: code, runs: 1, state: "not running"))
+    }
+
+    /** A job a signal ended prints no exit code line at all, only the signal
+        by name and number. Both lines verbatim from a real `launchctl print`
+        of `/bin/sh -c "kill -9 $$"` and `"kill -15 $$"`. */
+    @Test(arguments: [
+        ("last terminating signal = Killed: 9", 9),
+        ("last terminating signal = Terminated: 15", 15),
+    ])
+    func parseAgentPrintReadsTheTerminatingSignalNumber(line: String, signal: Int) {
+        let printed = """
+            state = not running
+            runs = 1
+            \(line)
+            """
+        #expect(
+            LaunchdJobs.parseAgentPrint(printed)
+                == LaunchdJobs.AgentStatus(lastTerminatingSignal: signal, runs: 1, state: "not running"))
+    }
+
     /** Before its first exit launchd prints `(never exited)`, which is no code. */
     @Test func parseAgentPrintReadsNeverExitedAsNoCode() {
         let printed = """

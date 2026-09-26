@@ -192,6 +192,51 @@ private func logTexts(router: Router, project: String, name: String) async throw
         #expect(statuses.allSatisfy { $0.phase == .stopped })
     }
 
+    /** A renamed or removed server whose recorded run is still alive: once the
+        row goes, nothing would ever supervise that process, so recover bounces
+        it first, but only with the same start-time proof adoption requires. A
+        pid whose process started long after the row recorded it is a recycled
+        number and is left alone. */
+    @Test(arguments: [true, false])
+    func bouncesALiveSurvivorWhoseSpecIsGoneOnlyWithStartTimeProof(recordedJustNow: Bool) async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath,
+            serversJSON: """
+            {
+              "myproj": {
+                "command": ["/bin/sh", "-c", "sleep 30"]
+              }
+            }
+            """)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        let staleID = serverID(project: env.projectPath, name: "dev")
+        try await registry.updateState(serverID: staleID) { entry in
+            entry.phase = .running
+            entry.pid = Int(survivor)
+            entry.resumeOnBoot = true
+            entry.startedAt = recordedJustNow ? Date() : Date().addingTimeInterval(-3_600)
+        }
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+        #expect(await registry.persistedState(serverID: staleID) == nil)
+
+        var gone = kill(survivor, 0) != 0
+        for _ in 0..<50 where !gone && recordedJustNow {
+            try await Task.sleep(for: .milliseconds(100))
+            gone = kill(survivor, 0) != 0
+        }
+        #expect(gone == recordedJustNow)
+        let events = try await eventsList(router: router, project: env.projectPath)
+        #expect(
+            events.contains {
+                $0.kind == .crashed && $0.detail == DaemonRestartDetail.orphanBounced(pid: survivor)
+            } == recordedJustNow)
+    }
+
     /** A stopped row under a deleted name (no resume intent) is still pruned. */
     @Test func prunesStoppedOrphanWithoutResumeIntent() async throws {
         let env = try makeRecoverEnv()

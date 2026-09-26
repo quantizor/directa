@@ -87,9 +87,10 @@ public struct PersistedServerState: Codable, Sendable {
 public actor Registry {
     private let paths: DirectaPaths
     private var registry: RegistryFile
-    /** Server ids whose state row a removal settled for good this daemon
-        lifetime (see `retireState`). In memory only: a restart starts empty. */
-    private var retiredServerIDs: Set<String> = []
+    /** Per server id, the writers `retireState` retired. In memory only: a
+        restart starts empty, and every supervisor it creates has a new
+        writer. */
+    private var retiredWriters: [String: Set<UUID>] = [:]
     private var state: StateFile
 
     public init(paths: DirectaPaths) {
@@ -173,26 +174,32 @@ public actor Registry {
         state.servers
     }
 
-    /** A no-op for a retired id, including one whose row is missing: a
-        supervisor's late write must not recreate a row its removal settled. */
-    public func updateState(serverID: String, _ mutate: (inout PersistedServerState) -> Void) throws {
+    /** `writer` is the calling supervisor's `ServerSupervisor.writerID`, nil
+        for the router's own writes. A no-op for a writer `retireState`
+        retired for this id, including when the row is missing: a dropped
+        supervisor's late write must not recreate a row its removal settled.
+        Every other writer, a later supervisor for the same id included, goes
+        through. */
+    public func updateState(
+        serverID: String, writer: UUID? = nil, _ mutate: (inout PersistedServerState) -> Void
+    ) throws {
         let serverID = Self.normalizeServerID(serverID)
-        guard !retiredServerIDs.contains(serverID) else { return }
+        if let writer, retiredWriters[serverID]?.contains(writer) == true { return }
         var entry = state.servers[serverID] ?? PersistedServerState()
         mutate(&entry)
         state.servers[serverID] = entry
         try persistState()
     }
 
-    /** Settles a removed server's row as `final` and refuses every later
-        `updateState` for that id, in one turn on this actor. For a server
-        whose stop never finished before its supervisor was dropped: that
-        supervisor's `recordOutcome` can still land afterward. A same-process
-        re-registration of the id does not persist state until the daemon
-        restarts. `removeState` still deletes a retired row. */
-    public func retireState(serverID: String, final: PersistedServerState) throws {
+    /** Settles a removed server's row as `final` and retires `writer` for that
+        id, in one turn on this actor. For a server whose stop never finished
+        before its supervisor was dropped: that supervisor's `recordOutcome`
+        can still land afterward. Both take effect in memory before the save,
+        so a save that throws still refuses the late write. `removeState`
+        still deletes a retired row. */
+    public func retireState(serverID: String, final: PersistedServerState, writer: UUID) throws {
         let serverID = Self.normalizeServerID(serverID)
-        retiredServerIDs.insert(serverID)
+        retiredWriters[serverID, default: []].insert(writer)
         state.servers[serverID] = final
         try persistState()
     }

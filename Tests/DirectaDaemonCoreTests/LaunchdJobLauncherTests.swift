@@ -143,6 +143,84 @@ struct LaunchdJobLauncherTests {
         }
     }
 
+    /** A command that cannot be run (a typo'd path) reports why on its own
+        stderr, which is what `logs` and `why` read, and exits 127 rather than
+        looking like a clean exit 0. launchd may report that 127 through the
+        armed watch or through its own last exit code, and on a loaded machine
+        the exit can outrun both, so status-unknown is also honest; exit 0 or a
+        spawn failure is not. */
+    @Test func aCommandThatCannotRunSaysSoAndExits127() async throws {
+        let (outFD, outURL) = try openSpool()
+        let (errFD, errURL) = try openSpool()
+        defer {
+            close(outFD)
+            close(errFD)
+            try? FileManager.default.removeItem(at: outURL)
+            try? FileManager.default.removeItem(at: errURL)
+        }
+        let missing = "/nonexistent/directa-typo-\(UUID().uuidString)"
+        let outcome = await LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix).run(
+            argv: [missing, "--port", "3000"],
+            capture: SpawnCapture(
+                stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),
+            cwd: nil,
+            environment: [:],
+            onExitedBeforeWatch: { _ in },
+            onSpawn: { _ in }
+        )
+        let stderr = try String(contentsOf: errURL, encoding: .utf8)
+        #expect(stderr == "directa: cannot run \(missing): No such file or directory\n")
+        switch outcome {
+        case .exited(let code):
+            #expect(code == 127)
+        case .exitedStatusUnknown:
+            break
+        case .signaled, .spawnFailed:
+            Issue.record("expected .exited(code: 127) or .exitedStatusUnknown, got \(outcome)")
+        }
+    }
+
+    /** The wrapper script itself, run directly: a missing command and one that
+        is not executable each name the command and the reason on stderr and
+        exit 127; a real command runs with its own arguments and status. */
+    @Test(arguments: [
+        (["/nonexistent/directa-typo", "arg"], "", "directa: cannot run /nonexistent/directa-typo: No such file or directory\n", Int32(127)),
+        (["/etc/hosts"], "", "directa: cannot run /etc/hosts: Permission denied\n", Int32(127)),
+        (["/bin/echo", "hi"], "hi\n", "", Int32(0)),
+        (["/bin/sh", "-c", "exit 3"], "", "", Int32(3)),
+    ])
+    func sessionWrapperReportsAFailedExec(
+        argv: [String], stdout: String, stderr: String, status: Int32
+    ) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+        process.arguments = ["-e", LaunchdJobLauncher.sessionWrapperScript, "--"] + argv
+        let out = Pipe()
+        let err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        try process.run()
+        process.waitUntilExit()
+        let printed = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        let complained = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        #expect(printed == stdout)
+        #expect(complained == stderr)
+        #expect(process.terminationStatus == status)
+    }
+
+    /** launchd's own record is what remains of a job reaped before its pid was
+        ever seen: a terminating signal wins, then the exit code, else unknown. */
+    @Test func unseenExitOutcomeReadsSignalThenCodeThenUnknown() {
+        let signaled = LaunchdJobLauncher.unseenExitOutcome(
+            LaunchdJobs.AgentStatus(lastTerminatingSignal: 9, runs: 1))
+        let exited = LaunchdJobLauncher.unseenExitOutcome(
+            LaunchdJobs.AgentStatus(lastExitCode: 64, runs: 1))
+        let unknown = LaunchdJobLauncher.unseenExitOutcome(LaunchdJobs.AgentStatus(runs: 1))
+        #expect("\(signaled)" == "signaled(signal: 9)")
+        #expect("\(exited)" == "exited(code: 64)")
+        #expect("\(unknown)" == "exitedStatusUnknown")
+    }
+
     private func openSpool() throws -> (Int32, URL) {
         let url = FileManager.default.temporaryDirectory.appending(
             path: "directa-job-\(UUID().uuidString).log")

@@ -28,7 +28,8 @@ enum ExitArm {
     may be called long after `arm`; it resumes immediately if the exit already
     arrived, or stores a continuation for the dedicated thread to resume later.
     Every successful `arm(pid:)` in this codebase is followed by exactly one
-    `wait(pid:)` call (`LaunchdJobLauncher.run` and `.adopt`), so a slot is
+    `wait(pid:)` call (inside `LaunchdJobLauncher.run`, and on the adopt path
+    `LaunchdJobLauncher.prepareAdopt` arms while `.adopt` waits), so a slot is
     always eventually consumed; nothing here reaps an unconsumed slot. */
 final class ExitWatcher: Sendable {
     static let shared = ExitWatcher()

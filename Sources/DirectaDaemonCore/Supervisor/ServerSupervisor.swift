@@ -1,12 +1,12 @@
 import DirectaKit
 import Foundation
 
-/** One registration in `ServerSupervisor.stoppingWaiters`. `deadlineTask` is
-    the sleeping task that calls `expireStoppingWaiter(id:)` if the real
-    transition never lands first. */
-private struct StoppingWaiter {
+/** One registration in `ServerSupervisor.spawnWaiters` or `.stoppingWaiters`.
+    `deadlineTask` is the sleeping task that expires this one waiter if the
+    real transition never lands first; nil for an unbounded wait. */
+private struct PhaseWaiter {
     let continuation: CheckedContinuation<Void, Never>
-    let deadlineTask: Task<Void, Never>
+    let deadlineTask: Task<Void, Never>?
     let id: UUID
 }
 
@@ -102,17 +102,24 @@ public actor ServerSupervisor {
         persisted, so this starts uncached every time). */
     private var recentLogTail: [String]??
     private let registry: Registry
+    /** Set by `stopForRemoval`, never cleared: the router has dropped (or is
+        dropping) this supervisor, so a caller still holding the reference (a
+        restart's `ensure`, a watch sweep) must not spawn or attach a run that
+        nothing would supervise. */
+    private var removed = false
     private var runningSpecHash: String?
     private var runTask: Task<Void, Never>?
     private var spawnError: SpawnError?
-    private var spawnWaiters: [CheckedContinuation<Void, Never>] = []
+    /** Waiters for the spawn settling (a pid, or a terminal phase); settled by
+        `settleSpawnWaiters`. Each has an id so a bounded waiter (see
+        `waitForSpawnSettled`) can be picked out and resumed on its own. */
+    private var spawnWaiters: [PhaseWaiter] = []
     private var spec: ServerSpec
-    /** Waiters for `phase` leaving `.stopping`; settled by `phase`'s `didSet`.
-        Modeled on `spawnWaiters`/`waitForSpawnSettled`/`settleSpawnWaiters`,
+    /** Waiters for `phase` leaving `.stopping`; settled by `phase`'s `didSet`,
         with an id so a timed-out waiter (see `waitForStoppingToClear`) can be
         picked out of the array and resumed on its own, ahead of the real
         transition. */
-    private var stoppingWaiters: [StoppingWaiter] = []
+    private var stoppingWaiters: [PhaseWaiter] = []
     /** Lifetime window a self-exit must land in to count toward the stall
         streak (see recordOutcome). Overridable so tests can use fast bounds. */
     private let stallBounds: (minSeconds: Int, maxSeconds: Int)
@@ -129,7 +136,8 @@ public actor ServerSupervisor {
     private var watchSuspended = false
     /** Set once the router has dropped this supervisor after a stop that never
         finished: a late `recordOutcome` must not write a row the router has
-        already retired or deleted. */
+        already retired or deleted. Covers the moment before the router's
+        `Registry.retireState` lands; the registry refuses `writerID` after. */
     private var stateWritesAbandoned = false
     private var stopRequested = false
     private let stopTiming: StopTiming
@@ -153,6 +161,10 @@ public actor ServerSupervisor {
         pair never alters the host. */
     private var worktreeLabel: String?
     private var mainProjectSlug: String?
+    /** Identifies this supervisor's state writes to `Registry.updateState`, so
+        `Registry.retireState` refuses a dropped supervisor's late write
+        without blocking a later supervisor for the same server. */
+    public nonisolated let writerID = UUID()
 
     public init(
         events: EventStore? = nil,
@@ -303,6 +315,7 @@ public actor ServerSupervisor {
         in-flight attempt. Returns once a pid exists or the spawn has failed; the
         phase stays `starting` until the healthcheck passes. */
     public func start() async -> ServerStatus {
+        guard !removed else { return status() }
         switch phase {
         case .running, .unhealthy:
             return status()
@@ -391,7 +404,8 @@ public actor ServerSupervisor {
 
         The exit watch is armed first, before anything is recorded: false
         means nothing changed here (phase, pid, registry, tailers) and the
-        caller bounces the process instead. The result is a Bool rather than a
+        caller bounces the process instead. A removed supervisor returns false
+        before arming, since an armed watch nobody waits on is never consumed. The result is a Bool rather than a
         status because the health monitor can promote a successful adopt to
         `.running` before this returns. The exit-watch task below is what
         closes the adoption hole: without it, a process this attaches to and
@@ -401,7 +415,7 @@ public actor ServerSupervisor {
     public func adopt(
         pid childPid: pid_t, label: String, boundPort: Int?, startedAt runStartedAt: Date?
     ) async -> Bool {
-        guard launcher.prepareAdopt(pid: childPid) else { return false }
+        guard !removed, launcher.prepareAdopt(pid: childPid) else { return false }
         listenScanGeneration += 1
         phase = .starting
         stopRequested = false
@@ -461,6 +475,7 @@ public actor ServerSupervisor {
         the in-flight attempt; running and unhealthy are no-ops (unhealthy is
         reported, not restarted). Blocks until healthy, terminal, or timeout. */
     public func ensure(timeoutSeconds: Double) async -> EnsureResult {
+        guard !removed else { return EnsureResult(reason: .stopped, server: status()) }
         switch phase {
         case .running, .unhealthy:
             return EnsureResult(server: status())
@@ -554,8 +569,25 @@ public actor ServerSupervisor {
             break
         }
         guard let target = pid else {
-            phase = .stopped
-            return status()
+            guard phase == .starting else {
+                phase = .stopped
+                return status()
+            }
+            /** The launcher has not reported a pid yet (a launchd job takes a
+                moment to publish one). Reading `.stopped` here would let that
+                run come up under a stopped phase, beside which a later start
+                spawns a second copy. Wait for the spawn to settle, then stop
+                whatever it produced from the top. */
+            guard await waitForSpawnSettled(timeout: stopWaitTimeout) else {
+                let seconds = stopWaitTimeout.components.seconds
+                await logStore.append(
+                    stream: .sys,
+                    text: "stop waited \(seconds)s for the process to start and gave up; it may still come up")
+                DirectaLog.supervisor.error(
+                    "\(spec.name) stop waited \(seconds)s for the process to start and gave up; it may still come up")
+                return status()
+            }
+            return await stop(graceSeconds: requestedGrace, deliberate: deliberate, reason: reason)
         }
         stopRequested = true
         stopWasDeliberate = deliberate
@@ -600,24 +632,20 @@ public actor ServerSupervisor {
     }
 
     /** A deliberate stop for a caller about to drop this supervisor (unregister,
-        forgetting a vanished project). Returns true when the stop gave up with
+        forgetting a vanished project). Marks it removed before the stop, so
+        from here on `start`, `ensure`, and `adopt` spawn or attach nothing,
+        whatever stop this one joins. Returns true when the stop gave up with
         the phase still `.stopping`: state writes are then abandoned in the
         same actor turn the stop returned in, so a `recordOutcome` landing
         after the caller retires or deletes the state row cannot put it back.
-        False means the stop finished and its own `recordOutcome` already
-        cleared the boot intent. */
+        False means the stop finished; a joined non-deliberate stop (a
+        restart, a watch sweep) keeps boot intent, which the caller clears. */
     public func stopForRemoval(reason: String) async -> Bool {
+        removed = true
         _ = await stop(reason: reason)
         guard phase == .stopping else { return false }
-        abandonStateWrites()
-        return true
-    }
-
-    /** Stops every later state.json write from this supervisor. One already
-        inside `Registry.updateState` can still land once; the caller's
-        `Registry.retireState` or `removeState` is what settles the row. */
-    public func abandonStateWrites() {
         stateWritesAbandoned = true
+        return true
     }
 
     /** One revalidated teardown pass. Descendants come from every source at once
@@ -1344,7 +1372,7 @@ public actor ServerSupervisor {
     private func registryUpdate(id: String, _ mutate: @escaping @Sendable (inout PersistedServerState) -> Void) async {
         guard !stateWritesAbandoned else { return }
         do {
-            try await registry.updateState(serverID: id, mutate)
+            try await registry.updateState(serverID: id, writer: writerID, mutate)
         } catch {
             FileHandle.standardError.write(
                 Data("ddirecta: state persistence failed for \(id): \(error)\n".utf8))
@@ -1354,16 +1382,27 @@ public actor ServerSupervisor {
     private func settleSpawnWaiters() {
         let waiters = spawnWaiters
         spawnWaiters = []
-        for waiter in waiters { waiter.resume() }
+        for waiter in waiters {
+            waiter.deadlineTask?.cancel()
+            waiter.continuation.resume()
+        }
     }
 
     private func settleStoppingWaiters() {
         let waiters = stoppingWaiters
         stoppingWaiters = []
         for waiter in waiters {
-            waiter.deadlineTask.cancel()
+            waiter.deadlineTask?.cancel()
             waiter.continuation.resume()
         }
+    }
+
+    /** The bounded half of `waitForSpawnSettled`, the same shape as
+        `expireStoppingWaiter`. */
+    private func expireSpawnWaiter(id: UUID) {
+        guard let index = spawnWaiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = spawnWaiters.remove(at: index)
+        waiter.continuation.resume()
     }
 
     /** The bounded half of `waitForStoppingToClear`: picks its own waiter out
@@ -1398,16 +1437,28 @@ public actor ServerSupervisor {
     }
 
     /** Blocks until the in-flight start has either produced a pid or gone
-        terminal; the phase itself stays `starting` until first-healthy. */
-    private func waitForSpawnSettled() async {
-        guard phase == .starting, pid == nil else { return }
-        await withCheckedContinuation { continuation in
-            if phase != .starting || pid != nil {
+        terminal; the phase itself stays `starting` until first-healthy. A nil
+        `timeout` waits for as long as the launcher takes, which `run` bounds
+        on its own. Returns false only when the deadline fired first. */
+    @discardableResult
+    private func waitForSpawnSettled(timeout: Duration? = nil) async -> Bool {
+        guard phase == .starting, pid == nil else { return true }
+        let id = UUID()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            guard phase == .starting, pid == nil else {
                 continuation.resume()
-            } else {
-                spawnWaiters.append(continuation)
+                return
             }
+            let deadlineTask = timeout.map { timeout in
+                Task { [weak self] in
+                    try? await Task.sleep(for: timeout)
+                    await self?.expireSpawnWaiter(id: id)
+                }
+            }
+            spawnWaiters.append(
+                PhaseWaiter(continuation: continuation, deadlineTask: deadlineTask, id: id))
         }
+        return phase != .starting || pid != nil
     }
 
     /** Blocks until `phase` leaves `.stopping`, settled by its `didSet`
@@ -1439,7 +1490,7 @@ public actor ServerSupervisor {
                 await self?.expireStoppingWaiter(id: id)
             }
             stoppingWaiters.append(
-                StoppingWaiter(continuation: continuation, deadlineTask: deadlineTask, id: id))
+                PhaseWaiter(continuation: continuation, deadlineTask: deadlineTask, id: id))
         }
         return phase != .stopping
     }

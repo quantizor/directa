@@ -199,6 +199,62 @@ struct StuckRunLauncher: ProcessLauncher {
     }
 }
 
+/** A one-way latch: `wait` suspends until `open`, and returns at once after. */
+actor SpawnGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters = []
+        for waiter in pending { waiter.resume() }
+    }
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+/** The launchd shape of a job whose pid publishes a moment after the process
+    exists: the real process runs (through `SubprocessLauncher`) while
+    `onSpawn` is held behind `gate`, so the supervisor sits in `.starting` with
+    no pid. Records every spawned pid so a test can check (and clean up) the
+    process itself. */
+final class DelayedSpawnLauncher: ProcessLauncher {
+    let gate: SpawnGate
+    private let inner: any ProcessLauncher = SubprocessLauncher()
+    private let spawned = OSAllocatedUnfairLock(initialState: [pid_t]())
+
+    init(gate: SpawnGate) {
+        self.gate = gate
+    }
+
+    var pids: [pid_t] { spawned.withLock { $0 } }
+
+    func run(
+        argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
+        onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
+        onSpawn: @escaping @Sendable (pid_t) async -> Void
+    ) async -> ProcessOutcome {
+        await inner.run(
+            argv: argv, capture: capture, cwd: cwd, environment: environment,
+            onExitedBeforeWatch: onExitedBeforeWatch,
+            onSpawn: { [gate, spawned] pid in
+                spawned.withLock { $0.append(pid) }
+                await gate.wait()
+                await onSpawn(pid)
+            })
+    }
+
+    func prepareAdopt(pid: pid_t) -> Bool { false }
+
+    func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
+        .spawnFailed(SpawnError(message: "DelayedSpawnLauncher never adopts"))
+    }
+}
+
 /** Ports the unit suites allocate from. Reserved as a block so the stray reaper
     below can tell this suite's leftovers from any other directa process on the
     machine, and so a new test picks its port from a documented range instead of

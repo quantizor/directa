@@ -72,13 +72,14 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         switch await Self.waitUntilPidPublished(domain: domain, label: label) {
         case .published(let published):
             pid = published
-        case .exitedUnseen(let code):
+        case .exitedUnseen(let outcome):
             /** launchd drops the pid from `launchctl print` the moment the job
                 exits, so a command that finishes before the first poll never
                 shows one no matter how long the poll runs; the job's run
-                count and last exit code are what remain. */
+                count and last exit code or terminating signal are what
+                remain. */
             await onExitedBeforeWatch(nil)
-            return code.map { .exited(code: $0) } ?? .exitedStatusUnknown
+            return outcome
         case .timedOut:
             return .spawnFailed(
                 SpawnError(errno: nil, message: "launchd job \(label) never published a pid"))
@@ -178,6 +179,15 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         return await ExitWatcher.shared.wait(pid: pid)
     }
 
+    /** launchd places the job in process group 1. Group teardown needs
+        `pgid == pid`. `/usr/bin/perl` is on every Mac; it calls setsid and
+        execs without a fourth product. A failed exec would otherwise fall off
+        the end of the script and exit 0 with nothing on stderr, so it names
+        the command and the reason on stderr (the spool `logs` and `why` read)
+        and exits 127, the shell's command-not-found status. */
+    static let sessionWrapperScript =
+        #"use POSIX qw(setsid); setsid(); exec { $ARGV[0] } @ARGV or do { print STDERR "directa: cannot run $ARGV[0]: $!\n"; exit 127 }"#
+
     private static func writePlist(
         argv: [String], cwd: String?, environment: [String: String], label: String,
         stderrPath: String, stdoutPath: String, url: URL
@@ -192,12 +202,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         let files =
             getrlimit(RLIMIT_NOFILE, &nofile) == 0
             ? Int(nofile.rlim_cur) : 8192
-        /** launchd places the job in process group 1. Group teardown needs
-            `pgid == pid`. `/usr/bin/perl` is on every Mac; it calls setsid and
-            execs without a fourth product. */
-        let wrapped = [
-            "/usr/bin/perl", "-e", "use POSIX qw(setsid); setsid(); exec { $ARGV[0] } @ARGV", "--",
-        ] + argv
+        let wrapped = ["/usr/bin/perl", "-e", sessionWrapperScript, "--"] + argv
         var job: [String: Any] = [
             "EnvironmentVariables": env,
             "KeepAlive": false,
@@ -218,12 +223,20 @@ public struct LaunchdJobLauncher: ProcessLauncher {
 
     /** Outcome of polling `launchctl print` for the job's pid. `exitedUnseen`
         is a job that already ran (`runs` above zero) and holds no pid:
-        launchd's own last exit code, when it printed one, is all that is
-        left of it. */
+        launchd's own record of how it ended is all that is left of it. */
     private enum PidPoll {
-        case exitedUnseen(code: Int?)
+        case exitedUnseen(ProcessOutcome)
         case published(pid_t)
         case timedOut
+    }
+
+    /** How a job launchd already reaped ended, read from its `launchctl print`
+        status: the terminating signal when launchd printed one, else the last
+        exit code, else unknown. */
+    static func unseenExitOutcome(_ status: LaunchdJobs.AgentStatus) -> ProcessOutcome {
+        if let signal = status.lastTerminatingSignal { return .signaled(signal: signal) }
+        if let code = status.lastExitCode { return .exited(code: code) }
+        return .exitedStatusUnknown
     }
 
     private static func waitUntilPidPublished(domain: String, label: String) async -> PidPoll {
@@ -232,7 +245,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
             if printed.status == 0 {
                 let status = LaunchdJobs.parseAgentPrint(printed.output)
                 if let pid = status.pid { return .published(pid) }
-                if let runs = status.runs, runs > 0 { return .exitedUnseen(code: status.lastExitCode) }
+                if let runs = status.runs, runs > 0 { return .exitedUnseen(unseenExitOutcome(status)) }
             }
             try? await Task.sleep(for: .milliseconds(50))
         }

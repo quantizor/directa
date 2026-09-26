@@ -11,21 +11,27 @@ public enum LaunchdJobs {
     public static var guiDomain: String { "gui/\(getuid())" }
 
     public struct AgentStatus: Equatable, Sendable {
-        /** `last exit code`, nil while the job has never exited (launchd
-            prints `(never exited)`) and for an exit launchd reports only as a
-            terminating signal. */
+        /** `last exit code`, the leading number of `64: EX_USAGE` and the like;
+            nil while the job has never exited (launchd prints `(never
+            exited)`) and for a death launchd reports only as a terminating
+            signal. */
         public var lastExitCode: Int?
         public var lastExitReason: String?
+        /** The signal number of `last terminating signal = Killed: 9`, which
+            launchd prints in place of an exit code for a job a signal ended. */
+        public var lastTerminatingSignal: Int?
         public var pid: pid_t?
         public var runs: Int?
         public var state: String?
 
         public init(
-            lastExitCode: Int? = nil, lastExitReason: String? = nil, pid: pid_t? = nil,
-            runs: Int? = nil, state: String? = nil
+            lastExitCode: Int? = nil, lastExitReason: String? = nil,
+            lastTerminatingSignal: Int? = nil, pid: pid_t? = nil, runs: Int? = nil,
+            state: String? = nil
         ) {
             self.lastExitCode = lastExitCode
             self.lastExitReason = lastExitReason
+            self.lastTerminatingSignal = lastTerminatingSignal
             self.pid = pid
             self.runs = runs
             self.state = state
@@ -64,9 +70,17 @@ public enum LaunchdJobs {
                 let number = trimmed.dropFirst("runs =".count).trimmingCharacters(in: .whitespaces)
                 status.runs = Int(number)
             } else if status.lastExitCode == nil, trimmed.hasPrefix("last exit code =") {
-                let number = trimmed.dropFirst("last exit code =".count).trimmingCharacters(
+                let value = trimmed.dropFirst("last exit code =".count).trimmingCharacters(
                     in: .whitespaces)
-                status.lastExitCode = Int(number)
+                status.lastExitCode = Int(value.prefix { $0 == "-" || $0.isASCII && $0.isNumber })
+            } else if status.lastTerminatingSignal == nil,
+                trimmed.hasPrefix("last terminating signal =")
+            {
+                let value = trimmed.dropFirst("last terminating signal =".count)
+                let number = value.split(separator: ":").last.map {
+                    $0.trimmingCharacters(in: .whitespaces)
+                }
+                status.lastTerminatingSignal = number.flatMap { Int($0) }
             } else if status.lastExitReason == nil, trimmed.hasPrefix("last exit reason =") {
                 status.lastExitReason = String(trimmed.dropFirst("last exit reason =".count))
                     .trimmingCharacters(in: .whitespaces)

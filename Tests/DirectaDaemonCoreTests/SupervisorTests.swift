@@ -1239,6 +1239,107 @@ private func makeEnv() throws -> TestEnv {
         #expect(persisted?.phase == .stopped)
         #expect(persisted?.resumeOnBoot == nil)
     }
+
+    /** A removal that joins a restart's non-deliberate stop returns false (the
+        stop finished), and the restart then calls `ensure` on the same
+        reference. The router has already dropped this supervisor, so a spawn
+        here would run with nothing supervising it: `ensure` and `start` must
+        read as stopped and spawn nothing. */
+    @Test func removedSupervisorNeverSpawnsAgainAfterJoiningARestartStop() async throws {
+        let env = try makeEnv()
+        let gate = AdoptGate()
+        let supervisor = ServerSupervisor(
+            launcher: StuckRunLauncher(gate: gate), paths: env.paths, projectPath: env.projectPath,
+            registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "web"),
+            stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 5))
+        #expect(await supervisor.start().pid != nil)
+        #expect(await gate.callCount == 1)
+
+        async let restartStop = supervisor.stop(deliberate: false, reason: "requested by restart")
+        #expect(try await waitForPhase(supervisor, .stopping).phase == .stopping)
+        async let removal = supervisor.stopForRemoval(reason: "unregistered")
+        /** Lets the removal join the stop in flight; the assertions below hold
+            for either order. */
+        try await Task.sleep(for: .milliseconds(100))
+        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        _ = await restartStop
+        #expect(await removal == false)
+
+        let ensured = await supervisor.ensure(timeoutSeconds: 1)
+        let started = await supervisor.start()
+        defer {
+            for pid in [ensured.server.pid, started.pid].compactMap({ $0 }) { kill(pid_t(pid), SIGKILL) }
+        }
+        #expect(ensured.reason == .stopped)
+        #expect(ensured.server.pid == nil)
+        #expect(started.pid == nil)
+        #expect(await gate.callCount == 1)
+    }
+
+    /** Adoption is attachment, so a removed supervisor refuses it before the
+        exit watch is armed (an armed watch nobody waits on would never be
+        consumed). */
+    @Test func removedSupervisorRefusesAdoption() async throws {
+        let env = try makeEnv()
+        let gate = AdoptGate()
+        let supervisor = ServerSupervisor(
+            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, projectPath: env.projectPath,
+            registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "web"))
+        #expect(await supervisor.stopForRemoval(reason: "unregistered") == false)
+        let survivor = try spawnSurvivor()
+        defer {
+            kill(survivor, SIGKILL)
+            Task { await gate.signal(.exitedStatusUnknown) }
+        }
+        let adopted = await supervisor.adopt(
+            pid: survivor, label: "dev.quantizor.directa.job.removed", boundPort: nil, startedAt: nil)
+        #expect(adopted == false)
+        #expect(await supervisor.status().pid == nil)
+        #expect(await supervisor.status().phase == .stopped)
+    }
+
+    /** A stop that lands while the launcher has not reported a pid yet (a
+        launchd job publishes one up to a few seconds after bootstrap) waits for
+        the spawn to settle and stops what it produced. Reading `.stopped` at
+        once let that run come up under a stopped phase, where a later start
+        spawned a second copy beside it. */
+    @Test func stopBeforeThePidIsKnownStopsTheRunOnceItAppears() async throws {
+        let env = try makeEnv()
+        let gate = SpawnGate()
+        let launcher = DelayedSpawnLauncher(gate: gate)
+        let supervisor = ServerSupervisor(
+            launcher: launcher, paths: env.paths, projectPath: env.projectPath,
+            registry: Registry(paths: env.paths),
+            spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web"))
+        defer { for pid in launcher.pids { kill(pid, SIGKILL) } }
+
+        async let started = supervisor.start()
+        for _ in 0..<100 where launcher.pids.isEmpty {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let child = try #require(launcher.pids.first)
+        let pending = await supervisor.status()
+        #expect(pending.phase == .starting)
+        #expect(pending.pid == nil)
+
+        let opener = Task {
+            try? await Task.sleep(for: .milliseconds(200))
+            await gate.open()
+        }
+        let stopped = await supervisor.stop(graceSeconds: 2, reason: "test")
+        _ = await started
+        await opener.value
+        #expect(stopped.phase == .stopped)
+        let settled = await supervisor.status()
+        #expect(settled.phase == .stopped)
+        #expect(settled.pid == nil)
+        var gone = kill(child, 0) != 0
+        for _ in 0..<50 where !gone {
+            try await Task.sleep(for: .milliseconds(20))
+            gone = kill(child, 0) != 0
+        }
+        #expect(gone, "pid \(child) kept running after a stop that reported stopped")
+    }
 }
 
 private struct AlwaysHealthyProber: HealthProber {
@@ -1265,20 +1366,23 @@ private struct AlwaysHealthyProber: HealthProber {
         #expect(await registry.project("/p") == nil)
     }
 
-    /** A retired id ignores every later `updateState`, both a write to its
-        settled row and, once `removeState` deleted that row, the insert that
-        would recreate it; the settled row is what a reload reads. */
-    @Test func retiredStateIgnoresLaterUpdatesButStillDeletes() async throws {
+    /** A retired writer's every later `updateState` for that id is dropped,
+        both a write to its settled row and, once `removeState` deleted that
+        row, the insert that would recreate it; the settled row is what a
+        reload reads, and `removeState` still deletes. */
+    @Test func retiredWriterIsIgnoredButRemoveStateStillDeletes() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
         let id = serverID(project: env.projectPath, name: "web")
-        try await registry.updateState(serverID: id) { entry in
+        let retired = UUID()
+        try await registry.updateState(serverID: id, writer: retired) { entry in
             entry.phase = .running
             entry.pid = 4242
             entry.resumeOnBoot = true
         }
-        try await registry.retireState(serverID: id, final: PersistedServerState(phase: .stopped))
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.retireState(
+            serverID: id, final: PersistedServerState(phase: .stopped), writer: retired)
+        try await registry.updateState(serverID: id, writer: retired) { entry in
             entry.phase = .crashed
             entry.pid = 4243
             entry.resumeOnBoot = true
@@ -1291,20 +1395,49 @@ private struct AlwaysHealthyProber: HealthProber {
 
         try await registry.removeState(serverID: id)
         #expect(await registry.persistedState(serverID: id) == nil)
-        try await registry.updateState(serverID: id) { $0.resumeOnBoot = true }
+        try await registry.updateState(serverID: id, writer: retired) { $0.resumeOnBoot = true }
         #expect(await registry.persistedState(serverID: id) == nil)
     }
 
-    /** The retired set is keyed on the normalized id, so a `/var` vs
-        `/private/var` spelling of the same project cannot slip a write past it. */
-    @Test func retiredStateMatchesEitherSpellingOfTheProject() async throws {
+    /** Retirement is scoped to the writer: a later supervisor for the same id
+        and the router's own writes (writer nil) persist normally, including
+        the insert of a row `removeState` deleted. */
+    @Test func otherWritersStillPersistForARetiredID() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        let id = serverID(project: env.projectPath, name: "web")
+        try await registry.retireState(
+            serverID: id, final: PersistedServerState(phase: .stopped), writer: UUID())
+        try await registry.removeState(serverID: id)
+
+        let successor = UUID()
+        try await registry.updateState(serverID: id, writer: successor) { entry in
+            entry.phase = .starting
+            entry.pid = 4244
+            entry.resumeOnBoot = true
+        }
+        let inserted = try #require(await registry.persistedState(serverID: id))
+        #expect(inserted.pid == 4244)
+        #expect(inserted.resumeOnBoot == true)
+
+        try await registry.updateState(serverID: id) { $0.boundPort = 4000 }
+        #expect(await registry.persistedState(serverID: id)?.boundPort == 4000)
+        #expect(await Registry(paths: env.paths).persistedState(serverID: id)?.pid == 4244)
+    }
+
+    /** Retirements are keyed on the normalized id, so a `/var` vs
+        `/private/var` spelling of the same project cannot slip a retired
+        writer's write past it. */
+    @Test func retiredWriterMatchesEitherSpellingOfTheProject() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
         let canonical = canonicalProjectPath(env.projectPath)
         let lexical = canonical.hasPrefix("/private/") ? String(canonical.dropFirst("/private".count)) : canonical
+        let retired = UUID()
         try await registry.retireState(
-            serverID: serverID(project: lexical, name: "web"), final: PersistedServerState(phase: .stopped))
-        try await registry.updateState(serverID: serverID(project: canonical, name: "web")) {
+            serverID: serverID(project: lexical, name: "web"), final: PersistedServerState(phase: .stopped),
+            writer: retired)
+        try await registry.updateState(serverID: serverID(project: canonical, name: "web"), writer: retired) {
             $0.resumeOnBoot = true
         }
         #expect(

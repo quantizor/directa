@@ -489,29 +489,47 @@ public actor Router {
                 /** A server still running when it is unregistered must be
                     stopped through the normal stop path first, awaiting its
                     actual exit: dropping the supervisor while it keeps running
-                    leaves an unmanaged process alive, and the log directory
-                    removal below would then delete the directory it is still
-                    writing to. `stop()` no-ops instantly for one already
-                    terminal, so this costs nothing on the common path. A stop
-                    that gives up still `.stopping` never reached the
-                    `recordOutcome` that clears boot intent, so the row is
-                    retired here instead: a server also declared in
-                    devservers.json would otherwise come back on the next
-                    daemon launch. */
-                if let supervisor = supervisors[id],
-                    await supervisor.stopForRemoval(reason: "unregistered")
-                {
-                    var final = await registry.persistedState(serverID: id) ?? PersistedServerState()
-                    final.phase = .stopped
-                    final.pid = nil
-                    final.resumeOnBoot = nil
-                    final.startedAt = nil
-                    try await registry.retireState(serverID: id, final: final)
+                    leaves an unmanaged process alive. `stop()` no-ops
+                    instantly for one already terminal, so this costs nothing
+                    on the common path. Either way the row ends with no boot
+                    intent, or a server also declared in devservers.json comes
+                    back on the next daemon launch: a stop that gave up still
+                    `.stopping` never reached the `recordOutcome` that clears
+                    it, so its row is retired; a finished one may have joined
+                    a restart's non-deliberate stop, which keeps it, so it is
+                    cleared. */
+                var stopGaveUp = false
+                if let supervisor = supervisors[id] {
+                    stopGaveUp = await supervisor.stopForRemoval(reason: "unregistered")
+                    if stopGaveUp {
+                        var final = await registry.persistedState(serverID: id) ?? PersistedServerState()
+                        final.phase = .stopped
+                        final.pid = nil
+                        final.resumeOnBoot = nil
+                        final.startedAt = nil
+                        await retireRemovedState(
+                            final: final, name: name, project: project, writer: supervisor.writerID)
+                    }
                 }
-                try await registry.unregister(project: project, name: name)
+                if !stopGaveUp {
+                    await clearBootIntent(name: name, project: project)
+                }
+                /** Dropped on failure too: a removed supervisor left resident
+                    would answer every later start of this name as stopped. */
+                do {
+                    try await registry.unregister(project: project, name: name)
+                } catch {
+                    supervisors[id] = nil
+                    throw error
+                }
                 supervisors[id] = nil
                 await events.post(kind: .unregistered, project: project, server: name)
-                await removeLogDirIfProjectIsForgotten(project)
+                /** A stop that gave up may leave the process still writing
+                    into the log directory, so it stays; doctor's leftover-log
+                    finding covers it once nothing claims it. */
+                if !stopGaveUp {
+                    await removeLogDirIfProjectIsForgotten(project)
+                }
                 return try respond(id: head.id, result: WireEmpty())
             }
         } catch let error as WireError {
@@ -652,6 +670,18 @@ public actor Router {
             case .missing:
                 DirectaLog.daemon.info(
                     "recover skip \(name)@\(project): no matching spec (renamed or removed)")
+                /** Nothing will supervise this name again, so a recorded run
+                    still alive is bounced before its row goes, with the same
+                    start-time proof adoption needs: a recycled pid is left
+                    alone. */
+                if let pid = persisted.pid.flatMap(ProcessTree.narrowed),
+                    let identity = ProcessTree.identity(of: pid),
+                    ProcessTree.startTimeConsistent(
+                        processStart: identity.wallClockStart,
+                        persistedStartedAt: persisted.startedAt)
+                {
+                    await bounceOrphan(identity, project: project, name: name)
+                }
                 try? await registry.removeState(serverID: id)
                 continue
             case .unavailable:
@@ -841,6 +871,38 @@ public actor Router {
             detail: DaemonRestartDetail.orphanBounced(pid: pid))
     }
 
+    /** Retires the state row of a supervisor whose removal stop gave up
+        (`Registry.retireState`). A save failure is logged at error level,
+        which persists, and the removal goes on: the retirement already holds
+        in memory, which is what refuses that supervisor's late write for the
+        rest of this daemon's life. */
+    private func retireRemovedState(
+        final: PersistedServerState, name: String, project: String, writer: UUID
+    ) async {
+        do {
+            try await registry.retireState(
+                serverID: serverID(project: project, name: name), final: final, writer: writer)
+        } catch {
+            DirectaLog.daemon.error(
+                "removing \(name)@\(project): could not save its retired state (\(error.localizedDescription)); the next daemon launch may try to restore it")
+        }
+    }
+
+    /** Clears resume-on-boot on a row that carries it, through the router's
+        own write. Never inserts a row. A save failure is logged at error
+        level and the unregister goes on, with the flag already cleared in
+        memory. */
+    private func clearBootIntent(name: String, project: String) async {
+        let id = serverID(project: project, name: name)
+        guard await registry.persistedState(serverID: id)?.resumeOnBoot != nil else { return }
+        do {
+            try await registry.updateState(serverID: id) { $0.resumeOnBoot = nil }
+        } catch {
+            DirectaLog.daemon.error(
+                "unregister \(name)@\(project): could not save its cleared restore-at-launch flag (\(error.localizedDescription)); the next daemon launch may try to restore it")
+        }
+    }
+
     /** Removes a project's log directory once `serverUnregister` has dropped
         its last ad hoc server AND nothing supervised is still resident for it.
         The registry only tracks ad hoc servers and trust, not the config-defined
@@ -930,8 +992,9 @@ public actor Router {
                 case .running, .starting, .stopping, .unhealthy: wasTerminal = false
                 }
                 if await supervisor.stopForRemoval(reason: "project path gone") {
-                    try? await registry.retireState(
-                        serverID: id, final: PersistedServerState(phase: .stopped))
+                    await retireRemovedState(
+                        final: PersistedServerState(phase: .stopped), name: name, project: project,
+                        writer: supervisor.writerID)
                 }
                 if wasTerminal {
                     await events.post(
@@ -956,10 +1019,10 @@ public actor Router {
         }
         try? await registry.removeState(forProject: project)
         try? await registry.removeProject(project)
-        /** Safe only here, after every supervisor above is stopped and dropped:
-            nothing is left writing into this directory. Only `uninstall --purge`
-            removed it before, so a discarded checkout's logs sat under
-            `logsDir` forever with no project left to claim them. Past this
+        /** Only here, after every supervisor above is stopped and dropped and
+            every live root bounced. Unlike unregister, a stop that gave up
+            does not keep the directory: the checkout is gone, so no project
+            will ever claim it again. Past this
             existence check the failure is suppressed on purpose (a
             permissions error must not crash the daemon over a cleanup step;
             doctor's orphan-log-dir finding catches whatever this leaves),

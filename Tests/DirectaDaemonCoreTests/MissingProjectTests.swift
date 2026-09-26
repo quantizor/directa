@@ -121,6 +121,47 @@ import Testing
         }
     }
 
+    /** A retirement the forget cannot save (state.json refuses the write) is
+        logged at error level rather than dropped silently, and the forget
+        still completes. */
+    @Test func forgetLogsARetirementItCannotSave() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
+        let gate = AdoptGate()
+        let router = Router(
+            launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
+            stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
+        guard let recorder = DirectaLog.backend as? RecordingBackend else {
+            Issue.record("expected the swift-test host's default backend to be a RecordingBackend")
+            return
+        }
+
+        _ = try await handle(
+            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+            ServerResult.self)
+        let canonicalProject = canonicalProjectPath(env.project)
+        let stateFile = env.paths.stateFile.path
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: stateFile)
+        defer {
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: stateFile)
+            Task { await gate.signal(.signaled(signal: Int(SIGKILL))) }
+        }
+
+        try FileManager.default.removeItem(atPath: env.project)
+        let now = Date()
+        await router.pruneMissingProjects(now: now)
+        await router.pruneMissingProjects(
+            now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
+
+        #expect(await registry.project(canonicalProject) == nil)
+        #expect(
+            recorder.entries.contains { entry in
+                entry.level == .error && entry.message.contains(canonicalProject)
+                    && entry.message.contains("could not save its retired state")
+            })
+    }
+
     @Test func forgottenTerminalServerStillPostsAStoppedEvent() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
