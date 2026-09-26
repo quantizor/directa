@@ -247,6 +247,32 @@ enum CLINotice {
     static let daemonRestoring = "directa: the daemon is restoring supervised servers; waiting…"
 }
 
+/** Screens every `--timeout`/`--acquire-timeout` option at the argument-parser
+    boundary, before an untrusted value ever reaches the wire: a non-finite
+    seconds value (`inf`, `nan`) fatally traps `Duration.seconds` downstream
+    (`ServerSupervisor.boundedTimeoutSeconds`, the client's own SO_RCVTIMEO
+    deadline), and the daemon clamps those cases silently rather than telling
+    the caller their input was nonsense. Rejecting here, with a message naming
+    the bad value and the accepted range, is more useful than a silent clamp. */
+enum TimeoutOption {
+    static let validRange: ClosedRange<Double> = 0...86400
+
+    static func parse(_ raw: String) throws -> Double {
+        guard let value = Double(raw) else {
+            throw ValidationError("'\(raw)' is not a number of seconds")
+        }
+        guard value.isFinite else {
+            throw ValidationError("a timeout must be a finite number of seconds, got '\(raw)'")
+        }
+        guard validRange.contains(value) else {
+            throw ValidationError(
+                "a timeout must be between \(Int(validRange.lowerBound)) and \(Int(validRange.upperBound)) seconds, got \(raw)"
+            )
+        }
+        return value
+    }
+}
+
 struct Ensure: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Idempotently start a server: healthy is a no-op, otherwise start and wait for health.")
@@ -259,7 +285,7 @@ struct Ensure: AsyncParsableCommand {
     @Option(help: "Override the declared port for this run.")
     var port: Int?
 
-    @Option(help: "Seconds to wait for health before giving up.")
+    @Option(help: "Seconds to wait for health before giving up.", transform: TimeoutOption.parse)
     var timeout: Double = 60
 
     func run() async throws {
@@ -296,7 +322,7 @@ struct Wait: AsyncParsableCommand {
     @Flag(help: "Wait for the server to be fully stopped instead.")
     var stopped = false
 
-    @Option(help: "Seconds to wait before giving up.")
+    @Option(help: "Seconds to wait before giving up.", transform: TimeoutOption.parse)
     var timeout: Double = 60
 
     func run() async throws {
@@ -455,7 +481,7 @@ struct Restart: AsyncParsableCommand {
     @Option(help: "Override the declared port for this run.")
     var port: Int?
 
-    @Option(help: "Per-server seconds to wait for health.")
+    @Option(help: "Per-server seconds to wait for health.", transform: TimeoutOption.parse)
     var timeout: Double = 60
 
     func run() async throws {
@@ -1114,7 +1140,7 @@ struct Up: AsyncParsableCommand {
     @Option(help: "Override the declared port for each server this up starts.")
     var port: Int?
 
-    @Option(help: "Per-server seconds to wait for health.")
+    @Option(help: "Per-server seconds to wait for health.", transform: TimeoutOption.parse)
     var timeout: Double = 60
 
     func run() async throws {
@@ -2001,7 +2027,9 @@ struct Switch: AsyncParsableCommand {
     @Flag(help: "Skip the git fetch before switching.")
     var noFetch = false
 
-    @Option(help: "Per-server seconds to wait for health when coming back up.")
+    @Option(
+        help: "Per-server seconds to wait for health when coming back up.",
+        transform: TimeoutOption.parse)
     var timeout: Double = 120
 
     func run() async throws {
@@ -2310,7 +2338,9 @@ struct Lock: AsyncParsableCommand {
     @Argument(help: "Resource name (matches servers' `locks` in devservers.json).")
     var resource: String
 
-    @Option(help: "Seconds to wait for the resource if another holder has it.")
+    @Option(
+        help: "Seconds to wait for the resource if another holder has it.",
+        transform: TimeoutOption.parse)
     var acquireTimeout: Double = 300
 
     /** Explicit opt-in to stopping declarers; the default leaves them running.
@@ -2319,7 +2349,9 @@ struct Lock: AsyncParsableCommand {
     @Flag(name: .customLong("pause"), help: "Stop servers that declare the resource for the command, then resume them.")
     var pause = false
 
-    @Option(help: "Per-server seconds to wait for health when servers return.")
+    @Option(
+        help: "Per-server seconds to wait for health when servers return.",
+        transform: TimeoutOption.parse)
     var timeout: Double = 120
 
     /** `.postTerminator`, not `.captureForPassthrough`: the latter ends option
