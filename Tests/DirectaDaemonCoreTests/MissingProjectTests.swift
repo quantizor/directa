@@ -5,11 +5,12 @@ import Testing
 @testable import DirectaDaemonCore
 
 /** `forgetMissingProject`'s event trail for a vanished checkout. A live server's
-    `stop()` already runs `recordOutcome`, which posts its own `.stopped` event
-    with the same "project path gone" detail this teardown reports; a server
-    already terminal never reaches `recordOutcome` at all, since `stop()` no-ops
-    for one. The manual post belongs to the terminal case only, or a live
-    server's stop is recorded twice. */
+    `recordOutcome` posts its own `.stopped` event with the same "project path
+    gone" detail this teardown reports, within the stop or, for a stop that
+    gave up, whenever the exit lands; a server already terminal never reaches
+    `recordOutcome` at all, since `stop()` no-ops for one. The manual post
+    belongs to the terminal case only, or a live server's stop is recorded
+    twice. */
 @Suite struct MissingProjectTests {
     private struct Env {
         let paths: DirectaPaths
@@ -74,6 +75,50 @@ import Testing
         #expect(stopped.count == 1)
         #expect(stopped.first?.detail == "project path gone")
         #expect(events.events.filter { $0.kind == .unregistered }.count == 1)
+    }
+
+    /** A forgotten server whose stop never finishes: `removeState` deletes its
+        row, and the exit that lands afterward must not recreate it (the row
+        would otherwise carry the server's resume intent into a project directa
+        no longer tracks). That late `recordOutcome` still posts the one
+        `stopped` event; the teardown adds none of its own. */
+    @Test func forgottenServerWhoseStopHangsStaysForgotten() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
+        let gate = AdoptGate()
+        let router = Router(
+            launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
+            stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
+
+        _ = try await handle(
+            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+            ServerResult.self)
+        let canonicalProject = canonicalProjectPath(env.project)
+        let id = serverID(project: canonicalProject, name: "web")
+        #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
+
+        try FileManager.default.removeItem(atPath: env.project)
+        let now = Date()
+        await router.pruneMissingProjects(now: now)
+        await router.pruneMissingProjects(
+            now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
+        #expect(await registry.persistedState(serverID: id) == nil)
+
+        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        var stopped: [EventRecord] = []
+        for _ in 0..<100 where stopped.isEmpty {
+            stopped = try await handle(
+                router, .eventsQuery, EventsQueryParams(project: canonicalProject),
+                EventsQueryResult.self
+            ).events.filter { $0.kind == .stopped }
+            if stopped.isEmpty { try await Task.sleep(for: .milliseconds(20)) }
+        }
+        #expect(stopped.map(\.detail) == ["project path gone"])
+        for _ in 0..<10 {
+            #expect(await registry.persistedState(serverID: id) == nil)
+            try await Task.sleep(for: .milliseconds(50))
+        }
     }
 
     @Test func forgottenTerminalServerStillPostsAStoppedEvent() async throws {

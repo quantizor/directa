@@ -27,6 +27,36 @@ import Testing
         #expect(status.jetsammed)
     }
 
+    /** A one-shot job that already ran and exited: launchd drops its pid and
+        keeps the run count and exit code, which is how the launcher tells an
+        instant exit from a job that has not started yet. Captured from a real
+        `launchctl print` of an `exit 7` job. */
+    @Test func parseAgentPrintReadsAnExitedJobsLastExitCode() {
+        let printed = """
+            gui/501/dev.quantizor.directa.test-job.probe = {
+            state = not running
+            runs = 1
+            last exit code = 7
+            }
+            """
+        #expect(
+            LaunchdJobs.parseAgentPrint(printed)
+                == LaunchdJobs.AgentStatus(lastExitCode: 7, runs: 1, state: "not running"))
+    }
+
+    /** Before its first exit launchd prints `(never exited)`, which is no code. */
+    @Test func parseAgentPrintReadsNeverExitedAsNoCode() {
+        let printed = """
+            state = running
+            runs = 1
+            pid = 99
+            last exit code = (never exited)
+            """
+        #expect(
+            LaunchdJobs.parseAgentPrint(printed)
+                == LaunchdJobs.AgentStatus(pid: 99, runs: 1, state: "running"))
+    }
+
     @Test func parseAgentPrintWithoutJetsamIsNotJetsammed() {
         let printed = """
             state = running

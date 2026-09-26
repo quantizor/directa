@@ -34,6 +34,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         capture: SpawnCapture,
         cwd: String?,
         environment: [String: String],
+        onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
         onSpawn: @escaping @Sendable (pid_t) async -> Void
     ) async -> ProcessOutcome {
         guard argv.first?.isEmpty == false else {
@@ -67,7 +68,18 @@ public struct LaunchdJobLauncher: ProcessLauncher {
             _ = LaunchdAdmin.shell("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
             try? FileManager.default.removeItem(at: plistURL)
         }
-        guard let pid = await Self.waitUntilPidPublished(domain: domain, label: label) else {
+        let pid: pid_t
+        switch await Self.waitUntilPidPublished(domain: domain, label: label) {
+        case .published(let published):
+            pid = published
+        case .exitedUnseen(let code):
+            /** launchd drops the pid from `launchctl print` the moment the job
+                exits, so a command that finishes before the first poll never
+                shows one no matter how long the poll runs; the job's run
+                count and last exit code are what remain. */
+            await onExitedBeforeWatch(nil)
+            return code.map { .exited(code: $0) } ?? .exitedStatusUnknown
+        case .timedOut:
             return .spawnFailed(
                 SpawnError(errno: nil, message: "launchd job \(label) never published a pid"))
         }
@@ -92,11 +104,12 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                     *different*, recycled process reusing the pid number, so
                     this reports the unrecoverable exit directly, the same
                     treatment `.died` below gives it, rather than a
-                    manufactured spawnFailed. `onSpawn` still runs so the
-                    tailers drain whatever the child already wrote to its
-                    spool files before dying. */
+                    manufactured spawnFailed. `onExitedBeforeWatch` runs so
+                    the tailers drain whatever the child already wrote to
+                    its spool files before dying, without recording a run
+                    that was never watched. */
                 guard error.errno == Int(ESRCH) else { return .spawnFailed(error) }
-                await onSpawn(pid)
+                await onExitedBeforeWatch(pid)
                 return .exitedStatusUnknown
             }
         case .died:
@@ -110,12 +123,12 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                 could only ever succeed by matching a *different*, recycled
                 process that reused the pid number, never the one that just
                 died; this reports the unrecoverable exit directly rather than
-                risk watching the wrong process. `onSpawn` still runs so the
-                tailers drain whatever the child already wrote to its spool
-                files before dying: skipping it, as every other early-return
-                branch in this method does, would silence that output from
-                the structured log entirely. */
-            await onSpawn(pid)
+                risk watching the wrong process. `onExitedBeforeWatch` runs so
+                the tailers drain whatever the child already wrote to its
+                spool files before dying: skipping it, as every other
+                early-return branch in this method does, would silence that
+                output from the structured log entirely. */
+            await onExitedBeforeWatch(pid)
             return .exitedStatusUnknown
         case .timedOut:
             return .spawnFailed(
@@ -135,23 +148,27 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         case timedOut
     }
 
-    /** Re-watches a launchd child job this process did not spawn: the surviving
-        half of a jetsam SIGKILL, where `run`'s defer bootout never ran. `label`
-        is the job's existing registration, discovered by the caller through
-        `LaunchdJobs.loadChildJobs()` matching on pid; nothing is bootstrapped
-        here. Arms the same exit watch `run` does, so an adopted child that
-        later dies reaches `recordOutcome` exactly like a spawned one, then
-        replicates `run`'s defer cleanup once the process exits: `launchctl
-        bootout` the label and best-effort remove its temp plist (already gone
-        in the common case, since the daemon that spawned it wrote and removed
-        that file itself; the removal here only covers a plist a crashed prior
-        daemon left behind). Returns nil only when the watch could not be armed,
-        which the caller reads as "adopt failed, bounce it instead". */
-    public func adopt(pid: pid_t, label: String) async -> ProcessOutcome? {
+    /** Arms the same exit watch `run` does for a launchd child job this
+        process did not spawn, so an adopted child that later dies reaches
+        `recordOutcome` exactly like a spawned one. A refused arm boots
+        nothing out: the caller bounces the process and its job label is
+        reaped with the other leftovers. */
+    public func prepareAdopt(pid: pid_t) -> Bool {
         switch ExitWatcher.shared.arm(pid: pid) {
-        case .armed: break
-        case .failed: return nil
+        case .armed: return true
+        case .failed: return false
         }
+    }
+
+    /** Waits on the surviving half of a jetsam SIGKILL, where `run`'s defer
+        bootout never ran. `label` is the job's existing registration,
+        discovered by the caller through `LaunchdJobs.loadChildJobs()` matching
+        on pid; nothing is bootstrapped here. Once the process exits, replicates
+        `run`'s defer cleanup: `launchctl bootout` the label and best-effort
+        remove its temp plist (already gone in the common case, since the
+        daemon that spawned it wrote and removed that file itself; the removal
+        here only covers a plist a crashed prior daemon left behind). */
+    public func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
         defer {
             let domain = LaunchdJobs.guiDomain
             _ = LaunchdAdmin.shell("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
@@ -199,12 +216,27 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         try data.write(to: url, options: .atomic)
     }
 
-    private static func waitUntilPidPublished(domain: String, label: String) async -> pid_t? {
+    /** Outcome of polling `launchctl print` for the job's pid. `exitedUnseen`
+        is a job that already ran (`runs` above zero) and holds no pid:
+        launchd's own last exit code, when it printed one, is all that is
+        left of it. */
+    private enum PidPoll {
+        case exitedUnseen(code: Int?)
+        case published(pid_t)
+        case timedOut
+    }
+
+    private static func waitUntilPidPublished(domain: String, label: String) async -> PidPoll {
         for _ in 0..<40 {
-            if let pid = publishedPid(domain: domain, label: label) { return pid }
+            let printed = LaunchdAdmin.shell("/bin/launchctl", ["print", "\(domain)/\(label)"])
+            if printed.status == 0 {
+                let status = LaunchdJobs.parseAgentPrint(printed.output)
+                if let pid = status.pid { return .published(pid) }
+                if let runs = status.runs, runs > 0 { return .exitedUnseen(code: status.lastExitCode) }
+            }
             try? await Task.sleep(for: .milliseconds(50))
         }
-        return nil
+        return .timedOut
     }
 
     private static func waitUntilSessionLeader(_ pid: pid_t) async -> SessionLeaderCheck {
@@ -221,11 +253,5 @@ public struct LaunchdJobLauncher: ProcessLauncher {
             try? await Task.sleep(for: .milliseconds(25))
         }
         return .timedOut
-    }
-
-    private static func publishedPid(domain: String, label: String) -> pid_t? {
-        let printed = LaunchdAdmin.shell("/bin/launchctl", ["print", "\(domain)/\(label)"])
-        guard printed.status == 0 else { return nil }
-        return LaunchdJobs.parseAgentPrint(printed.output).pid
     }
 }

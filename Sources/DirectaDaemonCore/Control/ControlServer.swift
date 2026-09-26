@@ -17,6 +17,8 @@ public actor Router {
     private let launcher: any ProcessLauncher
     private let paths: DirectaPaths
     private let registry: Registry
+    /** Handed to every supervisor this router creates. */
+    private let stopTiming: StopTiming
     private var supervisors: [String: ServerSupervisor] = [:]
     /** devservers.json views cached by mtime; a save invalidates naturally. */
     private var configCache: [String: (mtime: Date, view: ProjectConfigView)] = [:]
@@ -36,6 +38,7 @@ public actor Router {
     public init(
         agentJobs: AgentJobs? = LaunchdJobLauncher.runningAsAgent ? .live : nil,
         launcher: any ProcessLauncher, paths: DirectaPaths, registry: Registry,
+        stopTiming: StopTiming = .standard,
         watchEnabled: Bool = ProcessInfo.processInfo.environment["DIRECTA_NO_WATCH"] != "1"
     ) {
         self.agentJobs = agentJobs
@@ -44,6 +47,7 @@ public actor Router {
         self.launcher = launcher
         self.paths = paths
         self.registry = registry
+        self.stopTiming = stopTiming
         self.resourceLocks =
             Self.normalizedLocks(
                 AtomicFile.loadDefensively(LocksFile.self, from: paths.locksFile)?.locks ?? [:])
@@ -488,9 +492,21 @@ public actor Router {
                     leaves an unmanaged process alive, and the log directory
                     removal below would then delete the directory it is still
                     writing to. `stop()` no-ops instantly for one already
-                    terminal, so this costs nothing on the common path. */
-                if let supervisor = supervisors[id] {
-                    _ = await supervisor.stop(reason: "unregistered")
+                    terminal, so this costs nothing on the common path. A stop
+                    that gives up still `.stopping` never reached the
+                    `recordOutcome` that clears boot intent, so the row is
+                    retired here instead: a server also declared in
+                    devservers.json would otherwise come back on the next
+                    daemon launch. */
+                if let supervisor = supervisors[id],
+                    await supervisor.stopForRemoval(reason: "unregistered")
+                {
+                    var final = await registry.persistedState(serverID: id) ?? PersistedServerState()
+                    final.phase = .stopped
+                    final.pid = nil
+                    final.resumeOnBoot = nil
+                    final.startedAt = nil
+                    try await registry.retireState(serverID: id, final: final)
                 }
                 try await registry.unregister(project: project, name: name)
                 supervisors[id] = nil
@@ -659,11 +675,11 @@ public actor Router {
                     if let job = adoptableChildJobs[pid],
                         ProcessTree.startTimeConsistent(
                             processStart: identity.wallClockStart,
-                            persistedStartedAt: persisted.startedAt)
-                    {
+                            persistedStartedAt: persisted.startedAt),
                         await adoptSurvivor(
                             boundPort: persisted.boundPort, job: job, name: name, pid: pid,
                             project: project, spec: spec, startedAt: persisted.startedAt)
+                    {
                         continue
                     }
                     await bounceOrphan(identity, project: project, name: name)
@@ -746,11 +762,14 @@ public actor Router {
         spec exactly as `prepareSpawn` would for a fresh spawn (overlay, then
         effective port, then `PortMaterializer`) but never claims or binds the
         port: the live child already holds it. `boundPort`/`startedAt` come from
-        the persisted state so the adopted run keeps its rebind and its uptime. */
+        the persisted state so the adopted run keeps its rebind and its uptime.
+        Returns false when the exit watch could not be armed, which records no
+        phase, pid, or state and sends the caller down the same bounce+respawn
+        path as a pid with no matching job. */
     private func adoptSurvivor(
         boundPort: Int?, job: LaunchdJobs.ChildJob, name: String, pid: pid_t, project: String,
         spec: ServerSpec, startedAt: Date?
-    ) async {
+    ) async -> Bool {
         let supervisor = await self.supervisor(project: project, spec: spec)
         let overlay = LocalOverlay.load(project: project)
         let overlayServer = overlay?.servers?[name]
@@ -762,10 +781,16 @@ public actor Router {
         await supervisor.updateSpec(materialized)
         await supervisor.setPortMeta(
             claim: resolved.claim, declaredPort: declaredPort, effectivePort: effective)
-        _ = await supervisor.adopt(
+        guard await supervisor.adopt(
             pid: pid, label: job.label, boundPort: boundPort, startedAt: startedAt)
+        else {
+            DirectaLog.daemon.error(
+                "recover adopt \(name)@\(project): cannot watch pid \(pid) for exit; bouncing it instead")
+            return false
+        }
         DirectaLog.daemon.info(
             "recover adopt \(name)@\(project): pid \(pid) still alive as \(job.label)")
+        return true
     }
 
     /** Group-kill a live non-child left over from a prior daemon (or a prune that
@@ -891,17 +916,23 @@ public actor Router {
             if let supervisor = supervisors[id] {
                 /** `stop()` no-ops for a server already in a terminal phase
                     (recordOutcome never runs, so nothing posts its own
-                    `.stopped` event); a live one's stop always completes
-                    recordOutcome first (it awaits the run task), which posts
-                    `.stopped` with this same "project path gone" detail, so
-                    posting it again here would double the event. Only the
-                    terminal case needs the manual post. */
+                    `.stopped` event). A live one's recordOutcome posts
+                    `.stopped` with this same "project path gone" detail,
+                    either before the bounded stop returns or, for a stop
+                    that gave up still `.stopping`, whenever the exit finally
+                    lands; posting it here too would double the event. Only
+                    the terminal case needs the manual post. A stop that gave
+                    up also retires the row, so that late recordOutcome
+                    cannot recreate it after `removeState` below. */
                 let wasTerminal: Bool
                 switch await supervisor.status().phase {
                 case .crashed, .failed, .stopped: wasTerminal = true
                 case .running, .starting, .stopping, .unhealthy: wasTerminal = false
                 }
-                _ = await supervisor.stop(reason: "project path gone")
+                if await supervisor.stopForRemoval(reason: "project path gone") {
+                    try? await registry.retireState(
+                        serverID: id, final: PersistedServerState(phase: .stopped))
+                }
                 if wasTerminal {
                     await events.post(
                         kind: .stopped, project: project, server: name, detail: "project path gone")
@@ -1956,7 +1987,7 @@ public actor Router {
         }
         let created = ServerSupervisor(
             events: events, launcher: launcher, paths: paths, projectPath: project,
-            registry: registry, spec: spec)
+            registry: registry, spec: spec, stopTiming: stopTiming)
         supervisors[id] = created
         return created
     }

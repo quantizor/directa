@@ -87,6 +87,9 @@ public struct PersistedServerState: Codable, Sendable {
 public actor Registry {
     private let paths: DirectaPaths
     private var registry: RegistryFile
+    /** Server ids whose state row a removal settled for good this daemon
+        lifetime (see `retireState`). In memory only: a restart starts empty. */
+    private var retiredServerIDs: Set<String> = []
     private var state: StateFile
 
     public init(paths: DirectaPaths) {
@@ -170,11 +173,27 @@ public actor Registry {
         state.servers
     }
 
+    /** A no-op for a retired id, including one whose row is missing: a
+        supervisor's late write must not recreate a row its removal settled. */
     public func updateState(serverID: String, _ mutate: (inout PersistedServerState) -> Void) throws {
         let serverID = Self.normalizeServerID(serverID)
+        guard !retiredServerIDs.contains(serverID) else { return }
         var entry = state.servers[serverID] ?? PersistedServerState()
         mutate(&entry)
         state.servers[serverID] = entry
+        try persistState()
+    }
+
+    /** Settles a removed server's row as `final` and refuses every later
+        `updateState` for that id, in one turn on this actor. For a server
+        whose stop never finished before its supervisor was dropped: that
+        supervisor's `recordOutcome` can still land afterward. A same-process
+        re-registration of the id does not persist state until the daemon
+        restarts. `removeState` still deletes a retired row. */
+    public func retireState(serverID: String, final: PersistedServerState) throws {
+        let serverID = Self.normalizeServerID(serverID)
+        retiredServerIDs.insert(serverID)
+        state.servers[serverID] = final
         try persistState()
     }
 

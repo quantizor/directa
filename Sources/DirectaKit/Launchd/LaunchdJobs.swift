@@ -11,14 +11,20 @@ public enum LaunchdJobs {
     public static var guiDomain: String { "gui/\(getuid())" }
 
     public struct AgentStatus: Equatable, Sendable {
+        /** `last exit code`, nil while the job has never exited (launchd
+            prints `(never exited)`) and for an exit launchd reports only as a
+            terminating signal. */
+        public var lastExitCode: Int?
         public var lastExitReason: String?
         public var pid: pid_t?
         public var runs: Int?
         public var state: String?
 
         public init(
-            lastExitReason: String? = nil, pid: pid_t? = nil, runs: Int? = nil, state: String? = nil
+            lastExitCode: Int? = nil, lastExitReason: String? = nil, pid: pid_t? = nil,
+            runs: Int? = nil, state: String? = nil
         ) {
+            self.lastExitCode = lastExitCode
             self.lastExitReason = lastExitReason
             self.pid = pid
             self.runs = runs
@@ -57,6 +63,10 @@ public enum LaunchdJobs {
             } else if status.runs == nil, trimmed.hasPrefix("runs =") {
                 let number = trimmed.dropFirst("runs =".count).trimmingCharacters(in: .whitespaces)
                 status.runs = Int(number)
+            } else if status.lastExitCode == nil, trimmed.hasPrefix("last exit code =") {
+                let number = trimmed.dropFirst("last exit code =".count).trimmingCharacters(
+                    in: .whitespaces)
+                status.lastExitCode = Int(number)
             } else if status.lastExitReason == nil, trimmed.hasPrefix("last exit reason =") {
                 status.lastExitReason = String(trimmed.dropFirst("last exit reason =".count))
                     .trimmingCharacters(in: .whitespaces)

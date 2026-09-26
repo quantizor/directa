@@ -184,6 +184,75 @@ import Testing
         #expect(
             !FileManager.default.fileExists(
                 atPath: env.paths.projectLogDir(project: env.project).path))
+        /** The stop finished, so its own recordOutcome cleared the boot intent
+            and posted the one `stopped` event; unregister adds nothing twice. */
+        let persisted = await registry.persistedState(
+            serverID: serverID(project: env.project, name: "web"))
+        #expect(persisted?.phase == .stopped)
+        #expect(persisted?.resumeOnBoot == nil)
+        let events = try await handle(
+            router, .eventsQuery, EventsQueryParams(project: env.project), EventsQueryResult.self)
+        #expect(events.events.filter { $0.kind == .stopped }.map(\.detail) == ["unregistered"])
+        #expect(events.events.filter { $0.kind == .unregistered }.count == 1)
+    }
+
+    /** Unregistering a server whose stop never finishes (also declared in the
+        committed devservers.json, so the next daemon launch would restore it
+        from its state row) retires that row as stopped with no boot intent and
+        no pid, and the exit that finally lands afterward cannot write it back.
+        `lastExit` is the marker a late write would leave. */
+    @Test func unregisteringAServerWhoseStopHangsRetiresItsStateRow() async throws {
+        let env = try makeEnv()
+        try Data(
+            #"{"servers":{"web":{"command":["/bin/sh","-c","sleep 60"]}},"version":1}"#.utf8
+        ).write(to: URL(fileURLWithPath: env.project).appending(path: "devservers.json"))
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
+        let gate = AdoptGate()
+        let router = Router(
+            launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
+            stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
+        let id = serverID(project: env.project, name: "web")
+
+        _ = try await handle(
+            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+            ServerResult.self)
+        #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
+
+        _ = try await handle(
+            router, .serverUnregister, ServerTargetParams(name: "web", project: env.project),
+            WireEmpty.self)
+        let retired = try #require(await registry.persistedState(serverID: id))
+        #expect(retired.phase == .stopped)
+        #expect(retired.pid == nil)
+        #expect(retired.resumeOnBoot == nil)
+        #expect(retired.lastExit == nil)
+
+        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        try await awaitStoppedEvent(router: router, project: env.project, detail: "unregistered")
+        for _ in 0..<10 {
+            let row = await registry.persistedState(serverID: id)
+            #expect(row?.phase == .stopped)
+            #expect(row?.pid == nil)
+            #expect(row?.resumeOnBoot == nil)
+            #expect(row?.lastExit == nil)
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let events = try await handle(
+            router, .eventsQuery, EventsQueryParams(project: env.project), EventsQueryResult.self)
+        #expect(events.events.filter { $0.kind == .unregistered }.count == 1)
+    }
+
+    /** Polls until the late `recordOutcome` has posted its `stopped` event,
+        the last thing it does before its (abandoned) state write. */
+    private func awaitStoppedEvent(router: Router, project: String, detail: String) async throws {
+        for _ in 0..<100 {
+            let events = try await handle(
+                router, .eventsQuery, EventsQueryParams(project: project), EventsQueryResult.self)
+            if events.events.contains(where: { $0.kind == .stopped && $0.detail == detail }) { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        Issue.record("no stopped event with detail '\(detail)' after the gate opened")
     }
 
     /** A log directory removal that fails (a permission error, here, from a

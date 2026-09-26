@@ -370,6 +370,64 @@ private func logTexts(router: Router, project: String, name: String) async throw
         #expect(!texts.contains("preexisting line"))
     }
 
+    /** A matching child job whose exit watch cannot be armed (the arm is
+        refused, or the pid died after the job listing) is bounced and started
+        fresh, exactly like a pid with no matching job: never left `.failed`
+        with the survivor alive and unsupervised, which a later boot would
+        then start a second copy beside. */
+    @Test func bouncesAndRestartsAChildJobWhoseExitWatchCannotBeArmed() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath,
+            serversJSON: """
+            {
+              "web": {
+                "command": ["/bin/sh", "-c", "sleep 30"]
+              }
+            }
+            """)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let startedAt = Date()
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        let id = serverID(project: env.projectPath, name: "web")
+        try await registry.updateState(serverID: id) { entry in
+            entry.phase = .running
+            entry.pid = Int(survivor)
+            entry.resumeOnBoot = true
+            entry.startedAt = startedAt
+        }
+        let launcher = UnwatchableAdoptLauncher()
+        let router = Router(
+            agentJobs: RecordingAgentJobs().agentJobs(listing: [
+                LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-unwatchable", pid: survivor)
+            ]),
+            launcher: launcher, paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+        #expect(launcher.prepareCallCount == 1)
+        let web = try await statusList(router: router, project: env.projectPath)
+            .first { $0.server == "web" }
+        #expect(web?.pid != nil)
+        #expect(web?.pid != Int(survivor))
+        #expect(web?.phase == .starting || web?.phase == .running)
+        let events = try await eventsList(router: router, project: env.projectPath)
+        #expect(
+            events.contains {
+                $0.kind == .crashed
+                    && $0.detail == DaemonRestartDetail.orphanBounced(pid: survivor)
+            })
+        #expect(
+            events.contains { $0.kind == .started && ($0.detail ?? "").contains("adopted pid") } == false)
+        var reaped = false
+        for _ in 0..<50 where !reaped {
+            if kill(survivor, 0) != 0 { reaped = true; break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(reaped, "unwatchable survivor \(survivor) was left running beside its replacement")
+        await stopServer(router: router, project: env.projectPath, name: "web")
+    }
+
     /** A pid match alone is not proof of identity: `persisted.startedAt` set an
         hour in the past, well outside the tolerance, while the live process
         backing the matching child job actually started moments ago (a

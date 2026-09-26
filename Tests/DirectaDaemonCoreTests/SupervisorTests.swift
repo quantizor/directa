@@ -179,7 +179,8 @@ private func makeEnv() throws -> TestEnv {
         let gate = AdoptGate()
         let supervisor = ServerSupervisor(
             launcher: StuckRunLauncher(gate: gate), paths: paths, projectPath: env.projectPath,
-            registry: registry, spec: spec, stopWaitOvertimeSeconds: 0.2)
+            registry: registry, spec: spec,
+            stopTiming: StopTiming(graceSeconds: StopTiming.standard.graceSeconds, overtimeSeconds: 0.2))
         let started = await supervisor.start()
         #expect(started.pid != nil)
 
@@ -218,7 +219,7 @@ private func makeEnv() throws -> TestEnv {
         let supervisor = ServerSupervisor(
             launcher: StuckRunLauncher(gate: gate), paths: env.paths, projectPath: env.projectPath,
             registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "stuck"),
-            stopWaitOvertimeSeconds: 0.1)
+            stopTiming: StopTiming(graceSeconds: StopTiming.standard.graceSeconds, overtimeSeconds: 0.1))
         #expect(await supervisor.start().pid != nil)
 
         async let stopped = supervisor.stop(graceSeconds: 0.05, reason: "test")
@@ -250,7 +251,7 @@ private func makeEnv() throws -> TestEnv {
         let supervisor = ServerSupervisor(
             launcher: StuckRunLauncher(gate: gate), paths: env.paths, projectPath: env.projectPath,
             registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "stuck"),
-            stopWaitOvertimeSeconds: 0.1)
+            stopTiming: StopTiming(graceSeconds: StopTiming.standard.graceSeconds, overtimeSeconds: 0.1))
         #expect(await supervisor.start().pid != nil)
 
         async let stopped = supervisor.stop(graceSeconds: 0.05, reason: "test")
@@ -897,9 +898,11 @@ private func makeEnv() throws -> TestEnv {
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
         let priorStartedAt = Date().addingTimeInterval(-500)
-        let status = await supervisor.adopt(
+        let adopted = await supervisor.adopt(
             pid: survivor, label: "dev.quantizor.directa.job.uptime-test", boundPort: nil,
             startedAt: priorStartedAt)
+        #expect(adopted)
+        let status = await supervisor.status()
         #expect(status.pid == Int(survivor))
         #expect((status.uptimeSec ?? 0) >= 495)
         let persisted = await registry.persistedState(
@@ -922,9 +925,11 @@ private func makeEnv() throws -> TestEnv {
             registry: registry, spec: spec)
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
-        let status = await supervisor.adopt(
-            pid: survivor, label: "dev.quantizor.directa.job.uptime-fallback", boundPort: nil,
-            startedAt: nil)
+        #expect(
+            await supervisor.adopt(
+                pid: survivor, label: "dev.quantizor.directa.job.uptime-fallback", boundPort: nil,
+                startedAt: nil))
+        let status = await supervisor.status()
         #expect((status.uptimeSec ?? -1) >= 0)
         #expect((status.uptimeSec ?? .max) < 5)
         _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
@@ -947,9 +952,11 @@ private func makeEnv() throws -> TestEnv {
             registry: registry, spec: spec)
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
-        let adopted = await supervisor.adopt(
-            pid: survivor, label: "dev.quantizor.directa.job.exit-test", boundPort: nil,
-            startedAt: nil)
+        #expect(
+            await supervisor.adopt(
+                pid: survivor, label: "dev.quantizor.directa.job.exit-test", boundPort: nil,
+                startedAt: nil))
+        let adopted = await supervisor.status()
         #expect(adopted.phase == .starting)
         #expect(adopted.pid == Int(survivor))
         /** The exit-watch task's first `await` races this assertion; poll
@@ -973,6 +980,48 @@ private func makeEnv() throws -> TestEnv {
             serverID: serverID(project: env.projectPath, name: "web"))
         #expect(persisted?.phase == .crashed)
         #expect(persisted?.lastExit?.signal == Int(SIGKILL))
+    }
+
+    /** An adopt whose exit watch cannot be armed must record nothing, so the
+        router's bounce+respawn fallback starts from a clean supervisor: no
+        pid, no phase change, no state row (and so no boot intent written by
+        this attempt), and no tailer ingesting the survivor's spool. */
+    @Test func adoptWhoseExitWatchCannotBeArmedRecordsNothing() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
+        let launcher = UnwatchableAdoptLauncher()
+        let supervisor = ServerSupervisor(
+            launcher: launcher, paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        let survivor = try spawnSurvivor()
+        defer { kill(survivor, SIGKILL) }
+        let spool = paths.spoolOutFile(project: env.projectPath, server: "web")
+        try FileManager.default.createDirectory(
+            at: spool.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data().write(to: spool)
+
+        let adopted = await supervisor.adopt(
+            pid: survivor, label: "dev.quantizor.directa.job.unwatchable", boundPort: nil,
+            startedAt: Date())
+        #expect(adopted == false)
+        #expect(launcher.prepareCallCount == 1)
+        let status = await supervisor.status()
+        #expect(status.phase == .stopped)
+        #expect(status.pid == nil)
+        #expect(
+            await registry.persistedState(
+                serverID: serverID(project: env.projectPath, name: "web")) == nil)
+
+        let handle = try FileHandle(forWritingTo: spool)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("written after a refused adopt\n".utf8))
+        try handle.close()
+        /** A running tailer polls the spool well inside this window. */
+        try await Task.sleep(for: .milliseconds(500))
+        let lines = await supervisor.logQuery(LogQueryOptions(streams: [.out, .sys])).lines
+        #expect(lines.isEmpty, "log after a refused adopt: \(lines.map(\.text))")
     }
 
     /** Group teardown after adoption must reach the same escaped session
@@ -1015,10 +1064,11 @@ private func makeEnv() throws -> TestEnv {
             launcher: LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix), paths: paths,
             projectPath: env.projectPath,
             registry: registry, spec: spec)
-        let adopted = await supervisor.adopt(
-            pid: root, label: "dev.quantizor.directa.job.teardown-test", boundPort: nil,
-            startedAt: nil)
-        #expect(adopted.pid == Int(root))
+        #expect(
+            await supervisor.adopt(
+                pid: root, label: "dev.quantizor.directa.job.teardown-test", boundPort: nil,
+                startedAt: nil))
+        #expect(await supervisor.status().pid == Int(root))
         /** Same precondition as the spawned-run session test: no longer a
             parent-chain descendant of the root, so only the session sweep
             (seeded by `adopt`'s own `refreshDescendantSnapshot`) finds it. */
@@ -1038,13 +1088,12 @@ private func makeEnv() throws -> TestEnv {
     }
 
     /** A launchd job whose command exits instantly (a typo'd binary, a
-        config error caught before the server binds) used to skip `onSpawn`
-        on the `.died` and arm-fails-ESRCH paths, so the spool tailers never
-        started and the child's own stderr never reached the structured log
-        `logs`/`why` read. `onSpawn` now always runs before either path
-        returns, so `recordSpawn`'s tailers drain whatever the child already
-        wrote to its spool file even though it is already gone by the time
-        this daemon looks. */
+        config error caught before the server binds) must still get its own
+        stderr into the structured log `logs`/`why` read, whichever way it
+        races this daemon: through an armed watch (`onSpawn`), or through
+        `onExitedBeforeWatch` when it died before the arm or before launchd
+        ever showed its pid. Under load the last case is common, and it is
+        a crash with launchd's exit code, never a spawn failure. */
     @Test func launchdInstantExitOutputReachesTheStructuredLog() async throws {
         let env = try makeEnv()
         let paths = env.paths
@@ -1066,6 +1115,134 @@ private func makeEnv() throws -> TestEnv {
             encoding: .utf8)
         #expect(spool.contains("boom"))
     }
+
+    /** A command that exits before the launcher can watch it was never
+        supervised, so it must not become boot intent: otherwise every later
+        daemon launch starts it again. Its output still reaches the log, and
+        the phase still reads crashed so `why` has something to explain. */
+    @Test(arguments: [nil, Int32.max] as [pid_t?])
+    func exitBeforeWatchDrainsOutputWithoutRecordingBootIntent(pid: pid_t?) async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let supervisor = ServerSupervisor(
+            launcher: ExitedBeforeWatchLauncher(pid: pid, stderrText: "boom before watch\n"),
+            paths: paths,
+            projectPath: env.projectPath, registry: registry,
+            spec: ServerSpec(command: ["/bin/sh", "-c", "exit 1"], name: "web"))
+        _ = await supervisor.start()
+        let status = try await waitForPhase(supervisor, .crashed)
+        #expect(status.phase == .crashed)
+        #expect(status.pid == nil)
+        #expect(status.lastExit?.code == nil)
+        #expect(status.lastExit?.signal == nil)
+        let persisted = await registry.persistedState(
+            serverID: serverID(project: env.projectPath, name: "web"))
+        #expect(persisted?.phase == .crashed)
+        #expect(persisted?.resumeOnBoot == nil)
+        let errLines = await supervisor.logQuery(LogQueryOptions(streams: [.err])).lines
+        #expect(errLines.map(\.text) == ["boom before watch"])
+    }
+
+    /** The other side of the same line: a run whose exit watch was armed was
+        supervised, so an exit, even an instant one that still reported its
+        code, keeps the boot intent `recordSpawn` wrote. */
+    @Test func armedInstantExitKeepsBootIntent() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let gate = AdoptGate()
+        await gate.signal(.exited(code: 1))
+        let supervisor = ServerSupervisor(
+            launcher: StuckRunLauncher(gate: gate), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: ServerSpec(command: ["/bin/true"], name: "web"))
+        let started = await supervisor.start()
+        defer { if let pid = started.pid { kill(pid_t(pid), SIGKILL) } }
+        let status = try await waitForPhase(supervisor, .crashed)
+        #expect(status.lastExit?.code == 1)
+        let persisted = await registry.persistedState(
+            serverID: serverID(project: env.projectPath, name: "web"))
+        #expect(persisted?.phase == .crashed)
+        #expect(persisted?.resumeOnBoot == true)
+    }
+
+    /** A server that reached `.running` and then crashed keeps its boot intent,
+        so the next daemon launch restores it. */
+    @Test func runningServerThatCrashesKeepsBootIntent() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let gate = AdoptGate()
+        let port = 45482
+        let supervisor = ServerSupervisor(
+            launcher: StuckRunLauncher(gate: gate), paths: paths, prober: AlwaysHealthyProber(),
+            projectPath: env.projectPath, registry: registry,
+            spec: ServerSpec(
+                command: ["/bin/true"], healthcheck: HealthCheckSpec(port: port, type: .tcp),
+                name: "web", port: port))
+        let started = await supervisor.start()
+        defer { if let pid = started.pid { kill(pid_t(pid), SIGKILL) } }
+        #expect(try await waitForPhase(supervisor, .running).phase == .running)
+        await gate.signal(.exited(code: 1))
+        #expect(try await waitForPhase(supervisor, .crashed).phase == .crashed)
+        let persisted = await registry.persistedState(
+            serverID: serverID(project: env.projectPath, name: "web"))
+        #expect(persisted?.resumeOnBoot == true)
+    }
+
+    /** A stop that gives up still `.stopping` abandons the supervisor's state
+        writes in the same turn, so the late `recordOutcome` (the gate opening)
+        leaves the row the caller settled alone. The row is settled with a
+        plain `updateState` rather than `retireState`, so only the
+        supervisor's own abandonment is under test: the late exit would
+        otherwise stamp its `lastExit` onto the row. */
+    @Test func stopForRemovalThatGivesUpAbandonsLateStateWrites() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let gate = AdoptGate()
+        let id = serverID(project: env.projectPath, name: "stuck")
+        let supervisor = ServerSupervisor(
+            launcher: StuckRunLauncher(gate: gate), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: ServerSpec(command: ["/bin/true"], name: "stuck"),
+            stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
+        #expect(await supervisor.start().pid != nil)
+        #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
+
+        #expect(await supervisor.stopForRemoval(reason: "unregistered"))
+        try await registry.updateState(serverID: id) { $0 = PersistedServerState(phase: .stopped) }
+
+        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        let settled = try await waitForPhase(supervisor, .stopped)
+        #expect(settled.phase == .stopped)
+        #expect(settled.lastExit?.signal == Int(SIGKILL))
+        let persisted = await registry.persistedState(serverID: id)
+        #expect(persisted?.phase == .stopped)
+        #expect(persisted?.pid == nil)
+        #expect(persisted?.resumeOnBoot == nil)
+        #expect(persisted?.lastExit == nil)
+    }
+
+    /** A stop that finishes needs no retirement: its own `recordOutcome`
+        already cleared the boot intent, and state writes stay live. */
+    @Test func stopForRemovalThatFinishesKeepsStateWritesLive() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let id = serverID(project: env.projectPath, name: "web")
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web"))
+        _ = await supervisor.start()
+        #expect(await supervisor.stopForRemoval(reason: "unregistered") == false)
+        let persisted = await registry.persistedState(serverID: id)
+        #expect(persisted?.phase == .stopped)
+        #expect(persisted?.resumeOnBoot == nil)
+    }
+}
+
+private struct AlwaysHealthyProber: HealthProber {
+    func probe(_ check: EffectiveHealthcheck) async -> Bool { true }
 }
 
 @Suite struct RegistryTests {
@@ -1086,6 +1263,53 @@ private func makeEnv() throws -> TestEnv {
         try await registry.register(project: "/p", spec: ServerSpec(command: ["echo"], name: "web"))
         try await registry.unregister(project: "/p", name: "web")
         #expect(await registry.project("/p") == nil)
+    }
+
+    /** A retired id ignores every later `updateState`, both a write to its
+        settled row and, once `removeState` deleted that row, the insert that
+        would recreate it; the settled row is what a reload reads. */
+    @Test func retiredStateIgnoresLaterUpdatesButStillDeletes() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        let id = serverID(project: env.projectPath, name: "web")
+        try await registry.updateState(serverID: id) { entry in
+            entry.phase = .running
+            entry.pid = 4242
+            entry.resumeOnBoot = true
+        }
+        try await registry.retireState(serverID: id, final: PersistedServerState(phase: .stopped))
+        try await registry.updateState(serverID: id) { entry in
+            entry.phase = .crashed
+            entry.pid = 4243
+            entry.resumeOnBoot = true
+        }
+        let settled = try #require(await registry.persistedState(serverID: id))
+        #expect(settled.phase == .stopped)
+        #expect(settled.pid == nil)
+        #expect(settled.resumeOnBoot == nil)
+        #expect(await Registry(paths: env.paths).persistedState(serverID: id)?.phase == .stopped)
+
+        try await registry.removeState(serverID: id)
+        #expect(await registry.persistedState(serverID: id) == nil)
+        try await registry.updateState(serverID: id) { $0.resumeOnBoot = true }
+        #expect(await registry.persistedState(serverID: id) == nil)
+    }
+
+    /** The retired set is keyed on the normalized id, so a `/var` vs
+        `/private/var` spelling of the same project cannot slip a write past it. */
+    @Test func retiredStateMatchesEitherSpellingOfTheProject() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        let canonical = canonicalProjectPath(env.projectPath)
+        let lexical = canonical.hasPrefix("/private/") ? String(canonical.dropFirst("/private".count)) : canonical
+        try await registry.retireState(
+            serverID: serverID(project: lexical, name: "web"), final: PersistedServerState(phase: .stopped))
+        try await registry.updateState(serverID: serverID(project: canonical, name: "web")) {
+            $0.resumeOnBoot = true
+        }
+        #expect(
+            await registry.persistedState(serverID: serverID(project: canonical, name: "web"))?
+                .resumeOnBoot == nil)
     }
 }
 

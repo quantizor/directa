@@ -1,6 +1,8 @@
 import Darwin
 import DirectaKit
 import Foundation
+import Testing
+import os
 
 @testable import DirectaDaemonCore
 
@@ -89,13 +91,82 @@ struct FakeAdoptLauncher: ProcessLauncher {
 
     func run(
         argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
+        onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
         onSpawn: @escaping @Sendable (pid_t) async -> Void
     ) async -> ProcessOutcome {
-        await inner.run(argv: argv, capture: capture, cwd: cwd, environment: environment, onSpawn: onSpawn)
+        await inner.run(
+            argv: argv, capture: capture, cwd: cwd, environment: environment,
+            onExitedBeforeWatch: onExitedBeforeWatch, onSpawn: onSpawn)
     }
 
-    func adopt(pid: pid_t, label: String) async -> ProcessOutcome? {
+    func prepareAdopt(pid: pid_t) -> Bool { true }
+
+    func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
         await gate.outcome()
+    }
+}
+
+/** A launchd child job whose exit watch cannot be armed (the pid died between
+    the job listing and the arm, or the kernel refused the registration):
+    `prepareAdopt` refuses every pid, while `run` spawns for real so the
+    bounce+respawn fallback has something to start. Counts `prepareAdopt`
+    calls so a test can tell "refused" apart from "never asked". */
+final class UnwatchableAdoptLauncher: ProcessLauncher {
+    private let inner: any ProcessLauncher = SubprocessLauncher()
+    private let prepareCalls = OSAllocatedUnfairLock(initialState: 0)
+
+    var prepareCallCount: Int { prepareCalls.withLock { $0 } }
+
+    func run(
+        argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
+        onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
+        onSpawn: @escaping @Sendable (pid_t) async -> Void
+    ) async -> ProcessOutcome {
+        await inner.run(
+            argv: argv, capture: capture, cwd: cwd, environment: environment,
+            onExitedBeforeWatch: onExitedBeforeWatch, onSpawn: onSpawn)
+    }
+
+    func prepareAdopt(pid: pid_t) -> Bool {
+        prepareCalls.withLock { $0 += 1 }
+        return false
+    }
+
+    func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
+        Issue.record("adopt(pid:label:) ran after prepareAdopt refused pid \(pid)")
+        return .spawnFailed(SpawnError(message: "adopt after a refused prepareAdopt"))
+    }
+}
+
+/** The launchd shape of a command that exits before its exit watch is armed,
+    without a live launchd job: writes `stderrText` to the capture, reports
+    `pid` through `onExitedBeforeWatch` (never `onSpawn`), and returns the
+    status-unknown outcome `LaunchdJobLauncher` reports for that case. A nil
+    `pid` is the job launchd never showed a pid for. The narrow path never
+    signals the pid, and a non-nil one here is past the kernel's pid range
+    so it could not reach a live process even if it did. */
+struct ExitedBeforeWatchLauncher: ProcessLauncher {
+    let pid: pid_t?
+    let stderrText: String
+
+    func run(
+        argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
+        onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
+        onSpawn: @escaping @Sendable (pid_t) async -> Void
+    ) async -> ProcessOutcome {
+        let bytes = Array(stderrText.utf8)
+        let written = bytes.withUnsafeBytes { write(capture.stderrFD, $0.baseAddress, $0.count) }
+        guard written == bytes.count else {
+            return .spawnFailed(SpawnError(message: "could not write the fake child's stderr"))
+        }
+        await onExitedBeforeWatch(pid)
+        return .exitedStatusUnknown
+    }
+
+    func prepareAdopt(pid: pid_t) -> Bool { false }
+
+    func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
+        .spawnFailed(SpawnError(message: "ExitedBeforeWatchLauncher never adopts"))
     }
 }
 
@@ -111,6 +182,7 @@ struct StuckRunLauncher: ProcessLauncher {
 
     func run(
         argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
+        onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
         onSpawn: @escaping @Sendable (pid_t) async -> Void
     ) async -> ProcessOutcome {
         guard let pid = try? spawnSurvivor() else {
@@ -120,7 +192,11 @@ struct StuckRunLauncher: ProcessLauncher {
         return await gate.outcome()
     }
 
-    func adopt(pid: pid_t, label: String) async -> ProcessOutcome? { nil }
+    func prepareAdopt(pid: pid_t) -> Bool { false }
+
+    func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
+        .spawnFailed(SpawnError(message: "StuckRunLauncher never adopts"))
+    }
 }
 
 /** Ports the unit suites allocate from. Reserved as a block so the stray reaper

@@ -27,6 +27,9 @@ struct LaunchdJobLauncherTests {
                 stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),
             cwd: nil,
             environment: [:],
+            onExitedBeforeWatch: { pid in
+                Issue.record("an 8 s sleep reported as exited before its watch (pid \(String(describing: pid)))")
+            },
             onSpawn: { pid in
                 spawned.withLock { $0 = pid }
                 let ids = CoalitionIDs.read(of: pid)
@@ -74,6 +77,7 @@ struct LaunchdJobLauncherTests {
                 stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),
             cwd: nil,
             environment: [:],
+            onExitedBeforeWatch: { _ in },
             onSpawn: { _ in }
         )
         switch outcome {
@@ -113,14 +117,22 @@ struct LaunchdJobLauncherTests {
             try? FileManager.default.removeItem(at: outURL)
             try? FileManager.default.removeItem(at: errURL)
         }
+        let callbacks = OSAllocatedUnfairLock(initialState: [String]())
         let outcome = await LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix).run(
             argv: ["/bin/sh", "-c", "exit 7"],
             capture: SpawnCapture(
                 stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),
             cwd: nil,
             environment: [:],
-            onSpawn: { _ in }
+            onExitedBeforeWatch: { _ in callbacks.withLock { $0.append("exitedBeforeWatch") } },
+            onSpawn: { _ in callbacks.withLock { $0.append("spawn") } }
         )
+        /** Exactly one callback on every path: the armed watch reports a
+            supervised spawn, and each exit this daemon saw only after the
+            fact (the pid already gone, or never shown by launchd, whose own
+            last exit code then carries the 7) reports the narrow one. */
+        let fired = callbacks.withLock { $0 }
+        #expect(fired.count == 1, "callbacks fired: \(fired)")
         switch outcome {
         case .exited(let code):
             #expect(code == 7)
