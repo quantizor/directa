@@ -2381,7 +2381,11 @@ struct Lock: AsyncParsableCommand {
         verbatim (a nested `--`, a dash option, an empty string all survive) and
         leaves the options to parse normally. The default makes a missing command
         reach the typed usage error below rather than the parser's own printer. */
-    @Argument(parsing: .postTerminator, help: "Command to run while holding the resource; everything after `--`.")
+    @Argument(
+        parsing: .postTerminator,
+        help:
+            "Command to run while holding the resource, in the caller's own working directory; everything after `--`."
+    )
     var command: [String] = []
 
     /** Pure so the exact message is asserted without spawning the CLI. */
@@ -2399,6 +2403,14 @@ struct Lock: AsyncParsableCommand {
         if let usage = Self.usageError(command: command, resource: resource) {
             CLIRunner.fail(usage, json: global.json)
         }
+        /** Captured before anything below resolves `--project` or touches the
+            filesystem, so the guarded command runs where the caller actually
+            stood, which the resolved project can differ from (a monorepo
+            subpackage below the project root, or an explicit `--project`
+            pointing elsewhere): a relative file argument, or a tool that finds
+            its own config by walking up from cwd, must see the same directory
+            it would running unwrapped. */
+        let callerCwd = FileManager.default.currentDirectoryPath
         let project = global.resolvedProject()
         let holderPid = Int(getpid())
         let client = CLIRunner.client()
@@ -2473,19 +2485,7 @@ struct Lock: AsyncParsableCommand {
         /** Identity is taken before the command and again before release, so a
             resumed server's first writes are never blamed on the command. */
         let before = acquired.statePath.map(ResourceFingerprint.capture(path:))
-        /** Run the guarded command with inherited stdio. */
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = command
-        process.currentDirectoryURL = URL(fileURLWithPath: project)
-        var commandStatus: Int32 = 1
-        do {
-            try process.run()
-            process.waitUntilExit()
-            commandStatus = process.terminationStatus
-        } catch {
-            FileHandle.standardError.write(Data("directa lock: cannot run command: \(error)\n".utf8))
-        }
+        let commandStatus = Self.runGuardedCommand(command, cwd: callerCwd)
         var verdict = LockIdentityVerdict.silent
         if let statePath = acquired.statePath, let before {
             verdict = LockIdentityVerdict.of(
@@ -2518,5 +2518,23 @@ struct Lock: AsyncParsableCommand {
 
     static func note(_ text: String) {
         FileHandle.standardError.write(Data((text + "\n").utf8))
+    }
+
+    /** Spawns the guarded command with inherited stdio in `cwd`, so a test can
+        assert what directory a real child process observes without acquiring a
+        resource or a live daemon. */
+    static func runGuardedCommand(_ command: [String], cwd: String) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = command
+        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+        do {
+            try process.run()
+        } catch {
+            FileHandle.standardError.write(Data("directa lock: cannot run command: \(error)\n".utf8))
+            return 1
+        }
+        process.waitUntilExit()
+        return process.terminationStatus
     }
 }

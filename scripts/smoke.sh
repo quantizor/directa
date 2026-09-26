@@ -335,6 +335,19 @@ grep -q "directa lock data --" "$WORK/stop.err" || fail "stop did not hint towar
 grep -q "hint:" "$WORK/stop.json" && fail "stop --json leaked the hint into stdout"
 pass "stop hints toward lock in human mode and keeps --json stdout clean"
 
+# lock runs the guarded command in the CALLER's own working directory, never
+# the resolved project root: a relative file argument or a config-discovery
+# tool must see what it would running unwrapped. `pwd -P` matches what the
+# child's getcwd(2) reports, so the comparison tolerates no symlink drift.
+mkdir -p "$PROJECT3/sub"
+EXPECTED_SUBDIR="$(cd "$PROJECT3/sub" && pwd -P)"
+(cd "$PROJECT3/sub" && "$DIRECTA" lock data -- sh -c "pwd -P > '$WORK/lock-cwd.txt'") \
+  || fail "lock cwd check failed to run"
+SEEN_SUBDIR="$(cat "$WORK/lock-cwd.txt")"
+[[ "$SEEN_SUBDIR" == "$EXPECTED_SUBDIR" ]] \
+  || fail "lock ran the guarded command outside the caller's cwd: expected $EXPECTED_SUBDIR, got $SEEN_SUBDIR"
+pass "lock runs the guarded command in the caller's own working directory"
+
 "$DIRECTA" down --json > /dev/null
 
 # Deep-link and default/`--pause` lock coverage stay below; worktree coexistence first.
