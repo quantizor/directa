@@ -152,6 +152,22 @@ public enum LogQuery {
     }
 
     public static func run(current: URL, options: LogQueryOptions) -> [LogRecord] {
+        runMeasured(current: current, options: options, onDiskRead: nil)
+    }
+
+    /** Same as `run`, but also reports the byte size of every disk read to
+        `onDiskRead`, in call order. Internal-only observation seam (mirrors
+        `ExitWatcher`'s `sharedQueueDescriptorForTesting`) that lets
+        `LogQueryTests` prove the tail-only fast path reads only a bounded
+        number of bytes off the end of a family far larger than the requested
+        tail, by summing what a real `run(...)`-shaped call reports, rather
+        than a wall-clock budget that flakes under system load. Each call
+        supplies its own callback, so unlike a shared counter this carries no
+        risk of one test's reads contaminating another's measurement when the
+        suite runs in parallel. */
+    static func runMeasured(
+        current: URL, options: LogQueryOptions, onDiskRead: (@Sendable (Int) -> Void)?
+    ) -> [LogRecord] {
         /** A tail with no grep and no since is answerable from the end of the
             family backward, without materializing older files a caller never
             asked to see: `directa logs <name> --tail 50` must not read a whole
@@ -160,7 +176,8 @@ public enum LogQuery {
             correctness, so this fast path is scoped to the one shape that has
             no reason to touch bytes it will discard. */
         if let tail = options.tail, options.since == nil, options.grep == nil {
-            return tailOnly(current: current, tail: tail, streams: options.streams)
+            return tailOnly(
+                current: current, tail: tail, streams: options.streams, onDiskRead: onDiskRead)
         }
         /** A pattern that will not compile filters nothing out, so it would
             answer with the whole log. Fail closed and say so instead: callers
@@ -182,6 +199,7 @@ public enum LogQuery {
                 continue
             }
             guard let data = try? Data(contentsOf: file), !data.isEmpty else { continue }
+            onDiskRead?(data.count)
             let text = String(decoding: data, as: UTF8.self)
             var startIndex = text.startIndex
             if let since = options.since {
@@ -205,12 +223,16 @@ public enum LogQuery {
         family to answer `tail`, oldest file only once a newer one runs dry.
         Reproduces `run`'s trim-to-tail result exactly (same records, same
         order) without reading a file whose contribution to the tail is zero. */
-    private static func tailOnly(current: URL, tail: Int, streams: Set<LogStream>?) -> [LogRecord] {
+    private static func tailOnly(
+        current: URL, tail: Int, streams: Set<LogStream>?,
+        onDiskRead: (@Sendable (Int) -> Void)?
+    ) -> [LogRecord] {
         guard tail > 0 else { return [] }
         var collected: [LogRecord] = []
         for file in familyFiles(current: current).reversed() {
             guard collected.count < tail else { break }
-            let fromThisFile = tailRecords(of: file, needed: tail - collected.count, streams: streams)
+            let fromThisFile = tailRecords(
+                of: file, needed: tail - collected.count, streams: streams, onDiskRead: onDiskRead)
             collected = fromThisFile + collected
         }
         return collected
@@ -222,7 +244,10 @@ public enum LogQuery {
         the window only grows past `needed` lines when a `streams` filter
         thins the tail out. Growth is geometric, so total bytes read stay
         within roughly twice whatever window finally satisfied the request. */
-    private static func tailRecords(of url: URL, needed: Int, streams: Set<LogStream>?) -> [LogRecord] {
+    private static func tailRecords(
+        of url: URL, needed: Int, streams: Set<LogStream>?,
+        onDiskRead: (@Sendable (Int) -> Void)?
+    ) -> [LogRecord] {
         guard needed > 0, let handle = try? FileHandle(forReadingFrom: url) else { return [] }
         defer { try? handle.close() }
         guard let size = try? handle.seekToEnd(), size > 0 else { return [] }
@@ -232,6 +257,7 @@ public enum LogQuery {
             let clean = start == 0 || startsAtLineBoundary(start, handle: handle)
             guard (try? handle.seek(toOffset: start)) != nil, let data = try? handle.readToEnd()
             else { return [] }
+            onDiskRead?(data.count)
             var lines = Array(String(decoding: data, as: UTF8.self).split(
                 separator: "\n", omittingEmptySubsequences: true))
             /** A window boundary that does not land on a newline cuts a line in

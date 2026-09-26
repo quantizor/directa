@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import os
 
 @testable import DirectaKit
 
@@ -257,17 +258,26 @@ import Testing
 
     @Test func tailOnlyStaysFastOnAFarLargerFamilyThanRequested() throws {
         /** 150k lines across a rotation, asking for the last 50: the fast
-            path reads a handful of kilobytes off the end of current.log, so
-            this must complete far under the whole-family-parse budget the
-            aCapSizedFamily test above needs for its combined grep/since/tail
-            workload. A regression back to full-family parsing would blow
-            well past this bound long before it got as slow as that budget. */
+            path reads a handful of kilobytes off the end of current.log alone,
+            never touching the 100k-line rotated file. A wall-clock budget here
+            flakes under a loaded machine even when the code is correct, so the
+            proof is the actual byte count `runMeasured` reports rather than
+            elapsed time: bounded regardless of family size when the fast path
+            runs, and blown past by two orders of magnitude the moment it is
+            disabled (see `red/green` note below), since the whole 150k-line,
+            2-file family would then be read to answer a tail of 50. */
         let old = (0..<100_000).map { record(Double($0), .out, "old \($0)") }
         let recent = (100_000..<150_000).map { record(Double($0), .out, "new \($0)") }
         let current = try writeFamily([old, recent])
-        let started = ContinuousClock.now
-        let tail = LogQuery.run(current: current, options: LogQueryOptions(tail: 50))
+        let bytesRead = OSAllocatedUnfairLock<Int>(initialState: 0)
+        let tail = LogQuery.runMeasured(
+            current: current, options: LogQueryOptions(tail: 50),
+            onDiskRead: { bytes in bytesRead.withLock { $0 += bytes } })
         #expect(tail.map(\.text) == (149_950..<150_000).map { "new \($0)" })
-        #expect(ContinuousClock.now - started < Duration.milliseconds(100))
+        /** The fast path satisfies 50 short lines from its first 64 KB window
+            off the end of current.log alone; 256 KB leaves headroom for a
+            window doubling or two while staying two orders of magnitude under
+            the several-MB size of the full family a regression would read. */
+        #expect(bytesRead.withLock { $0 } < 256 * 1024)
     }
 }
