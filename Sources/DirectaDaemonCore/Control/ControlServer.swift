@@ -797,9 +797,23 @@ public actor Router {
         for name in sortedNames {
             let id = serverID(project: project, name: name)
             if let supervisor = supervisors[id] {
+                /** `stop()` no-ops for a server already in a terminal phase
+                    (recordOutcome never runs, so nothing posts its own
+                    `.stopped` event); a live one's stop always completes
+                    recordOutcome first (it awaits the run task), which posts
+                    `.stopped` with this same "project path gone" detail, so
+                    posting it again here would double the event. Only the
+                    terminal case needs the manual post. */
+                let wasTerminal: Bool
+                switch await supervisor.status().phase {
+                case .crashed, .failed, .stopped: wasTerminal = true
+                case .running, .starting, .stopping, .unhealthy: wasTerminal = false
+                }
                 _ = await supervisor.stop(reason: "project path gone")
-                await events.post(
-                    kind: .stopped, project: project, server: name, detail: "project path gone")
+                if wasTerminal {
+                    await events.post(
+                        kind: .stopped, project: project, server: name, detail: "project path gone")
+                }
             }
             supervisors[id] = nil
         }
