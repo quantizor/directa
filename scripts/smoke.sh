@@ -48,19 +48,49 @@ await_daemon() {
   fail "daemon never finished restoring over $DIRECTA_SOCKET ($label); last status: ${probe:-<none>}"
 }
 
+# Arrays, never space-joined strings: zsh does not word-split an unquoted
+# parameter, so a loop over a joined string runs once with the whole string,
+# and `kill` rejects it as an illegal pid while the processes live on.
+STRAY_PIDS=()
+MONITOR_PIDS=()
+
 cleanup() {
+  local cleanup_status=$? survivors=""
+  cd /
   [[ -n "${DAEMON_PID:-}" ]] && kill -9 "$DAEMON_PID" 2>/dev/null || true
   [[ -n "${CHILD_PID:-}" ]] && kill -9 "-$CHILD_PID" 2>/dev/null || true
   # Grandchildren escape the process group on purpose (that is what the teardown
   # assertions exercise), so a group kill leaves them behind. Reap them by pid.
-  for stray in ${STRAY_PIDS:-}; do kill -9 "$stray" 2>/dev/null || true; done
+  for stray in "${STRAY_PIDS[@]}"; do kill -9 "$stray" 2>/dev/null || true; done
   # Every `directa monitor` invocation started for the monitor checks below is
   # tracked here too, so a `fail` partway through that section (which exits and
   # runs this trap) cannot leave one running past this script.
-  for mon in ${MONITOR_PIDS:-}; do kill -9 "$mon" 2>/dev/null || true; done
+  for mon in "${MONITOR_PIDS[@]}"; do kill -9 "$mon" 2>/dev/null || true; done
+  # A fixture-server the daemon spawned leads its own session, and a
+  # --spawn-grandchild child sits in a process group of its own inside that
+  # session, so neither a group kill nor the pkill below reaches it. A failure
+  # partway through leaves such roots running with no stop ever sent. Killing
+  # each live root's whole session reaches their grandchildren; a root that does
+  # not lead a session names no session, so this only ever hits what a fixture
+  # started.
+  for root in $(pgrep -f "$BIN/fixture-server" 2>/dev/null); do pkill -9 -s "$root" 2>/dev/null || true; done
   # Orphans from a mid-smoke abort can hold fixed listen ports across reruns.
   pkill -f "$BIN/fixture-server" 2>/dev/null || true
+  # Every process this run started works under $WORK, so anything still holding
+  # a directory or file there once the kills above have landed outlived the run.
+  # It is named and fails the run rather than surviving into the next one.
+  for i in {1..20}; do
+    survivors="$(lsof -t +D "$WORK" 2>/dev/null | sort -u | tr '\n' ' ')"
+    [[ -z "$survivors" ]] && break
+    sleep 0.1
+  done
   rm -rf "$WORK"
+  if [[ -n "$survivors" ]]; then
+    echo "SMOKE FAIL: processes outlived cleanup: $survivors" >&2
+    ps -o pid,ppid,pgid,command -p "${(j:,:)${(z)survivors}}" >&2 || true
+    exit 1
+  fi
+  return $cleanup_status
 }
 trap cleanup EXIT
 
@@ -164,7 +194,7 @@ sleep 1
 AFTER="$(wc -l < "$RAW_SPOOL")"
 [[ "$AFTER" -gt "$BEFORE" ]] || fail "raw spool stopped growing after daemon death"
 pass "child survived daemon kill and kept logging ($BEFORE -> $AFTER raw lines)"
-STRAY_PIDS="${STRAY_PIDS:-} $(grep grandchild "$RAW_SPOOL" | tail -1 | awk '{print $NF}')"
+STRAY_PIDS+=("$(grep grandchild "$RAW_SPOOL" | tail -1 | awk '{print $NF}')")
 kill -9 "-$CHILD_PID" 2>/dev/null || true
 CHILD_PID=""
 
@@ -622,7 +652,7 @@ cd "$MONPROJ"
 MON_OUT="$WORK/monitor-out.log"
 "$DIRECTA" monitor monweb --tick 0.5 > "$MON_OUT" 2>/dev/null &
 MON_PID=$!
-MONITOR_PIDS="${MONITOR_PIDS:-} $MON_PID"
+MONITOR_PIDS+=("$MON_PID")
 for i in {1..50}; do grep -q "^directa monweb: monitoring" "$MON_OUT" && break; sleep 0.1; done
 grep -q "^directa monweb: monitoring" "$MON_OUT" || fail "monitor never printed its start marker"
 for i in {1..30}; do grep -q "monweb out| heartbeat" "$MON_OUT" && break; sleep 0.1; done
@@ -645,7 +675,7 @@ FLOOD_MON_OUT="$WORK/monitor-flood.log"
 "$DIRECTA" monitor monflood --tick 0.5 --lines-per-minute 1200 --lines-per-arm 20000 \
   --errors-per-minute 600 --errors-per-arm 5000 > "$FLOOD_MON_OUT" 2>/dev/null &
 FLOOD_MON_PID=$!
-MONITOR_PIDS="${MONITOR_PIDS:-} $FLOOD_MON_PID"
+MONITOR_PIDS+=("$FLOOD_MON_PID")
 sleep 2
 "$DIRECTA" restart monflood --timeout 15 --json > /dev/null || fail "restart under a flooding monitor failed"
 MON_RSS_CEILING_KB=40000
@@ -672,7 +702,7 @@ pass "monitor RSS stays under ${MON_RSS_CEILING_KB}KB (peaked ${MAX_RSS}KB) thro
 KEEP_OUT="$WORK/monitor-keepalive.log"
 "$DIRECTA" monitor monweb --tick 0.5 > "$KEEP_OUT" 2>/dev/null &
 KEEP_MON_PID=$!
-MONITOR_PIDS="${MONITOR_PIDS:-} $KEEP_MON_PID"
+MONITOR_PIDS+=("$KEEP_MON_PID")
 for i in {1..30}; do grep -q "monweb out| heartbeat" "$KEEP_OUT" && break; sleep 0.1; done
 grep -q "monweb out| heartbeat" "$KEEP_OUT" || fail "monitor never streamed before the daemon kill"
 BEFORE_LINES="$(wc -l < "$KEEP_OUT" | tr -d ' ')"
@@ -738,7 +768,7 @@ cd "$MON_WT_ROOT/main/.claude/worktrees/review"
 WT_MON_OUT="$WORK/monitor-wt.log"
 "$DIRECTA" monitor web --tick 1 > "$WT_MON_OUT" 2>/dev/null &
 WT_MON_PID=$!
-MONITOR_PIDS="${MONITOR_PIDS:-} $WT_MON_PID"
+MONITOR_PIDS+=("$WT_MON_PID")
 for i in {1..30}; do grep -q "^directa web@review: monitoring" "$WT_MON_OUT" && break; sleep 0.1; done
 grep -q "^directa web@review: monitoring" "$WT_MON_OUT" || fail "monitor from a linked worktree cwd did not attach with the @review label: $(head -3 "$WT_MON_OUT" 2>/dev/null)"
 pass "monitor from a linked-worktree cwd attaches to that worktree's server with a distinct label"
@@ -753,7 +783,7 @@ PROJ_OVERRIDE_OUT="$WORK/monitor-project-override.log"
 MON_WT_MAIN_CANONICAL="$(cd "$MON_WT_ROOT/main" && pwd -P)"
 "$DIRECTA" monitor web --project "$MON_WT_ROOT/main" --tick 1 > "$PROJ_OVERRIDE_OUT" 2>/dev/null &
 PROJ_OVERRIDE_PID=$!
-MONITOR_PIDS="${MONITOR_PIDS:-} $PROJ_OVERRIDE_PID"
+MONITOR_PIDS+=("$PROJ_OVERRIDE_PID")
 for i in {1..30}; do grep -q "^directa web: monitoring $MON_WT_MAIN_CANONICAL" "$PROJ_OVERRIDE_OUT" && break; sleep 0.1; done
 grep -q "^directa web: monitoring $MON_WT_MAIN_CANONICAL" "$PROJ_OVERRIDE_OUT" || fail "--project did not override cwd for monitor: $(head -3 "$PROJ_OVERRIDE_OUT" 2>/dev/null)"
 pass "--project overrides cwd for monitor"
@@ -778,7 +808,7 @@ for i in {1..30}; do
   sleep 0.05
 done
 [[ -n "$READER_MON_PID" ]] || fail "reader-gone check never saw the monitor process start"
-MONITOR_PIDS="${MONITOR_PIDS:-} $READER_MON_PID"
+MONITOR_PIDS+=("$READER_MON_PID")
 for i in {1..30}; do
   kill -0 "$READER_MON_PID" 2>/dev/null || break
   sleep 0.1
@@ -799,7 +829,7 @@ IDLE_OUT="$WORK/monitor-idle.log"
 IDLE_DEBUG="$WORK/monitor-idle-debug.log"
 DIRECTA_MONITOR_DEBUG=1 "$DIRECTA" monitor monweb --tick 0.5 > "$IDLE_OUT" 2>"$IDLE_DEBUG" &
 IDLE_MON_PID=$!
-MONITOR_PIDS="${MONITOR_PIDS:-} $IDLE_MON_PID"
+MONITOR_PIDS+=("$IDLE_MON_PID")
 sleep 20
 IDLE_TIME_RAW="$(ps -o time= -p "$IDLE_MON_PID" | tr -d ' ')"
 kill -9 "$IDLE_MON_PID" 2>/dev/null || true
