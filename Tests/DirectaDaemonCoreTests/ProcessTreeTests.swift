@@ -105,12 +105,124 @@ import Testing
     }
 
     @Test func shouldSignalRejectsMissingAndReusedPid() {
-        let snap = ProcessIdentity(pid: 42, startSeconds: 100, startMicroseconds: 5)
+        let snap = ProcessIdentity(pid: 42, startMicroseconds: 5, startSeconds: 100, uniqueID: 7)
         #expect(ProcessTree.shouldSignal(snapshotted: snap, live: nil) == false)
-        let reused = ProcessIdentity(pid: 42, startSeconds: 200, startMicroseconds: 0)
+        let reused = ProcessIdentity(pid: 42, startMicroseconds: 0, startSeconds: 200, uniqueID: 9)
         #expect(ProcessTree.shouldSignal(snapshotted: snap, live: reused) == false)
         #expect(ProcessTree.shouldSignal(snapshotted: snap, live: snap) == true)
     }
+
+    /** A unique id is never reused within a boot, so a different one under the
+        same pid and start time is a different process, however the clock read. */
+    @Test func shouldSignalRejectsADifferentUniqueID() {
+        let snap = ProcessIdentity(pid: 42, startMicroseconds: 5, startSeconds: 100, uniqueID: 7)
+        let other = ProcessIdentity(pid: 42, startMicroseconds: 5, startSeconds: 100, uniqueID: 8)
+        #expect(ProcessTree.shouldSignal(snapshotted: snap, live: other) == false)
+    }
+
+    private func row(_ uniqueID: UInt64, parent: UInt64, pid: pid_t) -> ProcessTree.LineageRow {
+        ProcessTree.LineageRow(
+            parentUniqueID: parent,
+            process: ProcessIdentity(
+                pid: pid, startMicroseconds: 0, startSeconds: 1_000, uniqueID: uniqueID))
+    }
+
+    /** The shape the walk exists for: launchd (1) parents the daemon (10), which
+        forked the root (20). The root's child (30) called setsid and was
+        reparented to launchd when the root exited, so its ppid would say 1,
+        but its parent unique id still names 20. Its own child (40) and
+        grandchild (50) are found through it, while a sibling server of the
+        daemon (60) and an unrelated process (70) are not. */
+    @Test func lineageWalksParentUniqueIDsToAFixedPoint() {
+        let rows = [
+            row(1, parent: 0, pid: 1),
+            row(10, parent: 1, pid: 100),
+            row(30, parent: 20, pid: 300),
+            row(40, parent: 30, pid: 400),
+            row(50, parent: 40, pid: 500),
+            row(60, parent: 10, pid: 600),
+            row(70, parent: 1, pid: 700),
+        ]
+        let found = ProcessTree.lineage(of: [20], in: rows, daemon: 10)
+        #expect(Set(found.map(\.pid)) == [300, 400, 500])
+    }
+
+    /** A seed already known (a snapshot entry) is not returned again, but its
+        descendants are, and two seeds on one chain find each process once. */
+    @Test func lineageSkipsSeedsAndFindsEachProcessOnce() {
+        let rows = [
+            row(10, parent: 1, pid: 100),
+            row(30, parent: 20, pid: 300),
+            row(40, parent: 30, pid: 400),
+        ]
+        let found = ProcessTree.lineage(of: [20, 30], in: rows, daemon: 10)
+        #expect(found.map(\.pid) == [400])
+    }
+
+    /** The refusals: a seed naming the daemon, any ancestor of it (launchd
+        here), or the kernel's 0 would sweep every server or the machine, so each
+        finds nothing. The positive control shows the same rows do answer a
+        legitimate seed. */
+    @Test(arguments: [10, 1, 0] as [UInt64])
+    func lineageRefusesTheDaemonItsAncestorsAndTheKernel(seed: UInt64) {
+        let rows = [
+            row(1, parent: 0, pid: 1),
+            row(10, parent: 1, pid: 100),
+            row(20, parent: 10, pid: 200),
+            row(30, parent: 20, pid: 300),
+            row(70, parent: 1, pid: 700),
+        ]
+        #expect(ProcessTree.lineage(of: [seed], in: rows, daemon: 10).isEmpty)
+        #expect(ProcessTree.lineage(of: [20], in: rows, daemon: 10).map(\.pid) == [300])
+    }
+
+    /** A row whose unique id could not be read has no key to match on and is
+        never returned, and the walk does not stall past it. */
+    @Test func lineageIgnoresARowWithNoUniqueID() {
+        let unreadable = ProcessTree.LineageRow(
+            parentUniqueID: 20,
+            process: ProcessIdentity(pid: 300, startMicroseconds: 0, startSeconds: 1, uniqueID: nil))
+        let rows = [unreadable, row(40, parent: 20, pid: 400)]
+        #expect(ProcessTree.lineage(of: [20], in: rows, daemon: 10).map(\.pid) == [400])
+    }
+
+    /** The flavor 17 layout against the live kernel: this process's parent id
+        is its parent's own id, and an identity read carries the same id. */
+    @Test func uniqueIDsOfSelfNameTheParent() throws {
+        let mine = try #require(ProcessUniqueIDs.read(of: getpid()))
+        let parent = try #require(ProcessUniqueIDs.read(of: getppid()))
+        #expect(mine.parent == parent.process)
+        #expect(mine.process != parent.process)
+        #expect(ProcessTree.identity(of: getpid())?.uniqueID == mine.process)
+        #expect(ProcessUniqueIDs.read(of: -1) == nil)
+    }
+
+    /** The real-process premise the lineage source rests on: a setsid child whose
+        parent exits is reparented to launchd yet keeps naming that parent's
+        unique id, and the live sweep finds it from that id alone. */
+    @Test func lineageMembersFindsASetsidChildAfterItsParentExits() throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let (readEnd, writeEnd) = try makeOutputPipe()
+        defer { close(readEnd) }
+        let root = try spawnBare(
+            [fixture, "--setsid-listener", "45488", "--exit-after-spawn"],
+            flags: POSIX_SPAWN_SETSID, stdoutFD: writeEnd)
+        close(writeEnd)
+        let rootIDs = ProcessUniqueIDs.read(of: root)
+        var status: Int32 = 0
+        waitpid(root, &status, 0)
+        let child = try #require(readSetsidListenerPid(from: readEnd))
+        defer { kill(child, SIGKILL) }
+        let rootID = try #require(rootIDs?.process)
+        /** The premise: alive, its parent reaped so the parent chain is gone,
+            and in a session of its own, so no other source can reach it. */
+        #expect(kill(child, 0) == 0)
+        #expect(!ProcessTree.descendants(of: root).pids.contains(child))
+        #expect(getsid(child) == child)
+        #expect(ProcessUniqueIDs.read(of: child)?.parent == rootID)
+        #expect(ProcessTree.lineageMembers(of: [rootID]).pids.contains(child))
+    }
+
 
     /** The adoption identity guard: a nil baseline (pre-feature state) always
         passes, a process that started at or slightly before the recorded
@@ -168,7 +280,8 @@ import Testing
         #expect(identity.pid == pid)
         #expect(ProcessTree.shouldSignal(snapshotted: identity, live: ProcessTree.identity(of: pid)))
         let forged = ProcessIdentity(
-            pid: pid, startSeconds: identity.startSeconds &+ 1, startMicroseconds: 0)
+            pid: pid, startMicroseconds: identity.startMicroseconds,
+            startSeconds: identity.startSeconds &+ 1, uniqueID: identity.uniqueID)
         #expect(
             ProcessTree.shouldSignal(snapshotted: forged, live: ProcessTree.identity(of: pid))
                 == false)

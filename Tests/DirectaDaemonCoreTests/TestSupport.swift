@@ -75,10 +75,11 @@ func spawnSurvivor() throws -> pid_t {
     try spawnReapedSessionLeader(["/bin/sh", "-c", "sleep 30"])
 }
 
-/** `argv` as a session leader nothing supervises, reaped the moment it exits.
-    The caller owns killing it. */
-func spawnReapedSessionLeader(_ argv: [String]) throws -> pid_t {
-    let pid = try spawnBare(argv, flags: POSIX_SPAWN_SETSID)
+/** `argv` as a session leader nothing supervises, reaped the moment it exits,
+    its stdout on `stdoutFD` when given (as `spawnBare`). The caller owns
+    killing it. */
+func spawnReapedSessionLeader(_ argv: [String], stdoutFD: Int32? = nil) throws -> pid_t {
+    let pid = try spawnBare(argv, flags: POSIX_SPAWN_SETSID, stdoutFD: stdoutFD)
     /** `swift-subprocess` reaps its own children as part of awaiting their
         termination status; a bare `posix_spawn` here has no one else doing
         that. Without a reaper, a test's `kill(pid, 0)` liveness check can
@@ -91,6 +92,32 @@ func spawnReapedSessionLeader(_ argv: [String]) throws -> pid_t {
     }
     reaper.start()
     return spawned
+}
+
+/** A pipe for a spawned root's stdout: the test reads the read end, passes
+    the write end as `stdoutFD`, and closes the write end once the spawn has
+    happened. Both ends are close-on-exec, so no other spawn inherits them. */
+func makeOutputPipe() throws -> (read: Int32, write: Int32) {
+    var fds: [Int32] = [0, 0]
+    try #require(pipe(&fds) == 0)
+    for fd in fds { _ = fcntl(fd, F_SETFD, FD_CLOEXEC) }
+    return (fds[0], fds[1])
+}
+
+/** The pid a fixture's `--setsid-listener` prints, read from `fd`. Stops at
+    that line rather than end of file, since the listener keeps the same
+    stdout open for as long as it lives; nil if every writer closes first. */
+func readSetsidListenerPid(from fd: Int32) -> pid_t? {
+    let pattern = #"setsid listener pid (\d+)\n"#
+    var text = ""
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while text.range(of: pattern, options: .regularExpression) == nil {
+        let count = read(fd, &buffer, buffer.count)
+        guard count > 0 else { return nil }
+        text += String(decoding: buffer.prefix(count), as: UTF8.self)
+    }
+    guard let match = text.range(of: pattern, options: .regularExpression) else { return nil }
+    return text[match].split(whereSeparator: \.isWhitespace).last.flatMap { pid_t($0) }
 }
 
 /** Resolves once `signal(_:)` is called (or immediately, if it already was),

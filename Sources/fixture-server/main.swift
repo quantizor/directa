@@ -17,6 +17,9 @@ import Foundation
                            the root's group nor its session can reach it and
                            only a descendant snapshot taken while the root
                            still parents it can. Prints `setsid listener pid N`
+    --exit-after-spawn     exit with --code the moment the setsid listener is
+                           spawned, so no snapshot refresh can land between the
+                           spawn and the root's exit
     --orphan-grandchild    background a `sleep 1000` through a shell that then
                            exits, so the sleep reparents away from this process
                            but keeps its session. A parent-chain sweep can no
@@ -40,6 +43,7 @@ import Foundation
 var listenPort: UInt16?
 var exitAfter: Double?
 var exitCode: Int32 = 0
+var exitAfterSpawn = false
 var spawnGrandchild = false
 var grandchildAfter: Double?
 var orphanGrandchild = false
@@ -61,6 +65,8 @@ while let arg = argIterator.next() {
         exitAfter = argIterator.next().flatMap { Double($0) }
     case "--code":
         exitCode = argIterator.next().flatMap { Int32($0) } ?? 0
+    case "--exit-after-spawn":
+        exitAfterSpawn = true
     case "--spawn-grandchild":
         spawnGrandchild = true
     case "--grandchild-after":
@@ -158,7 +164,13 @@ if spawnGrandchild {
 }
 
 if let port = setsidListenerPort {
-    launch(after: grandchildAfter) { launchSetsidListener(port: port) }
+    /** Captured for the same reason as `code` under --exit-after below. */
+    let exitNow = exitAfterSpawn
+    let code = exitCode
+    launch(after: grandchildAfter) {
+        launchSetsidListener(port: port)
+        if exitNow { exit(code) }
+    }
 }
 
 if orphanGrandchild {

@@ -858,9 +858,11 @@ public actor Router {
         /** A server is spawned as a session leader (createSession), so its
             session id is its own pid; sweeping the session as well as the parent
             chain catches an orphan descendant that setpgid'd or setsid'd out of
-            the group, the same union stop() and the crash path use. */
+            the group, and the root's unique id reaches one that also left the
+            session and reparented, the same union stop() and the crash path
+            use. */
         let descendants = ProcessTree.liveDescendants(
-            rootPid: pid, sessionID: pid, snapshot: [])
+            rootPid: pid, rootUniqueID: root.uniqueID, sessionID: pid, snapshot: [])
         ProcessTree.signalTree(
             descendants: descendants, revalidate: true, rootIdentity: root, rootPid: pid,
             signal: SIGTERM)

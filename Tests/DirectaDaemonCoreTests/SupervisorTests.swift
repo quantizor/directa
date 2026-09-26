@@ -833,33 +833,38 @@ private func makeEnv() throws -> TestEnv {
         the root no longer heads (its children reparent to launchd at exit),
         and must not erase what earlier refreshes recorded. `StuckRunLauncher`
         withholds the outcome while the starting-phase watch keeps refreshing
-        over the dead root; the pause spans several watch intervals. */
+        over the dead root; the pause spans several watch intervals. The child
+        pid comes from the root's own stdout, and the root lives until this
+        test ends it, a few watch intervals after the child is known, so the
+        premise never depends on winning a race against the root's exit. */
     @Test func aRefreshAfterTheRootExitsKeepsTheSetsidDescendantItRecorded() async throws {
         let fixture = try #require(fixtureServerExecutable())
         let env = try makeEnv()
         let gate = AdoptGate()
         let port = 45_487
+        let (readEnd, writeEnd) = try makeOutputPipe()
+        defer { close(readEnd) }
         let launcher = StuckRunLauncher(
             gate: gate,
             spawnRoot: {
                 try spawnReapedSessionLeader(
-                    [fixture, "--setsid-listener", "\(port)", "--exit-after", "1"])
+                    [fixture, "--setsid-listener", "\(port)"], stdoutFD: writeEnd)
             })
         let supervisor = ServerSupervisor(
             launcher: launcher, paths: env.paths, projectPath: env.projectPath,
             registry: Registry(paths: env.paths),
             spec: ServerSpec(command: ["/bin/true"], name: "setsid"))
         let root = try #require(await supervisor.start().pid.flatMap { pid_t(exactly: $0) })
-        var listener: pid_t?
-        for _ in 0..<100 where listener == nil {
-            listener = ProcessTree.descendants(of: root).pids.first
-            if listener == nil { try await Task.sleep(for: .milliseconds(20)) }
-        }
-        let child = try #require(listener, "root \(root) never spawned its setsid listener")
+        close(writeEnd)
+        defer { kill(root, SIGKILL) }
+        let child = try #require(
+            readSetsidListenerPid(from: readEnd), "root \(root) never spawned its setsid listener")
         defer { kill(child, SIGKILL) }
         /** The premise: a session of its own, so the session sweep cannot
             stand in for the snapshot. */
         #expect(getsid(child) == child)
+        try await Task.sleep(for: .milliseconds(600))
+        kill(root, SIGKILL)
         for _ in 0..<250 where getsid(root) != -1 {
             try await Task.sleep(for: .milliseconds(20))
         }
@@ -874,6 +879,56 @@ private func makeEnv() throws -> TestEnv {
             try await Task.sleep(for: .milliseconds(50))
         }
         #expect(reaped, "setsid listener \(child) survived a crash its snapshot had recorded")
+    }
+
+    /** A setsid child spawned after the last snapshot refresh, by a root that
+        exits the same instant: it left the group and the session, and the
+        root's exit reparented it to launchd before any refresh could record
+        it, so the snapshot, the parent chain, and the session all miss it.
+        Only the kernel's parent unique id, which reparenting leaves alone,
+        still ties it to this run. The root spawns it at 500ms, between the
+        200ms refreshes, and `--exit-after-spawn` leaves no gap for one. */
+    @Test func crashKillsASetsidChildTheRootSpawnedAsItExited() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeEnv()
+        let gate = AdoptGate()
+        let (readEnd, writeEnd) = try makeOutputPipe()
+        defer { close(readEnd) }
+        let launcher = StuckRunLauncher(
+            gate: gate,
+            spawnRoot: {
+                try spawnReapedSessionLeader(
+                    [
+                        fixture, "--setsid-listener", "45489", "--grandchild-after", "0.5",
+                        "--exit-after-spawn", "--code", "1",
+                    ],
+                    stdoutFD: writeEnd)
+            })
+        let supervisor = ServerSupervisor(
+            launcher: launcher, paths: env.paths, projectPath: env.projectPath,
+            registry: Registry(paths: env.paths),
+            spec: ServerSpec(command: ["/bin/true"], name: "late-setsid"))
+        let root = try #require(await supervisor.start().pid.flatMap { pid_t(exactly: $0) })
+        close(writeEnd)
+        let child = try #require(
+            readSetsidListenerPid(from: readEnd), "root \(root) never spawned its setsid listener")
+        defer { kill(child, SIGKILL) }
+        for _ in 0..<250 where getsid(root) != -1 {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try #require(getsid(root) == -1, "root \(root) never exited")
+        /** The premise: a session of its own, alive after the root is gone. */
+        #expect(getsid(child) == child)
+        #expect(kill(child, 0) == 0)
+
+        await gate.signal(.exited(code: 1))
+        #expect(try await waitForPhase(supervisor, .crashed, tries: 80).phase == .crashed)
+        var reaped = false
+        for _ in 0..<100 where !reaped {
+            if kill(child, 0) != 0 { reaped = true; break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(reaped, "setsid child \(child) outlived a crash (ppid \(parentPid(of: child)))")
     }
 
     /** Poll the supervisor until it reaches `phase` or the budget runs out. */
@@ -1193,6 +1248,13 @@ private func makeEnv() throws -> TestEnv {
         let stopped = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
         #expect(stopped.phase == .stopped)
         #expect(kill(root, 0) != 0)
+        /** The abandoned supervisor still awaits the root it spawned, so the
+            stop above ends that run for it too, and its recordOutcome then
+            drains its tailers and writes its log and state row into this
+            test's tree. It sets its phase only after those writes, so waiting
+            for the phase keeps them from landing after the tree is removed. */
+        let priorEnded = try await waitForPhase(priorDaemon, .stopped, tries: 80)
+        #expect(priorEnded.phase == .stopped)
         var reaped = false
         for _ in 0..<100 where !reaped {
             if kill(child, 0) != 0 { reaped = true; break }

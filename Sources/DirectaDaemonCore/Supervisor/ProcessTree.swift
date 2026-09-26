@@ -1,24 +1,33 @@
 import Darwin
+import DirectaKit
 import Foundation
 
 /** A process identity that survives PID reuse: pid alone is not enough across a
     grace window, because macOS can recycle the number. Start time comes from
-    `kinfo_proc.kp_proc.p_starttime`. */
+    `kinfo_proc.kp_proc.p_starttime`; `uniqueID` is the kernel's never-reused
+    id (`ProcessUniqueIDs`), nil only when that read failed. Every identity is
+    built through `ProcessTree`, which reads all three the same way, so two
+    reads of one live process compare equal and a recycled pid never does. */
 public struct ProcessIdentity: Hashable, Sendable, Equatable {
     public let pid: pid_t
     public let startMicroseconds: suseconds_t
     public let startSeconds: time_t
+    public let uniqueID: UInt64?
 
-    public init(pid: pid_t, startSeconds: time_t, startMicroseconds: suseconds_t) {
+    public init(
+        pid: pid_t, startMicroseconds: suseconds_t, startSeconds: time_t, uniqueID: UInt64?
+    ) {
         self.pid = pid
         self.startMicroseconds = startMicroseconds
         self.startSeconds = startSeconds
+        self.uniqueID = uniqueID
     }
 
-    init(_ info: kinfo_proc) {
+    init(_ info: kinfo_proc, uniqueID: UInt64?) {
         self.pid = info.kp_proc.p_pid
         self.startMicroseconds = info.kp_proc.p_starttime.tv_usec
         self.startSeconds = info.kp_proc.p_starttime.tv_sec
+        self.uniqueID = uniqueID
     }
 
     /** The kernel start time as a wall-clock `Date`, for comparison against a
@@ -57,15 +66,15 @@ public enum ProcessTree {
         case .failed(let errno):
             return .failed(errno: errno)
         case .ok(let table):
-            var childrenByParent: [pid_t: [ProcessIdentity]] = [:]
-            for identity in table {
-                childrenByParent[identity.parent, default: []].append(identity.process)
+            var childrenByParent: [pid_t: [TableRow]] = [:]
+            for row in table {
+                childrenByParent[row.parent, default: []].append(row)
             }
             var found: [ProcessIdentity] = []
             var queue: [pid_t] = [pid]
             while let parent = queue.popLast() {
                 for child in childrenByParent[parent] ?? [] where child.pid != parent {
-                    found.append(child)
+                    found.append(child.identity)
                     queue.append(child.pid)
                 }
             }
@@ -101,10 +110,92 @@ public enum ProcessTree {
         case .ok(let table):
             let mine = getpid()
             return .ok(
-                table.map(\.process).filter { identity in
-                    identity.pid != session && identity.pid != mine
-                        && getsid(identity.pid) == session
-                })
+                table.filter { row in
+                    row.pid != session && row.pid != mine && getsid(row.pid) == session
+                }.map(\.identity))
+        }
+    }
+
+    /** One process as the lineage walk reads it: its identity, whose
+        `uniqueID` is the key, and the unique id of the process that forked it. */
+    public struct LineageRow: Equatable, Sendable {
+        public let parentUniqueID: UInt64
+        public let process: ProcessIdentity
+
+        public init(parentUniqueID: UInt64, process: ProcessIdentity) {
+            self.parentUniqueID = parentUniqueID
+            self.process = process
+        }
+    }
+
+    /** Every row descended from a seed through parent unique ids, walked to a
+        fixed point so a grandchild of an escaped child is found too. Seeds are
+        never returned themselves.
+
+        This is the one handle on a child that escaped every other source at
+        once: it called setsid (out of the group and the session), its parent
+        exited (the kernel reparented it to launchd, so the parent-pid chain
+        lost it), and it appeared after the last snapshot refresh. The kernel
+        keeps its parent unique id through that reparenting, and unique ids are
+        never reused within a boot, so the match is exact rather than a pid
+        that may since name somebody else.
+
+        `daemon` is the caller's own unique id. Neither it nor any ancestor of
+        it (walked up the rows) is ever a seed or a result, and neither is 0,
+        the kernel's own id and launchd's parent: a seed naming the daemon
+        would sweep every server it supervises, and one naming launchd or the
+        kernel would sweep the machine. */
+    public static func lineage(
+        of seeds: Set<UInt64>, in rows: [LineageRow], daemon: UInt64
+    ) -> [ProcessIdentity] {
+        var byUniqueID: [UInt64: LineageRow] = [:]
+        var childrenByParent: [UInt64: [LineageRow]] = [:]
+        for row in rows {
+            guard let id = row.process.uniqueID else { continue }
+            byUniqueID[id] = row
+            childrenByParent[row.parentUniqueID, default: []].append(row)
+        }
+        var refused: Set<UInt64> = [0, daemon]
+        var cursor = daemon
+        while let row = byUniqueID[cursor], !refused.contains(row.parentUniqueID) {
+            refused.insert(row.parentUniqueID)
+            cursor = row.parentUniqueID
+        }
+        var queue = Array(seeds.subtracting(refused))
+        var seen = refused.union(queue)
+        var found: [ProcessIdentity] = []
+        while let parent = queue.popLast() {
+            for child in childrenByParent[parent] ?? [] {
+                guard let id = child.process.uniqueID, !seen.contains(id) else { continue }
+                seen.insert(id)
+                found.append(child.process)
+                queue.append(id)
+            }
+        }
+        return found
+    }
+
+    /** `lineage` over the live process table, excluding any member of this
+        process's own session (the same refusal the session sweep makes). Reads
+        every process's unique ids, one `proc_pidinfo` each, which is why only
+        teardown runs it and the startup refreshes do not. Refuses outright
+        when this process's own unique id cannot be read, since the
+        refusals above cannot be proven without it. */
+    public static func lineageMembers(of seeds: Set<UInt64>) -> DescendantsResult {
+        guard !seeds.isEmpty, let daemon = ProcessUniqueIDs.read(of: getpid())?.process else {
+            return .ok([])
+        }
+        switch fetchProcessTable() {
+        case .failed(let errno):
+            return .failed(errno: errno)
+        case .ok(let table):
+            let rows = table.compactMap { row -> LineageRow? in
+                guard let ids = ProcessUniqueIDs.read(of: row.pid) else { return nil }
+                return LineageRow(parentUniqueID: ids.parent, process: row.identity(uniqueID: ids.process))
+            }
+            let daemonSession = getsid(getpid())
+            return .ok(
+                lineage(of: seeds, in: rows, daemon: daemon).filter { getsid($0.pid) != daemonSession })
         }
     }
 
@@ -188,11 +279,14 @@ public enum ProcessTree {
 
     /** Every way a live descendant of a run can be found, deduped by pid: the
         snapshot taken while the root still parented them, a fresh parent-chain
-        sweep, and the session members that kept the root's session after
-        setpgid/setsid took them out of the group. No single source is enough
-        (see the note on ServerSupervisor.startDescendantWatch), so both the
-        deliberate-stop and crash paths union all three and revalidate each pid
-        at signal time. A failed sweep contributes nothing rather than throwing.
+        sweep, the session members that kept the root's session after
+        setpgid/setsid took them out of the group, and the lineage walk from
+        `rootUniqueID` and every unique id the other three found, which reaches
+        a setsid child that reparented after the last snapshot refresh. No
+        single source is enough (see the note on
+        ServerSupervisor.startDescendantWatch), so both the deliberate-stop and
+        crash paths union all four and revalidate each pid at signal time. A
+        failed sweep contributes nothing rather than throwing.
 
         `priorSignaled` carries the identities an earlier pass already signaled,
         so an escalation pass can re-signal a descendant that answered that pass
@@ -202,7 +296,7 @@ public enum ProcessTree {
         younger than the last snapshot refresh. Revalidation still applies, so a
         recycled pid is never hit. */
     public static func liveDescendants(
-        rootPid: pid_t, sessionID: pid_t?, snapshot: [ProcessIdentity],
+        rootPid: pid_t, rootUniqueID: UInt64?, sessionID: pid_t?, snapshot: [ProcessIdentity],
         priorSignaled: [ProcessIdentity] = []
     ) -> [ProcessIdentity] {
         var byPid: [pid_t: ProcessIdentity] = [:]
@@ -214,12 +308,31 @@ public enum ProcessTree {
                 byPid[identity.pid] = identity
             }
         }
+        var seeds = Set(byPid.values.compactMap(\.uniqueID))
+        if let rootUniqueID { seeds.insert(rootUniqueID) }
+        for identity in lineageMembers(of: seeds).identities { byPid[identity.pid] = identity }
         return Array(byPid.values)
     }
 
+    /** A `kinfo_proc` reduced to what the sweeps read. The unique id is not
+        here: it costs a `proc_pidinfo` per process, so each sweep reads it only
+        for the rows it keeps (`identity`), except the lineage sweep, which
+        needs every row's. */
     private struct TableRow: Sendable {
         let parent: pid_t
-        let process: ProcessIdentity
+        let pid: pid_t
+        let startMicroseconds: suseconds_t
+        let startSeconds: time_t
+
+        func identity(uniqueID: UInt64?) -> ProcessIdentity {
+            ProcessIdentity(
+                pid: pid, startMicroseconds: startMicroseconds, startSeconds: startSeconds,
+                uniqueID: uniqueID)
+        }
+
+        var identity: ProcessIdentity {
+            identity(uniqueID: ProcessUniqueIDs.read(of: pid)?.process)
+        }
     }
 
     private enum TableResult {
@@ -244,7 +357,10 @@ public enum ProcessTree {
             if status == 0 {
                 let count = length / MemoryLayout<kinfo_proc>.stride
                 let rows = buffer.prefix(count).map { info in
-                    TableRow(parent: info.kp_eproc.e_ppid, process: ProcessIdentity(info))
+                    TableRow(
+                        parent: info.kp_eproc.e_ppid, pid: info.kp_proc.p_pid,
+                        startMicroseconds: info.kp_proc.p_starttime.tv_usec,
+                        startSeconds: info.kp_proc.p_starttime.tv_sec)
                 }
                 return .ok(rows)
             }
@@ -295,6 +411,6 @@ public enum ProcessTree {
         guard sysctl(&mib, 4, &info, &length, nil, 0) == 0, length >= MemoryLayout<kinfo_proc>.stride
         else { return nil }
         guard info.kp_proc.p_pid == pid else { return nil }
-        return ProcessIdentity(info)
+        return ProcessIdentity(info, uniqueID: ProcessUniqueIDs.read(of: pid)?.process)
     }
 }
