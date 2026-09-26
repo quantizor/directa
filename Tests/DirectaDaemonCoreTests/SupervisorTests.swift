@@ -853,6 +853,35 @@ private func makeEnv() throws -> TestEnv {
             "grandchild \(child) survived group teardown after adopt (state: \(processState(of: child)))")
         if !reaped { kill(child, SIGKILL) }
     }
+
+    /** A launchd job whose command exits instantly (a typo'd binary, a
+        config error caught before the server binds) used to skip `onSpawn`
+        on the `.died` and arm-fails-ESRCH paths, so the spool tailers never
+        started and the child's own stderr never reached the structured log
+        `logs`/`why` read. `onSpawn` now always runs before either path
+        returns, so `recordSpawn`'s tailers drain whatever the child already
+        wrote to its spool file even though it is already gone by the time
+        this daemon looks. */
+    @Test func launchdInstantExitOutputReachesTheStructuredLog() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "echo boom >&2; exit 7"], name: "web")
+        let supervisor = ServerSupervisor(
+            launcher: LaunchdJobLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        _ = await supervisor.start()
+        let status = try await waitForPhase(supervisor, .crashed)
+        #expect(status.phase == .crashed)
+        switch (status.lastExit?.code, status.lastExit?.signal) {
+        case (7, nil), (nil, nil): break
+        default: Issue.record("expected exit 7 or an unknown exit, got \(String(describing: status.lastExit))")
+        }
+        let spool = try String(
+            contentsOf: paths.structuredLogFile(project: env.projectPath, server: "web"),
+            encoding: .utf8)
+        #expect(spool.contains("boom"))
+    }
 }
 
 @Suite struct RegistryTests {

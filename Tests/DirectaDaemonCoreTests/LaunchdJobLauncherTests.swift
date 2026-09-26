@@ -93,14 +93,17 @@ struct LaunchdJobLauncherTests {
         instead, so `spawnFailed` never happens here. `exit 7` is fast enough
         that this daemon's own two `/bin/launchctl` round trips (bootstrap,
         then the poll that confirms the pid) measure single-digit
-        milliseconds each and consistently lose the race to launchd reaping
-        the job: the kernel has already discarded the exit status by the time
-        this daemon can register interest, so `NOTE_EXITSTATUS` (or the
-        registration itself) is refused and `.exitedStatusUnknown` is the
-        honest, measured result for this exact command, not the real code 7.
+        milliseconds each and land on either side of the race against launchd
+        reaping the job, measured directly (repeated runs on one machine hit
+        both `.leader` and `.died` roughly evenly): when the kernel has
+        already discarded the exit status, `NOTE_EXITSTATUS` (or the
+        registration itself, refused with ESRCH) is unavailable and
+        `.exitedStatusUnknown` is the honest result for this exact command;
+        when this daemon wins the race, the real code 7 comes through.
         A slower failure (a command doing real work before a nonzero exit,
-        `sleep 0.3; exit 3` above) still recovers the real code, since the
-        process is still alive when this daemon gets to register interest. */
+        `sleep 0.3; exit 3` above) always recovers the real code, since the
+        process is reliably still alive when this daemon gets to register
+        interest. */
     @Test func launchdJobReportsAnInstantExitAsExitedOrStatusUnknownNeverSpawnFailed() async throws {
         let (outFD, outURL) = try openSpool()
         let (errFD, errURL) = try openSpool()

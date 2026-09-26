@@ -71,38 +71,44 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                 refuse NOTE_EXITSTATUS even for a process that is very much
                 still alive, trading a rare lost exit code for a common one. */
             switch ExitWatcher.shared.arm(pid: pid) {
-            case .armed: break
-            case .failed(let error): return .spawnFailed(error)
+            case .armed:
+                await onSpawn(pid)
+                return await ExitWatcher.shared.wait(pid: pid)
+            case .failed(let error):
+                /** Measured on a real machine: a session leader that dies in
+                    the gap between confirming leadership and this arm call is
+                    already gone by the time the kernel processes the
+                    registration, and kevent refuses ESRCH for both a
+                    lingering zombie and an already-reaped pid, never
+                    distinguishing the two. Arming again could only match a
+                    *different*, recycled process reusing the pid number, so
+                    this reports the unrecoverable exit directly, the same
+                    treatment `.died` below gives it, rather than a
+                    manufactured spawnFailed. `onSpawn` still runs so the
+                    tailers drain whatever the child already wrote to its
+                    spool files before dying. */
+                guard error.errno == Int(ESRCH) else { return .spawnFailed(error) }
+                await onSpawn(pid)
+                return .exitedStatusUnknown
             }
-            await onSpawn(pid)
-            return await ExitWatcher.shared.wait(pid: pid)
         case .died:
             /** The process exited before it could confirm session leadership,
                 the shape of a command that does nothing but exit
                 (`/bin/sh -c "exit N"`) racing this daemon's own two
                 `/bin/launchctl` round trips (bootstrap, then the poll that
-                confirms the pid). Arming now, after the fact, still reports
-                the real exit if the kernel has not yet reaped the pid, or
-                `.exitedStatusUnknown` if it has (NOTE_EXITSTATUS is refused
-                for a pid the kernel has already reaped): either beats a
-                manufactured spawnFailed that would otherwise hide the exit
-                entirely. onSpawn is skipped, matching every other early-return
-                branch in this method. */
-            switch ExitWatcher.shared.arm(pid: pid) {
-            case .armed: break
-            case .failed(let error):
-                /** By the time this daemon gets to register interest, launchd
-                    can have already fully reaped the pid (not merely made
-                    NOTE_EXITSTATUS unavailable): the kernel then refuses the
-                    registration outright with ESRCH, since it has no record of
-                    the process left at all to watch. The exit is not in
-                    question, only its code, which is exactly what
-                    `.exitedStatusUnknown` means; every other registration
-                    failure is a genuine spawnFailed. */
-                if error.errno == Int(ESRCH) { return .exitedStatusUnknown }
-                return .spawnFailed(error)
-            }
-            return await ExitWatcher.shared.wait(pid: pid)
+                confirms the pid). Measured on a real machine: kevent
+                registration (`ExitWatcher.arm`) refuses ESRCH for both a
+                lingering zombie and an already-reaped pid, so arming here
+                could only ever succeed by matching a *different*, recycled
+                process that reused the pid number, never the one that just
+                died; this reports the unrecoverable exit directly rather than
+                risk watching the wrong process. `onSpawn` still runs so the
+                tailers drain whatever the child already wrote to its spool
+                files before dying: skipping it, as every other early-return
+                branch in this method does, would silence that output from
+                the structured log entirely. */
+            await onSpawn(pid)
+            return .exitedStatusUnknown
         case .timedOut:
             return .spawnFailed(
                 SpawnError(
