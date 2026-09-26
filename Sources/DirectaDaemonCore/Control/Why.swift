@@ -15,12 +15,14 @@ enum WhyEngine {
             (structured-log window since last exit or start). */
         evidenceLines: (String) -> [String],
         /** The most recent `stopped` event's detail for a server, or nil when
-            there is none. `ServerSupervisor` writes `"signal=N (external)"`
-            there for a graceful external signal (SIGTERM/SIGINT/SIGHUP) and a
-            plain reason clause (`"requested by stop"`, `"watch change in
-            …"`) for a directa-requested one; `describe` reads only whether
-            this contains "(external)", never the raw text, so a future reason
-            string is never mistaken for the external marker. */
+            there is none. `ServerSupervisor` writes `ExternalSignalDetail`'s
+            `"signal=N (external)"` shape there for a graceful external signal
+            (SIGTERM/SIGINT/SIGHUP) and a plain reason clause (`"requested by
+            stop"`, `"watch change in …"`) for a directa-requested one;
+            `describe` reads `ExternalSignalDetail.matches`, an exact anchored
+            check, never a bare `contains`, so a watch-change detail naming a
+            path that happens to contain the literal substring "(external)" is
+            never mistaken for the marker. */
         lastStopDetail: (String) -> String? = { _ in nil }
     ) -> WhyResult {
         var findings: [WhyFinding] = []
@@ -84,7 +86,7 @@ enum WhyEngine {
                 is the one worth naming instead of leaving `why` to read like
                 nothing happened. */
             if let signal = status.lastExit?.signal,
-                let detail = lastStopDetail(status.server), detail.contains("(external)")
+                let detail = lastStopDetail(status.server), ExternalSignalDetail.matches(detail)
             {
                 summary = "not running (stopped by signal \(signal) sent from outside directa)"
             } else {

@@ -662,7 +662,8 @@ public actor Router {
                     await bounceOrphan(identity, project: project, name: name)
                 } else if leftActive {
                     await events.post(
-                        kind: .crashed, project: project, server: name, detail: "daemon-restart")
+                        kind: .crashed, project: project, server: name,
+                        detail: DaemonRestartDetail.crashed)
                 }
                 try? await registry.updateState(serverID: id) { entry in
                     entry.lastExit = entry.lastExit ?? LastExit(at: Date())
@@ -805,7 +806,7 @@ public actor Router {
         }
         await events.post(
             kind: .crashed, project: project, server: name,
-            detail: "daemon-restart: orphan pid \(pid) bounced")
+            detail: DaemonRestartDetail.orphanBounced(pid: pid))
     }
 
     /** Removes a project's log directory once `serverUnregister` has dropped

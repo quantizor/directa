@@ -366,7 +366,7 @@ public actor ServerSupervisor {
         await logStore.append(stream: .sys, text: "adopted pid=\(childPid)")
         await events?.post(
             kind: .started, project: projectPath, server: spec.name,
-            detail: "adopted pid \(childPid) across daemon-restart")
+            detail: DaemonRestartDetail.adopted(pid: childPid))
         startHealthMonitor()
         startDescendantWatch()
         await registryUpdate(id: id) { entry in
@@ -1104,7 +1104,7 @@ public actor ServerSupervisor {
         if wasStopRequested {
             eventDetail = stopReason
         } else if let externalGracefulSignal {
-            eventDetail = "signal=\(externalGracefulSignal) (external)"
+            eventDetail = ExternalSignalDetail.format(signal: externalGracefulSignal)
         } else {
             eventDetail = cause
         }

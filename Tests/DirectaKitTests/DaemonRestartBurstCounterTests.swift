@@ -60,6 +60,20 @@ import Testing
         #expect(DaemonRestartBurstCounter.count(events: events, window: 86_400, now: now) == 0)
     }
 
+    /** A watch-change detail names an arbitrary project file path, which can
+        legitimately contain the literal substring "daemon-restart" as a
+        directory or file name. A bare `contains` used to count it as a
+        restart burst; the anchored `DaemonRestartDetail.matches` must not. */
+    @Test func aWatchChangeDetailContainingTheSubstringIsNotMisread() {
+        let now = Date()
+        let events = [
+            event(
+                now.addingTimeInterval(-10), detail: "watch change in configs/daemon-restart/app.json",
+                kind: .crashed)
+        ]
+        #expect(DaemonRestartBurstCounter.count(events: events, window: 86_400, now: now) == 0)
+    }
+
     @Test func unsortedInputIsStillClusteredCorrectly() {
         let now = Date()
         let base = now.addingTimeInterval(-3600)

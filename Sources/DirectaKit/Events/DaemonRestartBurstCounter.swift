@@ -10,9 +10,12 @@ public enum DaemonRestartBurstCounter {
     private static let clusterSeconds: TimeInterval = 5
 
     /** Counts daemon-restart bursts among `events` in the `window` seconds
-        before `now`. A daemon-restart event is any whose `detail` carries the
-        `daemon-restart` marker (`ControlServer`'s bounce and adopt paths both
-        stamp it, whichever server posted it); everything else is ignored.
+        before `now`. A daemon-restart event is any whose `detail` matches
+        `DaemonRestartDetail` (`ControlServer`'s bounce and adopt paths both
+        stamp one of its shapes, whichever server posted it), an exact
+        anchored check rather than a bare `contains`, so a watch-change detail
+        naming a path that happens to contain the literal substring
+        "daemon-restart" is never counted; everything else is ignored.
         Consecutive matches less than `clusterSeconds` apart collapse into one
         burst, since a restart that bounces or adopts several servers posts one
         event per server. */
@@ -20,7 +23,9 @@ public enum DaemonRestartBurstCounter {
         let cutoff = now.addingTimeInterval(-window)
         let restarts = events
             .filter { event in
-                guard let detail = event.detail, detail.contains("daemon-restart") else { return false }
+                guard let detail = event.detail, DaemonRestartDetail.matches(detail) else {
+                    return false
+                }
                 return event.at >= cutoff && event.at <= now
             }
             .sorted { $0.at < $1.at }

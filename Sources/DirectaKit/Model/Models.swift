@@ -518,11 +518,11 @@ public struct EventRecord: Codable, Equatable, Sendable {
 }
 
 /** Whether the menu bar should banner an event. Expected daemon bounce markers
-    (`daemon-restart`) are forensics for the feed, not user alerts. */
+    (`DaemonRestartDetail`) are forensics for the feed, not user alerts. */
 public enum CrashNotificationPolicy {
     public static func shouldNotify(kind: EventKind, detail: String?) -> Bool {
         guard kind == .crashed || kind == .failed else { return false }
-        if let detail, detail.hasPrefix("daemon-restart") { return false }
+        if let detail, DaemonRestartDetail.matches(detail) { return false }
         return true
     }
 }

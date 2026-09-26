@@ -432,6 +432,25 @@ private func tempDir() throws -> URL {
                 == "not running (stopped by signal 15 sent from outside directa)")
     }
 
+    /** A watch-change detail names an arbitrary project file path, which can
+        legitimately contain the literal substring "(external)" as a
+        directory or file name. A bare `contains` used to read that as the
+        external-signal marker; the anchored `ExternalSignalDetail.matches`
+        must not, so the summary stays the bare "stopped" a directa-requested
+        stop gets. */
+    @Test func aWatchChangeDetailContainingTheSubstringIsNotMisreadAsExternal() {
+        var stopped = status("web", .stopped, exit: 0)
+        stopped.lastExit = LastExit(
+            at: Date(timeIntervalSince1970: 1_700_000_000), signal: 15)
+        let result = WhyEngine.diagnose(
+            target: "web",
+            statuses: ["web": stopped],
+            specs: ["web": ServerSpec(command: ["w"], name: "web")],
+            evidenceLines: { _ in [] },
+            lastStopDetail: { $0 == "web" ? "watch change in configs/(external)/app.json" : nil })
+        #expect(result.findings.first?.summary == "not running (stopped)")
+    }
+
     @Test func prefersTerminalEvidenceWhenTailCleared() {
         var crashed = status("web", .crashed, exit: 0)
         crashed.terminalEvidence = ["[out] persisted REFUSAL-TOKEN"]
