@@ -117,6 +117,13 @@ guard flock(lockFD, LOCK_EX | LOCK_NB) == 0 else {
     exit(0)
 }
 
+/** Sweeps `.<name>.tmp-<pid>-<uuid>` leftovers from a prior ddirecta killed
+    between an `AtomicFile.write`'s temp write and its rename: nothing else
+    ever names that file, so it survives forever otherwise. Safe only here,
+    holding the single-instance lock, so a live writer's temp (a concurrent
+    `write` mid-flight) is never mistaken for one a dead process abandoned. */
+AtomicFile.sweepStaleTemps(in: paths.dataDir, isAlive: ProcessTree.isAlive)
+
 /** Raise the fd ceiling only when below the target: launchd jobs default to a
     256 soft limit, and a dozen servers plus log subscribers approaches it. Never
     lower an already-higher soft limit. */

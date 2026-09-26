@@ -195,6 +195,16 @@ public func parseServerID(_ id: String) -> (name: String, project: String)? {
     )
 }
 
+/** A step of `AtomicFile.write`'s temp + fsync + rename sequence that did not
+    hold: the write happened, but the durability or cleanup guarantee around it
+    did not. `message` names the exact call and path, the same posture as a wire
+    error. */
+public struct AtomicFileError: CustomStringConvertible, Error, Sendable {
+    public let message: String
+
+    public var description: String { message }
+}
+
 /** Atomic file persistence: temp + fsync + rename. Loads are defensive: a parse
     failure quarantines the file to `.corrupt-<timestamp>` and returns nil rather
     than crashing (a startup parse crash under launchd KeepAlive loops forever). */
@@ -210,11 +220,75 @@ public enum AtomicFile {
             path: ".\(url.lastPathComponent).tmp-\(getpid())-\(UUID().uuidString)")
         try data.write(to: tmp)
         let fd = open(tmp.path, O_WRONLY)
-        if fd >= 0 {
-            fsync(fd)
-            close(fd)
+        if fd < 0 {
+            let openErrno = errno
+            try? FileManager.default.removeItem(at: tmp)
+            throw AtomicFileError(
+                message: "cannot open \(tmp.path) to fsync it: \(String(cString: strerror(openErrno)))")
         }
-        _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+        let syncStatus = fsync(fd)
+        let syncErrno = errno
+        close(fd)
+        if syncStatus != 0 {
+            try? FileManager.default.removeItem(at: tmp)
+            throw AtomicFileError(
+                message: "fsync(\(tmp.path)) failed: \(String(cString: strerror(syncErrno)))")
+        }
+        do {
+            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+        } catch {
+            /** The temp file is only ever meaningful mid-write: once the rename
+                fails, nothing will ever pick it up, so a daemon killed right
+                here would otherwise leave it on disk forever (that leftover
+                class is exactly what `sweepStaleTemps` cleans up for an
+                earlier crash; this path prevents adding to the pile). */
+            try? FileManager.default.removeItem(at: tmp)
+            throw error
+        }
+        /** Durability covers the rename, not only the bytes: fsyncing `tmp`
+            guarantees its content survives a crash, but a crash before the
+            directory entry itself is flushed can still lose the rename and
+            leave the old file in place. fsyncing the parent directory after
+            the replace closes that window. */
+        let dirFD = open(dir.path, O_RDONLY)
+        if dirFD < 0 {
+            let openErrno = errno
+            throw AtomicFileError(
+                message: "cannot open \(dir.path) to fsync the rename: \(String(cString: strerror(openErrno)))")
+        }
+        let dirSyncStatus = fsync(dirFD)
+        let dirSyncErrno = errno
+        close(dirFD)
+        if dirSyncStatus != 0 {
+            throw AtomicFileError(
+                message: "fsync(\(dir.path)) failed: \(String(cString: strerror(dirSyncErrno)))")
+        }
+    }
+
+    /** Deletes a `write`-generated temp (`.<name>.tmp-<pid>-<uuid>`) whose pid is
+        no longer alive, and leaves everything else in `dir` untouched: a daemon
+        killed between the temp write and the rename leaves one behind forever,
+        since nothing else ever names it to clean it up, but a temp whose writer
+        is still running must never be touched mid-write. Non-throwing: a sweep
+        that could fail startup over a leftover file would trade a cosmetic mess
+        for the exact crash-loop the defensive-load rule exists to prevent. */
+    public static func sweepStaleTemps(in dir: URL, isAlive: (Int) -> Bool) {
+        guard
+            let entries = try? FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: nil)
+        else { return }
+        for entry in entries {
+            guard let pid = tempFilePid(entry.lastPathComponent), !isAlive(pid) else { continue }
+            try? FileManager.default.removeItem(at: entry)
+        }
+    }
+
+    /** The pid embedded in a `write`-generated temp name, anchored to the exact
+        suffix `write` appends, or nil for anything else in the directory (a real
+        store, an unrelated dotfile, a `.corrupt-<timestamp>` quarantine). */
+    static func tempFilePid(_ filename: String) -> Int? {
+        guard let match = filename.firstMatch(of: /\.tmp-(\d+)-[0-9A-Fa-f-]+$/) else { return nil }
+        return Int(match.1)
     }
 
     /** Loads a persisted store, distinguishing three outcomes a single nil used

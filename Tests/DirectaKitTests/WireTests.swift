@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 
@@ -396,5 +397,66 @@ import Testing
             .filter { $0.hasPrefix(".agent.path.tmp-") }
         #expect(leftovers.isEmpty)
         try? FileManager.default.removeItem(at: dir)
+    }
+
+    /** A rename that fails (here, a destination `chflags`'d immutable, which
+        macOS refuses to replace) must not leave the temp file behind: nothing
+        else ever names it, so a leftover here sits in the state directory
+        forever, the same class of leak `sweepStaleTemps` exists to clean up
+        for an earlier crash rather than a failed replace. */
+    @Test func failedReplaceLeavesNoTempBehind() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appending(path: "state.json")
+        try Data("{}".utf8).write(to: file)
+        #expect(chflags(file.path, UInt32(UF_IMMUTABLE)) == 0)
+        defer {
+            _ = chflags(file.path, 0)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        #expect(throws: (any Error).self) {
+            try AtomicFile.write(Data("{\"value\":1}".utf8), to: file)
+        }
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.contains(".tmp-") }
+        #expect(leftovers.isEmpty)
+    }
+
+    /** The boot-time sweep removes a temp whose writer already died and leaves
+        alone one whose writer (this test process) is still running: the same
+        distinction that keeps the sweep from ever touching a concurrent
+        `write` mid-flight under a live daemon. */
+    @Test func sweepRemovesADeadPidTempAndKeepsALivePidTemp() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let deadProcess = Process()
+        deadProcess.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try deadProcess.run()
+        deadProcess.waitUntilExit()
+        let deadTemp = dir.appending(
+            path: ".registry.json.tmp-\(deadProcess.processIdentifier)-\(UUID().uuidString)")
+        let liveTemp = dir.appending(path: ".registry.json.tmp-\(getpid())-\(UUID().uuidString)")
+        try Data().write(to: deadTemp)
+        try Data().write(to: liveTemp)
+
+        AtomicFile.sweepStaleTemps(in: dir) { pid in
+            guard let narrow = pid_t(exactly: pid) else { return false }
+            return kill(narrow, 0) == 0
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: deadTemp.path))
+        #expect(FileManager.default.fileExists(atPath: liveTemp.path))
+    }
+
+    /** `tempFilePid` is the seam `sweepStaleTemps` trusts to tell a `write`
+        temp from anything else in the state directory; a bare `.corrupt-`
+        quarantine file or an unrelated dotfile must never parse as one. */
+    @Test func tempFilePidParsesOnlyTheWriteGeneratedShape() {
+        #expect(AtomicFile.tempFilePid(".registry.json.tmp-4242-\(UUID().uuidString)") == 4242)
+        #expect(AtomicFile.tempFilePid("registry.json") == nil)
+        #expect(AtomicFile.tempFilePid("registry.json.corrupt-2025-07-18T19-46-40.000Z") == nil)
+        #expect(AtomicFile.tempFilePid(".registry.json.tmp-not-a-pid-abc") == nil)
     }
 }
