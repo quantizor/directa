@@ -18,7 +18,7 @@ build:
 # debugger. Best-effort by design (macOS system dirs are unreadable and make
 # find exit 1), so a failed sweep never fails a test run.
 sweep-test-temp:
-	@find "$$(getconf DARWIN_USER_TEMP_DIR)" -depth 1 -name 'directa-*' -type d -mtime +0 -exec rm -rf {} + 2>/dev/null || true
+	@find "$$(getconf DARWIN_USER_TEMP_DIR)" -mindepth 1 -maxdepth 1 -name 'directa-*' -type d -mtime +0 -exec rm -rf {} + 2>/dev/null || true
 
 test: sweep-test-temp
 	swift test
