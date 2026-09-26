@@ -5,6 +5,9 @@ import Foundation
     chunk at a time rather than the file. */
 final class LogFileReader {
     private let descriptor: Int32
+    /** The file's inode number: its identity across a rotation's rename,
+        which is what a cursor's position names. */
+    let inode: UInt64
     private let onDiskRead: (@Sendable (Int) -> Void)?
     let size: Int
 
@@ -17,6 +20,7 @@ final class LogFileReader {
             return nil
         }
         self.descriptor = descriptor
+        self.inode = UInt64(info.st_ino)
         self.onDiskRead = onDiskRead
         self.size = Int(info.st_size)
     }
@@ -90,6 +94,51 @@ final class LogFileReader {
         return going
     }
 
+    /** Calls `body` with every non-empty line before `end`, newest first,
+        with its byte offset, until `body` answers false; a line cut by `end`
+        counts as a line, as a final unterminated one does going forward.
+        Lines are read in fixed chunks from the end, so memory holds one
+        chunk plus the longest line however far back the walk goes. Returns
+        false when `body` stopped the walk. */
+    @discardableResult
+    func forEachLineBackward(
+        before end: Int, chunkBytes: Int = LogScan.backwardChunkBytes,
+        _ body: (UnsafeBufferPointer<UInt8>, Int) -> Bool
+    ) -> Bool {
+        var chunkStart = min(end, size)
+        /** Bytes from `chunkStart` on that belong to a line whose start has
+            not been read yet. */
+        var pending: [UInt8] = []
+        while chunkStart > 0 {
+            let readStart = max(0, chunkStart - max(1, chunkBytes))
+            let chunk = read(at: readStart, count: chunkStart - readStart)
+            guard chunk.count == chunkStart - readStart else { return true }
+            chunkStart = readStart
+            var buffer = chunk
+            buffer.append(contentsOf: pending)
+            var going = true
+            var keep = 0
+            buffer.withUnsafeBufferPointer { bytes in
+                var lineEnd = bytes.count
+                var index = bytes.count - 1
+                while going, index >= 0 {
+                    if bytes[index] == LogScan.newline {
+                        if lineEnd > index + 1 {
+                            going = body(UnsafeBufferPointer(rebasing: bytes[(index + 1)..<lineEnd]), readStart + index + 1)
+                        }
+                        lineEnd = index
+                    }
+                    index -= 1
+                }
+                keep = lineEnd
+            }
+            guard going else { return false }
+            pending = Array(buffer[..<keep])
+        }
+        guard !pending.isEmpty else { return true }
+        return pending.withUnsafeBufferPointer { body($0, 0) }
+    }
+
     /** Where the line holding the byte before `offset` begins: just past the
         nearest newline before `offset`, or 0. */
     func lineStart(atOrBefore offset: Int) -> Int {
@@ -139,6 +188,7 @@ final class LogFileReader {
     file under a lower bound (per-file monotonic timestamps make every later
     line pass), and the records a cursor skips. */
 enum LogScan {
+    static let backwardChunkBytes = 64 * 1024
     static let chunkBytes = 256 * 1024
     static let newline: UInt8 = 0x0A
     static let tab: UInt8 = 0x09
@@ -148,33 +198,68 @@ enum LogScan {
     private static let maxGapBytes = 4096
     private static let maxRunBytes = 1024 * 1024
 
+    /** What the scan keeps of the lines that pass every filter: the trim
+        the options ask for, or only the first and last (a summary needs the
+        count, which totals already carry, and two timestamps). */
+    enum Retention {
+        case firstAndLast
+        case trim
+    }
+
+    /** The newest record of a family: its millisecond, how many records in
+        a row carry it, and where its line ends. */
+    struct Newest {
+        var count: Int
+        var end: Int
+        var file: Int
+        var ms: Int64
+    }
+
+    /** Where a scan past a cursor with a usable position picked up, and the
+        cursor's own millisecond and count for the records behind it. */
+    struct Resume {
+        var count: Int
+        var file: Int
+        var ms: Int64
+        var offset: Int
+    }
+
     static func scan(
-        files: [URL], options: LogQueryOptions, grep: Regex<AnyRegexOutput>?,
+        files: [URL], options: LogQueryOptions, grep: Regex<AnyRegexOutput>?, retention: Retention = .trim,
         onDiskRead: (@Sendable (Int) -> Void)?
-    ) -> (lines: [LogRecord], totals: LogStreamCounts) {
+    ) -> (lines: [LogRecord], readers: [LogFileReader?], resume: Resume?, totals: LogStreamCounts) {
         let cursorMs = options.after.map { milliseconds(of: $0.at) }
         let boundMs = cursorMs ?? options.since.map(ceilingMilliseconds)
         var skipRemaining = max(0, options.after?.count ?? 0)
-        var collector = Collector(options: options)
+        var collector = Collector(options: options, retention: retention)
         var totals = LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0)
-        var readers: [LogFileReader?] = Array(repeating: nil, count: files.count)
+        let readers = files.map { LogFileReader(url: $0, onDiskRead: onDiskRead) }
+        let resume = options.after.flatMap { after in
+            after.position.flatMap { resumePoint($0, after: after, readers: readers) }
+        }
+        if resume != nil { skipRemaining = 0 }
         var sequence = 0
         /** A head that reports no totals has its whole answer once it holds
             its lines; reading on would only count what nobody asked for. */
         let stopsWhenFull = !options.reportsTotals
         for (fileIndex, url) in files.enumerated() {
             if stopsWhenFull, collector.headIsFull { break }
-            /** Whole-file skip: a file whose last line predates the bound
-                cannot contribute. */
-            if let boundMs, let last = LogQuery.lastLineTimestamp(of: url), milliseconds(of: last) < boundMs {
-                continue
+            guard let reader = readers[fileIndex], reader.size > 0 else { continue }
+            let start: Int
+            var passedBound: Bool
+            if let resume {
+                guard fileIndex >= resume.file else { continue }
+                start = fileIndex == resume.file ? resume.offset : 0
+                passedBound = true
+            } else {
+                /** Whole-file skip: a file whose last line predates the bound
+                    cannot contribute. */
+                if let boundMs, let last = LogQuery.lastLineTimestamp(of: url), milliseconds(of: last) < boundMs {
+                    continue
+                }
+                start = boundMs.map { firstLineStart(atOrAfter: $0, in: reader) } ?? 0
+                passedBound = boundMs == nil
             }
-            guard let reader = LogFileReader(url: url, onDiskRead: onDiskRead), reader.size > 0 else {
-                continue
-            }
-            readers[fileIndex] = reader
-            let start = boundMs.map { firstLineStart(atOrAfter: $0, in: reader) } ?? 0
-            var passedBound = boundMs == nil
             let finished = !reader.forEachLine(from: start) { line, offset in
                 guard let shape = LineShape(line) else { return true }
                 if !passedBound || skipRemaining > 0 {
@@ -206,7 +291,61 @@ enum LogScan {
             }
             if finished { break }
         }
-        return (readBack(collector.ordered(), readers: readers), totals)
+        return (readBack(collector.ordered(), readers: readers), readers, resume, totals)
+    }
+
+    /** Where a cursor's position lets a scan resume, or nil when it names
+        no file in this family or no record ending there stamped with the
+        cursor's millisecond (a file rotated out of the family, or a
+        position a caller made up), in which case the count applies. */
+    static func resumePoint(_ position: LogFilePosition, after: LogCursor, readers: [LogFileReader?]) -> Resume? {
+        let cursorMs = milliseconds(of: after.at)
+        guard let file = readers.firstIndex(where: { $0?.inode == position.file }), let reader = readers[file],
+            position.offset > 0, position.offset <= reader.size,
+            position.offset == reader.size || reader.byte(at: position.offset) == newline
+        else { return nil }
+        let start = reader.lineStart(atOrBefore: position.offset)
+        let line = reader.read(at: start, count: position.offset - start)
+        guard line.withUnsafeBufferPointer({ recordMilliseconds($0) }) == cursorMs else { return nil }
+        return Resume(count: max(0, after.count), file: file, ms: cursorMs, offset: position.offset)
+    }
+
+    /** The newest record of the family, and how many records in a row
+        carry its millisecond, counted backward in fixed chunks across files
+        (one millisecond's records can straddle a rotation). Nil for a family
+        with no records. A resumed scan stops the count at its resume point
+        and takes the cursor's own count for the records behind it, so a
+        poll after a clock step (which pins every later record to one
+        millisecond) reads back only what arrived since the last one, not
+        the whole millisecond. */
+    static func newestGroup(readers: [LogFileReader?], resume: Resume?) -> Newest? {
+        var newest: Newest?
+        for (file, reader) in readers.enumerated().reversed() {
+            guard let reader else { continue }
+            if let resume, file < resume.file { break }
+            let floor = resume.flatMap { file == $0.file ? $0.offset : nil } ?? 0
+            let stopped = !reader.forEachLineBackward(before: reader.size) { line, offset in
+                guard offset >= floor else { return false }
+                guard let ms = recordMilliseconds(line) else { return true }
+                guard let current = newest else {
+                    newest = Newest(count: 1, end: offset + line.count, file: file, ms: ms)
+                    return true
+                }
+                guard current.ms == ms else { return false }
+                newest?.count += 1
+                return true
+            }
+            if stopped { break }
+        }
+        guard let resume else { return newest }
+        guard let found = newest else {
+            return Newest(count: resume.count, end: resume.offset, file: resume.file, ms: resume.ms)
+        }
+        /** Timestamps never fall within a family and the record behind the
+            resume point carries the cursor's millisecond, so a newest group
+            in that same millisecond runs unbroken back to the resume point. */
+        guard found.ms == resume.ms else { return found }
+        return Newest(count: found.count + resume.count, end: found.end, file: found.file, ms: found.ms)
     }
 
     /** Port of the in-memory search this file family always used, over byte
@@ -233,18 +372,6 @@ enum LogScan {
             }
         }
         return reader.lineStart(atOrBefore: min(low, reader.size))
-    }
-
-    /** Non-empty line ranges in `bytes`, a final unterminated line included. */
-    static func lineRanges(in bytes: [UInt8]) -> [Range<Int>] {
-        var ranges: [Range<Int>] = []
-        var start = 0
-        for (index, byte) in bytes.enumerated() where byte == newline {
-            if index > start { ranges.append(start..<index) }
-            start = index + 1
-        }
-        if start < bytes.count { ranges.append(start..<bytes.count) }
-        return ranges
     }
 
     /** A line's timestamp in milliseconds when it is a well-formed record
@@ -364,8 +491,10 @@ enum LogScan {
         return records
     }
 
-    private static func record(from line: UnsafeBufferPointer<UInt8>) -> LogRecord? {
-        guard let shape = LineShape(line),
+    /** The record a line holds, or nil when it is not one or its stream is
+        outside `streams` (checked before the payload is decoded). */
+    static func record(from line: UnsafeBufferPointer<UInt8>, streams: Set<LogStream>? = nil) -> LogRecord? {
+        guard let shape = LineShape(line), streams?.contains(shape.stream) ?? true,
             let ms = epochMilliseconds(UnsafeBufferPointer(rebasing: line[..<shape.firstTab]))
         else { return nil }
         let text = String(decoding: UnsafeBufferPointer(rebasing: line[(shape.secondTab + 1)...]), as: UTF8.self)
@@ -442,14 +571,18 @@ private struct LineRing {
 
 /** The trim a query asked for, applied as lines match. */
 private struct Collector {
+    private var first: Retained?
     private var headItems: [Retained] = []
     private let headLimit: Int?
+    private var last: Retained?
     private let perStream: Bool
+    private let retention: LogScan.Retention
     /** One ring per stream under `tailByStream`, else one ring for all. */
     private var rings: [LineRing]
 
-    init(options: LogQueryOptions) {
-        headLimit = options.head.map { max(0, $0) }
+    init(options: LogQueryOptions, retention: LogScan.Retention) {
+        self.retention = retention
+        headLimit = retention == .trim ? options.head.map { max(0, $0) } : nil
         if let byStream = options.tailByStream {
             perStream = true
             rings = LogStream.allCases.map { LineRing(capacity: byStream[$0]) }
@@ -466,6 +599,11 @@ private struct Collector {
     }
 
     mutating func add(_ item: Retained, stream: LogStream) {
+        if retention == .firstAndLast {
+            if first == nil { first = item }
+            last = item
+            return
+        }
         if let headLimit {
             if headItems.count < headLimit { headItems.append(item) }
             return
@@ -484,6 +622,10 @@ private struct Collector {
     }
 
     func ordered() -> [Retained] {
+        if retention == .firstAndLast {
+            guard let first, let last else { return [] }
+            return first.sequence == last.sequence ? [first] : [first, last]
+        }
         if headLimit != nil { return headItems }
         guard perStream else { return rings[0].ordered() }
         return rings.flatMap { $0.ordered() }.sorted { $0.sequence < $1.sequence }

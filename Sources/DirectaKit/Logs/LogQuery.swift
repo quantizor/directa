@@ -174,16 +174,20 @@ public enum LogQuery {
         (current.log is append-only across spawns), and drives the same file-skip
         and binary search `run` uses, so it does not scan a long history. */
     public static func summarize(current: URL, streams: Set<LogStream>, since: Date?) -> ErrorSummary? {
-        var count = 0
-        var first: Date?
-        var last: Date?
-        for record in run(current: current, options: LogQueryOptions(since: since, streams: streams)) {
-            count += 1
-            if first == nil { first = record.at }
-            last = record.at
-        }
-        guard count > 0, let first, let last else { return nil }
-        return ErrorSummary(count: count, firstAt: first, lastAt: last)
+        summarizeMeasured(current: current, streams: streams, since: since, onDiskRead: nil)
+    }
+
+    /** Keeps only the first and last match, so memory stays flat however
+        many records match. */
+    static func summarizeMeasured(
+        current: URL, streams: Set<LogStream>, since: Date?, onDiskRead: (@Sendable (Int) -> Void)?
+    ) -> ErrorSummary? {
+        let scanned = LogScan.scan(
+            files: familyFiles(current: current), options: LogQueryOptions(since: since, streams: streams),
+            grep: nil, retention: .firstAndLast, onDiskRead: onDiskRead)
+        let count = LogStream.allCases.reduce(0) { $0 + (scanned.totals[$1] ?? 0) }
+        guard count > 0, let first = scanned.lines.first, let last = scanned.lines.last else { return nil }
+        return ErrorSummary(count: count, firstAt: first.at, lastAt: last.at)
     }
 
     public static func run(current: URL, options: LogQueryOptions) -> [LogRecord] {
@@ -196,13 +200,27 @@ public enum LogQuery {
         windowMeasured(current: current, options: options, onDiskRead: nil)
     }
 
+    /** A cursor carries a position once its millisecond holds this many
+        records. Below it, counting through them again on the next poll
+        costs one small read, and a count-only cursor keeps the wire
+        answer in its older shape. */
+    static let positionThreshold = 1024
+
     static func windowMeasured(
-        current: URL, options: LogQueryOptions, onDiskRead: (@Sendable (Int) -> Void)?
+        current: URL, options: LogQueryOptions, positionThreshold: Int = positionThreshold,
+        onDiskRead: (@Sendable (Int) -> Void)?
     ) -> LogWindow {
         let files = familyFiles(current: current)
-        let (lines, totals) = collect(files: files, options: options, onDiskRead: onDiskRead)
-        return LogWindow(
-            cursor: endCursor(files: files, onDiskRead: onDiskRead), lines: lines, totals: totals)
+        let collected = collect(files: files, options: options, onDiskRead: onDiskRead)
+        let readers = collected.readers ?? files.map { LogFileReader(url: $0, onDiskRead: onDiskRead) }
+        let newest = LogScan.newestGroup(readers: readers, resume: collected.resume)
+        let cursor = newest.map { newest in
+            LogCursor(
+                at: LogScan.date(milliseconds: newest.ms), count: newest.count,
+                position: newest.count >= positionThreshold
+                    ? readers[newest.file].map { LogFilePosition(file: $0.inode, offset: newest.end) } : nil)
+        }
+        return LogWindow(cursor: cursor ?? .origin, lines: collected.lines, totals: collected.totals)
     }
 
     /** Same as `run`, but also reports the byte size of every disk read to
@@ -221,9 +239,11 @@ public enum LogQuery {
         collect(files: familyFiles(current: current), options: options, onDiskRead: onDiskRead).lines
     }
 
+    /** The answer, plus, when a forward scan ran, the readers it opened and
+        where a cursor's position let it resume. */
     private static func collect(
         files: [URL], options: LogQueryOptions, onDiskRead: (@Sendable (Int) -> Void)?
-    ) -> (lines: [LogRecord], totals: LogStreamCounts?) {
+    ) -> (lines: [LogRecord], readers: [LogFileReader?]?, resume: LogScan.Resume?, totals: LogStreamCounts?) {
         /** A tail with no grep and no lower bound is answerable from the end
             of the family backward, without reading older files a caller never
             asked to see: `directa logs <name> --tail 50` must not read a whole
@@ -234,7 +254,7 @@ public enum LogQuery {
             options.grep == nil, options.head == nil, options.tailByStream == nil
         {
             let lines = tailOnly(files: files, tail: tail, streams: options.streams, onDiskRead: onDiskRead)
-            return (truncated(lines, to: options.maxLineCharacters), nil)
+            return (truncated(lines, to: options.maxLineCharacters), nil, nil, nil)
         }
         /** A pattern that will not compile filters nothing out, so it would
             answer with the whole log. Fail closed and say so instead: callers
@@ -243,65 +263,15 @@ public enum LogQuery {
         if let pattern = options.grep {
             guard let compiled = try? Regex(pattern) else {
                 DirectaLog.daemon.error("log query grep pattern does not compile: \(pattern)")
-                return ([], options.reportsTotals ? LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0) : nil)
+                return ([], nil, nil, options.reportsTotals ? LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0) : nil)
             }
             grep = compiled
         }
         let scanned = LogScan.scan(files: files, options: options, grep: grep, onDiskRead: onDiskRead)
         return (
-            truncated(scanned.lines, to: options.maxLineCharacters),
+            truncated(scanned.lines, to: options.maxLineCharacters), scanned.readers, scanned.resume,
             options.reportsTotals ? scanned.totals : nil
         )
-    }
-
-    /** The family's end position: the newest record's millisecond and how
-        many records carry it, counted backward across files because one
-        millisecond's records can straddle a rotation. A family with no
-        records answers `LogCursor.origin`. */
-    static func endCursor(files: [URL], onDiskRead: (@Sendable (Int) -> Void)?) -> LogCursor {
-        var groupMs: Int64?
-        var count = 0
-        for url in files.reversed() {
-            guard let reader = LogFileReader(url: url, onDiskRead: onDiskRead), reader.size > 0 else {
-                continue
-            }
-            var window = 64 * 1024
-            while true {
-                let start = max(0, reader.size - window)
-                let clean = start == 0 || reader.byte(at: start - 1) == LogScan.newline
-                let bytes = reader.read(at: start, count: reader.size - start)
-                var lines = LogScan.lineRanges(in: bytes)
-                /** A window edge inside a line leaves only its tail; the next
-                    wider window reads it whole. */
-                if !clean, !lines.isEmpty { lines.removeFirst() }
-                var windowGroup = groupMs
-                var windowCount = 0
-                var closed = false
-                bytes.withUnsafeBufferPointer { buffer in
-                    for range in lines.reversed() {
-                        let line = UnsafeBufferPointer(rebasing: buffer[range])
-                        guard let ms = LogScan.recordMilliseconds(line) else { continue }
-                        if windowGroup == nil { windowGroup = ms }
-                        guard ms == windowGroup else {
-                            closed = true
-                            break
-                        }
-                        windowCount += 1
-                    }
-                }
-                if closed || start == 0 {
-                    groupMs = windowGroup
-                    count += windowCount
-                    if closed, let groupMs {
-                        return LogCursor(at: LogScan.date(milliseconds: groupMs), count: count)
-                    }
-                    break
-                }
-                window *= 2
-            }
-        }
-        guard let groupMs else { return .origin }
-        return LogCursor(at: LogScan.date(milliseconds: groupMs), count: count)
     }
 
     /** Cuts each text to `limit` characters, the last being `…`. */
@@ -337,55 +307,23 @@ public enum LogQuery {
         return collected
     }
 
-    /** Up to `needed` records off the end of one file, oldest-first. Reads a
-        doubling window from the end (64 KB, 128 KB, ...) so a file far larger
-        than the requested tail is never read past the bytes that satisfy it;
-        the window only grows past `needed` lines when a `streams` filter
-        thins the tail out. Growth is geometric, so total bytes read stay
-        within roughly twice whatever window finally satisfied the request. */
+    /** Up to `needed` records off the end of one file, oldest-first, read
+        backward in fixed chunks: a file far larger than the requested tail
+        is never read past the bytes that satisfy it, and a `streams` filter
+        that thins the tail out walks further back without holding more than
+        a chunk. */
     private static func tailRecords(
         of url: URL, needed: Int, streams: Set<LogStream>?,
         onDiskRead: (@Sendable (Int) -> Void)?
     ) -> [LogRecord] {
-        guard needed > 0, let handle = try? FileHandle(forReadingFrom: url) else { return [] }
-        defer { try? handle.close() }
-        guard let size = try? handle.seekToEnd(), size > 0 else { return [] }
-        var window: UInt64 = 64 * 1024
-        while true {
-            let start = size > window ? size - window : 0
-            let clean = start == 0 || startsAtLineBoundary(start, handle: handle)
-            guard (try? handle.seek(toOffset: start)) != nil, let data = try? handle.readToEnd()
-            else { return [] }
-            onDiskRead?(data.count)
-            var lines = Array(String(decoding: data, as: UTF8.self).split(
-                separator: "\n", omittingEmptySubsequences: true))
-            /** A window boundary that does not land on a newline cuts a line in
-                half; the half inside this window is missing its earlier bytes
-                and must not be parsed, or a partial line would masquerade as a
-                real (and wrong) record. The next-older window recovers it whole. */
-            if !clean, !lines.isEmpty { lines.removeFirst() }
-            var matched: [LogRecord] = []
-            for line in lines.reversed() {
-                guard let record = LogRecord.parse(line) else { continue }
-                if let streams, !streams.contains(record.stream) { continue }
-                matched.append(record)
-                if matched.count == needed { break }
-            }
-            if matched.count >= needed || start == 0 {
-                return matched.reversed()
-            }
-            window *= 2
+        guard needed > 0, let reader = LogFileReader(url: url, onDiskRead: onDiskRead) else { return [] }
+        var matched: [LogRecord] = []
+        reader.forEachLineBackward(before: reader.size) { line, _ in
+            guard let record = LogScan.record(from: line, streams: streams) else { return true }
+            matched.append(record)
+            return matched.count < needed
         }
-    }
-
-    /** True when the byte immediately before `offset` is a newline, i.e.
-        `offset` itself opens a new line rather than landing mid-line. */
-    private static func startsAtLineBoundary(_ offset: UInt64, handle: FileHandle) -> Bool {
-        guard offset > 0 else { return true }
-        guard (try? handle.seek(toOffset: offset - 1)) != nil,
-            let byte = try? handle.read(upToCount: 1), byte.first == 0x0A
-        else { return false }
-        return true
+        return matched.reversed()
     }
 
     /** Timestamp of a mark record whose payload starts with `<id>\t`. */

@@ -617,6 +617,258 @@ import os
         }
     }
 
+    /** The backward walk hands back exactly the lines a forward split
+        finds, newest first with the same offsets, at every chunk size down
+        to one byte: a line or a multi-byte character cut by a chunk edge is
+        reassembled, empty lines are skipped, and an unterminated last line
+        counts. */
+    @Test func aBackwardWalkMatchesAForwardSplitAtEveryChunkSize() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-logq-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appending(path: "current.log")
+        let bytes = Array("first é line\n\nsecond 👩‍👩‍👧‍👦 line\nü\n\n\nthird, unterminated ☃".utf8)
+        try Data(bytes).write(to: url)
+        var expected: [(String, Int)] = []
+        var start = 0
+        for (index, byte) in bytes.enumerated() where byte == 0x0A {
+            if index > start { expected.append((String(decoding: bytes[start..<index], as: UTF8.self), start)) }
+            start = index + 1
+        }
+        expected.append((String(decoding: bytes[start...], as: UTF8.self), start))
+        let reader = try #require(LogFileReader(url: url, onDiskRead: nil))
+        for chunk in [1, 2, 3, 5, 7, 16, 64 * 1024] {
+            var got: [(String, Int)] = []
+            let finished = reader.forEachLineBackward(before: reader.size, chunkBytes: chunk) { line, offset in
+                got.append((String(decoding: line, as: UTF8.self), offset))
+                return true
+            }
+            #expect(finished, "chunk \(chunk)")
+            #expect(got.reversed().map(\.0) == expected.map(\.0), "chunk \(chunk)")
+            #expect(got.reversed().map(\.1) == expected.map(\.1), "chunk \(chunk)")
+            var stoppedAfter: [String] = []
+            let stopped = !reader.forEachLineBackward(before: reader.size, chunkBytes: chunk) { line, _ in
+                stoppedAfter.append(String(decoding: line, as: UTF8.self))
+                return stoppedAfter.count < 2
+            }
+            #expect(stopped, "chunk \(chunk)")
+            #expect(stoppedAfter == ["third, unterminated ☃", "ü"], "chunk \(chunk)")
+        }
+    }
+
+    /** A tail whose stream filter thins the file out walks back past many
+        chunk edges, some of them splitting a multi-byte character, and must
+        answer exactly what parsing the whole file would, in reads no larger
+        than one chunk. */
+    @Test func aSparseStreamTailMatchesAWholeFileReadInChunkSizedReads() throws {
+        var records: [LogRecord] = []
+        for index in 0..<6_000 {
+            let text = "req \(index) " + String(repeating: index % 3 == 0 ? "é" : "ü👍", count: index % 11) + " done"
+            records.append(stamped(index / 4, index % 37 == 0 ? .err : .out, text))
+        }
+        let chunk = LogScan.backwardChunkBytes
+        /** A last line of the right length puts a chunk edge, counted back
+            from the end, inside a multi-byte character: the hard case. */
+        func splitsACharacter(_ bytes: [UInt8]) -> Bool {
+            stride(from: bytes.count - chunk, to: 0, by: -chunk).contains { bytes[$0] & 0xC0 == 0x80 }
+        }
+        var padding = 0
+        var current = try writeFamily([records])
+        while !splitsACharacter(try Array(Data(contentsOf: current))), padding < 16 {
+            try? FileManager.default.removeItem(at: current.deletingLastPathComponent())
+            padding += 1
+            current = try writeFamily([records + [stamped(9_999, .out, String(repeating: "x", count: padding))]])
+        }
+        defer { try? FileManager.default.removeItem(at: current.deletingLastPathComponent()) }
+        let bytes = try Array(Data(contentsOf: current))
+        #expect(bytes.count > 4 * chunk)
+        #expect(splitsACharacter(bytes))
+        let wholeFile = String(decoding: bytes, as: UTF8.self)
+            .split(separator: "\n", omittingEmptySubsequences: true).compactMap(LogRecord.parse)
+        for (streams, tail) in [([LogStream.err], 1), ([.err], 50), ([.err], 10_000), ([.mark], 5), ([.out, .err], 7)] {
+            let reads = OSAllocatedUnfairLock<[Int]>(initialState: [])
+            let got = LogQuery.runMeasured(
+                current: current, options: LogQueryOptions(streams: Set(streams), tail: tail),
+                onDiskRead: { count in reads.withLock { $0.append(count) } })
+            let expected = wholeFile.filter { streams.contains($0.stream) }.suffix(tail)
+            #expect(got == Array(expected), "streams \(streams) tail \(tail)")
+            #expect((reads.withLock { $0 }.max() ?? 0) <= chunk, "streams \(streams) tail \(tail)")
+        }
+    }
+
+    /** A summary keeps two records, not every match: over a family where
+        half the lines match, it reads the family once and reads back only
+        the first and last match. */
+    @Test func summarizeReadsTheFamilyOnceAndKeepsTwoRecords() throws {
+        let files = (0..<2).map { file in
+            (0..<8_000).map { index in
+                stamped(file * 8_000 + index, index % 2 == 0 ? .err : .out, "line \(file * 8_000 + index) padding-padding")
+            }
+        }
+        let current = try writeFamily(files)
+        defer { try? FileManager.default.removeItem(at: current.deletingLastPathComponent()) }
+        let familyBytes = try LogQuery.familyFiles(current: current)
+            .map { try FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int ?? 0 }
+            .reduce(0, +)
+        let read = OSAllocatedUnfairLock<Int>(initialState: 0)
+        let summary = LogQuery.summarizeMeasured(
+            current: current, streams: [.err], since: nil, onDiskRead: { count in read.withLock { $0 += count } })
+        #expect(summary == ErrorSummary(count: 8_000, firstAt: stamped(0, .err, "").at, lastAt: stamped(15_998, .err, "").at))
+        #expect(read.withLock { $0 } < familyBytes + 64 * 1024)
+    }
+
+    /** After a large backward clock step every record lands in one
+        millisecond (the store clamps each append to the last one). A poller
+        attached there must read only what arrived since its last poll, not
+        the whole millisecond again. */
+    @Test func aPollPastAClockStepMillisecondReadsOnlyWhatArrived() throws {
+        let before = (0..<100).map { stamped($0, .out, "before \($0)") }
+        let stuck = (0..<30_000).map { stamped(5_000, $0 % 50 == 0 ? .err : .out, "stuck \($0) padding-padding") }
+        let current = try writeFamily([before + stuck])
+        defer { try? FileManager.default.removeItem(at: current.deletingLastPathComponent()) }
+        let groupBytes = stuck.map { $0.formatted().utf8.count + 1 }.reduce(0, +)
+        #expect(groupBytes > 1024 * 1024)
+        let inode = try #require(LogFileReader(url: current, onDiskRead: nil)).inode
+
+        let attach = LogQuery.window(current: current, options: LogQueryOptions(tail: 0))
+        let attachedSize = try #require(LogFileReader(url: current, onDiskRead: nil)).size
+        #expect(
+            attach.cursor
+                == LogCursor(
+                    at: stamped(5_000, .out, "").at, count: 30_000,
+                    position: LogFilePosition(file: inode, offset: attachedSize - 1)))
+
+        try append((0..<10).map { stamped(5_000, .out, "new \($0)") }, to: current)
+        let newSize = try #require(LogFileReader(url: current, onDiskRead: nil)).size
+        let pollOptions = { (cursor: LogCursor) in
+            LogQueryOptions(after: cursor, tailByStream: LogStreamCounts(err: 300, out: 300))
+        }
+        let read = OSAllocatedUnfairLock<Int>(initialState: 0)
+        let poll = LogQuery.windowMeasured(
+            current: current, options: pollOptions(attach.cursor),
+            onDiskRead: { count in read.withLock { $0 += count } })
+        #expect(poll.lines.map(\.text) == (0..<10).map { "new \($0)" })
+        #expect(poll.totals == LogStreamCounts(err: 0, mark: 0, out: 10, sys: 0))
+        #expect(
+            poll.cursor
+                == LogCursor(
+                    at: stamped(5_000, .out, "").at, count: 30_010,
+                    position: LogFilePosition(file: inode, offset: newSize - 1)))
+        /** A backward chunk, the scan chunk, and the position check: a small
+            fraction of the millisecond it no longer rereads. */
+        #expect(read.withLock { $0 } < 512 * 1024)
+
+        let idleRead = OSAllocatedUnfairLock<Int>(initialState: 0)
+        let idle = LogQuery.windowMeasured(
+            current: current, options: pollOptions(poll.cursor),
+            onDiskRead: { count in idleRead.withLock { $0 += count } })
+        #expect(idle.lines.isEmpty)
+        #expect(idle.cursor == poll.cursor)
+        #expect(idleRead.withLock { $0 } < 512 * 1024)
+    }
+
+    /** A position names a file by inode, so it still resumes after the
+        store renames current.log to current.log.1 and the millisecond goes
+        on in a fresh current.log. */
+    @Test func aPositionResumesAcrossARotation() throws {
+        let current = try writeFamily([(0..<40).map { stamped(7, .out, "old \($0)") }])
+        defer { try? FileManager.default.removeItem(at: current.deletingLastPathComponent()) }
+        let attach = LogQuery.windowMeasured(
+            current: current, options: LogQueryOptions(tail: 0), positionThreshold: 4, onDiskRead: nil)
+        let rotatedInode = try #require(attach.cursor.position?.file)
+        try FileManager.default.moveItem(at: current, to: current.appendingPathExtension("1"))
+        try Data(([stamped(7, .sys, "rotated")] + (0..<3).map { stamped(7, .out, "new \($0)") })
+            .map { $0.formatted() + "\n" }.joined().utf8).write(to: current)
+        let poll = LogQuery.windowMeasured(
+            current: current, options: LogQueryOptions(after: attach.cursor), positionThreshold: 4, onDiskRead: nil)
+        #expect(poll.lines.map(\.text) == ["rotated", "new 0", "new 1", "new 2"])
+        #expect(poll.cursor.count == 44)
+        let newInode = try #require(LogFileReader(url: current, onDiskRead: nil)).inode
+        #expect(newInode != rotatedInode)
+        #expect(poll.cursor.position?.file == newInode)
+    }
+
+    /** A position that does not name a record ending there in this family,
+        stamped with the cursor's millisecond, is ignored and the count
+        applies: the answer is exactly the count-only cursor's. */
+    @Test func anUnusablePositionFallsBackToTheCount() throws {
+        let lines = [stamped(1, .out, "a"), stamped(5, .out, "b"), stamped(5, .err, "c"), stamped(5, .sys, "d"), stamped(6, .out, "e")]
+        let current = try writeFamily([lines])
+        defer { try? FileManager.default.removeItem(at: current.deletingLastPathComponent()) }
+        let reader = try #require(LogFileReader(url: current, onDiskRead: nil))
+        let lineEnds = lines.map { $0.formatted().utf8.count + 1 }.reduce(into: [Int]()) { ends, length in
+            ends.append((ends.last ?? 0) + length)
+        }.map { $0 - 1 }
+        let plain = LogCursor(at: stamped(5, .out, "").at, count: 2)
+        let expected = LogQuery.window(current: current, options: LogQueryOptions(after: plain))
+        #expect(expected.lines.map(\.text) == ["d", "e"])
+        let unusable = [
+            LogFilePosition(file: reader.inode &+ 1, offset: lineEnds[2]),
+            LogFilePosition(file: reader.inode, offset: lineEnds[2] - 1),
+            LogFilePosition(file: reader.inode, offset: reader.size + 10),
+            LogFilePosition(file: reader.inode, offset: lineEnds[0]),
+            LogFilePosition(file: reader.inode, offset: 0),
+            LogFilePosition(file: reader.inode, offset: -5),
+        ]
+        for position in unusable {
+            let got = LogQuery.window(
+                current: current, options: LogQueryOptions(after: LogCursor(at: plain.at, count: 2, position: position)))
+            #expect(got == expected, "position \(position)")
+        }
+        /** The usable one resumes right after "c" regardless of the count. */
+        let usable = LogQuery.window(
+            current: current,
+            options: LogQueryOptions(
+                after: LogCursor(at: plain.at, count: 2, position: LogFilePosition(file: reader.inode, offset: lineEnds[2]))))
+        #expect(usable.lines.map(\.text) == ["d", "e"])
+    }
+
+    /** Polling with every cursor positioned (a threshold of one) while
+        records land in long same-millisecond runs and the family rotates:
+        each poll returns exactly what arrived since the last, and each
+        cursor's millisecond and count are what counting the family says. */
+    @Test func positionedPollsAcrossAppendsAndRotationsLoseAndRepeatNothing() throws {
+        var random = SplitMix64(seed: 0xC10C)
+        let current = try writeFamily([[stamped(0, .sys, "started")]])
+        defer { try? FileManager.default.removeItem(at: current.deletingLastPathComponent()) }
+        var family: [[LogRecord]] = [[stamped(0, .sys, "started")]]
+        var ms = 0
+        var sequence = 0
+        var cursor = LogQuery.windowMeasured(
+            current: current, options: LogQueryOptions(tail: 0), positionThreshold: 1, onDiskRead: nil).cursor
+        var seen: [String] = []
+        var appended: [String] = []
+        for round in 0..<60 {
+            if random.next() % 7 == 0 {
+                for index in stride(from: family.count - 1, through: 1, by: -1) {
+                    let from = current.appendingPathExtension("\(index)")
+                    try FileManager.default.moveItem(at: from, to: current.appendingPathExtension("\(index + 1)"))
+                }
+                try FileManager.default.moveItem(at: current, to: current.appendingPathExtension("1"))
+                FileManager.default.createFile(atPath: current.path, contents: nil)
+                family.append([])
+            }
+            let batch = (0..<Int(random.next() % 30)).map { _ in
+                if random.next() % 10 == 0 { ms += 1 }
+                sequence += 1
+                return stamped(ms, LogStream.allCases[Int(random.next() % 4)], "r\(sequence)")
+            }
+            try append(batch, to: current)
+            family[family.count - 1] += batch
+            appended += batch.map(\.text)
+            let poll = LogQuery.windowMeasured(
+                current: current, options: LogQueryOptions(after: cursor), positionThreshold: 1, onDiskRead: nil)
+            seen += poll.lines.map(\.text)
+            let all = family.flatMap { $0 }
+            let last = try #require(all.last)
+            #expect(poll.cursor.at == last.at, "round \(round)")
+            #expect(poll.cursor.count == all.reversed().prefix { $0.at == last.at }.count, "round \(round)")
+            #expect(poll.cursor.position != nil, "round \(round)")
+            cursor = poll.cursor
+        }
+        #expect(seen == appended)
+    }
+
     private func naiveWindow(_ records: [LogRecord], _ options: LogQueryOptions) -> LogWindow {
         var matched = records
         if let after = options.after {

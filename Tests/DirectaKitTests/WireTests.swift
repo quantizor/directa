@@ -348,6 +348,20 @@ import Testing
                 == #"{"err":1,"mark":0,"out":20,"sys":4}"#)
         #expect(try encoded(LogStreamCounts(out: 300)) == #"{"out":300}"#)
         #expect(try encoded(LogCursor.origin) == #"{"at":"1970-01-01T00:00:00.000Z","count":0}"#)
+        #expect(
+            try encoded(LogCursor(at: logAt, count: 30_000, position: LogFilePosition(file: 1_234_567, offset: 2_097_151)))
+                == #"{"at":"2025-07-18T19:46:40.000Z","count":30000,"position":{"file":1234567,"offset":2097151}}"#)
+    }
+
+    /** A cursor from a daemon that predates positions decodes with none,
+        and one carrying a position decodes it whole. */
+    @Test func logCursorsDecodeWithAndWithoutAPosition() throws {
+        let plain = #"{"at":"2025-07-18T19:46:40.000Z","count":3}"#
+        #expect(try JSONCoding.decoder().decode(LogCursor.self, from: Data(plain.utf8)) == LogCursor(at: logAt, count: 3))
+        let positioned = #"{"at":"2025-07-18T19:46:40.000Z","count":3,"position":{"file":9,"offset":120}}"#
+        #expect(
+            try JSONCoding.decoder().decode(LogCursor.self, from: Data(positioned.utf8))
+                == LogCursor(at: logAt, count: 3, position: LogFilePosition(file: 9, offset: 120)))
     }
 
     @Test func logsQueryParamsSchemaGolden() throws {

@@ -613,14 +613,34 @@ public struct InitConfigResult: Codable, Equatable, Sendable {
 public struct LogCursor: Codable, Equatable, Sendable {
     public var at: Date
     public var count: Int
+    /** Where the newest record behind the cursor ends, carried once `count`
+        is large enough that skipping that many records costs a real read:
+        the daemon resumes there instead of counting through the
+        millisecond again. Ignored, with `count` applying, when it no longer
+        names such a record in the family. */
+    public var position: LogFilePosition?
 
-    public init(at: Date, count: Int) {
+    public init(at: Date, count: Int, position: LogFilePosition? = nil) {
         self.at = at
         self.count = count
+        self.position = position
     }
 
     /** The cursor of a family with no records yet: nothing lies behind it. */
     public static let origin = LogCursor(at: Date(timeIntervalSince1970: 0), count: 0)
+}
+
+/** A byte position in one file of a log family. `file` is the file's inode
+    number, which a rotation's rename keeps, so the position survives the
+    file moving from current.log to current.log.1. */
+public struct LogFilePosition: Codable, Equatable, Sendable {
+    public var file: UInt64
+    public var offset: Int
+
+    public init(file: UInt64, offset: Int) {
+        self.file = file
+        self.offset = offset
+    }
 }
 
 /** One number per log stream. As a trim (`tailByStream`), nil leaves that
