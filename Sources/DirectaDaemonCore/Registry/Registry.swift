@@ -133,10 +133,21 @@ public actor Registry {
         try persistRegistry()
     }
 
+    /** Drops one ad hoc server. A project row also carries recorded trust for
+        its committed devservers.json, independent of whether any ad hoc server
+        is registered there, so the row is only ever dropped once both the ad
+        hoc servers and trust are gone: a project trusted through a committed
+        server (`setTrusted`) must survive losing its last, or only, ad hoc
+        entry. Removing a name this project never registered ad hoc (including
+        one that exists solely in committed config) is a no-op; the caller is
+        expected to check `spec(project:name:)` first and surface its own
+        not-found error, since an ad hoc registry miss is not this type's to
+        report. */
     public func unregister(project: String, name: String) throws {
         let project = Self.normalize(project)
+        guard registry.projects[project]?.servers[name] != nil else { return }
         registry.projects[project]?.servers[name] = nil
-        if let entry = registry.projects[project], entry.servers.isEmpty {
+        if let entry = registry.projects[project], entry.servers.isEmpty, !entry.trusted {
             registry.projects[project] = nil
         }
         try persistRegistry()

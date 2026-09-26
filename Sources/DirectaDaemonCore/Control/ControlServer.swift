@@ -423,10 +423,21 @@ public actor Router {
                     or trailing-slash spelling from the app or a deep link
                     dropped the registry row and left the supervisor resident. */
                 let project = canonicalProjectPath(request.params.project)
-                try await registry.unregister(project: project, name: request.params.name)
-                supervisors[serverID(project: project, name: request.params.name)] = nil
-                await events.post(
-                    kind: .unregistered, project: project, server: request.params.name)
+                let name = request.params.name
+                /** A name declared only in the project's committed
+                    devservers.json was never written into the registry, so
+                    unregistering it is not the no-op `Registry.unregister`
+                    makes of it: the caller asked to remove something specific
+                    and nothing by that name is there to remove. */
+                guard await registry.spec(project: project, name: name) != nil else {
+                    throw WireError(
+                        code: .notFound,
+                        hint: "run: directa status --json",
+                        message: "'\(name)' is not registered as an ad hoc server for \(project)")
+                }
+                try await registry.unregister(project: project, name: name)
+                supervisors[serverID(project: project, name: name)] = nil
+                await events.post(kind: .unregistered, project: project, server: name)
                 await removeLogDirIfProjectIsForgotten(project)
                 return try respond(id: head.id, result: WireEmpty())
             }

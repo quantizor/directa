@@ -8,7 +8,13 @@ import Testing
     to zero servers and the missing-project sweep; only `uninstall --purge`
     removed it. `ControlServer`'s `serverUnregister` arm and
     `forgetMissingProject` are the two paths that now clean it up, each proven
-    here against real files on disk rather than a mocked FileManager. */
+    here against real files on disk rather than a mocked FileManager.
+    `serverUnregister` only ever removes an ad hoc registry entry, never a
+    project's recorded trust: a project keeps its row, and this directory,
+    as long as either an ad hoc server or trust survives, so unregistering an
+    unrelated or already-absent name, or the last ad hoc entry on a project
+    trusted through its committed devservers.json, must never delete logs a
+    live, merely un-registered, supervisor is still writing to. */
 @Suite struct LogDirCleanupTests {
     private struct Env {
         let paths: DirectaPaths
@@ -33,6 +39,18 @@ import Testing
         let data = await router.handle(line: line)
         let response = try JSONCoding.decoder().decode(WireResponse<R>.self, from: data)
         return try #require(response.result)
+    }
+
+    /** Returns the decoded result, or the `WireError` when the daemon refused,
+        for a call expected to fail. */
+    private func send<P: Codable & Sendable, R: Codable & Sendable>(
+        _ router: Router, _ method: WireMethod, _ params: P, _ expecting: R.Type
+    ) async throws -> Result<R, WireError> {
+        let line = try NDJSON.encodeLine(WireRequest(id: "t", method: method.rawValue, params: params))
+        let data = await router.handle(line: line)
+        let response = try JSONCoding.decoder().decode(WireResponse<R>.self, from: data)
+        if response.ok, let result = response.result { return .success(result) }
+        return .failure(response.error ?? WireError(code: .internalError, message: "no result"))
     }
 
     /** Plants a real file under a server's log directory so removal is proven
@@ -66,11 +84,13 @@ import Testing
     }
 
     /** "api" is committed config, never written into registry.json (per the
-        codebase's own rule), so unregistering "web" (the project's only ad hoc
-        entry) drops the registry row entirely while "api" still holds a
-        resident supervisor. The directory must survive: the registry row
-        disappearing is not proof nothing is left supervising the project. */
-    @Test func unregisteringOneServerKeepsTheDirectoryWhileAnotherIsStillSupervised() async throws {
+        codebase's own rule); starting it records trust for the project. Once
+        "web" (the project's only ad hoc entry) is unregistered, the registry
+        row must survive on trust alone, with no ad hoc servers left, and the
+        directory must survive with it: dropping trust here would let a later
+        autonomous restore refuse "api" outright, and would orphan its log
+        directory while "api" still holds a resident, log-writing supervisor. */
+    @Test func unregisteringTheLastAdHocServerOnATrustedConfigProjectKeepsTrust() async throws {
         let env = try makeEnv()
         try Data(
             #"{"servers":{"api":{"command":["/bin/sh","-c","sleep 60"]}},"version":1}"#.utf8
@@ -86,10 +106,50 @@ import Testing
         _ = try await handle(
             router, .serverUnregister, ServerTargetParams(name: "web", project: env.project),
             WireEmpty.self)
-        /** Confirms this test actually exercises the still-supervised guard
-            rather than passing because the registry still names something. */
-        #expect(await registry.project(env.project) == nil)
 
+        let entry = try #require(await registry.project(env.project))
+        #expect(entry.trusted == true)
+        #expect(entry.servers.isEmpty)
+
+        #expect(
+            FileManager.default.fileExists(
+                atPath: env.paths.projectLogDir(project: env.project).path))
+
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "api", project: env.project),
+            ServerResult.self)
+    }
+
+    /** "ghost" was never registered ad hoc, and is not named in the committed
+        devservers.json either: unregistering it must refuse rather than
+        silently succeed and drop the project's recorded trust as a side
+        effect of "web" already sitting empty (a project can be trusted with
+        zero ad hoc servers at all, purely through a committed server having
+        been started once). */
+    @Test func unregisteringAnUnknownNameOnATrustedConfigOnlyProjectIsRefused() async throws {
+        let env = try makeEnv()
+        try Data(
+            #"{"servers":{"api":{"command":["/bin/sh","-c","sleep 60"]}},"version":1}"#.utf8
+        ).write(to: URL(fileURLWithPath: env.project).appending(path: "devservers.json"))
+        let registry = Registry(paths: env.paths)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        _ = try await handle(
+            router, .serverStart, ServerTargetParams(name: "api", project: env.project),
+            ServerResult.self)
+        try plantLogFile(paths: env.paths, project: env.project, server: "api")
+        #expect(await registry.project(env.project)?.trusted == true)
+
+        let outcome = try await send(
+            router, .serverUnregister, ServerTargetParams(name: "ghost", project: env.project),
+            WireEmpty.self)
+        guard case .failure(let error) = outcome else {
+            Issue.record("unregister accepted a name that was never registered ad hoc")
+            return
+        }
+        #expect(error.code == .notFound)
+
+        #expect(await registry.project(env.project)?.trusted == true)
         #expect(
             FileManager.default.fileExists(
                 atPath: env.paths.projectLogDir(project: env.project).path))
