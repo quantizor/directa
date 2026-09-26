@@ -160,7 +160,7 @@ enum CLIRunner {
                     WireError(
                         code: .daemonUnreachable,
                         hint: "run: directa daemon start",
-                        message: "ddirecta was deliberately stopped"),
+                        message: CLINotice.daemonDeliberatelyStopped),
                     json: json)
             }
             fail(error, json: json)
@@ -195,8 +195,7 @@ enum CLIRunner {
                 guard ContinuousClock.now < deadline else { throw error }
                 if !announced {
                     announced = true
-                    FileHandle.standardError.write(
-                        Data("directa: ddirecta is restoring supervised servers; waiting…\n".utf8))
+                    FileHandle.standardError.write(Data((CLINotice.daemonRestoring + "\n").utf8))
                 }
                 /** A cancelled sleep just re-checks the deadline on the next
                     pass, so the loop still terminates and nothing is lost. */
@@ -231,6 +230,21 @@ enum CLIRunner {
         parts.append("log \(status.logPath)")
         return parts.joined(separator: "  ·  ")
     }
+}
+
+/** User-facing strings CLIRunner itself prints or fails with (never a message
+    the daemon composed), named so the exact wording is pinned by a test.
+    `CLIRunner.emitFailure` prepends "directa: " to every message on stderr, so
+    a message that led with "ddirecta" (the daemon binary's own name) used to
+    read as "directa: ddirecta …", a stutter easy to mistake for a typo; both
+    strings here name the daemon in plain English instead. */
+enum CLINotice {
+    /** What `directa daemon start` points at when auto-bootstrap declines to
+        restart a daemon a person stopped on purpose. */
+    static let daemonDeliberatelyStopped = "the daemon was deliberately stopped"
+    /** Printed once per invocation when a request is retried against a daemon
+        still finishing boot restore, so a silent wait does not read as a hang. */
+    static let daemonRestoring = "directa: the daemon is restoring supervised servers; waiting…"
 }
 
 struct Ensure: AsyncParsableCommand {
