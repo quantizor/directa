@@ -521,10 +521,24 @@ struct Restart: AsyncParsableCommand {
         let params = RestartParams(
             names: name.map { [$0] }, port: port, project: global.resolvedProject(),
             timeoutSeconds: timeout)
-        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-            try await client.request(
-                .serverRestart, params: params, expecting: GroupResult.self,
-                operationTimeoutSeconds: timeout)
+        let client = CLIRunner.client()
+        let session = RestartSession(
+            clock: SystemRestartClock(),
+            notice: { FileHandle.standardError.write(Data(($0 + "\n").utf8)) },
+            params: params,
+            requester: DaemonClientRestartRequester(client: client, timeoutSeconds: timeout))
+        let before = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { _ in
+            try await session.requester.status(session.scope)
+        }
+        /** Not through `CLIRunner.run`: once the restart is sent, its retry
+            would send it again and bounce a server whose restart landed. */
+        let result: GroupResult
+        do {
+            result = try await session.run(before: before)
+        } catch let error as WireError {
+            CLIRunner.fail(error, json: global.json)
+        } catch {
+            CLIRunner.fail(WireError(code: .internalError, message: String(describing: error)), json: global.json)
         }
         CLIRunner.emit(result, json: global.json) { r in
             r.results.map { CLIRunner.describe($0.server) }.joined(separator: "\n")

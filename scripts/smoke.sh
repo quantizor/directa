@@ -576,6 +576,40 @@ kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon (pid $DAEMON_PID) died restart
 pass "restarting a flooding server completes and the daemon (pid $DAEMON_PID) stays up"
 "$DIRECTA" stop flood --json > /dev/null
 
+# A daemon that dies while a restart waits for health (a crash, a jetsam kill)
+# closes the connection with the outcome unknown. The CLI must wait for the
+# daemon to come back and finish on the server's state, exit 0, and never send
+# the restart a second time: the events carry exactly one restart stop.
+SLOW_PORT=$((44500 + (RANDOM % 400)))
+"$DIRECTA" register --name slowboot --cmd /bin/sh --cmd -c \
+  --cmd "sleep 4; exec $BIN/fixture-server --listen-tcp $SLOW_PORT" --port "$SLOW_PORT" --json > /dev/null
+"$DIRECTA" ensure slowboot --timeout 20 --json > /dev/null || fail "slowboot fixture never became healthy"
+set +e
+"$DIRECTA" restart slowboot --timeout 30 --json > "$WORK/slow-restart.json" 2> "$WORK/slow-restart.err" &
+SLOW_RESTART_PID=$!
+set -e
+sleep 1.5
+kill -9 "$DAEMON_PID"
+wait "$DAEMON_PID" 2>/dev/null || true
+"$BIN/ddirecta" --foreground --socket "$DIRECTA_SOCKET" --data-dir "$WORK/data" --logs-dir "$WORK/logs" \
+  >>"$DAEMON_LOG" 2>&1 &
+DAEMON_PID=$!
+await_daemon "restart daemon-kill recovery"
+set +e
+wait "$SLOW_RESTART_PID"
+SLOW_RESTART_EXIT=$?
+set -e
+[[ "$SLOW_RESTART_EXIT" -eq 0 ]] \
+  || fail "restart across a daemon kill exited $SLOW_RESTART_EXIT: $(cat "$WORK/slow-restart.json") $(cat "$WORK/slow-restart.err")"
+grep -q "instead of restarting it again" "$WORK/slow-restart.err" \
+  || fail "restart across a daemon kill never said it was recovering: $(cat "$WORK/slow-restart.err")"
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/slow-restart.json'));s=d['results'][0]['server'];assert s['phase']=='running', d" \
+  || fail "restart across a daemon kill did not end running: $(cat "$WORK/slow-restart.json")"
+RESTART_STOPS="$("$DIRECTA" events --json | /usr/bin/python3 -c 'import json,sys; print(sum(1 for e in json.load(sys.stdin)["events"] if e["server"]=="slowboot" and e["kind"]=="stopped" and e.get("detail")=="requested by restart"))')"
+[[ "$RESTART_STOPS" -eq 1 ]] || fail "restart across a daemon kill stopped slowboot $RESTART_STOPS times for one restart"
+pass "restart across a daemon kill waits for the daemon and never restarts twice"
+"$DIRECTA" stop slowboot --json > /dev/null
+
 # directa monitor: a client-side polling loop over logs.query/server.status
 # shaped for an agent's own streaming tool. Every check below runs against
 # this script's own temp daemon/socket, never a live one.
