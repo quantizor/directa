@@ -48,7 +48,7 @@ struct PortCollisionTests {
             status(host: "otherproj.localhost", port: 3010, project: "/code/otherproj", server: "sandbox"),
         ])
         #expect(pairs.count == 1)
-        let pair = try? #require(pairs.first)
+        let pair = pairs.first
         #expect(pair?.port == 3010)
         #expect(pair?.detail.contains("/code/myproj") == true)
         #expect(pair?.detail.contains("/code/otherproj") == true)
