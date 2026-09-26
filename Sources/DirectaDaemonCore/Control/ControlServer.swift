@@ -345,6 +345,7 @@ public actor Router {
                 let target = ServerTargetParams(
                     name: request.params.name,
                     project: canonicalProjectPath(request.params.project))
+                if let refusal = request.params.refusal() { throw refusal }
                 let supervisor = try await resolvedSupervisor(target)
                 var since = request.params.since
                 if let markID = request.params.sinceMark {
@@ -363,12 +364,18 @@ public actor Router {
                         message: "--grep is not a valid regular expression: \(why)")
                 }
                 let options = LogQueryOptions(
+                    after: request.params.after,
                     grep: request.params.grep,
+                    head: request.params.head,
+                    maxLineCharacters: request.params.maxLineCharacters,
                     since: since,
                     streams: request.params.streams.map(Set.init),
-                    tail: request.params.tail)
-                let lines = await supervisor.logQuery(options)
-                return try respond(id: head.id, result: LogsQueryResult(lines: lines))
+                    tail: request.params.tail,
+                    tailByStream: request.params.tailByStream)
+                let window = await supervisor.logQuery(options)
+                return try respond(
+                    id: head.id,
+                    result: LogsQueryResult(cursor: window.cursor, lines: window.lines, totals: window.totals))
             case .logsMark:
                 let request = try decoder.decode(WireRequest<MarkParams>.self, from: line)
                 let project = canonicalProjectPath(request.params.project)
@@ -1157,10 +1164,7 @@ public actor Router {
         }
         let merged = try await mergedSpecs(project: target.project)
         guard var spec = merged.specs.first(where: { $0.name == target.name }) else {
-            throw WireError(
-                code: .notFound,
-                hint: "run: directa status --json",
-                message: "no server named '\(target.name)' in \(target.project)")
+            throw ProjectConfigLoader.serverNotFound(name: target.name, project: target.project)
         }
         if merged.fileNames.contains(target.name) {
             let trusted = await registry.isTrusted(project: target.project)
@@ -1647,11 +1651,7 @@ public actor Router {
     private func resolvedSupervisor(_ params: ServerTargetParams) async throws -> ServerSupervisor {
         let merged = try await mergedSpecs(project: params.project)
         guard let spec = merged.specs.first(where: { $0.name == params.name }) else {
-            throw WireError(
-                code: .notFound,
-                hint: "run: directa status --json",
-                message: "no server named '\(params.name)' is registered for \(params.project)"
-            )
+            throw ProjectConfigLoader.serverNotFound(name: params.name, project: params.project)
         }
         return await supervisor(project: params.project, spec: spec)
     }
@@ -1741,10 +1741,7 @@ public actor Router {
         var wanted = merged.specs
         if let names = params.names {
             for name in names where !merged.specs.contains(where: { $0.name == name }) {
-                throw WireError(
-                    code: .notFound,
-                    hint: "run: directa status --json",
-                    message: "no server named '\(name)' in \(params.project)")
+                throw ProjectConfigLoader.serverNotFound(name: name, project: params.project)
             }
             wanted = merged.specs.filter { names.contains($0.name) }
         }

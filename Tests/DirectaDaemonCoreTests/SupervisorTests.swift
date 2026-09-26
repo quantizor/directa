@@ -186,7 +186,7 @@ private func makeEnv() throws -> TestEnv {
         let stopped = await supervisor.stop(graceSeconds: 0.1, reason: "test")
         #expect(stopped.phase == .stopping)
 
-        let logs = await supervisor.logQuery(LogQueryOptions(streams: [.sys]))
+        let logs = await supervisor.logQuery(LogQueryOptions(streams: [.sys])).lines
         #expect(logs.contains { $0.text.contains("stop did not complete within") })
 
         /** Let the fake `run()` resolve now, so recordOutcome can actually

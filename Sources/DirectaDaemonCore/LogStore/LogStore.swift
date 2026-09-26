@@ -51,15 +51,19 @@ public actor LogStore {
         return PlacedMark(at: record.at, id: id, server: currentURL.deletingLastPathComponent().lastPathComponent)
     }
 
+    /** Reads need no flush first: `write` hands each line to write(2) with no
+        user-space buffer, so a read on another descriptor already sees it, and
+        this actor orders every append before or after the whole query. */
     public func query(_ options: LogQueryOptions) -> [LogRecord] {
-        /** Reads go through the files, so buffered bytes must land first. */
-        try? handle?.synchronize()
-        return LogQuery.run(current: currentURL, options: options)
+        LogQuery.run(current: currentURL, options: options)
+    }
+
+    public func window(_ options: LogQueryOptions) -> LogWindow {
+        LogQuery.window(current: currentURL, options: options)
     }
 
     public func resolveMark(_ markID: String) -> Date? {
-        try? handle?.synchronize()
-        return LogQuery.markDate(current: currentURL, markID: markID)
+        LogQuery.markDate(current: currentURL, markID: markID)
     }
 
     private func openIfNeeded() {

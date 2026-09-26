@@ -92,4 +92,60 @@ import Testing
         #expect(!logs.all)
         #expect(logs.tail == 5)
     }
+
+    @Test func headParsesAndSuppressesTheImplicitTail() throws {
+        let logs = try Logs.parse(["web", "--since", "2026-09-26T05:31:12.604Z", "--head", "200"])
+        #expect(logs.head == 200)
+        #expect(
+            Logs.effectiveTail(all: false, follow: false, head: 200, since: Date(), sinceMark: nil, tail: nil)
+                == nil)
+        #expect(Logs.effectiveTail(all: false, follow: false, head: 5, since: nil, sinceMark: nil, tail: nil) == nil)
+    }
+
+    @Test func headConflictsWithEveryOtherAmountAndWithFollow() throws {
+        #expect(
+            Logs.usageError(all: false, follow: false, head: 5, tail: 5)?.message == "pass --head or --tail, not both")
+        #expect(
+            Logs.usageError(all: true, follow: false, head: 5, tail: nil)?.message == "pass --head or --all, not both")
+        #expect(
+            Logs.usageError(all: false, follow: true, head: 5, tail: nil)?.message
+                == "pass --head or --follow, not both")
+        #expect(
+            Logs.usageError(all: false, follow: false, head: -1, tail: nil)?.message
+                == "--head takes 0 or more lines, got -1")
+        #expect(Logs.usageError(all: false, follow: false, head: 5, tail: nil) == nil)
+        #expect(Logs.usageError(all: false, follow: true, head: nil, tail: 5) == nil)
+        #expect(Logs.usageError(all: true, follow: false, head: nil, tail: 5)?.code == .usage)
+    }
+
+    /** An empty first answer still carries the daemon's cursor, and every
+        later poll reads only past it: no `since` (which would re-read from
+        the start when it is nil), no tail, no mark. */
+    @Test func followPollsPastTheDaemonsCursorEvenAfterAnEmptyFirstQuery() {
+        let first = LogsQueryParams(
+            grep: "err", name: "web", project: "/p", since: Date(timeIntervalSince1970: 5), sinceMark: "m1",
+            streams: [.err], tail: 50)
+        let cursor = LogCursor(at: Date(timeIntervalSince1970: 9), count: 61)
+        #expect(
+            Logs.followParams(first, after: cursor)
+                == LogsQueryParams(after: cursor, grep: "err", name: "web", project: "/p", streams: [.err]))
+        #expect(Logs.followParams(first, after: cursor).refusal() == nil)
+    }
+
+    @Test func theMonitorHintAppearsOnlyInClaudeCodeWithAPipedStdout() {
+        let hint =
+            "directa: to stream a server's output into this session, run directa monitor <name> with the Monitor tool"
+        #expect(Logs.monitorHint(environment: ["CLAUDECODE": "1"], stdoutIsTerminal: false) == hint)
+        #expect(Logs.monitorHint(environment: ["CLAUDECODE": "1"], stdoutIsTerminal: true) == nil)
+        #expect(Logs.monitorHint(environment: [:], stdoutIsTerminal: false) == nil)
+        #expect(Logs.monitorHint(environment: ["CLAUDECODE": "0"], stdoutIsTerminal: false) == nil)
+    }
+
+    @Test func aCursorlessResultReadsAsAnOlderDaemon() {
+        #expect(
+            Logs.olderDaemon
+                == WireError(
+                    code: .versionMismatch, hint: "run: directa daemon restart",
+                    message: "the daemon is older than this CLI and cannot answer this command"))
+    }
 }

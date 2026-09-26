@@ -925,8 +925,8 @@ public actor ServerSupervisor {
 
     /** Log access for the router: queries and marks flow through the store so
         ordering against process output is exact. */
-    public func logQuery(_ options: LogQueryOptions) async -> [LogRecord] {
-        await logStore.query(options)
+    public func logQuery(_ options: LogQueryOptions) async -> LogWindow {
+        await logStore.window(options)
     }
 
     public func placeMark(label: String, text: String) async -> PlacedMark {

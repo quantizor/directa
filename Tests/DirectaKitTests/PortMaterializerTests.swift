@@ -218,6 +218,116 @@ import Testing
         #expect(CheckoutIdentity.isLinkedWorktree(project: nonexistentProject()) == false)
     }
 
+    /** A main checkout with a submodule named with a slash (`libs/sub`, so
+        its git directory's parent is `libs`, not `modules`), a linked
+        worktree nested inside it the way Claude Code places one, and the
+        submodule initialized inside that worktree (its git directory sits
+        under `worktrees/<id>/modules/`, so a path containing `/worktrees/`
+        is not proof of a worktree). */
+    private struct GitLayout {
+        let base: URL
+        let main: URL
+        let submodule: URL
+        let worktree: URL
+        let worktreeSubmodule: URL
+    }
+
+    private func makeGitLayout() throws -> GitLayout {
+        let base = URL(fileURLWithPath: canonicalProjectPath(FileManager.default.temporaryDirectory.path))
+            .appending(path: "directa-gitlayout-\(UUID().uuidString)")
+        let main = base.appending(path: "main")
+        let source = base.appending(path: "sub-source")
+        for dir in [main, source] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        func git(_ args: [String], in cwd: URL) throws {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = [
+                "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "protocol.file.allow=always",
+            ] + args
+            process.currentDirectoryURL = cwd
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            try #require(
+                process.terminationStatus == 0,
+                "git \(args.joined(separator: " ")) exited \(process.terminationStatus)")
+        }
+        try git(["init", "-q"], in: source)
+        try git(["commit", "-q", "--allow-empty", "-m", "seed"], in: source)
+        try git(["init", "-q"], in: main)
+        try git(["submodule", "-q", "add", source.path, "libs/sub"], in: main)
+        try git(["commit", "-q", "-m", "seed"], in: main)
+        let worktree = main.appending(path: ".claude/worktrees/review")
+        try git(["worktree", "add", "-q", worktree.path], in: main)
+        try git(["submodule", "-q", "update", "--init"], in: worktree)
+        return GitLayout(
+            base: base, main: main, submodule: main.appending(path: "libs/sub"), worktree: worktree,
+            worktreeSubmodule: worktree.appending(path: "libs/sub"))
+    }
+
+    @Test func onlyALinkedWorktreesGitFileCountsAsALinkedWorktree() throws {
+        let layout = try makeGitLayout()
+        defer { try? FileManager.default.removeItem(at: layout.base) }
+        #expect(CheckoutIdentity.linkedWorktreeGitDir(of: layout.worktree.path) != nil)
+        #expect(CheckoutIdentity.linkedWorktreeGitDir(of: layout.main.path) == nil)
+        #expect(CheckoutIdentity.linkedWorktreeGitDir(of: layout.submodule.path) == nil)
+        #expect(CheckoutIdentity.linkedWorktreeGitDir(of: layout.worktreeSubmodule.path) == nil)
+        #expect(CheckoutIdentity.linkedWorktreeGitDir(of: layout.base.path) == nil)
+    }
+
+    @Test func isLinkedWorktreeIsFalseForASubmodule() throws {
+        let layout = try makeGitLayout()
+        defer { try? FileManager.default.removeItem(at: layout.base) }
+        #expect(CheckoutIdentity.isLinkedWorktree(project: layout.worktree.path))
+        #expect(!CheckoutIdentity.isLinkedWorktree(project: layout.submodule.path))
+        #expect(!CheckoutIdentity.isLinkedWorktree(project: layout.worktreeSubmodule.path))
+        #expect(!CheckoutIdentity.isLinkedWorktree(project: layout.main.path))
+    }
+
+    @Test func mainCheckoutOfALinkedWorktreeIsTheCheckoutHoldingTheCommonGitDirectory() throws {
+        let layout = try makeGitLayout()
+        defer { try? FileManager.default.removeItem(at: layout.base) }
+        #expect(CheckoutIdentity.mainCheckout(ofLinkedWorktree: layout.worktree.path) == layout.main.path)
+        #expect(CheckoutIdentity.mainCheckout(ofLinkedWorktree: layout.main.path) == nil)
+        #expect(CheckoutIdentity.mainCheckout(ofLinkedWorktree: layout.submodule.path) == nil)
+    }
+
+    /** From a linked worktree that lacks devservers.json, a name its main
+        checkout declares gets both fixes; any other not-found keeps the
+        plain hint. */
+    @Test func serverNotFoundNamesTheWorktreeFixesOnlyWhenTheMainCheckoutDeclaresTheName() throws {
+        let layout = try makeGitLayout()
+        defer { try? FileManager.default.removeItem(at: layout.base) }
+        let config = ProjectFileConfig(servers: ["web": ProjectFileServer(command: ["bun", "dev"])])
+        try JSONCoding.fileEncoder().encode(config).write(to: layout.main.appending(path: "devservers.json"))
+        let main = layout.main.path
+        let worktree = layout.worktree.path
+
+        let declared = ProjectConfigLoader.serverNotFound(name: "web", project: worktree)
+        #expect(
+            declared
+                == WireError(
+                    code: .notFound,
+                    hint: "commit or copy devservers.json from \(main) into this worktree, or pass --project \(main)",
+                    message:
+                        "no server named 'web' in \(worktree): this linked worktree has no devservers.json, and its main checkout \(main) declares 'web'"
+                ))
+        #expect(
+            ProjectConfigLoader.serverNotFound(name: "api", project: worktree)
+                == WireError(
+                    code: .notFound, hint: "run: directa status --json", message: "no server named 'api' in \(worktree)"))
+        #expect(
+            ProjectConfigLoader.serverNotFound(name: "web", project: main)
+                == WireError(code: .notFound, hint: "run: directa status --json", message: "no server named 'web' in \(main)"))
+
+        try JSONCoding.fileEncoder().encode(ProjectFileConfig(servers: [:]))
+            .write(to: layout.worktree.appending(path: "devservers.json"))
+        #expect(ProjectConfigLoader.serverNotFound(name: "web", project: worktree).hint == "run: directa status --json")
+    }
+
     @Test func worktreeDisplayAnswersNilForAMissingWorkingDirectory() {
         #expect(CheckoutIdentity.worktreeDisplay(project: nonexistentProject()) == nil)
     }

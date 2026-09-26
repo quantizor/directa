@@ -30,13 +30,20 @@ struct GlobalOptions: ParsableArguments {
     @Flag(help: "Never auto-install or auto-start the daemon on connection failure.")
     var noBootstrap = false
 
-    @Option(help: "Project root; defaults to the nearest devservers.json ancestor, then git root, then cwd.")
+    @Option(
+        help: "Project root; defaults to the nearest devservers.json ancestor (the search stops at a linked git worktree's root), then git root, then cwd."
+    )
     var project: String?
 
     /** Resolution order: nearest ancestor with devservers.json → git root → cwd,
-        then canonicalized (symlinks and on-disk case). A git worktree is a real
-        distinct path and keeps its own project identity; canonicalization does
-        not collapse sibling checkouts into one. */
+        then canonicalized (symlinks and on-disk case). The ancestor search
+        stops at a linked worktree's root, so a worktree nested inside its main
+        checkout (Claude Code's `.claude/worktrees/`) never picks up the main
+        checkout's config and resolves to itself when it has none; `.git`
+        directories and submodule `.git` files are crossed, so a devservers.json
+        above several repositories, or in a superproject, still applies. A git
+        worktree is a real distinct path and keeps its own project identity;
+        canonicalization does not collapse sibling checkouts into one. */
     func resolvedProject() -> String {
         if let project {
             /** An explicit `--project myproj` (a name, not a path) lands on a
@@ -65,7 +72,9 @@ struct GlobalOptions: ParsableArguments {
         let fm = FileManager.default
         var probe = URL(fileURLWithPath: cwd)
         while true {
-            if fm.fileExists(atPath: probe.appending(path: "devservers.json").path) {
+            if fm.fileExists(atPath: probe.appending(path: "devservers.json").path)
+                || CheckoutIdentity.linkedWorktreeGitDir(of: probe.path) != nil
+            {
                 return canonicalProjectPath(probe.path)
             }
             let parent = probe.deletingLastPathComponent()
@@ -245,6 +254,9 @@ enum CLINotice {
     /** Printed once per invocation when a request is retried against a daemon
         still finishing boot restore, so a silent wait does not read as a hang. */
     static let daemonRestoring = "directa: the daemon is restoring supervised servers; waiting…"
+    /** A command that needs a result field only a newer daemon sends (the
+        logs cursor) refuses rather than falling back to an unbounded read. */
+    static let daemonOlderThanCLI = "the daemon is older than this CLI and cannot answer this command"
 }
 
 /** Screens every `--timeout`/`--acquire-timeout` option at the argument-parser
@@ -448,10 +460,11 @@ struct Status: AsyncParsableCommand {
         }
         if let name, result.servers.isEmpty {
             CLIRunner.fail(
-                WireError(
-                    code: .notFound,
-                    hint: "run: directa status --json",
-                    message: "no server named '\(name)' is registered for this project"),
+                all
+                    ? WireError(
+                        code: .notFound, hint: "run: directa status --all --json",
+                        message: "no server named '\(name)' is registered on this machine")
+                    : ProjectConfigLoader.serverNotFound(name: name, project: project),
                 json: global.json)
         }
         CLIRunner.emit(result, json: global.json) { list in
@@ -583,6 +596,9 @@ struct Logs: AsyncParsableCommand {
     @Option(help: "Regex filter (Swift Regex dialect) applied to line text.")
     var grep: String?
 
+    @Option(help: "Only the first N lines of the window (oldest first); pairs with --since to read what came after a moment.")
+    var head: Int?
+
     @Argument(help: "Server name.")
     var name: String
 
@@ -606,14 +622,57 @@ struct Logs: AsyncParsableCommand {
         return WireError(code: .usage, message: "pass --tail or --all, not both")
     }
 
+    /** `--head` asks for a bounded slice from the start of the window, which
+        conflicts with any other amount (`--tail`, `--all`) and with
+        `--follow`, whose answer has no start. */
+    static func usageError(all: Bool, follow: Bool, head: Int?, tail: Int?) -> WireError? {
+        if let error = usageError(all: all, tail: tail) { return error }
+        guard let head else { return nil }
+        if head < 0 { return WireError(code: .usage, message: "--head takes 0 or more lines, got \(head)") }
+        if tail != nil { return WireError(code: .usage, message: "pass --head or --tail, not both") }
+        if all { return WireError(code: .usage, message: "pass --head or --all, not both") }
+        if follow { return WireError(code: .usage, message: "pass --head or --follow, not both") }
+        return nil
+    }
+
+    /** Printed once on stderr by `--follow` inside a Claude Code session whose
+        stdout is not a terminal: a polling command there is usually a
+        harness waiting on it, and the monitor command is the streaming shape
+        built for that. Nil everywhere else. */
+    static func monitorHint(environment: [String: String], stdoutIsTerminal: Bool) -> String? {
+        guard environment["CLAUDECODE"] == "1", !stdoutIsTerminal else { return nil }
+        return "directa: to stream a server's output into this session, run directa monitor <name> with the Monitor tool"
+    }
+
+    /** `--head` and `--follow` need the result's cursor; a daemon older than
+        that field omits it (and would ignore `head` and `after`, answering
+        unbounded), so the command stops with this instead. */
+    static let olderDaemon = WireError(
+        code: .versionMismatch, hint: "run: directa daemon restart", message: CLINotice.daemonOlderThanCLI)
+
+    /** Every poll after the first reads exactly what lies past the cursor the
+        daemon issued last, whatever lower bound and tail seeded the first
+        query; the cursor is exclusive and counts same-millisecond records,
+        so nothing repeats and nothing is skipped. */
+    static func followParams(_ first: LogsQueryParams, after cursor: LogCursor) -> LogsQueryParams {
+        var params = first
+        params.after = cursor
+        params.since = nil
+        params.sinceMark = nil
+        params.tail = nil
+        return params
+    }
+
     /** The tail bound actually sent to the daemon. `--all` always wins (full
         history, even under `--follow`). An explicit `--tail` always wins next.
         Otherwise `--follow` keeps its own smaller backlog default, and a bare
         `--since`/`--since-mark` is left unbounded (already scoped by time,
         not the bug this default fixes) while truly no bound at all falls back
         to `defaultTailLines`. */
-    static func effectiveTail(all: Bool, follow: Bool, since: Date?, sinceMark: String?, tail: Int?) -> Int? {
-        if all { return nil }
+    static func effectiveTail(
+        all: Bool, follow: Bool, head: Int? = nil, since: Date?, sinceMark: String?, tail: Int?
+    ) -> Int? {
+        if all || head != nil { return nil }
         if let tail { return tail }
         if follow { return followDefaultTailLines }
         if since != nil || sinceMark != nil { return nil }
@@ -621,7 +680,7 @@ struct Logs: AsyncParsableCommand {
     }
 
     func run() async throws {
-        if let usage = Self.usageError(all: all, tail: tail) {
+        if let usage = Self.usageError(all: all, follow: follow, head: head, tail: tail) {
             CLIRunner.fail(usage, json: global.json)
         }
         var sinceDate: Date?
@@ -638,44 +697,41 @@ struct Logs: AsyncParsableCommand {
             CLIRunner.fail(
                 WireError(code: .usage, message: "--stream takes out, err, sys, or mark"), json: global.json)
         }
-        var params = LogsQueryParams(
-            grep: grep, name: name, project: global.resolvedProject(), since: sinceDate,
+        let first = LogsQueryParams(
+            grep: grep, head: head, name: name, project: global.resolvedProject(), since: sinceDate,
             sinceMark: sinceMark, streams: streams,
-            tail: Self.effectiveTail(all: all, follow: follow, since: sinceDate, sinceMark: sinceMark, tail: tail))
-        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-            try await client.request(.logsQuery, params: params, expecting: LogsQueryResult.self)
-        }
+            tail: Self.effectiveTail(
+                all: all, follow: follow, head: head, since: sinceDate, sinceMark: sinceMark, tail: tail))
+        let result = await query(first)
+        if head != nil || follow, result.cursor == nil { failOlderDaemon() }
         emit(result.lines)
         guard follow else { return }
-        /** Follow = incremental polling since the last seen line: restart-safe
-            and no push machinery. Duplicate timestamps are deduped by count. */
-        var lastAt = result.lines.last?.at
-        var seenAtLast = result.lines.filter { $0.at == lastAt }.count
-        params.sinceMark = nil
-        params.tail = nil
+        if let hint = Self.monitorHint(
+            environment: ProcessInfo.processInfo.environment, stdoutIsTerminal: isatty(STDOUT_FILENO) == 1)
+        {
+            FileHandle.standardError.write(Data((hint + "\n").utf8))
+        }
+        /** Incremental polling past the daemon's cursor: restart-safe, no
+            push machinery, and seeded by the first answer even when it
+            matched nothing, so an empty start never re-reads history. */
+        guard var cursor = result.cursor else { failOlderDaemon() }
         while true {
             try await Task.sleep(for: .milliseconds(300))
-            params.since = lastAt
-            let more = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-                try await client.request(.logsQuery, params: params, expecting: LogsQueryResult.self)
-            }
-            var fresh = more.lines
-            if let lastAt {
-                var skip = seenAtLast
-                fresh = fresh.drop { record in
-                    if record.at == lastAt, skip > 0 {
-                        skip -= 1
-                        return true
-                    }
-                    return false
-                }.filter { $0.at >= lastAt }
-            }
-            if !fresh.isEmpty {
-                emit(fresh)
-                lastAt = fresh.last?.at
-                seenAtLast = more.lines.filter { $0.at == lastAt }.count
-            }
+            let more = await query(Self.followParams(first, after: cursor))
+            guard let next = more.cursor else { failOlderDaemon() }
+            emit(more.lines)
+            cursor = next
         }
+    }
+
+    private func query(_ params: LogsQueryParams) async -> LogsQueryResult {
+        await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.logsQuery, params: params, expecting: LogsQueryResult.self)
+        }
+    }
+
+    private func failOlderDaemon() -> Never {
+        CLIRunner.fail(Self.olderDaemon, json: global.json)
     }
 
     private func emit(_ lines: [LogRecord]) {
@@ -690,6 +746,11 @@ struct Logs: AsyncParsableCommand {
                 print("\(JSONCoding.formatISO8601(line.at)) [\(line.stream.rawValue)] \(line.text)")
             }
         }
+        /** `print` block-buffers into a pipe, so a follow reader would see
+            nothing until kilobytes pile up; nil flushes every output stream
+            without touching the `stdout` global, which strict concurrency
+            rejects. */
+        fflush(nil)
     }
 
     /** 5m / 2h / 1d / 30s relative forms, else ISO-8601. */
@@ -1385,10 +1446,7 @@ struct Open: AsyncParsableCommand {
         }
         guard let server = result.servers.first else {
             CLIRunner.fail(
-                WireError(
-                    code: .notFound, hint: "run: directa status --json",
-                    message: "no server named '\(name)' is registered for this project"),
-                json: global.json)
+                ProjectConfigLoader.serverNotFound(name: name, project: params.project), json: global.json)
         }
         var target = server.url
         if let head {

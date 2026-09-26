@@ -98,10 +98,8 @@ public struct DeepLinkRunner: Sendable {
         case .open:
             let list = try await daemon.statusList(project: project, name: link.server)
             guard let server = list.servers.first else {
-                throw WireError(
-                    code: .notFound,
-                    hint: "run: directa status --project \(project) --json",
-                    message: "no server named '\(link.server)' is registered for \(project)")
+                throw ProjectConfigLoader.serverNotFound(
+                    name: link.server, project: project, hint: "run: directa status --project \(project) --json")
             }
             let target = try resolveOpenURL(server: server, head: link.head)
             await effects.openBrowser(target)

@@ -605,39 +605,158 @@ public struct InitConfigResult: Codable, Equatable, Sendable {
     }
 }
 
+/** A position in a server's log family: every record before `at`, plus the
+    first `count` records stamped exactly `at` (all streams, file order), lie
+    behind it. Many records share one millisecond (a spool chunk is appended
+    under one timestamp), so a timestamp alone cannot say where a reader
+    stopped. */
+public struct LogCursor: Codable, Equatable, Sendable {
+    public var at: Date
+    public var count: Int
+
+    public init(at: Date, count: Int) {
+        self.at = at
+        self.count = count
+    }
+
+    /** The cursor of a family with no records yet: nothing lies behind it. */
+    public static let origin = LogCursor(at: Date(timeIntervalSince1970: 0), count: 0)
+}
+
+/** One number per log stream. As a trim (`tailByStream`), nil leaves that
+    stream untrimmed and 0 excludes it; as `totals`, every field is set. */
+public struct LogStreamCounts: Codable, Equatable, Sendable {
+    public var err: Int?
+    public var mark: Int?
+    public var out: Int?
+    public var sys: Int?
+
+    public init(err: Int? = nil, mark: Int? = nil, out: Int? = nil, sys: Int? = nil) {
+        self.err = err
+        self.mark = mark
+        self.out = out
+        self.sys = sys
+    }
+
+    public subscript(stream: LogStream) -> Int? {
+        get {
+            switch stream {
+            case .err: err
+            case .mark: mark
+            case .out: out
+            case .sys: sys
+            }
+        }
+        set {
+            switch stream {
+            case .err: err = newValue
+            case .mark: mark = newValue
+            case .out: out = newValue
+            case .sys: sys = newValue
+            }
+        }
+    }
+}
+
 public struct LogsQueryParams: Codable, Equatable, Sendable {
+    /** Exclusive lower bound: only records past this cursor. */
+    public var after: LogCursor?
     public var grep: String?
+    /** The oldest N matching records. */
+    public var head: Int?
+    /** Each returned text is cut to this many characters, ending in `…`. */
+    public var maxLineCharacters: Int?
     public var name: String
     public var project: String
     public var since: Date?
     public var sinceMark: String?
     public var streams: [LogStream]?
     public var tail: Int?
+    /** The newest N matching records per stream, so one stream's burst never
+        crowds another out of the answer. */
+    public var tailByStream: LogStreamCounts?
 
     public init(
+        after: LogCursor? = nil,
         grep: String? = nil,
+        head: Int? = nil,
+        maxLineCharacters: Int? = nil,
         name: String,
         project: String,
         since: Date? = nil,
         sinceMark: String? = nil,
         streams: [LogStream]? = nil,
-        tail: Int? = nil
+        tail: Int? = nil,
+        tailByStream: LogStreamCounts? = nil
     ) {
+        self.after = after
         self.grep = grep
+        self.head = head
+        self.maxLineCharacters = maxLineCharacters
         self.name = name
         self.project = project
         self.since = since
         self.sinceMark = sinceMark
         self.streams = streams
         self.tail = tail
+        self.tailByStream = tailByStream
+    }
+
+    /** Why the daemon must refuse these parameters, or nil when they are
+        coherent. The wire is untrusted: a negative count is refused rather
+        than trimmed, since a trim of a negative size has no meaning and the
+        older engine trapped on one. Every count is otherwise safe at any size,
+        because nothing is allocated ahead of the records that fill it. */
+    public func refusal() -> WireError? {
+        if after != nil, since != nil || sinceMark != nil {
+            return WireError(
+                code: .usage, hint: "send after, or since/sinceMark, not both",
+                message: "a logs query takes one lower bound: after, or since/sinceMark")
+        }
+        if tail != nil, tailByStream != nil {
+            return WireError(
+                code: .usage, hint: "send tail or tailByStream, not both",
+                message: "a logs query takes one tail: tail, or tailByStream")
+        }
+        if head != nil, tail != nil || tailByStream != nil {
+            return WireError(
+                code: .usage, hint: "send head, or tail/tailByStream, not both",
+                message: "a logs query keeps the oldest lines (head) or the newest (tail), not both")
+        }
+        var counts: [(String, Int?)] = [
+            ("after.count", after?.count), ("head", head), ("tail", tail),
+        ]
+        for stream in LogStream.allCases {
+            counts.append(("tailByStream.\(stream.rawValue)", tailByStream?[stream]))
+        }
+        for case let (field, value?) in counts where value < 0 {
+            return WireError(
+                code: .usage, hint: "send \(field) as 0 or more",
+                message: "\(field) is \(value), but a line count cannot be negative")
+        }
+        if let maxLineCharacters, maxLineCharacters < 1 {
+            return WireError(
+                code: .usage, hint: "send maxLineCharacters as 1 or more, or omit it",
+                message: "maxLineCharacters is \(maxLineCharacters), but a line needs room for at least one character")
+        }
+        return nil
     }
 }
 
 public struct LogsQueryResult: Codable, Equatable, Sendable {
+    /** The position after the newest record in the family when the query
+        ran, present even when no line matched: the next query's `after`. A
+        daemon older than this field omits it. */
+    public var cursor: LogCursor?
     public var lines: [LogRecord]
+    /** Records matched per stream before trimming, present when the query
+        carried `after`, `head`, or `tailByStream`. */
+    public var totals: LogStreamCounts?
 
-    public init(lines: [LogRecord]) {
+    public init(cursor: LogCursor? = nil, lines: [LogRecord], totals: LogStreamCounts? = nil) {
+        self.cursor = cursor
         self.lines = lines
+        self.totals = totals
     }
 }
 

@@ -1,8 +1,9 @@
 import Foundation
 import os
 
-/** Git checkout identity helpers for sibling port rebind and the worktree
-    display label. Shells out to `git`; failures return nil so non-git
+/** Git checkout identity helpers for sibling port rebind, the worktree
+    display label, and project resolution. The linked-worktree checks read
+    files; the rest shell out to `git`. Failures return nil so non-git
     projects keep the pre-coexistence path. */
 public enum CheckoutIdentity {
     /** Absolute path to the shared git directory, or nil if not a git checkout. */
@@ -12,13 +13,18 @@ public enum CheckoutIdentity {
         }
     }
 
-    /** True when this path is a linked worktree (git-dir differs from common-dir,
-        or `.git` is a file). Main checkouts and non-git trees return false. */
+    /** True when this path is a linked worktree: its `.git` file points into a
+        repository's `worktrees/` directory, or (for a path below a checkout
+        root) git-dir differs from common-dir. A submodule also has a `.git`
+        file, pointing into `modules/`, and is not a linked worktree. Main
+        checkouts and non-git trees return false. */
     public static func isLinkedWorktree(project: String) -> Bool {
-        let gitFile = URL(fileURLWithPath: project).appending(path: ".git")
         var isDir: ObjCBool = false
-        if FileManager.default.fileExists(atPath: gitFile.path, isDirectory: &isDir), !isDir.boolValue {
-            return true
+        if FileManager.default.fileExists(
+            atPath: URL(fileURLWithPath: project).appending(path: ".git").path, isDirectory: &isDir),
+            !isDir.boolValue
+        {
+            return linkedWorktreeGitDir(of: project) != nil
         }
         guard let common = gitCommonDir(project: project),
             let gitDir = git(project: project, args: ["rev-parse", "--git-dir"]).map({
@@ -26,6 +32,54 @@ public enum CheckoutIdentity {
             })
         else { return false }
         return common != gitDir
+    }
+
+    /** The worktree admin directory a `.git` file at the root of `directory`
+        points to, when that file makes `directory` a linked worktree; nil for
+        a `.git` directory, a submodule's `.git` file, or no `.git` at all.
+        Git keeps a linked worktree's admin directory at
+        `<common-dir>/worktrees/<id>`, holding a `commondir` file; a
+        submodule's git directory sits at `<git-dir>/modules/<name>` (inside
+        a worktree, `.../worktrees/<id>/modules/<name>`, and a name may itself
+        contain slashes) and is a full repository with no `commondir`. So
+        neither the path alone nor the parent directory's name settles it;
+        the `worktrees` parent plus the `commondir` file does. File reads
+        only, no git subprocess, because project resolution runs in every
+        session hook. */
+    public static func linkedWorktreeGitDir(of directory: String) -> String? {
+        let gitFile = URL(fileURLWithPath: directory).appending(path: ".git")
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: gitFile.path, isDirectory: &isDir), !isDir.boolValue,
+            let contents = try? String(contentsOf: gitFile, encoding: .utf8),
+            let line = contents.split(whereSeparator: \.isNewline).first,
+            line.hasPrefix("gitdir:")
+        else { return nil }
+        let pointer = line.dropFirst("gitdir:".count).trimmingCharacters(in: .whitespaces)
+        guard !pointer.isEmpty else { return nil }
+        let gitDir = URL(
+            fileURLWithPath: pointer, relativeTo: URL(fileURLWithPath: directory, isDirectory: true)
+        ).standardizedFileURL
+        guard gitDir.deletingLastPathComponent().lastPathComponent == "worktrees",
+            FileManager.default.fileExists(atPath: gitDir.appending(path: "commondir").path)
+        else { return nil }
+        return gitDir.path
+    }
+
+    /** The main checkout a linked worktree belongs to: the directory holding
+        the common `.git` directory that the admin directory's `commondir`
+        names. Nil when `directory` is not a linked worktree or its
+        repository is bare. */
+    public static func mainCheckout(ofLinkedWorktree directory: String) -> String? {
+        guard let gitDir = linkedWorktreeGitDir(of: directory),
+            let pointer = try? String(
+                contentsOf: URL(fileURLWithPath: gitDir).appending(path: "commondir"), encoding: .utf8)
+        else { return nil }
+        let common = URL(
+            fileURLWithPath: pointer.trimmingCharacters(in: .whitespacesAndNewlines),
+            relativeTo: URL(fileURLWithPath: gitDir, isDirectory: true)
+        ).standardizedFileURL
+        guard common.lastPathComponent == ".git" else { return nil }
+        return canonicalProjectPath(common.deletingLastPathComponent().path)
     }
 
     /** Display identity of a linked worktree: its sanitized checkout-directory

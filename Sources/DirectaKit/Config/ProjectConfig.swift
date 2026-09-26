@@ -344,6 +344,36 @@ public enum ProjectConfigLoader {
             hint: "run: directa config check",
             message: "cannot parse \(url.path): \(detail)")
     }
+
+    /** The one `not-found` for a server name a project does not have. Asked
+        from a linked worktree with no devservers.json of its own, for a name
+        its main checkout declares, it names why (the worktree does not see
+        that file, which is often untracked) and both ways out. */
+    public static func serverNotFound(
+        name: String, project: String, hint: String = "run: directa status --json"
+    ) -> WireError {
+        let message = "no server named '\(name)' in \(project)"
+        guard !FileManager.default.fileExists(atPath: configURL(project: project).path),
+            let main = CheckoutIdentity.mainCheckout(ofLinkedWorktree: project),
+            declares(name, project: main)
+        else { return WireError(code: .notFound, hint: hint, message: message) }
+        return WireError(
+            code: .notFound,
+            hint: "commit or copy devservers.json from \(main) into this worktree, or pass --project \(main)",
+            message:
+                "\(message): this linked worktree has no devservers.json, and its main checkout \(main) declares '\(name)'"
+        )
+    }
+
+    /** Whether the project's devservers.json names this server. A file that
+        is missing or does not parse declares nothing, which only drops the
+        worktree hint. */
+    private static func declares(_ name: String, project: String) -> Bool {
+        guard let data = try? Data(contentsOf: configURL(project: project)),
+            let config = try? JSONCoding.decoder().decode(ProjectFileConfig.self, from: data)
+        else { return false }
+        return config.servers[name] != nil
+    }
 }
 
 /** Dependency ordering for group operations: Kahn's algorithm producing waves of

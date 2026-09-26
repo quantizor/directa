@@ -280,4 +280,337 @@ import os
             the several-MB size of the full family a regression would read. */
         #expect(bytesRead.withLock { $0 } < 256 * 1024)
     }
+
+    private func stamped(_ ms: Int, _ stream: LogStream, _ text: String) -> LogRecord {
+        LogRecord(at: Date(timeIntervalSince1970: 1_700_000_000 + Double(ms) / 1000), stream: stream, text: text)
+    }
+
+    private func append(_ records: [LogRecord], to url: URL) throws {
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data((records.map { $0.formatted() + "\n" }.joined()).utf8))
+    }
+
+    @Test func afterSkipsExactlyCountRecordsAtTheCursorMillisecondAcrossStreams() throws {
+        let lines = [
+            stamped(1, .out, "a"), stamped(5, .out, "b"), stamped(5, .err, "c"), stamped(5, .sys, "d"),
+            stamped(5, .out, "e"), stamped(6, .out, "f"),
+        ]
+        let current = try writeFamily([lines])
+        let cursor = LogCursor(at: stamped(5, .out, "").at, count: 2)
+        let all = LogQuery.window(current: current, options: LogQueryOptions(after: cursor))
+        #expect(all.lines.map(\.text) == ["d", "e", "f"])
+        /** The skipped records count every stream, so a stream filter does
+            not change which records lie behind the cursor. */
+        let outOnly = LogQuery.window(current: current, options: LogQueryOptions(after: cursor, streams: [.out]))
+        #expect(outOnly.lines.map(\.text) == ["e", "f"])
+    }
+
+    @Test func recordsAppendedAtTheCursorMillisecondAfterItWasIssuedAreReturned() throws {
+        let current = try writeFamily([[stamped(1, .out, "a"), stamped(2, .out, "b"), stamped(2, .err, "c")]])
+        let first = LogQuery.window(current: current, options: LogQueryOptions(tail: 10))
+        #expect(first.cursor == LogCursor(at: stamped(2, .out, "").at, count: 2))
+        try append([stamped(2, .sys, "d"), stamped(2, .out, "e"), stamped(3, .out, "f")], to: current)
+        let next = LogQuery.window(current: current, options: LogQueryOptions(after: first.cursor))
+        #expect(next.lines.map(\.text) == ["d", "e", "f"])
+        #expect(next.cursor == LogCursor(at: stamped(3, .out, "").at, count: 1))
+    }
+
+    @Test func theCursorIsReturnedWhenNothingMatches() throws {
+        let current = try writeFamily([[stamped(1, .out, "a"), stamped(4, .err, "b"), stamped(4, .out, "c")]])
+        let window = LogQuery.window(current: current, options: LogQueryOptions(grep: "nothing-matches"))
+        #expect(window.lines.isEmpty)
+        #expect(window.cursor == LogCursor(at: stamped(4, .out, "").at, count: 2))
+        let caughtUp = LogQuery.window(current: current, options: LogQueryOptions(after: window.cursor))
+        #expect(caughtUp.lines.isEmpty)
+        #expect(caughtUp.cursor == window.cursor)
+        #expect(caughtUp.totals == LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0))
+    }
+
+    @Test func anEmptyFamilyAnswersTheOriginCursor() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-logq-\(UUID().uuidString)")
+        let window = LogQuery.window(current: dir.appending(path: "current.log"), options: LogQueryOptions())
+        #expect(window == LogWindow(cursor: .origin, lines: []))
+        /** The origin lies before every record, so the first query after it
+            returns everything a later append writes. */
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let current = dir.appending(path: "current.log")
+        try Data((stamped(0, .out, "first").formatted() + "\n").utf8).write(to: current)
+        #expect(
+            LogQuery.window(current: current, options: LogQueryOptions(after: .origin)).lines.map(\.text)
+                == ["first"])
+    }
+
+    @Test func aCursorMillisecondStraddlingARotationCountsBothFiles() throws {
+        let current = try writeFamily([
+            [stamped(1, .out, "a"), stamped(7, .out, "b"), stamped(7, .out, "c")],
+            [stamped(7, .sys, "rotated"), stamped(7, .out, "d")],
+        ])
+        let window = LogQuery.window(current: current, options: LogQueryOptions(tail: 1))
+        #expect(window.cursor == LogCursor(at: stamped(7, .out, "").at, count: 4))
+        let resumed = LogQuery.window(
+            current: current, options: LogQueryOptions(after: LogCursor(at: stamped(7, .out, "").at, count: 3)))
+        #expect(resumed.lines.map(\.text) == ["d"])
+    }
+
+    /** Sixty-plus records in one millisecond (one spool chunk) read in
+        pieces: every tick reads past the previous cursor, and together the
+        ticks return each record exactly once. */
+    @Test func aMillisecondBurstSplitAcrossQueriesLosesAndRepeatsNothing() throws {
+        let current = try writeFamily([[stamped(0, .sys, "started pid=1")]])
+        var cursor = LogQuery.window(current: current, options: LogQueryOptions(tail: 0)).cursor
+        var seen: [String] = []
+        let bursts = [(0..<25), (25..<61), (61..<64)]
+        for (index, burst) in bursts.enumerated() {
+            try append(burst.map { stamped(9, .out, "line \($0)") }, to: current)
+            let window = LogQuery.window(
+                current: current,
+                options: LogQueryOptions(after: cursor, tailByStream: LogStreamCounts(err: 300, out: 300)))
+            seen += window.lines.map(\.text)
+            #expect(window.totals?.out == burst.count, "tick \(index)")
+            cursor = window.cursor
+        }
+        #expect(seen == (0..<64).map { "line \($0)" })
+        #expect(cursor == LogCursor(at: stamped(9, .out, "").at, count: 64))
+    }
+
+    @Test func tailByStreamKeepsSysLinesInsideAnOutBurst() throws {
+        var lines = (0..<500).map { stamped($0, .out, "out \($0)") }
+        lines.insert(stamped(100, .sys, "exited code=1"), at: 101)
+        lines.insert(stamped(200, .sys, "started pid=9"), at: 202)
+        let current = try writeFamily([lines])
+        let window = LogQuery.window(
+            current: current,
+            options: LogQueryOptions(tailByStream: LogStreamCounts(err: 5, mark: 5, out: 3, sys: 5)))
+        #expect(window.lines.map(\.text) == ["exited code=1", "started pid=9", "out 497", "out 498", "out 499"])
+        #expect(window.totals == LogStreamCounts(err: 0, mark: 0, out: 500, sys: 2))
+        let plainTail = LogQuery.run(current: current, options: LogQueryOptions(tail: 5))
+        #expect(!plainTail.contains { $0.stream == .sys })
+    }
+
+    @Test func tailByStreamHonorsEachStreamsOwnValue() throws {
+        let lines = [
+            stamped(1, .err, "e1"), stamped(2, .out, "o1"), stamped(3, .mark, "m1"), stamped(4, .sys, "s1"),
+            stamped(5, .err, "e2"), stamped(6, .out, "o2"), stamped(7, .sys, "s2"), stamped(8, .out, "o3"),
+            stamped(9, .err, "e3"),
+        ]
+        let current = try writeFamily([lines])
+        /** err keeps its newest one, out its newest two, mark is excluded by
+            0, and sys (nil) is untrimmed. */
+        let window = LogQuery.window(
+            current: current,
+            options: LogQueryOptions(tailByStream: LogStreamCounts(err: 1, mark: 0, out: 2, sys: nil)))
+        #expect(window.lines.map(\.text) == ["s1", "o2", "s2", "o3", "e3"])
+        #expect(window.totals == LogStreamCounts(err: 3, mark: 1, out: 3, sys: 2))
+    }
+
+    @Test func headKeepsTheOldestMatches() throws {
+        let lines = (0..<20).map { stamped($0, $0 % 2 == 0 ? .out : .err, "line \($0)") }
+        let current = try writeFamily([Array(lines[..<10]), Array(lines[10...])])
+        let window = LogQuery.window(
+            current: current, options: LogQueryOptions(head: 3, since: stamped(5, .out, "").at, streams: [.err]))
+        #expect(window.lines.map(\.text) == ["line 5", "line 7", "line 9"])
+        #expect(window.totals == LogStreamCounts(err: 8, mark: 0, out: 0, sys: 0))
+        #expect(LogQuery.window(current: current, options: LogQueryOptions(head: 0)).lines.isEmpty)
+    }
+
+    @Test func maxLineCharactersCutsEachTextWithAnEllipsis() throws {
+        let lines = [
+            stamped(1, .out, "abcdef"), stamped(2, .out, "abcd"), stamped(3, .out, "👩‍👩‍👧‍👦 family emoji"),
+            stamped(4, .out, ""),
+        ]
+        let current = try writeFamily([lines])
+        let four = LogQuery.window(current: current, options: LogQueryOptions(maxLineCharacters: 4, tail: 10))
+        #expect(four.lines.map(\.text) == ["abc…", "abcd", "👩‍👩‍👧‍👦 f…", ""])
+        let one = LogQuery.window(
+            current: current, options: LogQueryOptions(after: .origin, maxLineCharacters: 1))
+        #expect(one.lines.map(\.text) == ["…", "…", "…", ""])
+    }
+
+    @Test func totalsAreAbsentForTheShapesThatPredateThem() throws {
+        let current = try writeFamily([[stamped(1, .out, "a"), stamped(2, .err, "b")]])
+        for options in [
+            LogQueryOptions(), LogQueryOptions(tail: 1), LogQueryOptions(since: stamped(0, .out, "").at),
+            LogQueryOptions(grep: "a"),
+        ] {
+            let window = LogQuery.window(current: current, options: options)
+            #expect(window.totals == nil)
+            #expect(window.cursor == LogCursor(at: stamped(2, .out, "").at, count: 1))
+        }
+    }
+
+    /** A sub-millisecond `since` (the CLI's `5m` form) keeps the old
+        `record.at < since` exclusion exactly: a record in the same
+        millisecond but before the instant is excluded. */
+    @Test func aSubMillisecondSinceExcludesTheEarlierPartOfItsMillisecond() throws {
+        let current = try writeFamily([[stamped(1, .out, "a"), stamped(2, .out, "b"), stamped(3, .out, "c")]])
+        let since = stamped(2, .out, "").at.addingTimeInterval(0.0004)
+        #expect(LogQuery.run(current: current, options: LogQueryOptions(since: since)).map(\.text) == ["c"])
+        let exact = stamped(2, .out, "").at
+        #expect(LogQuery.run(current: current, options: LogQueryOptions(since: exact)).map(\.text) == ["b", "c"])
+    }
+
+    @Test func theDigitParserAgreesWithTheISO8601Parser() throws {
+        let samples = [
+            "2024-02-29T23:59:59.999Z", "2025-12-31T00:00:00.000Z", "1970-01-01T00:00:00.001Z",
+            "2100-03-01T12:34:56.789Z", "2026-09-26T05:30:40.118Z", "2026-01-01T00:00:00Z",
+        ]
+        for sample in samples {
+            let parsed = try #require(JSONCoding.parseISO8601(sample))
+            let bytes = Array(sample.utf8)
+            let ms = bytes.withUnsafeBufferPointer { LogScan.epochMilliseconds($0) }
+            #expect(ms == LogScan.milliseconds(of: parsed), "\(sample)")
+            #expect(ms.map(LogScan.date(milliseconds:)) == parsed, "\(sample)")
+        }
+        for invalid in ["2025-02-29T00:00:00.000Z", "2025-13-01T00:00:00.000Z", "not a timestamp at all!"] {
+            let bytes = Array(invalid.utf8)
+            #expect(
+                bytes.withUnsafeBufferPointer { LogScan.epochMilliseconds($0) }
+                    == JSONCoding.parseISO8601(invalid).map(LogScan.milliseconds(of:)), "\(invalid)")
+        }
+    }
+
+    /** Memory tracks the answer, not the window: over a multi-megabyte
+        family the scan reads in bounded chunks and reads back only what it
+        keeps, so no single read approaches a file's size and the total read
+        stays near one pass over the family. */
+    @Test func aLargeWindowIsStreamedInBoundedReads() throws {
+        let files = (0..<3).map { file in
+            (0..<16_000).map { index in
+                let ms = file * 16_000 + index
+                return stamped(
+                    ms / 20, ms % 50 == 0 ? .err : .out,
+                    "GET /api/items/\(ms) 200 12ms padding-padding-padding-padding")
+            }
+        }
+        let current = try writeFamily(files)
+        let familyBytes = try LogQuery.familyFiles(current: current)
+            .map { try FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int ?? 0 }
+            .reduce(0, +)
+        let reads = OSAllocatedUnfairLock<[Int]>(initialState: [])
+        let window = LogQuery.windowMeasured(
+            current: current,
+            options: LogQueryOptions(after: .origin, tailByStream: LogStreamCounts(err: 300, out: 300)),
+            onDiskRead: { bytes in reads.withLock { $0.append(bytes) } })
+        #expect(window.lines.count == 600)
+        #expect(window.totals == LogStreamCounts(err: 960, mark: 0, out: 47_040, sys: 0))
+        let observed = reads.withLock { $0 }
+        #expect(familyBytes > 3 * 1024 * 1024)
+        #expect((observed.max() ?? 0) <= 1024 * 1024)
+        #expect(observed.reduce(0, +) < familyBytes + familyBytes / 4)
+    }
+
+    /** Differential check against a naive reading of the spec: parse every
+        record, apply the lower bound, filters, trim, and truncation in
+        order, and derive the cursor from the last record. Seeded, so a
+        failure reproduces. */
+    @Test func randomQueriesMatchANaiveModelOfTheSpec() throws {
+        var random = SplitMix64(seed: 0x5EED)
+        for iteration in 0..<250 {
+            var ms = 0
+            let fileCount = Int(random.next() % 3) + 1
+            var family: [[LogRecord]] = []
+            var sequence = 0
+            for _ in 0..<fileCount {
+                /** A file always holds at least one record, as a rotation
+                    writes `rotated` into the fresh file. */
+                let count = Int(random.next() % 40) + 1
+                family.append(
+                    (0..<count).map { _ in
+                        ms += Int(random.next() % 3) == 0 ? 1 : 0
+                        sequence += 1
+                        let stream = LogStream.allCases[Int(random.next() % 4)]
+                        let text = random.next() % 4 == 0 ? "needle \(sequence) long text" : "hay \(sequence)"
+                        return stamped(ms, stream, text)
+                    })
+            }
+            let current = try writeFamily(family)
+            defer { try? FileManager.default.removeItem(at: current.deletingLastPathComponent()) }
+            let records = family.flatMap { $0 }
+            var options = LogQueryOptions()
+            switch random.next() % 3 {
+            case 0:
+                options.after = LogCursor(
+                    at: stamped(Int(random.next() % UInt64(ms + 2)), .out, "").at, count: Int(random.next() % 5))
+            case 1:
+                options.since = stamped(Int(random.next() % UInt64(ms + 2)), .out, "").at
+                    .addingTimeInterval(random.next() % 2 == 0 ? 0 : 0.0004)
+            default:
+                break
+            }
+            if random.next() % 3 == 0 { options.streams = [.out, .sys] }
+            if random.next() % 4 == 0 { options.grep = "needle" }
+            switch random.next() % 4 {
+            case 0: options.tail = Int(random.next() % 10)
+            case 1: options.head = Int(random.next() % 10)
+            case 2:
+                options.tailByStream = LogStreamCounts(
+                    err: Int(random.next() % 4), mark: nil, out: Int(random.next() % 6), sys: 0)
+            default: break
+            }
+            if random.next() % 3 == 0 { options.maxLineCharacters = Int(random.next() % 8) + 1 }
+            let got = LogQuery.window(current: current, options: options)
+            #expect(got == naiveWindow(records, options), "iteration \(iteration)")
+        }
+    }
+
+    private func naiveWindow(_ records: [LogRecord], _ options: LogQueryOptions) -> LogWindow {
+        var matched = records
+        if let after = options.after {
+            matched.removeAll { $0.at < after.at }
+            var skip = after.count
+            matched = Array(matched.drop { record in
+                guard skip > 0, record.at == after.at else { return false }
+                skip -= 1
+                return true
+            })
+        } else if let since = options.since {
+            matched.removeAll { $0.at < since }
+        }
+        if let streams = options.streams { matched.removeAll { !streams.contains($0.stream) } }
+        if options.grep != nil { matched.removeAll { !$0.text.contains("needle") } }
+        var totals = LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0)
+        for record in matched { totals[record.stream] = (totals[record.stream] ?? 0) + 1 }
+        if let head = options.head {
+            matched = Array(matched.prefix(head))
+        } else if let byStream = options.tailByStream {
+            var keep: [Int] = []
+            for stream in LogStream.allCases {
+                let indices = matched.indices.filter { matched[$0].stream == stream }
+                keep += byStream[stream].map { Array(indices.suffix($0)) } ?? indices
+            }
+            matched = keep.sorted().map { matched[$0] }
+        } else if let tail = options.tail {
+            matched = Array(matched.suffix(tail))
+        }
+        if let limit = options.maxLineCharacters {
+            matched = matched.map { record in
+                guard record.text.count > limit else { return record }
+                return LogRecord(at: record.at, stream: record.stream, text: String(record.text.prefix(limit - 1)) + "…")
+            }
+        }
+        let cursor = records.last.map { last in
+            LogCursor(at: last.at, count: records.reversed().prefix { $0.at == last.at }.count)
+        } ?? .origin
+        let reportsTotals = options.after != nil || options.head != nil || options.tailByStream != nil
+        return LogWindow(cursor: cursor, lines: matched, totals: reportsTotals ? totals : nil)
+    }
+}
+
+/** A seeded generator so a randomized test replays the same inputs. */
+private struct SplitMix64 {
+    private var state: UInt64
+
+    init(seed: UInt64) {
+        state = seed
+    }
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var value = state
+        value = (value ^ (value >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        value = (value ^ (value >> 27)) &* 0x94D0_49BB_1331_11EB
+        return value ^ (value >> 31)
+    }
 }

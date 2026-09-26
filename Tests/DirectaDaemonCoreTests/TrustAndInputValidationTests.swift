@@ -83,6 +83,67 @@ import Testing
         #expect(await registry.spec(project: env.project, name: "web") != nil)
     }
 
+    /** A conflicting or negative logs query is refused `usage` at the wire,
+        before any server is resolved or any file read. */
+    @Test func logsQueryRefusesConflictingParamsBeforeResolvingTheServer() async throws {
+        let env = try makeEnv()
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths))
+        for params in [
+            LogsQueryParams(after: .origin, name: "ghost", project: env.project, since: Date()),
+            LogsQueryParams(head: 1, name: "ghost", project: env.project, tail: 1),
+            LogsQueryParams(name: "ghost", project: env.project, tail: -1),
+        ] {
+            let outcome = try await send(router, .logsQuery, params, LogsQueryResult.self)
+            guard case .failure(let error) = outcome else {
+                Issue.record("logs.query accepted \(params)")
+                continue
+            }
+            #expect(error.code == .usage)
+        }
+    }
+
+    /** The router hands every new field to the engine and every new answer
+        back: the cursor, per-stream totals, and truncated text. */
+    @Test func logsQueryPassesTheCursorTrimAndTruncationThrough() async throws {
+        let env = try makeEnv()
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths))
+        _ = try await send(
+            router, .serverRegister,
+            RegisterParams(project: env.project, spec: ServerSpec(command: ["bun", "dev"], name: "web")),
+            ServerResult.self
+        ).get()
+        let log = env.paths.structuredLogFile(project: canonicalProjectPath(env.project), server: "web")
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let at = Date(timeIntervalSince1970: 1_752_868_000)
+        let records = [
+            LogRecord(at: at, stream: .sys, text: "started pid=7"),
+            LogRecord(at: at, stream: .out, text: "listening on 3000"),
+            LogRecord(at: at, stream: .out, text: "GET /"),
+        ]
+        try Data(records.map { $0.formatted() + "\n" }.joined().utf8).write(to: log)
+        let result = try await send(
+            router, .logsQuery,
+            LogsQueryParams(
+                after: LogCursor(at: at, count: 1), maxLineCharacters: 5, name: "web", project: env.project,
+                tailByStream: LogStreamCounts(out: 1)),
+            LogsQueryResult.self
+        ).get()
+        #expect(
+            result
+                == LogsQueryResult(
+                    cursor: LogCursor(at: at, count: 3), lines: [LogRecord(at: at, stream: .out, text: "GET /")],
+                    totals: LogStreamCounts(err: 0, mark: 0, out: 2, sys: 0)))
+        let truncated = try await send(
+            router, .logsQuery,
+            LogsQueryParams(head: 1, maxLineCharacters: 5, name: "web", project: env.project, streams: [.out]),
+            LogsQueryResult.self
+        ).get()
+        #expect(truncated.lines.map(\.text) == ["list…"])
+    }
+
     @Test func writeConfigRefusesAnUntrackedProjectPath() async throws {
         let env = try makeEnv()
         let stranger = FileManager.default.temporaryDirectory

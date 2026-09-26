@@ -331,6 +331,101 @@ import Testing
         let reencoded = String(data: try JSONCoding.encoder().encode(result), encoding: .utf8)
         #expect(reencoded == json)
     }
+
+    private func encoded<T: Encodable>(_ value: T) throws -> String {
+        try #require(String(data: JSONCoding.encoder().encode(value), encoding: .utf8))
+    }
+
+    private let logAt = Date(timeIntervalSince1970: 1_752_868_000)
+
+    /** `LogStream` is not `CodingKeyRepresentable`, so a `[LogStream: Int]`
+        would encode as an alternating array; both count types are structs so
+        they encode as objects. */
+    @Test func logCursorAndStreamCountsEncodeAsObjects() throws {
+        #expect(try encoded(LogCursor(at: logAt, count: 3)) == #"{"at":"2025-07-18T19:46:40.000Z","count":3}"#)
+        #expect(
+            try encoded(LogStreamCounts(err: 1, mark: 0, out: 20, sys: 4))
+                == #"{"err":1,"mark":0,"out":20,"sys":4}"#)
+        #expect(try encoded(LogStreamCounts(out: 300)) == #"{"out":300}"#)
+        #expect(try encoded(LogCursor.origin) == #"{"at":"1970-01-01T00:00:00.000Z","count":0}"#)
+    }
+
+    @Test func logsQueryParamsSchemaGolden() throws {
+        let params = LogsQueryParams(
+            after: LogCursor(at: logAt, count: 2), maxLineCharacters: 400, name: "web", project: "/tmp/proj",
+            streams: [.out, .sys], tailByStream: LogStreamCounts(err: 300, mark: 50, out: 300, sys: 50))
+        #expect(
+            try encoded(params)
+                == #"{"after":{"at":"2025-07-18T19:46:40.000Z","count":2},"maxLineCharacters":400,"name":"web","project":"/tmp/proj","streams":["out","sys"],"tailByStream":{"err":300,"mark":50,"out":300,"sys":50}}"#
+        )
+        #expect(
+            try encoded(LogsQueryParams(head: 200, name: "web", project: "/tmp/proj"))
+                == #"{"head":200,"name":"web","project":"/tmp/proj"}"#)
+    }
+
+    @Test func logsQueryResultSchemaGolden() throws {
+        let result = LogsQueryResult(
+            cursor: LogCursor(at: logAt, count: 1), lines: [LogRecord(at: logAt, stream: .out, text: "ready")],
+            totals: LogStreamCounts(err: 0, mark: 0, out: 1, sys: 0))
+        #expect(
+            try encoded(result)
+                == #"{"cursor":{"at":"2025-07-18T19:46:40.000Z","count":1},"lines":[{"at":"2025-07-18T19:46:40.000Z","stream":"out","text":"ready"}],"totals":{"err":0,"mark":0,"out":1,"sys":0}}"#
+        )
+    }
+
+    /** Append-only both ways: an older client's params decode with every new
+        field absent, and an older daemon's result (no cursor, no totals)
+        decodes too, which is how a newer CLI tells it needs a restart. */
+    @Test func olderLogsFramesStillDecode() throws {
+        let oldParams = #"{"name":"web","project":"/tmp/proj","since":"2025-07-18T19:46:40.000Z","tail":5}"#
+        let params = try JSONCoding.decoder().decode(LogsQueryParams.self, from: Data(oldParams.utf8))
+        #expect(params == LogsQueryParams(name: "web", project: "/tmp/proj", since: logAt, tail: 5))
+        #expect(params.refusal() == nil)
+        let oldResult = #"{"lines":[]}"#
+        let result = try JSONCoding.decoder().decode(LogsQueryResult.self, from: Data(oldResult.utf8))
+        #expect(result == LogsQueryResult(lines: []))
+        #expect(result.cursor == nil)
+    }
+
+    @Test func logsQueryParamsRefuseEachExclusivePair() {
+        let cursor = LogCursor(at: logAt, count: 0)
+        let byStream = LogStreamCounts(out: 10)
+        let refused: [(LogsQueryParams, String)] = [
+            (LogsQueryParams(after: cursor, name: "web", project: "/p", since: logAt), "after with since"),
+            (LogsQueryParams(after: cursor, name: "web", project: "/p", sinceMark: "m1"), "after with sinceMark"),
+            (LogsQueryParams(name: "web", project: "/p", tail: 5, tailByStream: byStream), "tail with tailByStream"),
+            (LogsQueryParams(head: 5, name: "web", project: "/p", tail: 5), "head with tail"),
+            (LogsQueryParams(head: 5, name: "web", project: "/p", tailByStream: byStream), "head with tailByStream"),
+        ]
+        for (params, label) in refused {
+            #expect(params.refusal()?.code == .usage, "\(label)")
+            #expect(params.refusal()?.hint != nil, "\(label)")
+        }
+        #expect(
+            LogsQueryParams(after: cursor, head: 5, name: "web", project: "/p").refusal() == nil)
+        #expect(
+            LogsQueryParams(name: "web", project: "/p", since: logAt, sinceMark: "m1", tail: 5).refusal() == nil)
+    }
+
+    @Test func logsQueryParamsRefuseNegativeCountsAndAnEmptyLineBudget() {
+        let refused: [(LogsQueryParams, String)] = [
+            (LogsQueryParams(after: LogCursor(at: logAt, count: -1), name: "w", project: "/p"), "after.count"),
+            (LogsQueryParams(head: -1, name: "w", project: "/p"), "head"),
+            (LogsQueryParams(name: "w", project: "/p", tail: -1), "tail"),
+            (LogsQueryParams(name: "w", project: "/p", tailByStream: LogStreamCounts(sys: -3)), "tailByStream.sys"),
+        ]
+        for (params, field) in refused {
+            let refusal = params.refusal()
+            #expect(refusal?.code == .usage, "\(field)")
+            #expect(refusal?.message.hasPrefix("\(field) is ") == true, "\(field)")
+        }
+        #expect(LogsQueryParams(maxLineCharacters: 0, name: "w", project: "/p").refusal()?.code == .usage)
+        #expect(LogsQueryParams(maxLineCharacters: 1, name: "w", project: "/p").refusal() == nil)
+        #expect(
+            LogsQueryParams(
+                name: "w", project: "/p", tailByStream: LogStreamCounts(err: 0, mark: 0, out: Int.max, sys: 0)
+            ).refusal() == nil)
+    }
 }
 
 @Suite struct PathTests {
