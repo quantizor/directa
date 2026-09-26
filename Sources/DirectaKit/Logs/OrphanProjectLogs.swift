@@ -32,10 +32,44 @@ public enum OrphanProjectLogs {
     public enum Removal: Equatable, Sendable {
         /** `removeItem` threw; the payload is its message. */
         case failed(String)
-        /** A safety check left the path in place; the payload says why in
-            plain words. */
-        case refused(String)
+        /** A safety check left the path in place. */
+        case refused(Refusal)
         case removed
+    }
+
+    /** Why `removalRefusal` left a path in place. */
+    public enum Refusal: Equatable, Sendable {
+        case claimed
+        case gone
+        case link
+        case notADirectory
+        case notADirectaName
+        /** The payload is the logs root the path should have been directly
+            inside. */
+        case outsideLogsRoot(String)
+
+        /** Plain words for why the path was left alone. */
+        public var reason: String {
+            switch self {
+            case .claimed: "a registered project claims it"
+            case .gone: "it is no longer there"
+            case .link: "it is a link to another location, not a log directory directa created"
+            case .notADirectory: "it is not a directory"
+            case .notADirectaName: "its name is not one directa gives a log directory, so directa did not create it"
+            case .outsideLogsRoot(let logsDir): "it is not directly inside directa's logs folder \(logsDir)"
+            }
+        }
+
+        /** What a person can do about it, or nil when nothing is left to do.
+            Never a deletion command: whatever is removed by hand is the
+            reader's own call. */
+        public var remedy: String? {
+            switch self {
+            case .claimed, .gone, .outsideLogsRoot: nil
+            case .link: "remove the link yourself if nothing needs it"
+            case .notADirectory, .notADirectaName: "move or remove it yourself if nothing needs it"
+            }
+        }
     }
 
     public static let remedy = "directa doctor --fix"
@@ -47,12 +81,17 @@ public enum OrphanProjectLogs {
         orphan as empty). `claimedSlugDirs` is
         `DirectaPaths.projectLogDir(project:).lastPathComponent` for every
         project the daemon currently reports; a directory not in that set has
-        no project left to speak for it. */
+        no project left to speak for it. A name without the
+        `DirectaPaths.isProjectLogDirName` shape is never reported: directa did
+        not create it, and `remove` refuses it. */
     public static func detect(
         entries: [(apparentBytes: Int64, path: URL)], claimedSlugDirs: Set<String>
     ) -> [Finding] {
         entries
-            .filter { !claimedSlugDirs.contains($0.path.lastPathComponent) }
+            .filter { entry in
+                let name = entry.path.lastPathComponent
+                return DirectaPaths.isProjectLogDirName(name) && !claimedSlugDirs.contains(name)
+            }
             .sorted { $0.path.path < $1.path.path }
             .map { entry in
                 Finding(
@@ -66,7 +105,9 @@ public enum OrphanProjectLogs {
         file sizes); the decision it feeds is the pure `detect` above. A
         symbolic link is skipped even when it points at a directory: directa
         never creates one here, `remove` refuses it, and sizing it would count
-        whatever the link points at. */
+        whatever the link points at. A name `detect` would drop is skipped
+        before sizing, so a logs root shared with other apps never has their
+        trees walked. */
     public static func scan(
         paths: DirectaPaths, claimedSlugDirs: Set<String>, fileManager: FileManager = .default
     ) -> [Finding] {
@@ -74,6 +115,9 @@ public enum OrphanProjectLogs {
             return []
         }
         let entries: [(apparentBytes: Int64, path: URL)] = names.compactMap { name in
+            guard DirectaPaths.isProjectLogDirName(name), !claimedSlugDirs.contains(name) else {
+                return nil
+            }
             let url = paths.logsDir.appending(path: name)
             guard fileType(at: url) == S_IFDIR else { return nil }
             return (apparentBytes: apparentSize(of: url, fileManager: fileManager), path: url)
@@ -82,7 +126,7 @@ public enum OrphanProjectLogs {
     }
 
     /** Nil when `directory` is safe to delete as a leftover log directory,
-        else the plain-words reason it is not. Safe means all of: every path
+        else why it is not. Safe means all of: every path
         component is a real name (a `.` or `..` is resolved lexically by
         `resolvingSymlinksInPath` but physically by the kernel after following
         links, so the two could name different directories); its resolved
@@ -90,12 +134,14 @@ public enum OrphanProjectLogs {
         /var and /tmp are links to /private/var and /private/tmp and either
         spelling can arrive); the path itself, read without following links,
         is a directory and not a symbolic link (deleting through a link would
-        delete its target, which could be a claimed project's logs); and its
-        name is no claimed slug. */
+        delete its target, which could be a claimed project's logs); its name
+        has the `DirectaPaths.isProjectLogDirName` shape (a logs root shared
+        with other apps holds folders directa never made); and its name is no
+        claimed slug. */
     public static func removalRefusal(
         of directory: URL, logsDir: URL, claimedSlugDirs: Set<String>
-    ) -> String? {
-        let outsideRoot = "it is not directly inside directa's logs folder \(logsDir.path)"
+    ) -> Refusal? {
+        let outsideRoot = Refusal.outsideLogsRoot(logsDir.path)
         if directory.pathComponents.contains(where: { $0 == "." || $0 == ".." }) {
             return outsideRoot
         }
@@ -105,16 +151,18 @@ public enum OrphanProjectLogs {
         guard resolvedParent == resolvedRoot else { return outsideRoot }
         switch fileType(at: directory) {
         case nil:
-            return "it is no longer there"
+            return .gone
         case S_IFLNK:
-            return "it is a link to another location, not a log directory directa created"
+            return .link
         case S_IFDIR:
             break
         default:
-            return "it is not a directory"
+            return .notADirectory
         }
-        if claimedSlugDirs.contains(directory.lastPathComponent) {
-            return "a registered project claims it"
+        let name = directory.lastPathComponent
+        guard DirectaPaths.isProjectLogDirName(name) else { return .notADirectaName }
+        if claimedSlugDirs.contains(name) {
+            return .claimed
         }
         return nil
     }
@@ -126,8 +174,8 @@ public enum OrphanProjectLogs {
         _ directory: URL, logsDir: URL, claimedSlugDirs: Set<String>,
         fileManager: FileManager = .default
     ) -> Removal {
-        if let reason = removalRefusal(of: directory, logsDir: logsDir, claimedSlugDirs: claimedSlugDirs) {
-            return .refused(reason)
+        if let refusal = removalRefusal(of: directory, logsDir: logsDir, claimedSlugDirs: claimedSlugDirs) {
+            return .refused(refusal)
         }
         do {
             try fileManager.removeItem(at: directory)

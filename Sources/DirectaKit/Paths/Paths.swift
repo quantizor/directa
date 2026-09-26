@@ -97,6 +97,15 @@ public struct DirectaPaths: Sendable {
         return logsDir.appending(path: "\(projectSlug(project))-\(Self.hash8(project))")
     }
 
+    /** True when `name` has the shape `projectLogDir` gives a directory: the
+        `projectSlug` alphabet, a dash, then eight lowercase hex characters. A
+        logs root shared with other apps (`ddirecta --logs-dir ~/Library/Logs`)
+        holds folders directa never made, and this shape is how they are told
+        apart. */
+    public static func isProjectLogDirName(_ name: String) -> Bool {
+        name.wholeMatch(of: /[a-z0-9-]*-[0-9a-f]{8}/) != nil
+    }
+
     /** Per-server log directory: `<slug>-<hash8>/<server>`. */
     public func serverLogDir(project: String, server: String) -> URL {
         projectLogDir(project: project).appending(path: Self.serverPathComponent(server))

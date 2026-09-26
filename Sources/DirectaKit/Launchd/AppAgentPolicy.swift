@@ -27,7 +27,9 @@ public enum AppAgentPolicy {
             both for a user who never turned the legacy login item on and for
             one who turned it off, so both are recorded as off. */
         case recordOff
-        /** Migrate off the legacy login item, then register the agent. */
+        /** Register the agent, then migrate off the legacy login item only
+            when `retiresLegacyLoginItem` says the agent now carries the
+            user's choice. */
         case register
     }
 
@@ -56,6 +58,21 @@ public enum AppAgentPolicy {
         case _ where legacyLoginItemEnabled: return .register
         case .enabled, .requiresApproval: return .leaveAlone
         case .notFound, .notRegistered: return .recordOff
+        }
+    }
+
+    /** After a `.register` launch action, whether the legacy login item may
+        be unregistered, read from the agent's status once registration has
+        run. `enabled` and `requiresApproval` both carry the user's Start at
+        login choice forward (approval pending is the same choice waiting on
+        System Settings). Any other status means registration did not take:
+        the legacy item stays, so the user keeps Start at login and the next
+        launch reads it on and retries, where retiring it would have that
+        launch record Start at login off for good. */
+    public static func retiresLegacyLoginItem(agentStatusAfterRegister: AgentStatus) -> Bool {
+        switch agentStatusAfterRegister {
+        case .enabled, .requiresApproval: true
+        case .notFound, .notRegistered, .unknown: false
         }
     }
 }

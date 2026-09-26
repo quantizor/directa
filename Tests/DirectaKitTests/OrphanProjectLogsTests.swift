@@ -26,14 +26,37 @@ import Testing
     @Test func multipleOrphansSortByPath() {
         let findings = OrphanProjectLogs.detect(
             entries: [
-                (apparentBytes: 0, path: URL(fileURLWithPath: "/logs/zproj-1111")),
-                (apparentBytes: 0, path: URL(fileURLWithPath: "/logs/aproj-2222")),
+                (apparentBytes: 0, path: URL(fileURLWithPath: "/logs/zproj-11111111")),
+                (apparentBytes: 0, path: URL(fileURLWithPath: "/logs/aproj-22222222")),
             ],
             claimedSlugDirs: [])
         #expect(findings.map(\.detail) == [
-            "/logs/aproj-2222 (Zero KB) matches no registered project",
-            "/logs/zproj-1111 (Zero KB) matches no registered project",
+            "/logs/aproj-22222222 (Zero KB) matches no registered project",
+            "/logs/zproj-11111111 (Zero KB) matches no registered project",
         ])
+    }
+
+    /** A logs root shared with other apps (`ddirecta --logs-dir
+        ~/Library/Logs`) holds folders directa never made; only the
+        `<slug>-<hash8>` shape `projectLogDir` produces is ever reported. */
+    @Test func detectReportsOnlyNamesWithTheProjectLogDirShape() {
+        let names = [
+            "DiagnosticReports", "com.apple.xpc.launchd", "myproj-abcd123", "myproj-ABCD1234",
+            "myproj-abcd12345", "My App-abcd1234", "-abcd1234", "web-app-0123abcd",
+        ]
+        let findings = OrphanProjectLogs.detect(
+            entries: names.map { (apparentBytes: 0, path: URL(fileURLWithPath: "/logs/\($0)")) },
+            claimedSlugDirs: [])
+        #expect(findings.map(\.path.lastPathComponent) == ["-abcd1234", "web-app-0123abcd"])
+    }
+
+    @Test func aProjectLogDirNameMatchesTheShapeItDeclares() {
+        let paths = DirectaPaths(
+            dataDir: URL(fileURLWithPath: "/data"), logsDir: URL(fileURLWithPath: "/logs"))
+        for project in ["/Users/x/My App", "/Users/x/web.app", "/", "/Users/x/ünïcode"] {
+            let name = paths.projectLogDir(project: project).lastPathComponent
+            #expect(DirectaPaths.isProjectLogDirName(name), "\(name) from \(project)")
+        }
     }
 
     @Test func scanFindsOnlyTheDirectoryNoProjectClaims() throws {
@@ -45,7 +68,7 @@ import Testing
             directory itself) must not be mistaken for one. */
         try Data().write(to: fixture.logsDir.appending(path: "stray.log"))
 
-        let findings = OrphanProjectLogs.scan(paths: fixture.paths, claimedSlugDirs: ["claimed-1111"])
+        let findings = OrphanProjectLogs.scan(paths: fixture.paths, claimedSlugDirs: [Fixture.claimedName])
 
         #expect(findings.count == 1)
         #expect(findings[0].detail.hasPrefix(fixture.orphaned.path))
@@ -54,15 +77,26 @@ import Testing
         #expect(findings[0].remedy == "directa doctor --fix")
     }
 
+    @Test func scanSkipsAnotherAppsFolderUnderASharedLogsRoot() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let foreign = fixture.logsDir.appending(path: "DiagnosticReports")
+        try FileManager.default.createDirectory(at: foreign, withIntermediateDirectories: true)
+
+        let findings = OrphanProjectLogs.scan(paths: fixture.paths, claimedSlugDirs: [Fixture.claimedName])
+
+        #expect(findings.map(\.path) == [fixture.orphaned])
+    }
+
     /** A link is not a log directory directa created, and `--fix` refuses to
         remove one, so the report never names it as something `--fix` handles. */
     @Test func scanSkipsASymlinkEvenWhenItPointsAtADirectory() throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
         try FileManager.default.createSymbolicLink(
-            at: fixture.logsDir.appending(path: "link-3333"), withDestinationURL: fixture.claimed)
+            at: fixture.logsDir.appending(path: "link-33333333"), withDestinationURL: fixture.claimed)
 
-        let findings = OrphanProjectLogs.scan(paths: fixture.paths, claimedSlugDirs: ["claimed-1111"])
+        let findings = OrphanProjectLogs.scan(paths: fixture.paths, claimedSlugDirs: [Fixture.claimedName])
 
         #expect(findings.map(\.path) == [fixture.orphaned])
     }
@@ -88,14 +122,28 @@ import Testing
 
         #expect(
             OrphanProjectLogs.removalRefusal(
-                of: orphan, logsDir: fixture.logsDir, claimedSlugDirs: ["claimed-1111"])
+                of: orphan, logsDir: fixture.logsDir, claimedSlugDirs: [Fixture.claimedName])
                 == nil)
         let outcome = OrphanProjectLogs.remove(
-            orphan, logsDir: fixture.logsDir, claimedSlugDirs: ["claimed-1111"])
+            orphan, logsDir: fixture.logsDir, claimedSlugDirs: [Fixture.claimedName])
 
         #expect(outcome == .removed)
         #expect(!FileManager.default.fileExists(atPath: fixture.orphaned.path))
         #expect(FileManager.default.fileExists(atPath: fixture.claimed.path))
+    }
+
+    /** Another app's unclaimed folder under a shared logs root is exactly
+        what the location and claim checks alone would delete. */
+    @Test func anotherAppsFolderUnderASharedLogsRootIsRefused() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let foreign = fixture.logsDir.appending(path: "DiagnosticReports")
+        try FileManager.default.createDirectory(at: foreign, withIntermediateDirectories: true)
+
+        let outcome = OrphanProjectLogs.remove(foreign, logsDir: fixture.logsDir, claimedSlugDirs: [])
+
+        #expect(outcome == .refused(.notADirectaName))
+        #expect(FileManager.default.fileExists(atPath: foreign.path))
     }
 
     /** `removeItem` on a link whose target is a claimed project's log
@@ -103,14 +151,14 @@ import Testing
     @Test func aSymlinkToAClaimedSiblingIsRefusedAndItsTargetSurvives() throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
-        let link = fixture.logsDir.appending(path: "link-3333")
+        let link = fixture.logsDir.appending(path: "link-33333333")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: fixture.claimed)
         try Data().write(to: fixture.claimed.appending(path: "current.log"))
 
         let outcome = OrphanProjectLogs.remove(
-            link, logsDir: fixture.logsDir, claimedSlugDirs: ["claimed-1111"])
+            link, logsDir: fixture.logsDir, claimedSlugDirs: [Fixture.claimedName])
 
-        #expect(outcome == .refused("it is a link to another location, not a log directory directa created"))
+        #expect(outcome == .refused(.link))
         #expect(FileManager.default.fileExists(atPath: fixture.claimed.appending(path: "current.log").path))
         #expect((try? FileManager.default.destinationOfSymbolicLink(atPath: link.path)) != nil)
     }
@@ -120,9 +168,9 @@ import Testing
         defer { fixture.cleanUp() }
 
         let outcome = OrphanProjectLogs.remove(
-            fixture.claimed, logsDir: fixture.logsDir, claimedSlugDirs: ["claimed-1111"])
+            fixture.claimed, logsDir: fixture.logsDir, claimedSlugDirs: [Fixture.claimedName])
 
-        #expect(outcome == .refused("a registered project claims it"))
+        #expect(outcome == .refused(.claimed))
         #expect(FileManager.default.fileExists(atPath: fixture.claimed.path))
     }
 
@@ -134,19 +182,19 @@ import Testing
 
         let outcome = OrphanProjectLogs.remove(stray, logsDir: fixture.logsDir, claimedSlugDirs: [])
 
-        #expect(outcome == .refused("it is not a directory"))
+        #expect(outcome == .refused(.notADirectory))
         #expect(FileManager.default.fileExists(atPath: stray.path))
     }
 
     @Test func aDirectoryOutsideTheLogsRootIsRefused() throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
-        let outside = fixture.root.appending(path: "elsewhere/orphaned-4444")
+        let outside = fixture.root.appending(path: "elsewhere/orphaned-44444444")
         try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
 
         let outcome = OrphanProjectLogs.remove(outside, logsDir: fixture.logsDir, claimedSlugDirs: [])
 
-        #expect(outcome == .refused("it is not directly inside directa's logs folder \(fixture.logsDir.path)"))
+        #expect(outcome == .refused(.outsideLogsRoot(fixture.logsDir.path)))
         #expect(FileManager.default.fileExists(atPath: outside.path))
     }
 
@@ -156,18 +204,18 @@ import Testing
     @Test func aPathWhoseDotDotEscapesThroughALinkIsRefused() throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
-        let victim = fixture.root.appending(path: "elsewhere/orphaned-2222")
+        let victim = fixture.root.appending(path: "elsewhere/\(Fixture.orphanedName)")
         try FileManager.default.createDirectory(at: victim, withIntermediateDirectories: true)
         try FileManager.default.createSymbolicLink(
             at: fixture.logsDir.appending(path: "hop"),
             withDestinationURL: fixture.root.appending(path: "elsewhere/inner"))
         try FileManager.default.createDirectory(
             at: fixture.root.appending(path: "elsewhere/inner"), withIntermediateDirectories: true)
-        let spelled = URL(fileURLWithPath: fixture.logsDir.path + "/hop/../orphaned-2222")
+        let spelled = URL(fileURLWithPath: fixture.logsDir.path + "/hop/../\(Fixture.orphanedName)")
 
         let outcome = OrphanProjectLogs.remove(spelled, logsDir: fixture.logsDir, claimedSlugDirs: [])
 
-        #expect(outcome == .refused("it is not directly inside directa's logs folder \(fixture.logsDir.path)"))
+        #expect(outcome == .refused(.outsideLogsRoot(fixture.logsDir.path)))
         #expect(FileManager.default.fileExists(atPath: victim.path))
         #expect(FileManager.default.fileExists(atPath: fixture.orphaned.path))
     }
@@ -182,23 +230,50 @@ import Testing
 
         let outcome = OrphanProjectLogs.remove(sibling, logsDir: fixture.logsDir, claimedSlugDirs: [])
 
-        #expect(outcome == .refused("it is not directly inside directa's logs folder \(fixture.logsDir.path)"))
+        #expect(outcome == .refused(.outsideLogsRoot(fixture.logsDir.path)))
         #expect(FileManager.default.fileExists(atPath: sibling.path))
     }
 
     @Test func aDirectoryThatIsAlreadyGoneIsRefusedRatherThanReportedRemoved() throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
-        let gone = fixture.logsDir.appending(path: "gone-5555")
+        let gone = fixture.logsDir.appending(path: "gone-55555555")
 
         let outcome = OrphanProjectLogs.remove(gone, logsDir: fixture.logsDir, claimedSlugDirs: [])
 
-        #expect(outcome == .refused("it is no longer there"))
+        #expect(outcome == .refused(.gone))
     }
 
-    /** A logs root at `<tmp>/<uuid>/logs` holding `claimed-1111` and
-        `orphaned-2222`, spelled through `temporaryDirectory` (under /var). */
+    /** Every refusal's words, and a next step only where a person has one,
+        never a deletion command. */
+    @Test func eachRefusalNamesItsReasonAndRemedy() {
+        let refusals: [OrphanProjectLogs.Refusal] = [
+            .claimed, .gone, .link, .notADirectory, .notADirectaName, .outsideLogsRoot("/logs"),
+        ]
+        #expect(refusals.map(\.reason) == [
+            "a registered project claims it",
+            "it is no longer there",
+            "it is a link to another location, not a log directory directa created",
+            "it is not a directory",
+            "its name is not one directa gives a log directory, so directa did not create it",
+            "it is not directly inside directa's logs folder /logs",
+        ])
+        #expect(refusals.map(\.remedy) == [
+            nil,
+            nil,
+            "remove the link yourself if nothing needs it",
+            "move or remove it yourself if nothing needs it",
+            "move or remove it yourself if nothing needs it",
+            nil,
+        ])
+    }
+
+    /** A logs root at `<tmp>/<uuid>/logs` holding `claimedName` and
+        `orphanedName`, spelled through `temporaryDirectory` (under /var). */
     private struct Fixture {
+        static let claimedName = "claimed-11111111"
+        static let orphanedName = "orphaned-22222222"
+
         let claimed: URL
         let logsDir: URL
         let orphaned: URL
@@ -209,8 +284,8 @@ import Testing
             root = FileManager.default.temporaryDirectory
                 .appending(path: "directa-orphanlogs-\(UUID().uuidString)")
             logsDir = root.appending(path: "logs")
-            claimed = logsDir.appending(path: "claimed-1111")
-            orphaned = logsDir.appending(path: "orphaned-2222")
+            claimed = logsDir.appending(path: Self.claimedName)
+            orphaned = logsDir.appending(path: Self.orphanedName)
             paths = DirectaPaths(dataDir: root.appending(path: "data"), logsDir: logsDir)
             try FileManager.default.createDirectory(at: claimed, withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: orphaned, withIntermediateDirectories: true)

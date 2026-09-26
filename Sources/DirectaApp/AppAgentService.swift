@@ -88,12 +88,13 @@ enum AppAgentService {
         DirectaLog.app.info("app agent unregistered")
     }
 
-    /** Drop the pre-migration login item once. Best effort: `mainApp`'s own
-        `unregister()` can throw for reasons that do not matter here (already
-        gone, a transient Service Management error), and the app agent
-        registration that follows is what actually matters going forward, so a
-        failure here is not worth surfacing. Idempotent: a copy with no
-        legacy item registered is a fast no-op status read. */
+    /** Drop the pre-migration login item once the app agent carries Start at
+        login. Best effort: `mainApp`'s own `unregister()` can throw for
+        reasons that do not matter here (already gone, a transient Service
+        Management error), and the app agent already registered is what
+        matters going forward, so a failure here is not worth surfacing.
+        Idempotent: a copy with no legacy item registered is a fast no-op
+        status read. */
     nonisolated static func migrateFromLoginItem() {
         let item = SMAppService.mainApp
         guard item.status == .enabled else { return }
@@ -114,7 +115,8 @@ enum AppAgentService {
     /** At launch, act on `AppAgentPolicy.launchAction`. The legacy login
         item's status is read before `migrateFromLoginItem()`, which
         unregisters it: a read after would always be false and record Off for
-        someone who had Start at login on. */
+        someone who had Start at login on. Registration runs before that
+        migration, so a registration that fails keeps the legacy item. */
     nonisolated static func ensureRegisteredAtLaunch(paths: DirectaPaths = DirectaPaths()) {
         let legacyLoginItemEnabled = SMAppService.mainApp.status == .enabled
         let action = AppAgentPolicy.launchAction(
@@ -137,12 +139,18 @@ enum AppAgentService {
                 )
             }
         case .register:
-            migrateFromLoginItem()
             do {
                 try register()
                 DirectaLog.app.info("app agent register at launch: \(statusDescription)")
             } catch {
                 DirectaLog.app.error("app agent register at launch: \(error.localizedDescription)")
+            }
+            if AppAgentPolicy.retiresLegacyLoginItem(agentStatusAfterRegister: policyStatus) {
+                migrateFromLoginItem()
+            } else {
+                DirectaLog.app.error(
+                    "app agent register at launch left the agent \(statusDescription); kept the Start at Login item so the next launch retries"
+                )
             }
         }
     }

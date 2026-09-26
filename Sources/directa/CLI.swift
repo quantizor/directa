@@ -1772,15 +1772,72 @@ struct Doctor: AsyncParsableCommand {
             return Finding(
                 detail: "removed \(path.path), which matched no registered project",
                 kind: "orphan-log-dir", severity: "fixed")
-        case .refused(let reason):
+        case .refused(let refusal):
+            let remedy = refusal.remedy.map { "; \($0)" } ?? ""
             return Finding(
-                detail: "left \(path.path) in place: \(reason)",
+                detail: "left \(path.path) in place: \(refusal.reason)\(remedy)",
                 kind: "orphan-log-dir", severity: "error")
         case .failed(let message):
             return Finding(
                 detail: "could not remove \(path.path): \(message)",
                 kind: "orphan-log-dir", severity: "error")
         }
+    }
+
+    /** The `orphan-log-dir` findings for one doctor run. Report-only reads
+        the claimed set from `info`, the `daemon.info` fetched when doctor
+        began. `fix` never deletes on that set: seconds of other checks run
+        after it, and a project first started in that window would have its
+        new log directory deleted under a live server. It calls `refetchInfo`
+        and scans and removes against that fresh claimed set and logs root
+        with no other wait in between; when the re-fetch fails or lacks
+        `claimedProjects`, nothing is removed and one `error` finding says so. */
+    static func orphanLogDirFindings(
+        fix: Bool, info: DaemonInfo, refetchInfo: () async throws -> DaemonInfo
+    ) async -> [Finding] {
+        guard fix else {
+            let claimedSlugDirs = claimedLogDirNames(info.claimedProjects ?? [])
+            return OrphanProjectLogs.scan(
+                paths: DirectaPaths(logsDir: URL(fileURLWithPath: info.logsDir)),
+                claimedSlugDirs: claimedSlugDirs
+            ).map { orphan in
+                Finding(
+                    detail: "\(orphan.detail) (run: \(orphan.remedy))",
+                    kind: "orphan-log-dir", severity: "warning")
+            }
+        }
+        let fresh: DaemonInfo
+        do {
+            fresh = try await refetchInfo()
+        } catch {
+            return [
+                Finding(
+                    detail:
+                        "removed no leftover log directories: could not re-check which projects the daemon uses right before removing (\(error.localizedDescription)); run: directa doctor --fix",
+                    kind: "orphan-log-dir", severity: "error")
+            ]
+        }
+        guard let claimedProjects = fresh.claimedProjects else {
+            return [
+                Finding(
+                    detail:
+                        "removed no leftover log directories: the daemon stopped reporting which projects it uses; run: directa daemon restart, then directa doctor --fix",
+                    kind: "orphan-log-dir", severity: "error")
+            ]
+        }
+        let claimedSlugDirs = claimedLogDirNames(claimedProjects)
+        let logsDir = URL(fileURLWithPath: fresh.logsDir)
+        return OrphanProjectLogs.scan(paths: DirectaPaths(logsDir: logsDir), claimedSlugDirs: claimedSlugDirs)
+            .map { orphan in
+                orphanLogDirFixFinding(
+                    path: orphan.path,
+                    outcome: OrphanProjectLogs.remove(
+                        orphan.path, logsDir: logsDir, claimedSlugDirs: claimedSlugDirs))
+            }
+    }
+
+    private static func claimedLogDirNames(_ projects: [String]) -> Set<String> {
+        Set(projects.map { DirectaPaths().projectLogDir(project: $0).lastPathComponent })
     }
 
     func run() async throws {
@@ -2011,23 +2068,9 @@ struct Doctor: AsyncParsableCommand {
             too, since an empty claimed set would call every directory a
             leftover. Runs after the stale-project pass so the scan sees the
             log directories `project.forget` already removed. */
-        if let info, let claimedProjects = info.claimedProjects {
-            let claimedSlugDirs = Set(
-                claimedProjects.map { DirectaPaths().projectLogDir(project: $0).lastPathComponent })
-            let logsDir = URL(fileURLWithPath: info.logsDir)
-            for orphan in OrphanProjectLogs.scan(
-                paths: DirectaPaths(logsDir: logsDir), claimedSlugDirs: claimedSlugDirs)
-            {
-                if fix {
-                    let outcome = OrphanProjectLogs.remove(
-                        orphan.path, logsDir: logsDir, claimedSlugDirs: claimedSlugDirs)
-                    findings.append(Self.orphanLogDirFixFinding(path: orphan.path, outcome: outcome))
-                } else {
-                    findings.append(
-                        Finding(
-                            detail: "\(orphan.detail) (run: \(orphan.remedy))",
-                            kind: "orphan-log-dir", severity: "warning"))
-                }
+        if let info, info.claimedProjects != nil {
+            findings += await Self.orphanLogDirFindings(fix: fix, info: info) {
+                try await client.request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
             }
         }
         if global.json {
