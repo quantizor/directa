@@ -57,7 +57,7 @@ public actor DaemonClient {
             throw WireError(
                 code: .daemonUnreachable,
                 hint: "run: directa daemon status",
-                message: "cannot connect to ddirecta at \(socketPath): \(String(cString: strerror(err)))"
+                message: "cannot connect to the daemon at \(socketPath): \(String(cString: strerror(err)))"
             )
         }
         fd = sock
@@ -176,7 +176,7 @@ public actor DaemonClient {
                     throw WireError(
                         code: .daemonUnreachable,
                         hint: "run: directa daemon restart",
-                        message: "ddirecta did not answer in time; it may be wedged")
+                        message: "the daemon did not answer in time; it may be wedged")
                 }
                 throw WireError(code: .daemonUnreachable, message: "read failed: \(String(cString: strerror(errno)))")
             }

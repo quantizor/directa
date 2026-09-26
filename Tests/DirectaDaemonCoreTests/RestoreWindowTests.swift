@@ -55,7 +55,12 @@ import Testing
         #expect(response.ok == false)
         let error = try #require(response.error)
         #expect(error.code == .daemonStarting)
-        #expect(error.message == "ddirecta is still restoring supervised servers and is not serving requests yet")
+        #expect(error.message == "the daemon is still restoring supervised servers and is not serving requests yet")
+        /** `CLIRunner.emitFailure` prepends "directa: " to this message; a
+            message that itself led with "ddirecta" (the daemon binary's own
+            name) would read as "directa: ddirecta …", a stutter easy to
+            mistake for a typo. */
+        #expect(!error.message.contains("ddirecta"))
         /** The hint has to be the literal command that reports progress, because
             every other failure hint sends the reader to `daemon status` and that
             is exactly the command that has to keep working here. */

@@ -622,11 +622,11 @@ struct DaemonDownRow: View {
     var model: DaemonModel
 
     private var message: String {
-        if model.daemonRecovering { return "Starting ddirecta…" }
+        if model.daemonRecovering { return "Starting the daemon…" }
         if model.daemonNeedsApproval { return "directa needs your approval" }
-        if model.daemonStoppedOnPurpose { return "ddirecta is stopped" }
-        if model.daemonRecoveryError != nil { return "ddirecta is not running" }
-        return "ddirecta is not running; restarting"
+        if model.daemonStoppedOnPurpose { return "the daemon is stopped" }
+        if model.daemonRecoveryError != nil { return "the daemon is not running" }
+        return "the daemon is not running; restarting"
     }
 
     private var glyph: String {
@@ -661,7 +661,7 @@ struct DaemonDownRow: View {
                 }
                 .buttonStyle(.borderless)
                 .disabled(model.daemonRecovering)
-                .help("Start ddirecta now")
+                .help("Start the daemon now")
             }
         }
     }

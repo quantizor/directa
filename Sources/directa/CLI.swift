@@ -1634,7 +1634,7 @@ struct Doctor: AsyncParsableCommand {
                 findings.append(
                     Finding(
                         detail:
-                            "ddirecta last exited \(agent.lastExitReason ?? "OS_REASON_JETSAM")\(runs)\(burstDetail); memory pressure killed the daemon, not a crash dump. Check: launchctl print \(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)",
+                            "the daemon last exited \(agent.lastExitReason ?? "OS_REASON_JETSAM")\(runs)\(burstDetail); memory pressure killed it, not a crash dump. Check: launchctl print \(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)",
                         kind: "jetsam", severity: "warning"))
             }
         }
@@ -1974,10 +1974,10 @@ struct DaemonInstall: AsyncParsableCommand {
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
             if restored.isEmpty {
                 viaApp
-                    ? "ddirecta ensured via \(SetupPlanner.applicationsAppPath) (Login Items)"
-                    : "ddirecta installed and running (\(LaunchdAdmin.label))"
+                    ? "the daemon is ensured via \(SetupPlanner.applicationsAppPath) (Login Items)"
+                    : "the daemon is installed and running (\(LaunchdAdmin.label))"
             } else {
-                "ddirecta installed; re-ensured \(restored.map(\.name).joined(separator: ", "))"
+                "the daemon is installed; re-ensured \(restored.map(\.name).joined(separator: ", "))"
             }
         }
     }
@@ -2002,7 +2002,7 @@ struct DaemonUninstall: AsyncParsableCommand {
                     .utf8))
         await LaunchdAdmin.uninstall(paths: DirectaPaths(), purge: purge)
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
-            purge ? "ddirecta uninstalled; data and logs removed" : "ddirecta uninstalled"
+            purge ? "the daemon is uninstalled; data and logs removed" : "the daemon is uninstalled"
         }
     }
 }
@@ -2028,7 +2028,7 @@ struct DaemonStart: AsyncParsableCommand {
         } catch let error as WireError {
             CLIRunner.fail(error, json: global.json)
         }
-        CLIRunner.emit(WireEmpty(), json: global.json) { _ in "ddirecta running" }
+        CLIRunner.emit(WireEmpty(), json: global.json) { _ in "the daemon is running" }
     }
 }
 
@@ -2042,7 +2042,7 @@ struct DaemonStop: AsyncParsableCommand {
         let client = CLIRunner.client()
         _ = try? await client.request(.daemonShutdown, params: WireEmpty(), expecting: WireEmpty.self)
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
-            "ddirecta stopping (servers drained; directa daemon start to bring it back)"
+            "the daemon is stopping (servers drained; directa daemon start to bring it back)"
         }
     }
 }
@@ -2063,8 +2063,8 @@ struct DaemonRestart: AsyncParsableCommand {
         }
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
             bounced.isEmpty
-                ? "ddirecta restarted (no servers were running)"
-                : "ddirecta restarted; re-ensured \(bounced.map(\.name).joined(separator: ", "))"
+                ? "the daemon restarted (no servers were running)"
+                : "the daemon restarted; re-ensured \(bounced.map(\.name).joined(separator: ", "))"
         }
     }
 }

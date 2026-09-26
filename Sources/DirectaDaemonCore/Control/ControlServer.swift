@@ -108,7 +108,7 @@ public actor Router {
                 throw WireError(
                     code: .daemonStarting,
                     hint: "run: directa daemon status",
-                    message: "ddirecta is still restoring supervised servers and is not serving requests yet")
+                    message: "the daemon is still restoring supervised servers and is not serving requests yet")
             }
             switch method {
             case .daemonInfo:
@@ -1960,7 +1960,7 @@ public final class ControlServer: Sendable {
                         code: .internalError,
                         hint: "run: directa doctor",
                         message:
-                            "ddirecta could not start listening on \(socketPath) (listener state: \(stuck))"
+                            "the daemon could not start listening on \(socketPath) (listener state: \(stuck))"
                     ))
             }
             listener.stateUpdateHandler = { state in

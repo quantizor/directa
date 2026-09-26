@@ -230,7 +230,7 @@ enum AgentService {
             return
         }
         guard agent.status == .enabled else {
-            throw WireError(code: .daemonUnreachable, message: "ddirecta never answered")
+            throw WireError(code: .daemonUnreachable, message: "the daemon never answered")
         }
         guard !LaunchdAdmin.deliberatelyStopped(paths: paths) else { return }
 

@@ -312,7 +312,7 @@ final class DaemonModel {
         } else if daemonNeedsApproval {
             daemonRecoveryError = AgentService.Failure.needsApproval.localizedDescription
         } else {
-            daemonRecoveryError = "could not start ddirecta automatically"
+            daemonRecoveryError = "could not start the daemon automatically"
         }
     }
 
