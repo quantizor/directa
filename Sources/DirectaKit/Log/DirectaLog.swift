@@ -125,8 +125,21 @@ public enum DirectaLog {
         emit(category: category, level: .info, message: message)
     }
 
+    /** `swiftpm-testing-helper` is the process `swift test` runs every suite
+        under, and Swift Testing suites run in parallel by default, so a
+        per-test swap of this shared backend would race across suites. Deciding
+        the default backend once here, at first access, instead keeps every
+        error/info call a test's negative path exercises out of the real
+        `dev.quantizor.directa` unified log, which persists error-level entries
+        indefinitely: without this, a full test run left permanent, unqueryable
+        noise (including temp-directory paths from throwaway fixtures) in the
+        developer's own system log. */
+    static func defaultBackend(processName: String) -> any DirectaLogBackend {
+        processName == "swiftpm-testing-helper" ? RecordingBackend() : OSLogBackend()
+    }
+
     private static let backendLock = OSAllocatedUnfairLock<any DirectaLogBackend>(
-        initialState: OSLogBackend())
+        initialState: defaultBackend(processName: ProcessInfo.processInfo.processName))
 
     private static func emit(category: DirectaLogCategory, level: DirectaLogLevel, message: String) {
         backend.log(category: category, level: level, message: message)

@@ -49,4 +49,22 @@ import Testing
     @Test func subsystemIsStable() {
         #expect(DirectaLog.subsystem == "dev.quantizor.directa")
     }
+
+    /** The exact process name `swift test` runs every suite under (measured via
+        `log show --process`), so a build reaching this default keeps its
+        error/info calls out of the developer's real unified log. */
+    @Test func defaultBackendIsARecorderUnderTheSwiftTestHost() {
+        #expect(DirectaLog.defaultBackend(processName: "swiftpm-testing-helper") is RecordingBackend)
+    }
+
+    @Test func defaultBackendIsOSLogElsewhere() {
+        #expect(DirectaLog.defaultBackend(processName: "ddirecta") is OSLogBackend)
+    }
+
+    /** End to end, not just the pure decision: the process actually running
+        these tests must have picked up the recording default, since nothing in
+        this file sets it before this test runs. */
+    @Test func theRunningTestProcessDefaultsToARecorder() {
+        #expect(DirectaLog.backend is RecordingBackend)
+    }
 }
