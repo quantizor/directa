@@ -561,6 +561,20 @@ struct Logs: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Query a server's structured logs (out/err/sys/mark streams).")
 
+    /** With none of `--tail`/`--since`/`--since-mark`/`--follow`/`--all`, `logs`
+        bounds itself to this many lines from the end instead of answering the
+        whole history a long-running server has accumulated. */
+    static let defaultTailLines = 200
+
+    /** `--follow`'s own initial-backlog default, unchanged by
+        `defaultTailLines`: follow is about watching new lines arrive, not
+        backfilling history, and it was already bounded before the unbounded
+        no-flags default became a problem. */
+    static let followDefaultTailLines = 50
+
+    @Flag(help: "Full history instead of the last \(defaultTailLines) lines.")
+    var all = false
+
     @Flag(help: "Keep polling for new lines (Ctrl-C to stop).")
     var follow = false
 
@@ -581,10 +595,35 @@ struct Logs: AsyncParsableCommand {
     @Option(help: "Filter to one stream: out, err, sys, or mark.")
     var stream: [String] = []
 
-    @Option(help: "Only the last N lines.")
+    @Option(help: "Only the last N lines (default: \(defaultTailLines), unless --since/--since-mark/--follow/--all is given).")
     var tail: Int?
 
+    /** `--all` asks for the whole history outright, which is meaningless
+        alongside a bounded `--tail`: the two name incompatible amounts of
+        output. */
+    static func usageError(all: Bool, tail: Int?) -> WireError? {
+        guard all, tail != nil else { return nil }
+        return WireError(code: .usage, message: "pass --tail or --all, not both")
+    }
+
+    /** The tail bound actually sent to the daemon. `--all` always wins (full
+        history, even under `--follow`). An explicit `--tail` always wins next.
+        Otherwise `--follow` keeps its own smaller backlog default, and a bare
+        `--since`/`--since-mark` is left unbounded (already scoped by time,
+        not the bug this default fixes) while truly no bound at all falls back
+        to `defaultTailLines`. */
+    static func effectiveTail(all: Bool, follow: Bool, since: Date?, sinceMark: String?, tail: Int?) -> Int? {
+        if all { return nil }
+        if let tail { return tail }
+        if follow { return followDefaultTailLines }
+        if since != nil || sinceMark != nil { return nil }
+        return defaultTailLines
+    }
+
     func run() async throws {
+        if let usage = Self.usageError(all: all, tail: tail) {
+            CLIRunner.fail(usage, json: global.json)
+        }
         var sinceDate: Date?
         if let since {
             sinceDate = Self.parseSince(since)
@@ -601,7 +640,8 @@ struct Logs: AsyncParsableCommand {
         }
         var params = LogsQueryParams(
             grep: grep, name: name, project: global.resolvedProject(), since: sinceDate,
-            sinceMark: sinceMark, streams: streams, tail: follow ? (tail ?? 50) : tail)
+            sinceMark: sinceMark, streams: streams,
+            tail: Self.effectiveTail(all: all, follow: follow, since: sinceDate, sinceMark: sinceMark, tail: tail))
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
             try await client.request(.logsQuery, params: params, expecting: LogsQueryResult.self)
         }

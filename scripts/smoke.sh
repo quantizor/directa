@@ -578,7 +578,10 @@ cat > "$WATCHP/devservers.json" <<CFG
 CFG
 cd "$WATCHP"
 "$DIRECTA" ensure web --timeout 15 --json > /dev/null || fail "ensure watch server"
-"$DIRECTA" logs web --json | grep -q "config: v1" || fail "watch fixture never read its config"
+# --all: the default 200-line tail could plausibly miss the boot-time config
+# line by the time this asserts, given the fixture's 200ms heartbeat plus the
+# restart loop below piling up lines ahead of it.
+"$DIRECTA" logs web --all --json | grep -q "config: v1" || fail "watch fixture never read its config"
 W_PID_BEFORE="$("$DIRECTA" status web --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["servers"][0]["pid"])')"
 # The baseline is taken once the run has been alive for the settle window, which
 # is what stops a server that writes its own config during boot from bouncing
@@ -593,7 +596,7 @@ for _ in $(seq 1 80); do
 done
 [[ "$W_PID_NOW" != "$W_PID_BEFORE" ]] || fail "a watched file changed and the server never restarted (status: $("$DIRECTA" status web --json 2>&1 | head -c 400))"
 "$DIRECTA" wait web --healthy --timeout 15 --json > /dev/null || fail "watch restart never became healthy"
-"$DIRECTA" logs web --json | grep -q "config: v2" || fail "the restarted server did not read the new config"
+"$DIRECTA" logs web --all --json | grep -q "config: v2" || fail "the restarted server did not read the new config"
 pass "a watched file change restarts the server and it reads the new config"
 
 # A server that declares no watch must behave exactly as before.
