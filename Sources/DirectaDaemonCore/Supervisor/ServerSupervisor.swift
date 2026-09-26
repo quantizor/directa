@@ -1065,18 +1065,47 @@ public actor ServerSupervisor {
         pid = nil
         startedAt = nil
         observedPort = nil
-        let finalPhase: ServerPhase = stopRequested ? .stopped : .crashed
+        /** Read once, before the reset below: retireIntent and the descendant
+            escalation both need to know whether directa's own stop() asked for
+            THIS exit, which `finalPhase` alone can no longer tell them now that
+            an external graceful signal also lands `.stopped`. */
+        let wasStopRequested = stopRequested
+        /** SIGTERM, SIGINT, and SIGHUP are what a well-behaved external
+            supervisor, an IDE stop button, or a forwarded Ctrl-C sends for a
+            graceful shutdown; directa did not ask for it, but nothing else
+            looks like a crash either. SIGKILL cannot be graceful (the process
+            never runs its own handler for it), and neither can any other
+            signal or a nonzero self-exit, so those stay `crashed`. */
+        let externalGracefulSignal: Int? = {
+            guard case .signaled(let signal) = outcome, !wasStopRequested else { return nil }
+            return Self.externalGracefulSignals.contains(signal) ? signal : nil
+        }()
+        let finalPhase: ServerPhase =
+            wasStopRequested || externalGracefulSignal != nil ? .stopped : .crashed
         stopRequested = false
         let exit = lastExit
-        /** A deliberate stop retires the boot intent; a drain (or a crash) keeps
-            whatever was recorded at start so the next boot restores it. */
-        let retireIntent = finalPhase == .stopped && stopWasDeliberate
+        /** A deliberate stop retires the boot intent; a drain, an external
+            signal, or a crash all keep whatever was recorded at start so the
+            next boot restores it. Gated on `wasStopRequested`, not
+            `finalPhase`: an external signal now also lands `.stopped` without
+            directa having asked for it, and must not retire an intent nobody
+            expressed. */
+        let retireIntent = wasStopRequested && finalPhase == .stopped && stopWasDeliberate
         let cause = exit?.code.map { "code=\($0)" } ?? exit?.signal.map { "signal=\($0)" } ?? "unknown"
         await logStore.append(stream: .sys, text: "exited \(cause)")
-        /** A stopped server's detail says why directa asked it down (the reason
-            stop() logged before signalling); a crashed one says how it died,
-            since nothing asked for that exit. */
-        let eventDetail = finalPhase == .stopped ? stopReason : cause
+        /** A directa-requested stop's detail says why directa asked it down
+            (the reason stop() logged before signalling); an external graceful
+            signal says the signal and that it came from outside directa, since
+            nothing else in directa's own log explains it; a crash says how the
+            process died. */
+        let eventDetail: String
+        if wasStopRequested {
+            eventDetail = stopReason
+        } else if let externalGracefulSignal {
+            eventDetail = "signal=\(externalGracefulSignal) (external)"
+        } else {
+            eventDetail = cause
+        }
         await events?.post(
             kind: finalPhase == .stopped ? .stopped : .crashed,
             project: projectPath, server: spec.name, detail: eventDetail)
@@ -1114,7 +1143,12 @@ public actor ServerSupervisor {
         }
         phase = finalPhase
         settleSpawnWaiters()
-        if finalPhase == .crashed {
+        /** Gated on `wasStopRequested`, not `finalPhase`: an external graceful
+            signal now also lands `.stopped`, but directa's own stop() never
+            ran its SIGTERM/SIGKILL escalation over this run's descendants, so
+            they need the same sweep an ordinary crash gets or an orphaned
+            worker can outlive it holding a listener. */
+        if !wasStopRequested {
             await escalateCrashDescendants(
                 rootPid: capturedPid, sessionID: capturedSessionID,
                 snapshot: capturedSnapshot)
@@ -1152,6 +1186,15 @@ public actor ServerSupervisor {
         phase is already published, so this only bounds how long an
         old-generation listener can compete with the next spawn. */
     nonisolated private static let crashEscalationGraceMilliseconds = 1_000
+
+    /** The signals a graceful external stop can plausibly send: SIGTERM (the
+        default `kill`), SIGINT (Ctrl-C forwarded to the child), SIGHUP (a
+        terminal or controlling session going away). SIGKILL is deliberately
+        excluded: a process cannot run a handler for it, so it can never be
+        the polite half of a shutdown request. */
+    nonisolated private static let externalGracefulSignals: Set<Int> = [
+        Int(SIGHUP), Int(SIGINT), Int(SIGTERM),
+    ]
 
     /** State persistence failures (full disk, permissions) must not kill the
         supervisor, but they must not vanish either: crash forensics silently

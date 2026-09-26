@@ -218,6 +218,135 @@ private func makeEnv() throws -> TestEnv {
         #expect(persisted?.lastExit?.code == 3)
     }
 
+    /** A SIGTERM directa never sent (something else signalled the pid directly)
+        is the shape of an external supervisor, an IDE stop button, or a
+        forwarded Ctrl-C: not a crash, so the phase lands `stopped` and the
+        event names the signal and that it came from outside directa. Boot
+        intent must survive it, since nobody told directa to keep this down. */
+    @Test func externalSIGTERMLandsStoppedWithTheSignalNamedAsExternal() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let events = EventStore(url: paths.eventsFile)
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
+        let id = serverID(project: env.projectPath, name: "web")
+        let supervisor = ServerSupervisor(
+            events: events, launcher: SubprocessLauncher(), paths: paths,
+            projectPath: env.projectPath, registry: registry, spec: spec)
+        let started = await supervisor.start()
+        let pid = try #require(started.pid)
+        #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
+
+        kill(pid_t(pid), SIGTERM)
+        let status = try await waitForPhase(supervisor, .stopped)
+        #expect(status.phase == .stopped)
+        #expect(status.lastExit?.signal == Int(SIGTERM))
+
+        /** An external signal is not a directa decision, so it must not retire
+            the intent to come back on the next boot. */
+        let persisted = await registry.persistedState(serverID: id)
+        #expect(persisted?.phase == .stopped)
+        #expect(persisted?.resumeOnBoot == true)
+
+        /** Queried unfiltered: the supervisor canonicalizes projectPath at
+            construction (`/private/var` vs `/var` on a symlinked temp dir), so
+            filtering on env.projectPath's raw spelling would silently match
+            nothing; this EventStore is this test's own temp file regardless. */
+        let posted = await events.query()
+        let stoppedEvent = try #require(posted.last { $0.kind == .stopped })
+        #expect(stoppedEvent.detail == "signal=15 (external)")
+    }
+
+    /** SIGKILL cannot be a polite request (the process never runs a handler
+        for it), so it stays `crashed` exactly like before this feature. */
+    @Test func externalSIGKILLStaysCrashed() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        let started = await supervisor.start()
+        let pid = try #require(started.pid)
+
+        kill(pid_t(pid), SIGKILL)
+        let status = try await waitForPhase(supervisor, .crashed)
+        #expect(status.phase == .crashed)
+        #expect(status.lastExit?.signal == Int(SIGKILL))
+    }
+
+    /** A directa-requested stop is unchanged by the external-signal carve-out:
+        SIGTERM sent by directa's own stop() still retires boot intent exactly
+        as before. */
+    @Test func directaRequestedStopIsUnchangedByTheExternalSignalCarveOut() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let events = EventStore(url: paths.eventsFile)
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
+        let id = serverID(project: env.projectPath, name: "web")
+        let supervisor = ServerSupervisor(
+            events: events, launcher: SubprocessLauncher(), paths: paths,
+            projectPath: env.projectPath, registry: registry, spec: spec)
+        _ = await supervisor.start()
+        let stopped = await supervisor.stop(
+            graceSeconds: 2, deliberate: true, reason: "requested by stop")
+        #expect(stopped.phase == .stopped)
+
+        let persisted = await registry.persistedState(serverID: id)
+        #expect(persisted?.phase == .stopped)
+        #expect(persisted?.resumeOnBoot == nil)
+
+        let posted = await events.query()
+        let stoppedEvent = try #require(posted.last { $0.kind == .stopped })
+        #expect(stoppedEvent.detail == "requested by stop")
+    }
+
+    /** An external SIGTERM lands `stopped`, not `crashed`, but directa's own
+        stop() never ran its SIGTERM/SIGKILL escalation over this run: the
+        descendant sweep must still fire (gated on stopRequested, not phase) or
+        a session-escaped grandchild like this one outlives the exit. */
+    @Test func externalSIGTERMStillEscalatesOrphanedDescendants() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(command: [fixture, "--spawn-grandchild"], name: "composite")
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        let started = await supervisor.start()
+        let root = try #require(started.pid)
+        var grandchild: pid_t?
+        for _ in 0..<40 {
+            let spool =
+                (try? String(
+                    contentsOf: paths.structuredLogFile(
+                        project: env.projectPath, server: "composite"),
+                    encoding: .utf8)) ?? ""
+            if let match = spool.range(of: #"grandchild pid (\d+)"#, options: .regularExpression) {
+                grandchild = String(spool[match]).split(separator: " ").last.flatMap { pid_t($0) }
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let child = try #require(grandchild)
+        #expect(kill(child, 0) == 0)
+
+        kill(pid_t(root), SIGTERM)
+        let status = try await waitForPhase(supervisor, .stopped, tries: 80)
+        #expect(status.phase == .stopped)
+
+        var reaped = false
+        for _ in 0..<100 where !reaped {
+            if kill(child, 0) != 0 { reaped = true; break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        if !reaped { kill(child, SIGKILL) }
+        #expect(reaped, "grandchild \(child) survived an externally SIGTERM'd root")
+    }
+
     @Test func crashKillsSessionGrandchild() async throws {
         let fixture = try #require(fixtureServerExecutable())
         let env = try makeEnv()
@@ -649,15 +778,19 @@ private func makeEnv() throws -> TestEnv {
         #expect(await gate.callCount == 1)
         /** The real process is untouched; only the exit-watch fake fires. */
         #expect(kill(survivor, 0) == 0)
-        await gate.signal(.signaled(signal: Int(SIGTERM)))
+        /** SIGKILL rather than SIGTERM: this test is about the exit-watch wiring
+            reaching recordOutcome at all, not about signal classification (see
+            externalSIGTERMLandsStoppedWithTheSignalNamedAsExternal for that), so
+            it uses the one signal that stays `crashed` regardless of who sent it. */
+        await gate.signal(.signaled(signal: Int(SIGKILL)))
         let crashed = try await waitForPhase(supervisor, .crashed)
         #expect(crashed.phase == .crashed)
-        #expect(crashed.lastExit?.signal == Int(SIGTERM))
+        #expect(crashed.lastExit?.signal == Int(SIGKILL))
         #expect(crashed.pid == nil)
         let persisted = await registry.persistedState(
             serverID: serverID(project: env.projectPath, name: "web"))
         #expect(persisted?.phase == .crashed)
-        #expect(persisted?.lastExit?.signal == Int(SIGTERM))
+        #expect(persisted?.lastExit?.signal == Int(SIGKILL))
     }
 
     /** Group teardown after adoption must reach the same escaped session
