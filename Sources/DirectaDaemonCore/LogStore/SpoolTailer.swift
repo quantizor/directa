@@ -77,10 +77,56 @@ enum SpoolRelease {
     }
 }
 
+/** Coalesces catch-up skips into at most one report per `interval`. A flood
+    that outruns the tailer skips on nearly every chunk, and a sys line per
+    skip would flood the structured log and every monitor watching it, since
+    sys lines pass monitor budgets. The skipping itself is never deferred;
+    only the line that names it is. */
+struct SkipReport {
+    let interval: Duration
+    private var lastReported: ContinuousClock.Instant?
+    private var pending: UInt64 = 0
+
+    init(interval: Duration) {
+        self.interval = interval
+    }
+
+    /** Adds a skip and answers the total to report now, if one is due. */
+    mutating func add(_ bytes: UInt64, now: ContinuousClock.Instant) -> UInt64? {
+        pending += bytes
+        return due(now: now)
+    }
+
+    /** The unreported total once `interval` has passed since the last
+        report (or there has been none), else nil. */
+    mutating func due(now: ContinuousClock.Instant) -> UInt64? {
+        guard pending > 0 else { return nil }
+        if let lastReported, now - lastReported < interval { return nil }
+        return take(now: now)
+    }
+
+    /** The unreported total regardless of the interval, for a final drain. */
+    mutating func flush(now: ContinuousClock.Instant) -> UInt64? {
+        guard pending > 0 else { return nil }
+        return take(now: now)
+    }
+
+    private mutating func take(now: ContinuousClock.Instant) -> UInt64 {
+        let total = pending
+        pending = 0
+        lastReported = now
+        return total
+    }
+}
+
 /** Tails one raw spool file (the fd the child writes; survives daemon death)
     into the structured LogStore. Polling keeps it simple and restart-safe; an
     idle tick still opens the file and seeks to the end, not a cheap stat. */
 actor SpoolTailer {
+    /** Set by a catch-up skip, which lands mid-line: the rest of that line
+        is dropped rather than ingested as if it were whole, however many
+        chunks or drains it takes to reach its newline. */
+    private var droppingUntilNewline = false
     private let intervalMs: Int
     /** Unread bytes above this are skipped to the recent tail. Replaying a
         flood into a rotating structured log (10 MB) is wasted work, and a
@@ -95,12 +141,12 @@ actor SpoolTailer {
         of that `Data` copies the remainder once per line and keeps the original
         allocation alive for the whole drain. */
     private let readChunkBytes: Int
-    /** Set once the volume refuses to release blocks, so the refusal is
-        reported once rather than retried every tick. */
-    private var releaseRefused = false
     /** Returns 0 or an errno; a seam so a test can stand in for a volume
         that refuses hole punching. */
     private let releaseHole: @Sendable (String, Range<UInt64>) -> Int32
+    /** Set once the volume refuses to release blocks, so the refusal is
+        reported once rather than retried every chunk. */
+    private var releaseRefused = false
     /** Everything below this offset is already released. */
     private var releasedThrough: UInt64 = 0
     /** Ingested raw bytes kept readable behind the read cursor; older ones
@@ -109,10 +155,13 @@ actor SpoolTailer {
     /** True until the first drain has run: gates the end-of-file seed so it
         applies once, at attach, and never again on a later drain. */
     private var seedingAtEnd: Bool
+    private var skipReport = SkipReport(interval: .seconds(1))
     private let store: LogStore
     private let stream: LogStream
     private var task: Task<Void, Never>?
     private let url: URL
+    /** Read once, at the first release. */
+    private var volumeBlockBytes: Int?
 
     /** `startAtEnd` seeds `offset` to the file's current size before the first
         drain reads anything, so re-attaching to a spool a prior run already
@@ -155,21 +204,81 @@ actor SpoolTailer {
         task?.cancel()
         task = nil
         await drain()
+        await reportSkipped(skipReport.flush(now: .now))
         await flushPartial()
     }
 
+    /** Reads the unread tail one chunk per pass, re-reading the size before
+        each: a child that writes as fast as the tailer reads never lets a
+        drain reach end of file, so the catch-up skip and the block release
+        both run per chunk rather than once per drain, or neither would ever
+        run under a sustained flood. Chunked reads, never `readToEnd`; the
+        offset advances by bytes actually read, so a child that appends
+        after a size read cannot leave the cursor behind data already
+        ingested (duplicate lines, doubled error tally). The polling task
+        checks cancellation between chunks so a `stop` call can run; `stop`
+        itself still drains, and the catch-up skip keeps that bounded. */
     private func drain() async {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return }
         defer { try? handle.close() }
-        await ingestUnread(from: handle)
+        while !Task.isCancelled {
+            guard await skipToReadable(size: (try? handle.seekToEnd()) ?? 0),
+                (try? handle.seek(toOffset: offset)) != nil,
+                let data = try? handle.read(upToCount: readChunkBytes), !data.isEmpty
+            else { break }
+            offset += UInt64(data.count)
+            var chunk = data
+            if droppingUntilNewline {
+                guard let newline = chunk.firstIndex(of: 0x0A) else { continue }
+                chunk = Data(chunk[chunk.index(after: newline)...])
+                droppingUntilNewline = false
+            }
+            if !chunk.isEmpty { await ingest(chunk: chunk) }
+            await releaseIngested()
+        }
         await releaseIngested()
+        await reportSkipped(skipReport.due(now: .now))
+    }
+
+    private func reportSkipped(_ bytes: UInt64?) async {
+        guard let bytes else { return }
+        await store.append(stream: .sys, text: "spool catch-up skipped \(bytes) bytes")
+    }
+
+    /** Settles `offset` against the file's current `size` (the attach seed, a
+        truncation by a fresh start, a backlog past the catch-up cap) and
+        answers whether unread bytes remain. */
+    private func skipToReadable(size: UInt64) async -> Bool {
+        if seedingAtEnd {
+            offset = size
+            partial.removeAll()
+            seedingAtEnd = false
+        }
+        if size < offset {
+            offset = 0
+            partial.removeAll()
+            droppingUntilNewline = false
+            releasedThrough = 0
+        }
+        guard size > offset else { return false }
+        let cap = UInt64(maxCatchUpBytes)
+        if maxCatchUpBytes > 0, size - offset > cap {
+            let skipped = size - offset - cap
+            offset = size - cap
+            partial.removeAll()
+            droppingUntilNewline = true
+            await reportSkipped(skipReport.add(skipped, now: .now))
+        }
+        return true
     }
 
     private func releaseIngested() async {
+        let blockBytes = volumeBlockBytes ?? SpoolRelease.blockBytes(path: url.path)
+        volumeBlockBytes = blockBytes
         guard !releaseRefused,
             let range = SpoolRelease.range(
-                blockBytes: SpoolRelease.blockBytes(path: url.path), ingestedThrough: offset,
-                releasedThrough: releasedThrough, retainBytes: retainBytes)
+                blockBytes: blockBytes, ingestedThrough: offset, releasedThrough: releasedThrough,
+                retainBytes: retainBytes)
         else { return }
         let failure = releaseHole(url.path, range)
         guard failure != 0 else {
@@ -182,57 +291,6 @@ actor SpoolTailer {
         await store.append(
             stream: .sys,
             text: "\(url.lastPathComponent) cannot shrink on this volume (\(reason)), so it grows until the server restarts")
-    }
-
-    private func ingestUnread(from handle: FileHandle) async {
-        let size = (try? handle.seekToEnd()) ?? 0
-        if seedingAtEnd {
-            offset = size
-            partial.removeAll()
-            seedingAtEnd = false
-        }
-        /** Truncation (a fresh start reuses the path) resets the cursor. */
-        if size < offset {
-            offset = 0
-            partial.removeAll()
-            releasedThrough = 0
-        }
-        guard size > offset else { return }
-        var dropUntilNewline = false
-        if maxCatchUpBytes > 0 {
-            let unread = size - offset
-            let cap = UInt64(maxCatchUpBytes)
-            if unread > cap {
-                let skipped = unread - cap
-                offset = size - cap
-                partial.removeAll()
-                dropUntilNewline = true
-                await store.append(
-                    stream: .sys,
-                    text: "spool catch-up skipped \(skipped) bytes")
-            }
-        }
-        try? handle.seek(toOffset: offset)
-        /** Chunked reads, never `readToEnd`. Advance by bytes actually read so a
-            child that appends after the size snapshot cannot leave the cursor
-            behind data already ingested (duplicate lines, doubled error tally).
-            The polling task checks cancellation between chunks so a `stop` call
-            can run; `stop` itself still drains, and catch-up skip keeps that
-            bounded. */
-        while !Task.isCancelled {
-            guard let data = try? handle.read(upToCount: readChunkBytes), !data.isEmpty else {
-                return
-            }
-            offset += UInt64(data.count)
-            var chunk = data
-            if dropUntilNewline {
-                guard let newline = chunk.firstIndex(of: 0x0A) else { continue }
-                chunk = Data(chunk[chunk.index(after: newline)...])
-                dropUntilNewline = false
-                if chunk.isEmpty { continue }
-            }
-            await ingest(chunk: chunk)
-        }
     }
 
     private func flushPartial() async {

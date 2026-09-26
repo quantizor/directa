@@ -129,6 +129,33 @@ private func tempDir() throws -> URL {
     }
 }
 
+@Suite struct SkipReportTests {
+    /** The first skip reports at once; skips inside the next second add up
+        and report together once it has passed, never one line each. */
+    @Test func skipsInsideAnIntervalReportAsOneTotal() {
+        let start = ContinuousClock.now
+        var report = SkipReport(interval: .seconds(1))
+        #expect(report.add(100, now: start) == 100)
+        #expect(report.add(20, now: start + .milliseconds(50)) == nil)
+        #expect(report.add(30, now: start + .milliseconds(400)) == nil)
+        #expect(report.due(now: start + .milliseconds(999)) == nil)
+        #expect(report.due(now: start + .milliseconds(1000)) == 50)
+        #expect(report.due(now: start + .milliseconds(5000)) == nil)
+        #expect(report.add(7, now: start + .milliseconds(5000)) == 7)
+    }
+
+    @Test func aFlushReportsWhateverIsPendingAtOnce() {
+        let start = ContinuousClock.now
+        var report = SkipReport(interval: .seconds(1))
+        #expect(report.flush(now: start) == nil)
+        #expect(report.add(10, now: start) == 10)
+        #expect(report.add(5, now: start + .milliseconds(10)) == nil)
+        #expect(report.flush(now: start + .milliseconds(20)) == 5)
+        #expect(report.flush(now: start + .milliseconds(30)) == nil)
+        #expect(report.add(1, now: start + .milliseconds(40)) == nil)
+    }
+}
+
 @Suite struct SpoolTailerTests {
     @Test func tailsIncrementallyAndSanitizes() async throws {
         let dir = try tempDir()
@@ -305,11 +332,16 @@ private func tempDir() throws -> URL {
             intervalMs: 20, maxCatchUpBytes: 256 * 1024, retainBytes: retain, store: store, stream: .out,
             url: spool)
         await tailer.start()
-        let floodBytes: Int64 = 1024 * 1024
+        let floodBytes: Int64 = 2 * 1024 * 1024
         let deadline = ContinuousClock.now + .seconds(20)
         while try spoolSizes(spool).apparent < floodBytes, ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(20))
         }
+        /** Measured mid-flood, while a drain never reaches end of file: the
+            retained window, the catch-up cap, and a chunk in flight. */
+        let flooding = try spoolSizes(spool)
+        #expect(flooding.apparent >= floodBytes)
+        #expect(flooding.allocated <= 512 * 1024, "allocated mid-flood \(flooding.allocated)")
         kill(child, SIGSTOP)
         await tailer.stop()
         let stopped = try spoolSizes(spool)
@@ -329,6 +361,44 @@ private func tempDir() throws -> URL {
         #expect(kill(child, 0) == 0)
         #expect(try spoolSizes(spool).apparent > stopped.apparent)
         #expect(try spoolTailText(spool).hasPrefix("heartbeat"))
+    }
+
+    /** A flood that outruns the tailer is skipped chunk by chunk, but named
+        in at most one sys line a second, never one per skip. */
+    @Test func aFloodThatOutrunsTheTailerIsNamedAboutOnceASecond() async throws {
+        let fixture = try #require(fixtureServerExecutable(), "fixture-server is not built; run swift build")
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let spool = dir.appending(path: "out.spool")
+        let descriptor = open(spool.path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0o644)
+        try #require(descriptor >= 0)
+        let child = try spawnBare([fixture, "--flood"], stdoutFD: descriptor)
+        close(descriptor)
+        defer {
+            kill(child, SIGKILL)
+            var status: Int32 = 0
+            waitpid(child, &status, 0)
+        }
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        /** Sixteen-byte reads cannot keep up with the fixture's flood. */
+        let tailer = SpoolTailer(
+            intervalMs: 20, maxCatchUpBytes: 2048, readChunkBytes: 16, retainBytes: 16 * 1024, store: store,
+            stream: .out, url: spool)
+        let started = ContinuousClock.now
+        await tailer.start()
+        try await Task.sleep(for: .milliseconds(1500))
+        kill(child, SIGSTOP)
+        await tailer.stop()
+        let elapsed = ContinuousClock.now - started
+        let skips = await store.query(LogQueryOptions(streams: [.sys])).map(\.text)
+            .filter { $0.hasPrefix("spool catch-up skipped ") }
+        let skipped = skips.compactMap { UInt64($0.split(separator: " ")[3]) }
+        #expect(skipped.count == skips.count)
+        #expect(!skips.isEmpty)
+        #expect(skipped.reduce(0, +) > 0)
+        /** One per elapsed second, plus the first (reported at once) and the
+            final flush. */
+        #expect(skips.count <= Int(elapsed.components.seconds) + 2, "\(skips.count) lines in \(elapsed)")
     }
 
     /** Attaching to a spool a prior run filled (adoption) releases that
