@@ -103,15 +103,15 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                     lingering zombie and an already-reaped pid, never
                     distinguishing the two. Arming again could only match a
                     *different*, recycled process reusing the pid number, so
-                    this reports the unrecoverable exit directly, the same
-                    treatment `.died` below gives it, rather than a
+                    this reads the exit from launchd's own record instead, the
+                    same treatment `.died` below gives it, rather than a
                     manufactured spawnFailed. `onExitedBeforeWatch` runs so
                     the tailers drain whatever the child already wrote to
                     its spool files before dying, without recording a run
                     that was never watched. */
                 guard error.errno == Int(ESRCH) else { return .spawnFailed(error) }
                 await onExitedBeforeWatch(pid)
-                return .exitedStatusUnknown
+                return await Self.launchdExitRecord(domain: domain, label: label)
             }
         case .died:
             /** The process exited before it could confirm session leadership,
@@ -123,14 +123,15 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                 lingering zombie and an already-reaped pid, so arming here
                 could only ever succeed by matching a *different*, recycled
                 process that reused the pid number, never the one that just
-                died; this reports the unrecoverable exit directly rather than
-                risk watching the wrong process. `onExitedBeforeWatch` runs so
-                the tailers drain whatever the child already wrote to its
+                died. The job is still bootstrapped (the bootout is in the
+                defer), so launchd's own record of the exit is read instead of
+                risking a watch on the wrong process. `onExitedBeforeWatch`
+                runs so the tailers drain whatever the child already wrote to its
                 spool files before dying: skipping it, as every other
                 early-return branch in this method does, would silence that
                 output from the structured log entirely. */
             await onExitedBeforeWatch(pid)
-            return .exitedStatusUnknown
+            return await Self.launchdExitRecord(domain: domain, label: label)
         case .timedOut:
             return .spawnFailed(
                 SpawnError(
@@ -236,6 +237,44 @@ public struct LaunchdJobLauncher: ProcessLauncher {
     static func unseenExitOutcome(_ status: LaunchdJobs.AgentStatus) -> ProcessOutcome {
         if let signal = status.lastTerminatingSignal { return .signaled(signal: signal) }
         if let code = status.lastExitCode { return .exited(code: code) }
+        return .exitedStatusUnknown
+    }
+
+    /** How many `launchctl print` reads `launchdExitRecord` makes, and the
+        pause between them: launchd reaps a dead job and writes its exit
+        record within a few milliseconds, so this bound only matters when
+        launchd is slow, and past it the exit stays status-unknown. */
+    static let exitRecordAttempts = 10
+    static let exitRecordInterval = Duration.milliseconds(50)
+
+    /** The exit of a still-bootstrapped job whose process died before its
+        watch was armed, read from `launchctl print` once launchd shows the
+        job not running with an exit record. */
+    private static func launchdExitRecord(domain: String, label: String) async -> ProcessOutcome {
+        await exitRecord(attempts: exitRecordAttempts, interval: exitRecordInterval) {
+            let printed = LaunchdAdmin.shell("/bin/launchctl", ["print", "\(domain)/\(label)"])
+            return printed.status == 0 ? LaunchdJobs.parseAgentPrint(printed.output) : nil
+        }
+    }
+
+    /** Polls `read` (nil when the print failed) until it shows a job with no
+        pid and an exit code or terminating signal, then maps that record
+        through `unseenExitOutcome`. Status-unknown once `attempts` reads pass
+        without one. */
+    static func exitRecord(
+        attempts: Int, interval: Duration, read: () async -> LaunchdJobs.AgentStatus?
+    ) async -> ProcessOutcome {
+        for attempt in 0..<attempts {
+            let status = await read()
+            if let status, status.pid == nil,
+                status.lastExitCode != nil || status.lastTerminatingSignal != nil
+            {
+                return unseenExitOutcome(status)
+            }
+            if attempt < attempts - 1 {
+                try? await Task.sleep(for: interval)
+            }
+        }
         return .exitedStatusUnknown
     }
 

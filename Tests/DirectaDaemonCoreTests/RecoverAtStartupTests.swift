@@ -475,12 +475,15 @@ private func logTexts(router: Router, project: String, name: String) async throw
 
     /** A pid match alone is not proof of identity: `persisted.startedAt` set an
         hour in the past, well outside the tolerance, while the live process
-        backing the matching child job actually started moments ago (a
+        (with or without a matching child job) actually started moments ago (a
         recycled-pid stand-in, since forcing a real pid collision is not
-        reproducible in a test). The guard must reject the match and fall
-        through to the ordinary bounce+respawn, not cross-wire this server's
-        supervision onto a process it never spawned. */
-    @Test func doesNotAdoptWhenTheProcessStartTimeContradictsThePersistedRecord() async throws {
+        reproducible in a test). That process is someone else's: it is neither
+        adopted nor signaled, and the server is restarted fresh as though its
+        recorded run were simply gone. */
+    @Test(arguments: [true, false])
+    func neitherAdoptsNorSignalsAProcessWhoseStartTimeContradictsThePersistedRecord(
+        listedAsChildJob: Bool
+    ) async throws {
         let env = try makeRecoverEnv()
         try writeDevservers(
             project: env.projectPath,
@@ -504,29 +507,97 @@ private func logTexts(router: Router, project: String, name: String) async throw
         }
         let gate = AdoptGate()
         let recorder = RecordingAgentJobs()
+        let listed =
+            listedAsChildJob
+            ? [LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-recycled", pid: survivor)]
+            : []
         let router = Router(
-            agentJobs: recorder.agentJobs(listing: [
-                LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-recycled", pid: survivor)
-            ]),
+            agentJobs: recorder.agentJobs(listing: listed),
             launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
         await router.recoverAtStartup()
         let web = try await statusList(router: router, project: env.projectPath)
             .first { $0.server == "web" }
+        #expect(web?.pid != nil)
         #expect(web?.pid != Int(survivor))
         #expect(web?.phase == .starting || web?.phase == .running)
         #expect(await gate.callCount == 0)
         let events = try await eventsList(router: router, project: env.projectPath)
         #expect(
-            events.contains { $0.kind == .crashed && ($0.detail ?? "").hasPrefix("daemon-restart") })
+            events.filter { $0.kind == .crashed }.map(\.detail) == [DaemonRestartDetail.crashed])
         #expect(
             events.contains { $0.kind == .started && ($0.detail ?? "").contains("adopted pid") } == false)
-        var reaped = false
-        for _ in 0..<50 where !reaped {
-            if kill(survivor, 0) != 0 { reaped = true; break }
-            try await Task.sleep(for: .milliseconds(100))
+        /** `bounceOrphan` runs to its SIGKILL inside `recoverAtStartup`, so a
+            bounce would already have landed; this only waits out the reap. */
+        var gone = kill(survivor, 0) != 0
+        for _ in 0..<20 where !gone {
+            try await Task.sleep(for: .milliseconds(50))
+            gone = kill(survivor, 0) != 0
         }
-        #expect(reaped, "recycled-pid stand-in \(survivor) survived the bounce")
+        #expect(!gone, "recycled-pid stand-in \(survivor) was signaled")
         await stopServer(router: router, project: env.projectPath, name: "web")
+    }
+
+    /** A row with no restore intent (a removal whose stop gave up retired it
+        as stopped, keeping the run's pid and start time) is never restored or
+        adopted, even when its pid is a matching child job. A live recorded
+        run is bounced only with start-time proof, and the row keeps its
+        stopped phase with the pid cleared. */
+    @Test(arguments: [true, false])
+    func aRetiredRowIsNeverRestoredOrAdoptedAndItsLiveRunIsBouncedOnlyWithProof(
+        recordedJustNow: Bool
+    ) async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath,
+            serversJSON: """
+            {
+              "web": {
+                "command": ["/bin/sh", "-c", "sleep 30"]
+              }
+            }
+            """)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let startedAt = recordedJustNow ? Date() : Date().addingTimeInterval(-3_600)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        let id = serverID(project: env.projectPath, name: "web")
+        try await registry.updateState(serverID: id) { entry in
+            entry.phase = .stopped
+            entry.pid = Int(survivor)
+            entry.resumeOnBoot = nil
+            entry.startedAt = startedAt
+        }
+        let gate = AdoptGate()
+        let router = Router(
+            agentJobs: RecordingAgentJobs().agentJobs(listing: [
+                LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-retired", pid: survivor)
+            ]),
+            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+
+        #expect(await gate.callCount == 0)
+        let web = try await statusList(router: router, project: env.projectPath)
+            .first { $0.server == "web" }
+        #expect(web?.pid == nil)
+        #expect(web?.phase == .stopped)
+        let row = try #require(await registry.persistedState(serverID: id))
+        #expect(row.phase == .stopped)
+        #expect(row.pid == nil)
+        #expect(row.resumeOnBoot == nil)
+
+        /** `bounceOrphan` runs to its SIGKILL inside `recoverAtStartup`, so
+            only the reaping of a signaled process is left to wait for. */
+        var gone = kill(survivor, 0) != 0
+        for _ in 0..<20 where !gone {
+            try await Task.sleep(for: .milliseconds(50))
+            gone = kill(survivor, 0) != 0
+        }
+        #expect(gone == recordedJustNow)
+        let events = try await eventsList(router: router, project: env.projectPath)
+        #expect(
+            events.filter { $0.kind == .crashed }.map(\.detail)
+                == (recordedJustNow ? [DaemonRestartDetail.orphanBounced(pid: survivor)] : []))
     }
 
     /** No launchd child job matches the persisted pid (the common case outside

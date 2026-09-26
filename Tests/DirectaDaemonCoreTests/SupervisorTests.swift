@@ -1144,6 +1144,31 @@ private func makeEnv() throws -> TestEnv {
         #expect(errLines.map(\.text) == ["boom before watch"])
     }
 
+    /** Exiting before the watch writes no intent of its own, so it keeps
+        whatever an earlier supervised run left: a server already set to
+        restore at launch stays set. */
+    @Test func exitBeforeWatchKeepsAnEarlierRunsBootIntent() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let id = serverID(project: env.projectPath, name: "web")
+        try await registry.updateState(serverID: id) { entry in
+            entry.phase = .stopped
+            entry.resumeOnBoot = true
+        }
+        let supervisor = ServerSupervisor(
+            launcher: ExitedBeforeWatchLauncher(pid: nil, stderrText: "boom before watch\n"),
+            paths: paths,
+            projectPath: env.projectPath, registry: registry,
+            spec: ServerSpec(command: ["/bin/sh", "-c", "exit 1"], name: "web"))
+        _ = await supervisor.start()
+        #expect(try await waitForPhase(supervisor, .crashed).phase == .crashed)
+        let persisted = await registry.persistedState(serverID: id)
+        #expect(persisted?.phase == .crashed)
+        #expect(persisted?.lastExit != nil)
+        #expect(persisted?.resumeOnBoot == true)
+    }
+
     /** The other side of the same line: a run whose exit watch was armed was
         supervised, so an exit, even an instant one that still reported its
         code, keeps the boot intent `recordSpawn` wrote. */
@@ -1339,6 +1364,45 @@ private func makeEnv() throws -> TestEnv {
             gone = kill(child, 0) != 0
         }
         #expect(gone, "pid \(child) kept running after a stop that reported stopped")
+    }
+
+    /** A removal whose stop gives up while the launcher has not reported a
+        pid yet still abandons state writes, and the run that appears later
+        is stopped the moment its pid arrives rather than recorded: nothing
+        supervises it any more, so it must neither keep running nor write a
+        restore-at-launch intent. */
+    @Test func removalThatGivesUpBeforeThePidIsKnownStopsTheRunWhenItAppears() async throws {
+        let env = try makeEnv()
+        let gate = SpawnGate()
+        let launcher = DelayedSpawnLauncher(gate: gate)
+        let registry = Registry(paths: env.paths)
+        let id = serverID(project: env.projectPath, name: "web")
+        let supervisor = ServerSupervisor(
+            launcher: launcher, paths: env.paths, projectPath: env.projectPath,
+            registry: registry, spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web"),
+            stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
+        defer { for pid in launcher.pids { kill(pid, SIGKILL) } }
+
+        async let started = supervisor.start()
+        for _ in 0..<100 where launcher.pids.isEmpty {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let child = try #require(launcher.pids.first)
+        #expect(await supervisor.stopForRemoval(reason: "unregistered"))
+        #expect(await supervisor.status().phase == .starting)
+
+        await gate.open()
+        _ = await started
+        var gone = kill(child, 0) != 0
+        for _ in 0..<100 where !gone {
+            try await Task.sleep(for: .milliseconds(20))
+            gone = kill(child, 0) != 0
+        }
+        #expect(gone, "pid \(child) kept running after its supervisor was removed")
+        let settled = try await waitForPhase(supervisor, .stopped)
+        #expect(settled.phase == .stopped)
+        #expect(settled.pid == nil)
+        #expect(await registry.persistedState(serverID: id) == nil)
     }
 }
 

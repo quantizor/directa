@@ -250,6 +250,136 @@ import Testing
         _ = await thief.stop(graceSeconds: 2, reason: "test cleanup")
     }
 
+    /** A server failed for its port keeps its process running (the failure is
+        a finding, not a teardown), so stopping it stops that process, and
+        starting it again stops the old run before spawning a new one: two
+        copies never run side by side, and the old run's exit never
+        overwrites the new run's state. */
+    @Test(arguments: [(45011, false), (45012, true)])
+    func aPortFailedServerIsReallyStoppedAndRestarted(port: Int, restart: Bool) async throws {
+        guard let fixture = fixtureServerExecutable() else {
+            Issue.record("fixture-server is not built; run swift build")
+            return
+        }
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        let thiefSpec = ServerSpec(
+            command: [fixture, "--listen-tcp", String(port)], name: "web", port: port)
+        try await registry.register(project: env.projectB, spec: thiefSpec)
+        let thief = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectB,
+            registry: registry, spec: thiefSpec)
+        _ = await thief.start()
+        _ = await settle(thief) { $0.phase == .running }
+
+        let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web", port: port)
+        try await registry.register(project: env.projectA, spec: spec)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectA,
+            registry: registry, spec: spec)
+        _ = await supervisor.start()
+        let failed = await settle(supervisor) { $0.phase == .failed }
+        #expect(failed.phase == .failed)
+        let oldPid = try #require(failed.pid)
+        defer { kill(pid_t(oldPid), SIGKILL) }
+        _ = await thief.stop(graceSeconds: 2, reason: "test cleanup")
+
+        let after: ServerStatus
+        if restart {
+            after = await supervisor.start()
+        } else {
+            after = await supervisor.stop(graceSeconds: 2, reason: "test")
+        }
+        defer { if let pid = after.pid, pid != oldPid { kill(pid_t(pid), SIGKILL) } }
+        var gone = kill(pid_t(oldPid), 0) != 0
+        for _ in 0..<50 where !gone {
+            try await Task.sleep(for: .milliseconds(20))
+            gone = kill(pid_t(oldPid), 0) != 0
+        }
+        #expect(gone, "the failed run \(oldPid) kept running")
+        if restart {
+            let newPid = try #require(after.pid)
+            #expect(newPid != oldPid)
+            #expect(after.phase == .starting)
+            let persisted = await registry.persistedState(
+                serverID: serverID(project: env.projectA, name: "web"))
+            #expect(persisted?.pid == newPid)
+            #expect(persisted?.phase == .starting)
+            _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
+        } else {
+            #expect(after.phase == .stopped)
+            #expect(after.pid == nil)
+        }
+    }
+
+    /** Forgetting a vanished checkout whose server failed for its port stops
+        that live process through its own exit, which posts the one `stopped`
+        event; the teardown's own post is only for a server with nothing left
+        running. */
+    @Test func forgettingAPortFailedServerStopsItWithOneStoppedEvent() async throws {
+        guard let fixture = fixtureServerExecutable() else {
+            Issue.record("fixture-server is not built; run swift build")
+            return
+        }
+        let env = try makeEnv()
+        let port = 45013
+        let registry = Registry(paths: env.paths)
+        try await registry.register(
+            project: env.projectA,
+            spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web", port: port))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let target = ServerTargetParams(name: "web", project: env.projectA)
+        let start = await handle(router, .serverStart, target, ServerResult.self)
+        guard case .success(let started) = start else {
+            Issue.record("the victim did not start")
+            return
+        }
+        let victim = try #require(started.server.pid)
+        defer { kill(pid_t(victim), SIGKILL) }
+
+        /** Started after the victim so the victim's port pre-check passes; its
+            listener then answers the victim's healthcheck. */
+        let thiefSpec = ServerSpec(
+            command: [fixture, "--listen-tcp", String(port)], name: "web", port: port)
+        let thief = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectB,
+            registry: registry, spec: thiefSpec)
+        _ = await thief.start()
+        var phase: ServerPhase?
+        for _ in 0..<60 where phase != .failed {
+            try await Task.sleep(for: .milliseconds(100))
+            let listed = await handle(
+                router, .serverStatus, ProjectParams(name: "web", project: env.projectA),
+                ServerListResult.self)
+            if case .success(let result) = listed {
+                phase = result.servers.first?.phase
+            }
+        }
+        #expect(phase == .failed)
+        _ = await thief.stop(graceSeconds: 2, reason: "test cleanup")
+
+        let canonicalProject = canonicalProjectPath(env.projectA)
+        try FileManager.default.removeItem(atPath: env.projectA)
+        let now = Date()
+        await router.pruneMissingProjects(now: now)
+        await router.pruneMissingProjects(
+            now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
+
+        var gone = kill(pid_t(victim), 0) != 0
+        for _ in 0..<50 where !gone {
+            try await Task.sleep(for: .milliseconds(20))
+            gone = kill(pid_t(victim), 0) != 0
+        }
+        #expect(gone, "the port-failed run \(victim) outlived its forgotten project")
+        let queried = await handle(
+            router, .eventsQuery, EventsQueryParams(project: canonicalProject), EventsQueryResult.self)
+        guard case .success(let events) = queried else {
+            Issue.record("events query failed")
+            return
+        }
+        #expect(events.events.filter { $0.kind == .stopped }.map(\.detail) == ["project path gone"])
+    }
+
     /** The control. Same shape, except the supervised process owns the port, so
         the check must stay silent. Without this a probe that always reported a
         foreign owner would pass the test above and look like a working feature. */

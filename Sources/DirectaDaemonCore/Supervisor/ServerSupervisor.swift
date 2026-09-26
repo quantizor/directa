@@ -102,11 +102,12 @@ public actor ServerSupervisor {
         persisted, so this starts uncached every time). */
     private var recentLogTail: [String]??
     private let registry: Registry
-    /** Set by `stopForRemoval`, never cleared: the router has dropped (or is
-        dropping) this supervisor, so a caller still holding the reference (a
-        restart's `ensure`, a watch sweep) must not spawn or attach a run that
-        nothing would supervise. */
-    private var removed = false
+    /** Set by `stopForRemoval` to its reason, never cleared: the router has
+        dropped (or is dropping) this supervisor, so a caller still holding the
+        reference (a restart's `ensure`, a watch sweep) must not spawn or
+        attach a run that nothing would supervise, and a spawn already in
+        flight is stopped for this reason the moment its pid arrives. */
+    private var removalReason: String?
     private var runningSpecHash: String?
     private var runTask: Task<Void, Never>?
     private var spawnError: SpawnError?
@@ -315,7 +316,7 @@ public actor ServerSupervisor {
         in-flight attempt. Returns once a pid exists or the spawn has failed; the
         phase stays `starting` until the healthcheck passes. */
     public func start() async -> ServerStatus {
-        guard !removed else { return status() }
+        guard removalReason == nil else { return status() }
         switch phase {
         case .running, .unhealthy:
             return status()
@@ -329,6 +330,14 @@ public actor ServerSupervisor {
             guard await waitForStoppingToClear(timeout: stoppingWaitBound) else {
                 return status()
             }
+            return await start()
+        case .failed where pid != nil:
+            /** A port failure leaves its run alive. Spawning beside it would
+                run two copies, and the old run's exit would later overwrite
+                the new run's state, so it is stopped first; a stop that gives
+                up reports its honest `.stopping`. */
+            let stopped = await stop(deliberate: false, reason: "restarting after a port failure")
+            guard stopped.phase != .stopping else { return stopped }
             return await start()
         case .crashed, .failed, .stopped:
             break
@@ -405,17 +414,18 @@ public actor ServerSupervisor {
         The exit watch is armed first, before anything is recorded: false
         means nothing changed here (phase, pid, registry, tailers) and the
         caller bounces the process instead. A removed supervisor returns false
-        before arming, since an armed watch nobody waits on is never consumed. The result is a Bool rather than a
-        status because the health monitor can promote a successful adopt to
-        `.running` before this returns. The exit-watch task below is what
-        closes the adoption hole: without it, a process this attaches to and
-        later loses (the common second-jetsam-wave case, or an ordinary crash)
-        would become an undetected zombie, since nothing else calls
-        `recordOutcome` for a pid this instance never spawned. */
+        before arming, since an armed watch nobody waits on is never consumed.
+        The result is a Bool rather than a status because the health monitor
+        can promote a successful adopt to `.running` before this returns. The
+        exit-watch task below is what closes the adoption hole: without it, a
+        process this attaches to and later loses (the common second-jetsam-wave
+        case, or an ordinary crash) would become an undetected zombie, since
+        nothing else calls `recordOutcome` for a pid this instance never
+        spawned. */
     public func adopt(
         pid childPid: pid_t, label: String, boundPort: Int?, startedAt runStartedAt: Date?
     ) async -> Bool {
-        guard !removed, launcher.prepareAdopt(pid: childPid) else { return false }
+        guard removalReason == nil, launcher.prepareAdopt(pid: childPid) else { return false }
         listenScanGeneration += 1
         phase = .starting
         stopRequested = false
@@ -475,7 +485,7 @@ public actor ServerSupervisor {
         the in-flight attempt; running and unhealthy are no-ops (unhealthy is
         reported, not restarted). Blocks until healthy, terminal, or timeout. */
     public func ensure(timeoutSeconds: Double) async -> EnsureResult {
-        guard !removed else { return EnsureResult(reason: .stopped, server: status()) }
+        guard removalReason == nil else { return EnsureResult(reason: .stopped, server: status()) }
         switch phase {
         case .running, .unhealthy:
             return EnsureResult(server: status())
@@ -558,6 +568,10 @@ public actor ServerSupervisor {
             does. */
         let stopWaitTimeout = Duration.seconds(graceSeconds + stopTiming.overtimeSeconds)
         switch phase {
+        case .failed where pid != nil:
+            /** A port failure leaves its run alive, so it stops like a
+                running one. */
+            break
         case .stopped, .crashed, .failed:
             return status()
         case .stopping:
@@ -634,18 +648,26 @@ public actor ServerSupervisor {
     /** A deliberate stop for a caller about to drop this supervisor (unregister,
         forgetting a vanished project). Marks it removed before the stop, so
         from here on `start`, `ensure`, and `adopt` spawn or attach nothing,
-        whatever stop this one joins. Returns true when the stop gave up with
-        the phase still `.stopping`: state writes are then abandoned in the
-        same actor turn the stop returned in, so a `recordOutcome` landing
-        after the caller retires or deletes the state row cannot put it back.
-        False means the stop finished; a joined non-deliberate stop (a
-        restart, a watch sweep) keeps boot intent, which the caller clears. */
+        whatever stop this one joins, and a spawn still in flight is stopped
+        when its pid arrives (`recordSpawn`). Returns true when the stop gave
+        up short of a terminal phase (still `.stopping`, or still `.starting`
+        with no pid yet): state writes are then abandoned in the same actor
+        turn the stop returned in, so a `recordOutcome` landing after the
+        caller retires or deletes the state row cannot put it back. False
+        means the stop finished; a joined non-deliberate stop (a restart, a
+        watch sweep) keeps boot intent, which the caller clears. */
     public func stopForRemoval(reason: String) async -> Bool {
-        removed = true
+        removalReason = reason
         _ = await stop(reason: reason)
-        guard phase == .stopping else { return false }
-        stateWritesAbandoned = true
-        return true
+        switch phase {
+        case .crashed, .stopped:
+            return false
+        case .failed where pid == nil:
+            return false
+        case .failed, .running, .starting, .stopping, .unhealthy:
+            stateWritesAbandoned = true
+            return true
+        }
     }
 
     /** One revalidated teardown pass. Descendants come from every source at once
@@ -1061,6 +1083,10 @@ public actor ServerSupervisor {
         let session = getsid(childPid)
         rootSessionID = session > 0 ? session : nil
         refreshDescendantSnapshot()
+        if let removalReason {
+            await stopRemovedSpawn(target: childPid, reason: removalReason)
+            return
+        }
         let spawnedAt = Date()
         startedAt = spawnedAt
         let out = SpoolTailer(
@@ -1086,6 +1112,48 @@ public actor ServerSupervisor {
             entry.startedAt = spawnedAt
         }
         settleSpawnWaiters()
+    }
+
+    /** A pid that arrives after `stopForRemoval` (its stop gave up while the
+        launcher had not published one yet): nothing supervises this run any
+        more, so it is torn down instead of recorded, through `signalRun` like
+        any stop. This runs inside the launcher's own spawn callback, and the
+        run cannot finish until that returns, so it signals SIGTERM and leaves
+        the SIGKILL escalation to a task after the grace rather than awaiting
+        the exit. `recordOutcome` then lands `.stopped`, its state writes
+        abandoned when the removal already gave up. */
+    private func stopRemovedSpawn(target: pid_t, reason: String) async {
+        let grace = stopTiming.graceSeconds
+        stopRequested = true
+        stopWasDeliberate = true
+        stopReason = reason
+        stoppingWaitBound = .seconds(grace + stopTiming.overtimeSeconds)
+        phase = .stopping
+        settleSpawnWaiters()
+        let rootIdentity = ProcessTree.identity(of: target)
+        let sessionID = rootSessionID
+        let snapshot = lastDescendantSnapshot
+        await logStore.append(stream: .sys, text: "stopping: \(reason)")
+        let signaled = signalRun(
+            target: target, rootIdentity: rootIdentity, sessionID: sessionID,
+            snapshot: snapshot, signal: SIGTERM)
+        Task {
+            try? await Task.sleep(for: .seconds(grace))
+            self.escalateRemovedSpawn(
+                target: target, rootIdentity: rootIdentity, sessionID: sessionID,
+                snapshot: snapshot, priorSignaled: signaled)
+        }
+    }
+
+    /** The SIGKILL half of `stopRemovedSpawn`, the same revalidated pass
+        `stop()` escalates with. */
+    private func escalateRemovedSpawn(
+        target: pid_t, rootIdentity: ProcessIdentity?, sessionID: pid_t?,
+        snapshot: [ProcessIdentity], priorSignaled: [ProcessIdentity]
+    ) {
+        signalRun(
+            target: target, rootIdentity: rootIdentity, sessionID: sessionID,
+            snapshot: snapshot, signal: SIGKILL, priorSignaled: priorSignaled)
     }
 
     /** The launcher learned of the process only after it had already exited

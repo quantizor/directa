@@ -99,11 +99,11 @@ struct LaunchdJobLauncherTests {
         then the poll that confirms the pid) measure single-digit
         milliseconds each and land on either side of the race against launchd
         reaping the job, measured directly (repeated runs on one machine hit
-        both `.leader` and `.died` roughly evenly): when the kernel has
-        already discarded the exit status, `NOTE_EXITSTATUS` (or the
-        registration itself, refused with ESRCH) is unavailable and
-        `.exitedStatusUnknown` is the honest result for this exact command;
-        when this daemon wins the race, the real code 7 comes through.
+        both `.leader` and `.died` roughly evenly): when the process is gone
+        before the watch is armed, the code 7 comes from launchd's own
+        record of the still-bootstrapped job; when this daemon wins the race,
+        the armed watch reports it, unless the kernel withholds the status,
+        which is the one case `.exitedStatusUnknown` stays honest.
         A slower failure (a command doing real work before a nonzero exit,
         `sleep 0.3; exit 3` above) always recovers the real code, since the
         process is reliably still alive when this daemon gets to register
@@ -137,7 +137,7 @@ struct LaunchdJobLauncherTests {
         case .exited(let code):
             #expect(code == 7)
         case .exitedStatusUnknown:
-            break
+            #expect(fired != ["exitedBeforeWatch"], "an exit seen only after the fact lost launchd's recorded 7")
         case .signaled, .spawnFailed:
             Issue.record("expected .exited(code: 7) or .exitedStatusUnknown, got \(outcome)")
         }
@@ -145,10 +145,11 @@ struct LaunchdJobLauncherTests {
 
     /** A command that cannot be run (a typo'd path) reports why on its own
         stderr, which is what `logs` and `why` read, and exits 127 rather than
-        looking like a clean exit 0. launchd may report that 127 through the
-        armed watch or through its own last exit code, and on a loaded machine
-        the exit can outrun both, so status-unknown is also honest; exit 0 or a
-        spawn failure is not. */
+        looking like a clean exit 0. An exit this daemon saw only after the
+        fact (`onExitedBeforeWatch`) still holds launchd's own record of it, so
+        that path always reports the 127. Through an armed watch the kernel
+        may withhold the status, so status-unknown is honest there; exit 0 or
+        a spawn failure never is. */
     @Test func aCommandThatCannotRunSaysSoAndExits127() async throws {
         let (outFD, outURL) = try openSpool()
         let (errFD, errURL) = try openSpool()
@@ -159,13 +160,14 @@ struct LaunchdJobLauncherTests {
             try? FileManager.default.removeItem(at: errURL)
         }
         let missing = "/nonexistent/directa-typo-\(UUID().uuidString)"
+        let exitedBeforeWatch = OSAllocatedUnfairLock(initialState: false)
         let outcome = await LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix).run(
             argv: [missing, "--port", "3000"],
             capture: SpawnCapture(
                 stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),
             cwd: nil,
             environment: [:],
-            onExitedBeforeWatch: { _ in },
+            onExitedBeforeWatch: { _ in exitedBeforeWatch.withLock { $0 = true } },
             onSpawn: { _ in }
         )
         let stderr = try String(contentsOf: errURL, encoding: .utf8)
@@ -174,7 +176,9 @@ struct LaunchdJobLauncherTests {
         case .exited(let code):
             #expect(code == 127)
         case .exitedStatusUnknown:
-            break
+            #expect(
+                !exitedBeforeWatch.withLock { $0 },
+                "an exit seen only after the fact lost launchd's recorded 127")
         case .signaled, .spawnFailed:
             Issue.record("expected .exited(code: 127) or .exitedStatusUnknown, got \(outcome)")
         }
@@ -219,6 +223,33 @@ struct LaunchdJobLauncherTests {
         #expect("\(signaled)" == "signaled(signal: 9)")
         #expect("\(exited)" == "exited(code: 64)")
         #expect("\(unknown)" == "exitedStatusUnknown")
+    }
+
+    /** A job whose process died before its watch was armed is still
+        bootstrapped, so its exit is read from `launchctl print`: reads that
+        fail, or that still show a pid or no exit record, are polled past, and
+        the first record of a job not running decides the outcome. */
+    @Test(arguments: [
+        ([nil, LaunchdJobs.AgentStatus(pid: 4242, runs: 1), LaunchdJobs.AgentStatus(runs: 1),
+          LaunchdJobs.AgentStatus(lastExitCode: 127, runs: 1)], "exited(code: 127)", 4),
+        ([LaunchdJobs.AgentStatus(lastTerminatingSignal: 9, runs: 1)], "signaled(signal: 9)", 1),
+        ([LaunchdJobs.AgentStatus(lastExitCode: 0, runs: 1)], "exited(code: 0)", 1),
+        ([LaunchdJobs.AgentStatus(lastExitCode: 3, pid: 4242, runs: 1)], "exitedStatusUnknown", 5),
+        ([nil], "exitedStatusUnknown", 5),
+    ] as [([LaunchdJobs.AgentStatus?], String, Int)])
+    func exitRecordPollsUntilLaunchdShowsTheExit(
+        reads: [LaunchdJobs.AgentStatus?], expected: String, readCount: Int
+    ) async {
+        let made = OSAllocatedUnfairLock(initialState: 0)
+        let outcome = await LaunchdJobLauncher.exitRecord(attempts: 5, interval: .zero) {
+            let index = made.withLock { count in
+                defer { count += 1 }
+                return count
+            }
+            return reads[min(index, reads.count - 1)]
+        }
+        #expect("\(outcome)" == expected)
+        #expect(made.withLock { $0 } == readCount)
     }
 
     private func openSpool() throws -> (Int32, URL) {

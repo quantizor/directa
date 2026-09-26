@@ -198,9 +198,11 @@ import Testing
 
     /** Unregistering a server whose stop never finishes (also declared in the
         committed devservers.json, so the next daemon launch would restore it
-        from its state row) retires that row as stopped with no boot intent and
-        no pid, and the exit that finally lands afterward cannot write it back.
-        `lastExit` is the marker a late write would leave. */
+        from its state row) retires that row as stopped with no boot intent,
+        keeping the run's pid and start time so a later daemon launch can
+        still prove and bounce a process that outlived the stop, and the exit
+        that finally lands afterward cannot write it back. `lastExit` is the
+        marker a late write would leave. */
     @Test func unregisteringAServerWhoseStopHangsRetiresItsStateRow() async throws {
         let env = try makeEnv()
         try Data(
@@ -214,17 +216,21 @@ import Testing
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
         let id = serverID(project: env.project, name: "web")
 
-        _ = try await handle(
+        let started = try await handle(
             router, .serverStart, ServerTargetParams(name: "web", project: env.project),
             ServerResult.self)
-        #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
+        let pid = try #require(started.server.pid)
+        let running = try #require(await registry.persistedState(serverID: id))
+        #expect(running.resumeOnBoot == true)
+        let startedAt = try #require(running.startedAt)
 
         _ = try await handle(
             router, .serverUnregister, ServerTargetParams(name: "web", project: env.project),
             WireEmpty.self)
         let retired = try #require(await registry.persistedState(serverID: id))
         #expect(retired.phase == .stopped)
-        #expect(retired.pid == nil)
+        #expect(retired.pid == pid)
+        #expect(retired.startedAt == startedAt)
         #expect(retired.resumeOnBoot == nil)
         #expect(retired.lastExit == nil)
 
@@ -233,7 +239,7 @@ import Testing
         for _ in 0..<10 {
             let row = await registry.persistedState(serverID: id)
             #expect(row?.phase == .stopped)
-            #expect(row?.pid == nil)
+            #expect(row?.pid == pid)
             #expect(row?.resumeOnBoot == nil)
             #expect(row?.lastExit == nil)
             try await Task.sleep(for: .milliseconds(50))
@@ -385,7 +391,8 @@ import Testing
             return
         }
 
-        _ = try await handle(router, .serverStart, target, ServerResult.self)
+        let started = try await handle(router, .serverStart, target, ServerResult.self)
+        let pid = try #require(started.server.pid)
         let stateFile = env.paths.stateFile.path
         try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: stateFile)
         defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: stateFile) }
@@ -405,7 +412,7 @@ import Testing
         try await awaitStoppedEvent(router: router, project: env.project, detail: "unregistered")
         let row = try #require(await registry.persistedState(serverID: id))
         #expect(row.resumeOnBoot == nil)
-        #expect(row.pid == nil)
+        #expect(row.pid == pid)
         #expect(row.lastExit == nil)
     }
 

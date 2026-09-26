@@ -493,22 +493,17 @@ public actor Router {
                     instantly for one already terminal, so this costs nothing
                     on the common path. Either way the row ends with no boot
                     intent, or a server also declared in devservers.json comes
-                    back on the next daemon launch: a stop that gave up still
-                    `.stopping` never reached the `recordOutcome` that clears
-                    it, so its row is retired; a finished one may have joined
-                    a restart's non-deliberate stop, which keeps it, so it is
-                    cleared. */
+                    back on the next daemon launch: a stop that gave up short
+                    of a terminal phase never reached the `recordOutcome` that
+                    clears it, so its row is retired; a finished one may have
+                    joined a restart's non-deliberate stop, which keeps it, so
+                    it is cleared. */
                 var stopGaveUp = false
                 if let supervisor = supervisors[id] {
                     stopGaveUp = await supervisor.stopForRemoval(reason: "unregistered")
                     if stopGaveUp {
-                        var final = await registry.persistedState(serverID: id) ?? PersistedServerState()
-                        final.phase = .stopped
-                        final.pid = nil
-                        final.resumeOnBoot = nil
-                        final.startedAt = nil
                         await retireRemovedState(
-                            final: final, name: name, project: project, writer: supervisor.writerID)
+                            name: name, project: project, writer: supervisor.writerID)
                     }
                 }
                 if !stopGaveUp {
@@ -605,11 +600,14 @@ public actor Router {
         exit is re-watched through the shared `ExitWatcher` feeding
         `recordOutcome`, and its health is re-monitored, so a jetsam SIGKILL of
         the daemon no longer bounces a dev server that never actually died. A
-        recorded pid that is gone becomes crashed(daemon-restart); a live
-        orphan that is not a matching launchd child job (foreground/test mode,
-        or a pid launchd never knew about) is group-killed instead, since
-        there is no launchd job label to bootout once a fresh watch on it
-        fires. What comes back:
+        recorded pid that is gone, or live but without a kernel start time
+        consistent with the recorded one (a recycled number), becomes
+        crashed(daemon-restart) and is never signaled; a proven live orphan
+        that is not a matching launchd child job (foreground/test mode, or a
+        pid launchd never knew about) is group-killed instead, since there is
+        no launchd job label to bootout once a fresh watch on it fires. A row
+        with no restore intent that still names a proven live run (a removal
+        whose stop gave up) is only bounced. What comes back:
         any server whose start intent survives (resumeOnBoot), which a machine
         shutdown's drain leaves set, plus the classic daemon-crash case of a
         phase left running/starting. A deliberate stop clears the flag, so only
@@ -689,23 +687,25 @@ public actor Router {
                     "recover defer \(name)@\(project): config unreadable; keeping resume intent")
                 continue
             case .found(let spec):
+                let restores = leftActive || wantsRestore
+                /** A bare pid match is not proof: the number may have been
+                    recycled during the daemon-down window (a reboot hands it
+                    to an unrelated app, and the pid space is only ~100k wide).
+                    Adopting or bouncing it is mutative, so both need the
+                    kernel start time to be consistent with the moment this
+                    pid was last recorded running. Without that proof the
+                    process is someone else's and is never signaled; the
+                    recorded run is treated as gone. */
                 if let pid = persisted.pid.flatMap(ProcessTree.narrowed),
-                    let identity = ProcessTree.identity(of: pid)
+                    let identity = ProcessTree.identity(of: pid),
+                    ProcessTree.startTimeConsistent(
+                        processStart: identity.wallClockStart,
+                        persistedStartedAt: persisted.startedAt)
                 {
-                    /** A bare pid match is not proof: a launchd child job
-                        holding this pid could be a different, later run if the
-                        number was recycled during the daemon-down window (the
-                        pid space is only ~100k wide). Adoption is mutative
-                        (rewrites state.json, attaches supervision), so it needs
-                        the same identity proof `bounceOrphan`/`stop` require
-                        before signaling: the kernel start time must be
-                        consistent with the moment this pid was last recorded
-                        running. A mismatch falls through to the ordinary
-                        bounce. */
-                    if let job = adoptableChildJobs[pid],
-                        ProcessTree.startTimeConsistent(
-                            processStart: identity.wallClockStart,
-                            persistedStartedAt: persisted.startedAt),
+                    /** A row with no restore intent (a removal whose stop gave
+                        up retired it) keeps its pid only so its leftover run
+                        can be bounced here: it is never adopted or restarted. */
+                    if restores, let job = adoptableChildJobs[pid],
                         await adoptSurvivor(
                             boundPort: persisted.boundPort, job: job, name: name, pid: pid,
                             project: project, spec: spec, startedAt: persisted.startedAt)
@@ -718,14 +718,20 @@ public actor Router {
                         kind: .crashed, project: project, server: name,
                         detail: DaemonRestartDetail.crashed)
                 }
+                guard restores else {
+                    try? await registry.updateState(serverID: id) { entry in
+                        entry.pid = nil
+                        entry.startedAt = nil
+                    }
+                    continue
+                }
                 try? await registry.updateState(serverID: id) { entry in
                     entry.lastExit = entry.lastExit ?? LastExit(at: Date())
                     entry.phase = .crashed
                     entry.pid = nil
+                    entry.startedAt = nil
                 }
-                if leftActive || wantsRestore {
-                    toStart.append((project: project, spec: spec))
-                }
+                toStart.append((project: project, spec: spec))
             }
         }
         for item in toStart {
@@ -824,8 +830,10 @@ public actor Router {
     }
 
     /** Group-kill a live non-child left over from a prior daemon (or a prune that
-        could not stop through the supervisor). Signals only while the snapshotted
-        start time still matches: a recycled pid must not be killed. */
+        could not stop through the supervisor). `root` is read moments before
+        this call, so the identity checks here only cover the gap between that
+        read and each signal; a caller holding a pid from disk proves it first
+        with `ProcessTree.startTimeConsistent`, or a recycled pid is killed. */
     private func bounceOrphan(
         _ root: ProcessIdentity, project: String, name: String
     ) async {
@@ -872,16 +880,19 @@ public actor Router {
     }
 
     /** Retires the state row of a supervisor whose removal stop gave up
-        (`Registry.retireState`). A save failure is logged at error level,
-        which persists, and the removal goes on: the retirement already holds
-        in memory, which is what refuses that supervisor's late write for the
-        rest of this daemon's life. */
-    private func retireRemovedState(
-        final: PersistedServerState, name: String, project: String, writer: UUID
-    ) async {
+        (`Registry.retireState`) as stopped with no restore intent. The run's
+        pid and start time stay, so a later daemon launch can prove and bounce
+        a process that outlived the stop (`recoverAtStartup`). A save failure
+        is logged at error level, which persists, and the removal goes on: the
+        retirement already holds in memory, which is what refuses that
+        supervisor's late write for the rest of this daemon's life. */
+    private func retireRemovedState(name: String, project: String, writer: UUID) async {
+        let id = serverID(project: project, name: name)
+        var final = await registry.persistedState(serverID: id) ?? PersistedServerState()
+        final.phase = .stopped
+        final.resumeOnBoot = nil
         do {
-            try await registry.retireState(
-                serverID: serverID(project: project, name: name), final: final, writer: writer)
+            try await registry.retireState(serverID: id, final: final, writer: writer)
         } catch {
             DirectaLog.daemon.error(
                 "removing \(name)@\(project): could not save its retired state (\(error.localizedDescription)); the next daemon launch may try to restore it")
@@ -945,7 +956,7 @@ public actor Router {
     private func forgetMissingProject(_ project: String) async -> [String] {
         let prefix = "\(project)::"
         /** Snapshot identities before teardown: a composite tree can outlive a
-            no-op stop (phase already crashed/failed after the checkout vanished),
+            no-op stop (phase already crashed after the checkout vanished),
             so we keep the recorded ProcessIdentity and bounce only while that
             start time still matches. */
         var liveRoots: [(identity: ProcessIdentity, name: String)] = []
@@ -963,8 +974,12 @@ public actor Router {
         for (id, persisted) in await registry.allPersistedState() where id.hasPrefix(prefix) {
             guard let name = parseServerID(id)?.name else { continue }
             names.insert(name)
+            /** A pid read from disk may have been recycled since it was
+                recorded, so it is bounced only with start-time proof. */
             if let pid = persisted.pid.flatMap(ProcessTree.narrowed),
                 let identity = ProcessTree.identity(of: pid),
+                ProcessTree.startTimeConsistent(
+                    processStart: identity.wallClockStart, persistedStartedAt: persisted.startedAt),
                 !liveRoots.contains(where: { $0.identity.pid == pid })
             {
                 liveRoots.append((identity: identity, name: name))
@@ -986,15 +1001,18 @@ public actor Router {
                     the terminal case needs the manual post. A stop that gave
                     up also retires the row, so that late recordOutcome
                     cannot recreate it after `removeState` below. */
+                let before = await supervisor.status()
                 let wasTerminal: Bool
-                switch await supervisor.status().phase {
-                case .crashed, .failed, .stopped: wasTerminal = true
+                switch before.phase {
+                case .crashed, .stopped: wasTerminal = true
+                /** A port-failed run is still alive, so its stop lands a
+                    `recordOutcome` of its own. */
+                case .failed: wasTerminal = before.pid == nil
                 case .running, .starting, .stopping, .unhealthy: wasTerminal = false
                 }
                 if await supervisor.stopForRemoval(reason: "project path gone") {
                     await retireRemovedState(
-                        final: PersistedServerState(phase: .stopped), name: name, project: project,
-                        writer: supervisor.writerID)
+                        name: name, project: project, writer: supervisor.writerID)
                 }
                 if wasTerminal {
                     await events.post(
