@@ -211,6 +211,10 @@ public actor Router {
                 }
                 let servers = await forgetMissingProject(project)
                 return try respond(id: head.id, result: ProjectForgetResult(servers: servers))
+            case .logsRemoveOrphan:
+                let request = try decoder.decode(WireRequest<LogsRemoveOrphanParams>.self, from: line)
+                return try respond(
+                    id: head.id, result: await removeOrphanLogDirectory(named: request.params.directory))
             case .projectCheck:
                 let request = try decoder.decode(WireRequest<ProjectOnlyParams>.self, from: line)
                 let project = canonicalProjectPath(request.params.project)
@@ -1088,16 +1092,36 @@ public actor Router {
         }
     }
 
-    private func daemonInfo() async -> DaemonInfo {
-        /** Every registry project plus every project with a resident
-            supervisor: `doctor`'s orphan-log-dir finding wants the set of
-            projects the daemon claims, not the narrower set with a currently
-            readable config (a trusted project mid-edit on an invalid
-            devservers.json still claims its log directory). */
-        var claimed = Set(await registry.allProjects())
+    /** Every registry project plus every project with a resident supervisor:
+        the set of projects the daemon claims, not the narrower set with a
+        currently readable config (a trusted project mid-edit on an invalid
+        devservers.json still claims its log directory). */
+    private func claimedProjects(registryProjects: [String]) -> Set<String> {
+        var claimed = Set(registryProjects)
         for id in supervisors.keys {
             if let parsed = parseServerID(id) { claimed.insert(parsed.project) }
         }
+        return claimed
+    }
+
+    /** `logs.removeOrphan`: removes one leftover log directory while holding
+        the claim set. The registry read is the only suspension; from the
+        supervisor scan to `removeItem` the actor runs nothing else, and a
+        start creates a project's log directory only from a supervisor already
+        resident in `supervisors`, so a project started concurrently is either
+        claimed here or has not created its directory yet. */
+    private func removeOrphanLogDirectory(named name: String) async -> LogsRemoveOrphanResult {
+        let registryProjects = await registry.allProjects()
+        let claimed = claimedProjects(registryProjects: registryProjects)
+        let directory = paths.logsDir.appending(path: name)
+        let removal = OrphanProjectLogs.remove(
+            directory, logsDir: paths.logsDir,
+            claimedSlugDirs: Set(claimed.map { DirectaPaths.projectLogDirName(project: $0) }))
+        return LogsRemoveOrphanResult(path: directory, removal: removal)
+    }
+
+    private func daemonInfo() async -> DaemonInfo {
+        let claimed = claimedProjects(registryProjects: await registry.allProjects())
         return DaemonInfo(
             claimedProjects: claimed.sorted(),
             dataDir: paths.dataDir.path,

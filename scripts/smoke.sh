@@ -861,6 +861,70 @@ set -e
 echo "$BAD_OUT" | grep -Eq 'not-found|"ok":false' || fail "x-url bad slug envelope: $BAD_OUT"
 pass "x-url rejects unknown slug"
 
+# doctor against the smoke daemon: every file a daemon owns is read and written
+# in that daemon's own data and logs dirs (daemon.info), never the real ones
+# under $HOME. A fresh update-check cache naming a far-future release is seeded
+# in the smoke data dir, so an `update` finding proves doctor read this cache
+# (and needs no network), and the real cache's mtime proves it wrote nothing
+# there. A planted leftover log dir must be reported, then removed by --fix
+# through the daemon, while the smoke project's own log dir stays.
+REAL_CACHE="$HOME/Library/Application Support/directa/update-check.json"
+REAL_CACHE_BEFORE="$(stat -f %m "$REAL_CACHE" 2>/dev/null || echo absent)"
+printf '{"checkedAt":"%s","latestVersion":"999.0.0"}' "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+  > "$WORK/data/update-check.json"
+ORPHAN_DIR="$WORK/logs/smoke-orphan-deadbeef"
+mkdir -p "$ORPHAN_DIR/web"
+echo leftover > "$ORPHAN_DIR/web/current.log"
+WEB_LOG_DIR="$(dirname "$(dirname "$SPOOL")")"
+[[ -d "$WEB_LOG_DIR" ]] || fail "smoke project log dir $WEB_LOG_DIR missing before doctor"
+set +e
+DOCTOR_JSON="$("$DIRECTA" doctor --json --no-bootstrap 2>/dev/null)"
+DOCTOR_EXIT=$?
+set -e
+[[ "$DOCTOR_EXIT" -eq 0 ]] || fail "doctor exited $DOCTOR_EXIT: $DOCTOR_JSON"
+/usr/bin/python3 - "$DOCTOR_JSON" "$ORPHAN_DIR" "$HOME" <<'PY' || fail "doctor report: $DOCTOR_JSON"
+import json, sys
+findings = json.loads(sys.argv[1])["findings"]
+orphan, home = sys.argv[2], sys.argv[3]
+orphans = [f for f in findings if f["kind"] == "orphan-log-dir" and f["detail"].startswith(orphan + " (")]
+assert [f["severity"] for f in orphans] == ["warning"], findings
+assert "directa doctor --fix" in orphans[0]["detail"], orphans
+updates = [f for f in findings if f["kind"] == "update"]
+assert len(updates) == 1 and "999.0.0" in updates[0]["detail"], updates
+real_logs = home + "/Library/Logs/directa"
+assert not any(real_logs in f["detail"] for f in findings), [f for f in findings if real_logs in f["detail"]]
+PY
+[[ -d "$ORPHAN_DIR" ]] || fail "report-only doctor removed $ORPHAN_DIR"
+pass "doctor reports the planted leftover log dir and reads the smoke daemon's update cache"
+set +e
+FIX_JSON="$("$DIRECTA" doctor --fix --json --no-bootstrap 2>/dev/null)"
+FIX_EXIT=$?
+set -e
+[[ "$FIX_EXIT" -eq 0 ]] || fail "doctor --fix exited $FIX_EXIT: $FIX_JSON"
+/usr/bin/python3 - "$FIX_JSON" "$ORPHAN_DIR" <<'PY' || fail "doctor --fix report: $FIX_JSON"
+import json, sys
+findings = json.loads(sys.argv[1])["findings"]
+orphans = [f for f in findings if f["kind"] == "orphan-log-dir"]
+assert {"detail": "removed %s, which matched no registered project" % sys.argv[2],
+        "kind": "orphan-log-dir", "severity": "fixed"} in orphans, orphans
+assert not [f for f in orphans if f["severity"] != "fixed"], orphans
+PY
+[[ ! -e "$ORPHAN_DIR" ]] || fail "doctor --fix left $ORPHAN_DIR in place"
+[[ -d "$WEB_LOG_DIR" ]] || fail "doctor --fix removed the claimed log dir $WEB_LOG_DIR"
+REAL_CACHE_AFTER="$(stat -f %m "$REAL_CACHE" 2>/dev/null || echo absent)"
+[[ "$REAL_CACHE_AFTER" == "$REAL_CACHE_BEFORE" ]] \
+  || fail "doctor touched the real update cache $REAL_CACHE ($REAL_CACHE_BEFORE -> $REAL_CACHE_AFTER)"
+pass "doctor --fix removes the leftover through the daemon, keeps the claimed dir, and leaves the real data dir alone"
+
+# Antigravity's PreInvocation hook fires before every model call; only the
+# first (invocationNum 0) carries the context block.
+"$DIRECTA" trust --json > /dev/null
+FIRST_CALL="$(printf '{"invocationNum":0,"workspacePaths":["%s"]}' "$PROJECT" | "$DIRECTA" hook antigravity-session-start)"
+grep -q '"ephemeralMessage"' <<<"$FIRST_CALL" || fail "antigravity hook was silent on the first model call: $FIRST_CALL"
+LATER_CALL="$(printf '{"invocationNum":1,"workspacePaths":["%s"]}' "$PROJECT" | "$DIRECTA" hook antigravity-session-start)"
+[[ "$LATER_CALL" == '{"injectSteps":[]}' ]] || fail "antigravity hook spoke on a later model call: $LATER_CALL"
+pass "antigravity hook injects context on the first model call only"
+
 # Bundle advertises the custom URL scheme and ships CLI + daemon for first-run.
 # Ad-hoc on purpose: the gate asserts layout and never installs this bundle, so
 # it needs no signing identity and wants no warning about lacking one.

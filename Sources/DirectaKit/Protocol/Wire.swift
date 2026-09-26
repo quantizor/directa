@@ -224,6 +224,7 @@ public enum WireMethod: String, CaseIterable, Sendable {
     case lockStatus = "lock.status"
     case logsMark = "logs.mark"
     case logsQuery = "logs.query"
+    case logsRemoveOrphan = "logs.removeOrphan"
     case projectCheck = "project.check"
     case projectForget = "project.forget"
     case projectInitConfig = "project.initConfig"
@@ -489,6 +490,52 @@ public struct ProjectForgetResult: Codable, Equatable, Sendable {
 
     public init(servers: [String]) {
         self.servers = servers
+    }
+}
+
+/** `logs.removeOrphan`'s params: the name of one directory directly inside
+    the daemon's own logs dir, never a path, so a client cannot aim the
+    removal anywhere else. */
+public struct LogsRemoveOrphanParams: Codable, Equatable, Sendable {
+    public var directory: String
+
+    public init(directory: String) {
+        self.directory = directory
+    }
+}
+
+/** `logs.removeOrphan`'s result. `reason` is present when the directory was
+    left in place (`refused`) or the removal failed (`failed`); `remedy` only
+    for a refusal a person can act on, and never a deletion command. */
+public struct LogsRemoveOrphanResult: Codable, Equatable, Sendable {
+    public enum Outcome: String, Codable, Sendable {
+        case failed
+        case refused
+        case removed
+    }
+
+    public var outcome: Outcome
+    /** The full path the daemon checked, inside its own logs dir. */
+    public var path: String
+    public var reason: String?
+    public var remedy: String?
+
+    public init(outcome: Outcome, path: String, reason: String? = nil, remedy: String? = nil) {
+        self.outcome = outcome
+        self.path = path
+        self.reason = reason
+        self.remedy = remedy
+    }
+
+    public init(path: URL, removal: OrphanProjectLogs.Removal) {
+        switch removal {
+        case .removed:
+            self.init(outcome: .removed, path: path.path)
+        case .refused(let refusal):
+            self.init(outcome: .refused, path: path.path, reason: refusal.reason, remedy: refusal.remedy)
+        case .failed(let message):
+            self.init(outcome: .failed, path: path.path, reason: message)
+        }
     }
 }
 

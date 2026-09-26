@@ -304,6 +304,31 @@ import Testing
         #expect(json == #"{"servers":["api","web"]}"#)
     }
 
+    /** `logs.removeOrphan` carries a directory name, never a path, and answers
+        with the outcome and the path it checked. */
+    @Test func logsRemoveOrphanSchemaGolden() throws {
+        let params = LogsRemoveOrphanParams(directory: "app-deadbeef")
+        #expect(
+            String(data: try JSONCoding.encoder().encode(params), encoding: .utf8)
+                == #"{"directory":"app-deadbeef"}"#)
+        let refused = LogsRemoveOrphanResult(
+            path: URL(fileURLWithPath: "/logs/app-deadbeef"), removal: .refused(.link))
+        #expect(
+            String(data: try JSONCoding.encoder().encode(refused), encoding: .utf8)
+                == #"{"outcome":"refused","path":"/logs/app-deadbeef","reason":"it is a link to another location, not a log directory directa created","remedy":"remove the link yourself if nothing needs it"}"#
+        )
+        let removed = LogsRemoveOrphanResult(
+            path: URL(fileURLWithPath: "/logs/app-deadbeef"), removal: .removed)
+        #expect(
+            String(data: try JSONCoding.encoder().encode(removed), encoding: .utf8)
+                == #"{"outcome":"removed","path":"/logs/app-deadbeef"}"#)
+        let failed = LogsRemoveOrphanResult(
+            path: URL(fileURLWithPath: "/logs/app-deadbeef"), removal: .failed("busy"))
+        #expect(
+            String(data: try JSONCoding.encoder().encode(failed), encoding: .utf8)
+                == #"{"outcome":"failed","path":"/logs/app-deadbeef","reason":"busy"}"#)
+    }
+
     /** Append-only is a wire promise: a reason the current daemon never
         produces (the worktree label host was removed) must still decode, so an
         older daemon on the socket does not break a newer CLI. */

@@ -168,7 +168,11 @@ public enum LaunchdAdmin {
         extraDaemonCandidates: [URL] = [],
         forceLegacy: Bool = false
     ) async -> Bool {
-        guard ProcessInfo.processInfo.environment["DIRECTA_SOCKET"] == nil else { return false }
+        let environment = ProcessInfo.processInfo.environment
+        let overrides = [
+            "DIRECTA_SOCKET", DirectaPaths.dataDirEnvironmentKey, DirectaPaths.logsDirEnvironmentKey,
+        ]
+        guard overrides.allSatisfy({ environment[$0] == nil }) else { return false }
         guard !deliberatelyStopped(paths: paths) else { return false }
         /** With the app installed it owns registration, so a silent socket is
             answered by waiting, never by installing a second job. Falling through

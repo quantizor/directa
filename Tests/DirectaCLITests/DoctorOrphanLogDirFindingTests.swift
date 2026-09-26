@@ -4,29 +4,31 @@ import Testing
 
 @testable import directa
 
-/** `Doctor.orphanLogDirFixFinding` turns one `OrphanProjectLogs.remove`
-    outcome into the `orphan-log-dir` finding `doctor --fix` reports: a removal
-    is `fixed`, and a refusal or a failed delete is an `error` naming the
-    directory, never reported as success. */
+/** `Doctor.orphanLogDirFixFinding` turns one `logs.removeOrphan` answer into
+    the `orphan-log-dir` finding `doctor --fix` reports: a removal is `fixed`,
+    and a refusal or a failed delete is an `error` naming the directory, never
+    reported as success. */
 @Suite struct DoctorOrphanLogDirFindingTests {
     private let path = URL(fileURLWithPath: "/logs/myproj-abcd1234")
 
     @Test func aRemovedDirectoryIsFixed() {
-        let finding = Doctor.orphanLogDirFixFinding(path: path, outcome: .removed)
+        let finding = Doctor.orphanLogDirFixFinding(LogsRemoveOrphanResult(path: path, removal: .removed))
         #expect(finding.detail == "removed /logs/myproj-abcd1234, which matched no registered project")
         #expect(finding.kind == "orphan-log-dir")
         #expect(finding.severity == "fixed")
     }
 
     @Test func aRefusedDirectoryWithNothingLeftToDoNamesOnlyTheReason() {
-        let finding = Doctor.orphanLogDirFixFinding(path: path, outcome: .refused(.claimed))
+        let finding = Doctor.orphanLogDirFixFinding(
+            LogsRemoveOrphanResult(path: path, removal: .refused(.claimed)))
         #expect(finding.detail == "left /logs/myproj-abcd1234 in place: a registered project claims it")
         #expect(finding.kind == "orphan-log-dir")
         #expect(finding.severity == "error")
     }
 
     @Test func aRefusedLinkNamesTheReasonAndTheNextStep() {
-        let finding = Doctor.orphanLogDirFixFinding(path: path, outcome: .refused(.link))
+        let finding = Doctor.orphanLogDirFixFinding(
+            LogsRemoveOrphanResult(path: path, removal: .refused(.link)))
         #expect(
             finding.detail
                 == "left /logs/myproj-abcd1234 in place: it is a link to another location, not a log directory directa created; remove the link yourself if nothing needs it"
@@ -36,91 +38,120 @@ import Testing
 
     @Test func aFailedDeleteKeepsTheSystemMessage() {
         let finding = Doctor.orphanLogDirFixFinding(
-            path: path, outcome: .failed("permission denied"))
+            LogsRemoveOrphanResult(path: path, removal: .failed("permission denied")))
         #expect(finding.detail == "could not remove /logs/myproj-abcd1234: permission denied")
         #expect(finding.kind == "orphan-log-dir")
         #expect(finding.severity == "error")
     }
 }
 
-/** `Doctor.orphanLogDirFindings` over a real temp logs root. `--fix` deletes
-    only against the claimed set it re-reads right before removing, never the
-    one fetched when doctor began. */
+/** `Doctor.orphanLogDirFindings` over a real temp logs root with a scripted
+    daemon. `--fix` asks the daemon to remove each unclaimed directory by name
+    and never deletes anything itself. */
 @Suite struct DoctorOrphanLogDirPassTests {
-    private struct RefetchFailed: Error, LocalizedError {
+    private struct Dropped: Error, LocalizedError {
         var errorDescription: String? { "daemon went away" }
     }
 
-    /** A project first started after doctor's opening `daemon.info` owns a
-        log directory the opening claimed set does not name. */
-    @Test func fixKeepsALogDirectoryClaimedSinceDoctorBegan() async throws {
-        let fixture = try Fixture()
-        defer { fixture.cleanUp() }
-        let started = fixture.root.appending(path: "started-late").path
-        let startedLogDir = fixture.logsDir.appending(
-            path: DirectaPaths().projectLogDir(project: started).lastPathComponent)
-        try FileManager.default.createDirectory(at: startedLogDir, withIntermediateDirectories: true)
-
-        let findings = await Doctor.orphanLogDirFindings(
-            fix: true, info: fixture.info(claiming: [])
-        ) { fixture.info(claiming: [started]) }
-
-        #expect(findings.isEmpty)
-        #expect(FileManager.default.fileExists(atPath: startedLogDir.path))
+    /** Collects the names `removeOrphan` was asked for. */
+    private actor Requests {
+        var names: [String] = []
+        func record(_ name: String) { names.append(name) }
     }
 
-    @Test func fixRemovesALogDirectoryStillUnclaimedAfterTheRecheck() async throws {
+    @Test func fixAsksTheDaemonForEachUnclaimedDirectoryByNameAndReportsItsAnswer() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
-        let orphan = fixture.logsDir.appending(path: "gone-project-abcd1234")
-        try FileManager.default.createDirectory(at: orphan, withIntermediateDirectories: true)
+        let claimedProject = fixture.root.appending(path: "live").path
+        let claimedDir = fixture.logsDir.appending(path: DirectaPaths.projectLogDirName(project: claimedProject))
+        let first = fixture.logsDir.appending(path: "gone-aaaaaaaa")
+        let second = fixture.logsDir.appending(path: "gone-bbbbbbbb")
+        for directory in [claimedDir, first, second] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        let requests = Requests()
 
         let findings = await Doctor.orphanLogDirFindings(
-            fix: true, info: fixture.info(claiming: [])
-        ) { fixture.info(claiming: []) }
+            fix: true, info: fixture.info(claiming: [claimedProject])
+        ) { name in
+            await requests.record(name)
+            return LogsRemoveOrphanResult(
+                path: fixture.logsDir.appending(path: name),
+                removal: name == "gone-aaaaaaaa" ? .removed : .refused(.claimed))
+        }
 
-        #expect(findings.map(\.detail) == ["removed \(orphan.path), which matched no registered project"])
-        #expect(findings.map(\.severity) == ["fixed"])
-        #expect(!FileManager.default.fileExists(atPath: orphan.path))
+        #expect(await requests.names == ["gone-aaaaaaaa", "gone-bbbbbbbb"])
+        #expect(findings.map(\.detail) == [
+            "removed \(first.path), which matched no registered project",
+            "left \(second.path) in place: a registered project claims it",
+        ])
+        #expect(findings.map(\.severity) == ["fixed", "error"])
+        /** The scripted daemon deleted nothing, so every directory is still
+            there: the client never removes one on its own. */
+        for directory in [claimedDir, first, second] {
+            #expect(FileManager.default.fileExists(atPath: directory.path))
+        }
     }
 
-    @Test func fixRemovesNothingWhenTheRecheckFails() async throws {
+    @Test func aDaemonThatPredatesTheMethodGetsTheReportAndOneRestartFinding() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
-        let orphan = fixture.logsDir.appending(path: "gone-project-abcd1234")
-        try FileManager.default.createDirectory(at: orphan, withIntermediateDirectories: true)
+        let orphans = ["gone-aaaaaaaa", "gone-bbbbbbbb"].map { fixture.logsDir.appending(path: $0) }
+        for orphan in orphans {
+            try FileManager.default.createDirectory(at: orphan, withIntermediateDirectories: true)
+        }
+        let requests = Requests()
 
         let findings = await Doctor.orphanLogDirFindings(
             fix: true, info: fixture.info(claiming: [])
-        ) { throw RefetchFailed() }
+        ) { name in
+            await requests.record(name)
+            throw WireError(
+                code: .usage, message: WireError.unknownMethodMessage(WireMethod.logsRemoveOrphan.rawValue))
+        }
+
+        #expect(await requests.names == ["gone-aaaaaaaa"])
+        #expect(findings.map(\.detail) == [
+            "\(orphans[0].path) (Zero KB) matches no registered project (run: directa doctor --fix)",
+            "\(orphans[1].path) (Zero KB) matches no registered project (run: directa doctor --fix)",
+            "removed no leftover log directories: the running daemon is too old to remove them safely; run: directa daemon restart, then directa doctor --fix",
+        ])
+        #expect(findings.map(\.severity) == ["warning", "warning", "error"])
+        for orphan in orphans {
+            #expect(FileManager.default.fileExists(atPath: orphan.path))
+        }
+    }
+
+    /** Any other failure is that directory's own error, and the pass goes on. */
+    @Test func anotherFailureIsReportedPerDirectoryAndThePassContinues() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let first = fixture.logsDir.appending(path: "gone-aaaaaaaa")
+        let second = fixture.logsDir.appending(path: "gone-bbbbbbbb")
+        for directory in [first, second] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+
+        let findings = await Doctor.orphanLogDirFindings(
+            fix: true, info: fixture.info(claiming: [])
+        ) { name in
+            if name == "gone-aaaaaaaa" {
+                throw WireError(code: .daemonUnreachable, message: "daemon closed the connection")
+            }
+            if name == "gone-bbbbbbbb" { throw Dropped() }
+            Issue.record("unexpected name \(name)")
+            throw Dropped()
+        }
 
         #expect(findings.map(\.detail) == [
-            "removed no leftover log directories: could not re-check which projects the daemon uses right before removing (daemon went away); run: directa doctor --fix"
+            "could not remove \(first.path): daemon closed the connection",
+            "could not remove \(second.path): daemon went away",
         ])
-        #expect(findings.map(\.severity) == ["error"])
-        #expect(FileManager.default.fileExists(atPath: orphan.path))
+        #expect(findings.map(\.severity) == ["error", "error"])
     }
 
-    @Test func fixRemovesNothingWhenTheRecheckLacksClaimedProjects() async throws {
-        let fixture = try Fixture()
-        defer { fixture.cleanUp() }
-        let orphan = fixture.logsDir.appending(path: "gone-project-abcd1234")
-        try FileManager.default.createDirectory(at: orphan, withIntermediateDirectories: true)
-
-        let findings = await Doctor.orphanLogDirFindings(
-            fix: true, info: fixture.info(claiming: [])
-        ) { fixture.info(claiming: nil) }
-
-        #expect(findings.map(\.detail) == [
-            "removed no leftover log directories: the daemon stopped reporting which projects it uses; run: directa daemon restart, then directa doctor --fix"
-        ])
-        #expect(findings.map(\.severity) == ["error"])
-        #expect(FileManager.default.fileExists(atPath: orphan.path))
-    }
-
-    /** Report-only never deletes, so it reads the opening claimed set and
-        never asks the daemon again. */
-    @Test func reportOnlyWarnsAndNeverRechecks() async throws {
+    /** Report-only never deletes, so it never asks the daemon to. */
+    @Test func reportOnlyWarnsAndNeverAsksForARemoval() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
         let orphan = fixture.logsDir.appending(path: "gone-project-abcd1234")
@@ -128,9 +159,9 @@ import Testing
 
         let findings = await Doctor.orphanLogDirFindings(
             fix: false, info: fixture.info(claiming: [])
-        ) {
-            Issue.record("report-only must not re-fetch daemon.info")
-            return fixture.info(claiming: [])
+        ) { name in
+            Issue.record("report-only must not ask for a removal")
+            return LogsRemoveOrphanResult(path: fixture.logsDir.appending(path: name), removal: .removed)
         }
 
         #expect(findings.map(\.detail) == [
@@ -138,6 +169,18 @@ import Testing
         ])
         #expect(findings.map(\.severity) == ["warning"])
         #expect(FileManager.default.fileExists(atPath: orphan.path))
+    }
+
+    @Test func fixWithNothingUnclaimedAsksForNothing() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let findings = await Doctor.orphanLogDirFindings(
+            fix: true, info: fixture.info(claiming: [])
+        ) { name in
+            Issue.record("nothing to remove, yet asked for \(name)")
+            return LogsRemoveOrphanResult(path: fixture.logsDir.appending(path: name), removal: .removed)
+        }
+        #expect(findings.isEmpty)
     }
 
     private struct Fixture {

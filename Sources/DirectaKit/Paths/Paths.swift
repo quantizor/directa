@@ -13,6 +13,34 @@ public struct DirectaPaths: Sendable {
         self.logsDir = logsDir ?? home.appending(path: "Library/Logs/directa")
     }
 
+    /** The CLI's local layout: `DIRECTA_DATA_DIR` and `DIRECTA_LOGS_DIR` stand
+        in for the defaults, the way `ddirecta --data-dir`/`--logs-dir` do for
+        the daemon, so a CLI pointed at a throwaway daemon never reads or writes
+        the real ones. The socket follows the data dir unless `DIRECTA_SOCKET`
+        names one, matching a daemon started with `--data-dir` alone. An empty
+        value is treated as unset. */
+    public static func fromEnvironment(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> DirectaPaths {
+        func directory(_ key: String) -> URL? {
+            guard let value = environment[key], !value.isEmpty else { return nil }
+            return URL(fileURLWithPath: value).standardizedFileURL
+        }
+        return DirectaPaths(
+            dataDir: directory(dataDirEnvironmentKey), logsDir: directory(logsDirEnvironmentKey))
+    }
+
+    public static let dataDirEnvironmentKey = "DIRECTA_DATA_DIR"
+    public static let logsDirEnvironmentKey = "DIRECTA_LOGS_DIR"
+
+    /** The layout of the daemon that answered `daemon.info`: its own data and
+        logs directories, which a daemon started with `--data-dir`/`--logs-dir`
+        moves away from this machine's defaults. */
+    public init(daemon info: DaemonInfo) {
+        self.init(
+            dataDir: URL(fileURLWithPath: info.dataDir), logsDir: URL(fileURLWithPath: info.logsDir))
+    }
+
     public var daemonBinaryDir: URL { dataDir.appending(path: "bin") }
     public var daemonLog: URL { dataDir.appending(path: "daemon.log") }
     /** Login-shell PATH captured at install/start. The sealed in-bundle
@@ -93,8 +121,13 @@ public struct DirectaPaths: Sendable {
         servers, the missing-project sweep) deletes exactly what a fresh spawn
         would recreate. */
     public func projectLogDir(project: String) -> URL {
+        logsDir.appending(path: Self.projectLogDirName(project: project))
+    }
+
+    /** The `<slug>-<hash8>` name alone, independent of any logs root. */
+    public static func projectLogDirName(project: String) -> String {
         let project = canonicalProjectPath(project)
-        return logsDir.appending(path: "\(projectSlug(project))-\(Self.hash8(project))")
+        return "\(projectSlug(project))-\(hash8(project))"
     }
 
     /** True when `name` has the shape `projectLogDir` gives a directory: the

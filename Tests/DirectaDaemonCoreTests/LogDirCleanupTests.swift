@@ -530,4 +530,148 @@ import Testing
                     && entry.message.contains("could not remove log directory")
             })
     }
+
+    /** `logs.removeOrphan` removes a directa-named directory no project claims,
+        with its files. */
+    @Test func removeOrphanDeletesAnUnclaimedDirectory() async throws {
+        let env = try makeEnv()
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths))
+        let gone = URL(fileURLWithPath: env.project).deletingLastPathComponent()
+            .appending(path: "gone").path
+        try plantLogFile(paths: env.paths, project: gone, server: "web")
+        let name = DirectaPaths.projectLogDirName(project: gone)
+
+        let result = try await handle(
+            router, .logsRemoveOrphan, LogsRemoveOrphanParams(directory: name),
+            LogsRemoveOrphanResult.self)
+
+        #expect(
+            result
+                == LogsRemoveOrphanResult(
+                    outcome: .removed, path: env.paths.logsDir.appending(path: name).path))
+        #expect(!FileManager.default.fileExists(atPath: env.paths.projectLogDir(project: gone).path))
+    }
+
+    /** A registered project claims its directory even with no supervisor. */
+    @Test func removeOrphanRefusesARegisteredProjectsDirectory() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        try plantLogFile(paths: env.paths, project: env.project, server: "web")
+        let name = DirectaPaths.projectLogDirName(project: env.project)
+
+        let result = try await handle(
+            router, .logsRemoveOrphan, LogsRemoveOrphanParams(directory: name),
+            LogsRemoveOrphanResult.self)
+
+        #expect(result.outcome == .refused)
+        #expect(result.reason == OrphanProjectLogs.Refusal.claimed.reason)
+        #expect(
+            FileManager.default.fileExists(
+                atPath: env.paths.structuredLogFile(project: env.project, server: "web").path))
+    }
+
+    /** The name is one directory inside the daemon's logs dir; a name that
+        reaches outside it is refused and nothing is touched. */
+    @Test(arguments: ["../data", "..", "", "gone-aaaaaaaa/../../data", "/tmp"])
+    func removeOrphanRefusesANameThatLeavesTheLogsDir(name: String) async throws {
+        let env = try makeEnv()
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths))
+        try FileManager.default.createDirectory(
+            at: env.paths.logsDir.appending(path: "gone-aaaaaaaa"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: env.paths.dataDir, withIntermediateDirectories: true)
+        let kept = env.paths.dataDir.appending(path: "registry.json")
+        try Data("keep".utf8).write(to: kept)
+
+        let result = try await handle(
+            router, .logsRemoveOrphan, LogsRemoveOrphanParams(directory: name),
+            LogsRemoveOrphanResult.self)
+
+        #expect(result.outcome == .refused)
+        #expect(FileManager.default.fileExists(atPath: kept.path))
+        #expect(FileManager.default.fileExists(atPath: env.paths.logsDir.path))
+    }
+
+    /** A project started before the removal is asked for owns its directory
+        by the time the daemon checks, so the removal is refused and the live
+        run's spool files stay. */
+    @Test func removeOrphanAfterAStartKeepsTheLiveRunsDirectory() async throws {
+        let env = try makeEnv()
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths))
+        _ = try await handle(
+            router, .serverRegister,
+            RegisterParams(project: env.project, spec: sleeperSpec(name: "web")), ServerResult.self)
+        _ = try await handle(
+            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+            ServerResult.self)
+
+        let result = try await handle(
+            router, .logsRemoveOrphan,
+            LogsRemoveOrphanParams(directory: DirectaPaths.projectLogDirName(project: env.project)),
+            LogsRemoveOrphanResult.self)
+
+        #expect(result.outcome == .refused)
+        #expect(
+            FileManager.default.fileExists(
+                atPath: env.paths.spoolOutFile(project: env.project, server: "web").path))
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "web", project: env.project),
+            ServerResult.self)
+    }
+
+    /** A removal racing a first start of the project the directory belongs
+        to: whichever lands first, the started run ends with its spool files
+        in place, so a claimed directory is never deleted. A leftover
+        directory from an earlier run is planted first so the removal always
+        has something to delete. The removal is held back by a growing delay
+        so the iterations spread across the start: early ones land before the
+        supervisor exists, later ones after its spawn made the directory. */
+    @Test func removeOrphanRacingAFirstStartNeverDeletesTheLiveRunsDirectory() async throws {
+        for iteration in 0..<8 {
+            let env = try makeEnv()
+            let router = Router(
+                launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths))
+            try plantLogFile(paths: env.paths, project: env.project, server: "old")
+            let name = DirectaPaths.projectLogDirName(project: env.project)
+            let project = env.project
+            let spec = sleeperSpec(name: "web")
+
+            async let removal = delayedRemoval(
+                router, name: name, delay: .milliseconds(15 * iteration))
+            async let started = registerThenStart(router, project: project, spec: spec)
+            let (removed, run) = try await (removal, started)
+
+            #expect(removed.outcome != .failed)
+            #expect(run.server.pid != nil)
+            #expect(
+                FileManager.default.fileExists(
+                    atPath: env.paths.spoolOutFile(project: project, server: "web").path))
+            _ = try await handle(
+                router, .serverStop, ServerTargetParams(name: "web", project: project),
+                ServerResult.self)
+        }
+    }
+
+    private func delayedRemoval(
+        _ router: Router, name: String, delay: Duration
+    ) async throws -> LogsRemoveOrphanResult {
+        try await Task.sleep(for: delay)
+        return try await handle(
+            router, .logsRemoveOrphan, LogsRemoveOrphanParams(directory: name),
+            LogsRemoveOrphanResult.self)
+    }
+
+    private func registerThenStart(
+        _ router: Router, project: String, spec: ServerSpec
+    ) async throws -> ServerResult {
+        _ = try await handle(
+            router, .serverRegister, RegisterParams(project: project, spec: spec), ServerResult.self)
+        return try await handle(
+            router, .serverStart, ServerTargetParams(name: spec.name, project: project),
+            ServerResult.self)
+    }
 }

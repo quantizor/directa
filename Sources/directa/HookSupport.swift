@@ -51,7 +51,7 @@ enum CLISelf {
     stays silent when the daemon is unreachable. */
 enum HookContext {
     static func render(project: String, harness: AgentContext.Harness) async -> String? {
-        let client = DaemonClient(socketPath: DirectaPaths().socketPath)
+        let client = CLIRunner.client()
         guard
             let list = try? await client.request(
                 .serverStatus, params: ProjectParams(project: project), expecting: ServerListResult.self)

@@ -50,6 +50,15 @@ Commit that file where the whole team runs the same servers. Keep it gitignored 
 - `directa`: the CLI. `ensure`, `wait`, `up`/`down`, `logs --since-mark`, `mark`, `events`, `restart`, `why`, `open`, `switch`, `monitor` (stream a server's output into an agent's own streaming tool, Claude Code's Monitor or Grok Build's monitor, with a budget so a flooding or looping server can't fill the agent's context), `lock` (take exclusive access to a resource a server holds while a harness runs, leaving the server up by default or stopping it with `--pause`, and report when a command changed that resource while a server still held it open), `config init`, `doctor`, and launchd management. A server can list the config files it reads at boot and directa restarts it when one changes. Agents are the first-class consumer.
 - `directa.app`: the menu bar. Presence dots with counts, per-project rows with click-to-open heads (pinnable), crash notifications, a dashboard with live logs, an event timeline, and a validating config editor. Every server and head is Spotlight-searchable.
 
+## Environment variables
+
+None are needed for everyday use. They point the CLI at a daemon other than the background one, such as a throwaway daemon in a test script started with `ddirecta --foreground --socket … --data-dir … --logs-dir …`:
+
+- `DIRECTA_SOCKET`: the daemon socket to talk to.
+- `DIRECTA_DATA_DIR` and `DIRECTA_LOGS_DIR`: the CLI's own data and logs folders, matching the daemon's `--data-dir` and `--logs-dir`. Without `DIRECTA_SOCKET`, the socket is `daemon.sock` inside `DIRECTA_DATA_DIR`.
+
+With any of them set, the CLI never installs or starts the background daemon on its own. Details: [docs/cli-contract.md](./docs/cli-contract.md#environment).
+
 ## Building
 
 `make build` and `make test`; `make app` / `make dmg` assemble the menu bar app (and a double-click-to-install disk image) without Xcode, and `make release-dmg` builds the signed, notarized release image maintainers ship. `scripts/smoke.sh` is the end-to-end gate. See `CLAUDE.md` for the codebase map and `CONTRIBUTING.md` for adding an agent-harness adapter and for release DMG signing secrets.

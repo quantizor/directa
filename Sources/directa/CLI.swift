@@ -98,7 +98,7 @@ struct GlobalOptions: ParsableArguments {
     failed, 2 usage, 3 daemon unreachable, 4 named server not found. */
 enum CLIRunner {
     static func client() -> DaemonClient {
-        DaemonClient(socketPath: DirectaPaths().socketPath)
+        DaemonClient(socketPath: DirectaPaths.fromEnvironment().socketPath)
     }
 
     static func stdinData() -> Data {
@@ -171,7 +171,7 @@ enum CLIRunner {
                     fail(WireError(code: .internalError, message: String(describing: error)), json: json)
                 }
             }
-            if FileManager.default.fileExists(atPath: DirectaPaths().stoppedIntentFile.path) {
+            if FileManager.default.fileExists(atPath: DirectaPaths.fromEnvironment().stoppedIntentFile.path) {
                 fail(
                     WireError(
                         code: .daemonUnreachable,
@@ -220,7 +220,8 @@ enum CLIRunner {
         }
     }
 
-    /** Auto-bootstrap: only against the default socket (never a test override),
+    /** Auto-bootstrap: only against the default layout (never under a
+        `DIRECTA_SOCKET`, `DIRECTA_DATA_DIR`, or `DIRECTA_LOGS_DIR` override),
         never past a deliberate-stop marker, install-if-missing when the ddirecta
         binary ships alongside this CLI. */
     static func attemptBootstrap() async -> Bool {
@@ -1306,7 +1307,7 @@ struct Statusline: AsyncParsableCommand {
             }
         }
         let project = GlobalOptions.resolveProject(from: cwd)
-        let client = DaemonClient(socketPath: DirectaPaths().socketPath)
+        let client = CLIRunner.client()
         guard
             let list = try? await client.request(
                 .serverStatus, params: ProjectParams(project: project), expecting: ServerListResult.self),
@@ -1778,94 +1779,120 @@ struct Doctor: AsyncParsableCommand {
         }
     }
 
-    /** Turns one `OrphanProjectLogs.remove` outcome into the `orphan-log-dir`
-        finding `doctor --fix` reports. Pure so each wording is asserted without
+    /** Turns one `logs.removeOrphan` answer into the `orphan-log-dir` finding
+        `doctor --fix` reports. Pure so each wording is asserted without
         touching disk. */
-    static func orphanLogDirFixFinding(path: URL, outcome: OrphanProjectLogs.Removal) -> Finding {
-        switch outcome {
+    static func orphanLogDirFixFinding(_ result: LogsRemoveOrphanResult) -> Finding {
+        switch result.outcome {
         case .removed:
             return Finding(
-                detail: "removed \(path.path), which matched no registered project",
+                detail: "removed \(result.path), which matched no registered project",
                 kind: "orphan-log-dir", severity: "fixed")
-        case .refused(let refusal):
-            let remedy = refusal.remedy.map { "; \($0)" } ?? ""
+        case .refused:
+            let remedy = result.remedy.map { "; \($0)" } ?? ""
             return Finding(
-                detail: "left \(path.path) in place: \(refusal.reason)\(remedy)",
+                detail: "left \(result.path) in place: \(result.reason ?? "the daemon refused")\(remedy)",
                 kind: "orphan-log-dir", severity: "error")
-        case .failed(let message):
+        case .failed:
             return Finding(
-                detail: "could not remove \(path.path): \(message)",
+                detail: "could not remove \(result.path): \(result.reason ?? "the removal failed")",
                 kind: "orphan-log-dir", severity: "error")
         }
     }
 
-    /** The `orphan-log-dir` findings for one doctor run. Report-only reads
-        the claimed set from `info`, the `daemon.info` fetched when doctor
-        began. `fix` never deletes on that set: seconds of other checks run
-        after it, and a project first started in that window would have its
-        new log directory deleted under a live server. It calls `refetchInfo`,
-        then lists the unclaimed directories without sizing them and removes
-        each against that fresh claimed set and logs root; when the re-fetch
-        fails or lacks
-        `claimedProjects`, nothing is removed and one `error` finding says so. */
+    /** The `orphan-log-dir` findings for one doctor run, against `info`, the
+        `daemon.info` fetched when doctor began. Report-only sizes each
+        unclaimed directory. `fix` lists them and asks the daemon to remove
+        each by name (`removeOrphan`, which sends `logs.removeOrphan`); the
+        daemon decides against the claim set it holds at that moment, so a
+        project started while doctor ran keeps its directory, and this client
+        never deletes anything itself. A daemon that predates the method gets
+        the report-only findings plus one `error` finding naming the restart. */
     static func orphanLogDirFindings(
-        fix: Bool, info: DaemonInfo, refetchInfo: () async throws -> DaemonInfo
+        fix: Bool, info: DaemonInfo,
+        removeOrphan: (String) async throws -> LogsRemoveOrphanResult
     ) async -> [Finding] {
-        guard fix else {
-            let claimedSlugDirs = claimedLogDirNames(info.claimedProjects ?? [])
-            return OrphanProjectLogs.scan(
-                paths: DirectaPaths(logsDir: URL(fileURLWithPath: info.logsDir)),
-                claimedSlugDirs: claimedSlugDirs
-            ).map { orphan in
+        let paths = DirectaPaths(daemon: info)
+        let claimedSlugDirs = claimedLogDirNames(info.claimedProjects ?? [])
+        func reportOnly() -> [Finding] {
+            OrphanProjectLogs.scan(paths: paths, claimedSlugDirs: claimedSlugDirs).map { orphan in
                 Finding(
                     detail: "\(orphan.detail) (run: \(orphan.remedy))",
                     kind: "orphan-log-dir", severity: "warning")
             }
         }
-        let fresh: DaemonInfo
-        do {
-            fresh = try await refetchInfo()
-        } catch {
-            return [
-                Finding(
-                    detail:
-                        "removed no leftover log directories: could not re-check which projects the daemon uses right before removing (\(error.localizedDescription)); run: directa doctor --fix",
-                    kind: "orphan-log-dir", severity: "error")
-            ]
+        guard fix else { return reportOnly() }
+        var findings: [Finding] = []
+        for directory in OrphanProjectLogs.unclaimedDirectories(
+            paths: paths, claimedSlugDirs: claimedSlugDirs)
+        {
+            do {
+                findings.append(orphanLogDirFixFinding(try await removeOrphan(directory.lastPathComponent)))
+            } catch let error as WireError
+                where error.code == .usage
+                && error.message == WireError.unknownMethodMessage(WireMethod.logsRemoveOrphan.rawValue)
+            {
+                return findings + reportOnly() + [
+                    Finding(
+                        detail:
+                            "removed no leftover log directories: the running daemon is too old to remove them safely; run: directa daemon restart, then directa doctor --fix",
+                        kind: "orphan-log-dir", severity: "error")
+                ]
+            } catch let error as WireError {
+                findings.append(
+                    Finding(
+                        detail: "could not remove \(directory.path): \(error.message)",
+                        kind: "orphan-log-dir", severity: "error"))
+            } catch {
+                findings.append(
+                    Finding(
+                        detail: "could not remove \(directory.path): \(error.localizedDescription)",
+                        kind: "orphan-log-dir", severity: "error"))
+            }
         }
-        guard let claimedProjects = fresh.claimedProjects else {
-            return [
-                Finding(
-                    detail:
-                        "removed no leftover log directories: the daemon stopped reporting which projects it uses; run: directa daemon restart, then directa doctor --fix",
-                    kind: "orphan-log-dir", severity: "error")
-            ]
-        }
-        let claimedSlugDirs = claimedLogDirNames(claimedProjects)
-        let logsDir = URL(fileURLWithPath: fresh.logsDir)
-        return OrphanProjectLogs.unclaimedDirectories(
-            paths: DirectaPaths(logsDir: logsDir), claimedSlugDirs: claimedSlugDirs
-        ).map { directory in
-            orphanLogDirFixFinding(
-                path: directory,
-                outcome: OrphanProjectLogs.remove(
-                    directory, logsDir: logsDir, claimedSlugDirs: claimedSlugDirs))
+        return findings
+    }
+
+    /** `port-squatter` findings: a server that is down while something listens
+        on its declared port. Only a listener no managed server accounts for is
+        a squatter: when another supervised server is up on that port, calling
+        it unmanaged is wrong, and the port-collision finding already names both
+        sides. `isListening` is the loopback probe, injected so the decision is
+        tested without binding ports. A server whose checkout is gone is never
+        a candidate (the stale-project finding covers it), though a live run of
+        one still counts as a managed owner. */
+    static func portSquatterFindings(
+        servers: [ServerStatus], isListening: (Int) -> Bool, projectExists: (String) -> Bool
+    ) -> [Finding] {
+        servers.compactMap { server in
+            guard let port = server.declaredPort, !server.hasLiveRun, projectExists(server.project)
+            else { return nil }
+            let managedOwner = servers.first { other in
+                (other.effectivePort ?? other.declaredPort) == port
+                    && !(other.project == server.project && other.server == server.server)
+                    && other.phase.holdsPort
+            }
+            guard managedOwner == nil, isListening(port) else { return nil }
+            return Finding(
+                detail: "port \(port) has an unmanaged listener while \(server.server) is down",
+                kind: "port-squatter", severity: "warning")
         }
     }
 
     private static func claimedLogDirNames(_ projects: [String]) -> Set<String> {
-        Set(projects.map { DirectaPaths().projectLogDir(project: $0).lastPathComponent })
+        Set(projects.map { DirectaPaths.projectLogDirName(project: $0) })
     }
 
     func run() async throws {
         var findings: [Finding] = []
         let client = CLIRunner.client()
         let info = try? await client.request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
+        let paths = info.map(DirectaPaths.init(daemon:)) ?? DirectaPaths.fromEnvironment()
         if let info {
             findings.append(
                 Finding(detail: "v\(info.daemonVersion) pid \(info.pid) on \(info.socketPath)", kind: "daemon", severity: "ok"))
             let livePath = LaunchdAdmin.capturedPath()
-            let storedPath = LaunchdAdmin.readAgentPath()
+            let storedPath = LaunchdAdmin.readAgentPath(paths: paths)
             if let daemonPath = info.searchPath, daemonPath != livePath {
                 findings.append(
                     Finding(
@@ -1969,25 +1996,11 @@ struct Doctor: AsyncParsableCommand {
                                 detail: "\(signature) -> \(holder) [\(server.phase.rawValue)]",
                                 kind: "signature", severity: "info"))
                     }
-                    /** Only a listener no managed server accounts for is a
-                        squatter. When another supervised server is up on this
-                        port, calling it unmanaged is simply wrong, and the
-                        port-collision finding above already names both sides. */
-                    let managedOwner = all.servers.first { other in
-                        (other.effectivePort ?? other.declaredPort) == port
-                            && !(other.project == server.project && other.server == server.server)
-                            && other.phase.holdsPort
-                    }
-                    if !server.hasLiveRun,
-                        managedOwner == nil,
-                        LoopbackProbe.isListening(port: port) {
-                        findings.append(
-                            Finding(
-                                detail: "port \(port) has an unmanaged listener while \(server.server) is down",
-                                kind: "port-squatter", severity: "warning"))
-                    }
                 }
             }
+            findings += Self.portSquatterFindings(
+                servers: all.servers, isListening: { LoopbackProbe.isListening(port: $0) },
+                projectExists: { !staleProjects.contains($0) })
             for project in staleProjects.sorted() {
                 if fix {
                     /** `project.forget` runs the same daemon-side teardown the
@@ -2023,7 +2036,7 @@ struct Doctor: AsyncParsableCommand {
         /** Update check: read the shared cache, refreshing only when stale, so a
             machine where the menu bar app never runs still learns about a release
             without doctor hitting the network every time. Silent on failure. */
-        if let update = await UpdateCheck.refreshIfStale(), update.updateAvailable {
+        if let update = await UpdateCheck.refreshIfStale(paths: paths), update.updateAvailable {
             findings.append(
                 Finding(
                     detail:
@@ -2085,8 +2098,10 @@ struct Doctor: AsyncParsableCommand {
             leftover. Runs after the stale-project pass so the scan sees the
             log directories `project.forget` already removed. */
         if let info, info.claimedProjects != nil {
-            findings += await Self.orphanLogDirFindings(fix: fix, info: info) {
-                try await client.request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
+            findings += await Self.orphanLogDirFindings(fix: fix, info: info) { name in
+                try await client.request(
+                    .logsRemoveOrphan, params: LogsRemoveOrphanParams(directory: name),
+                    expecting: LogsRemoveOrphanResult.self)
             }
         }
         if global.json {
