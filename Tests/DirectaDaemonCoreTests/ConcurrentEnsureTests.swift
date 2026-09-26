@@ -97,6 +97,60 @@ import Testing
         await stop(router, project: env.project)
     }
 
+    /** The race behind a second ensure calling the first ensure's child an
+        unmanaged squatter, pinned without timing luck. The second start
+        reaches the port pre-check before the first has spawned; the first then
+        spawns and its child binds before the second's probe answers. The
+        scripted probe stands in for that bind: its first call runs the first
+        start through to a pid, then reports the port as listening. That
+        listener is the server's own run, so the second start joins it. */
+    @Test func aRunSpawnedWhileThePreCheckProbesIsTheServersOwn() async throws {
+        let port = 45473
+        let base = FileManager.default.temporaryDirectory
+            .appending(path: "directa-concurrent-\(UUID().uuidString)")
+        let project = base.appending(path: "proj")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let paths = DirectaPaths(
+            dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs"))
+        let registry = Registry(paths: paths)
+        try await registry.register(
+            project: project.path,
+            spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web", port: port))
+        let script = ProbeScript()
+        let startLine = try NDJSON.encodeLine(
+            WireRequest(
+                id: "s", method: WireMethod.serverStart.rawValue,
+                params: ServerTargetParams(name: "web", project: project.path)))
+        let probe = PortProbe { probed in
+            guard probed == port else { return false }
+            switch await script.next() {
+            case .interleave:
+                guard let router = await script.router else { return false }
+                let first = await router.handle(line: startLine)
+                await script.recordFirst(first)
+                return true
+            case .free:
+                return false
+            case .bound:
+                return true
+            }
+        }
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: paths, portProbe: probe, registry: registry)
+        await script.attach(router)
+
+        let secondData = await router.handle(line: startLine)
+        let second = try JSONCoding.decoder().decode(WireResponse<ServerResult>.self, from: secondData)
+        let recorded = await script.first
+        let firstData = try #require(recorded)
+        let first = try JSONCoding.decoder().decode(WireResponse<ServerResult>.self, from: firstData)
+        let firstPid = try #require(first.result?.server.pid)
+        defer { kill(pid_t(firstPid), SIGKILL) }
+        #expect(second.ok, "the second start was refused: \(String(describing: second.error))")
+        #expect(second.result?.server.pid == firstPid)
+        await stop(router, project: project.path)
+    }
+
     /** The same burst with no `stop` mixed in, which is the half that is known
         to hold. Interleaving a stop kills the test process outright; that is
         written up in BACKLOG.md with its reproduction rather than committed as
@@ -123,5 +177,35 @@ import Testing
             if !free { try await Task.sleep(for: .milliseconds(100)) }
         }
         #expect(free, "port 45472 is still held after every server was stopped")
+    }
+}
+
+/** Drives the scripted probe: the outer request's first probe interleaves the
+    first start, probes made while that start runs its own pre-check see a free
+    port, and every probe after it sees the port bound. */
+private actor ProbeScript {
+    enum Step {
+        case bound
+        case free
+        case interleave
+    }
+
+    private(set) var first: Data?
+    private var interleaving = false
+    private(set) var router: Router?
+
+    func attach(_ router: Router) {
+        self.router = router
+    }
+
+    func next() -> Step {
+        if first != nil { return .bound }
+        if interleaving { return .free }
+        interleaving = true
+        return .interleave
+    }
+
+    func recordFirst(_ data: Data) {
+        first = data
     }
 }

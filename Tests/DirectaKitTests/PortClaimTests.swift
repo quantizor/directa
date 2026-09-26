@@ -134,4 +134,83 @@ import Testing
         #expect(claim.relative.last == 45_063)
         #expect(claim.allPorts == Array(45_000...45_063))
     }
+
+    private let spanSpec = ServerSpec(command: ["serve"], name: "web", port: 45_200, portSpan: 3)
+
+    private func status(
+        observedPort: Int? = nil, phase: ServerPhase, pid: Int? = nil, ports: [String: Int]? = nil
+    ) -> ServerStatus {
+        ServerStatus(
+            declaredPort: 45_200, effectivePort: 45_200, logPath: "/dev/null",
+            observedPort: observedPort, phase: phase, pid: pid, ports: ports, project: "/main",
+            server: "web")
+    }
+
+    /** The overlap seen in a sibling-worktree run: main runs a span of three
+        but listens only on its base, and a rebind search starting just past
+        that base landed inside main's span. A running holder reserves its
+        whole claim, so the block lands past it. */
+    @Test func aSiblingRebindClearsARunningHoldersWholeSpan() async throws {
+        let mainClaim = PortClaim.resolve(spec: spanSpec, effectivePort: 45_200).claim
+        let reserved = status(observedPort: 45_200, phase: .running, pid: 7)
+            .heldPorts(claim: mainClaim)
+        #expect(reserved == [45_200, 45_201, 45_202])
+        let rebound = await SiblingRebind.search(
+            isListening: { $0 == 45_200 }, reserved: reserved, spec: spanSpec, start: 45_201)
+        #expect(rebound == 45_203)
+    }
+
+    /** A listener anywhere in a candidate block rules the block out, whoever
+        owns it. */
+    @Test func aSiblingRebindSkipsEveryBlockWithAListener() async {
+        let rebound = await SiblingRebind.search(
+            isListening: { $0 == 45_205 }, reserved: [], spec: spanSpec, start: 45_203)
+        #expect(rebound == 45_206)
+    }
+
+    /** The walk wraps from the top of the rebind range to its bottom. */
+    @Test func aSiblingRebindWrapsAtTheTopOfItsRange() async {
+        let spec = ServerSpec(command: ["serve"], name: "web", port: 3000)
+        let top = SiblingRebind.range.upperBound
+        let rebound = await SiblingRebind.search(
+            isListening: { _ in false }, reserved: [top], spec: spec, start: top)
+        #expect(rebound == SiblingRebind.range.lowerBound)
+    }
+
+    /** Which ports each phase holds, the question every port check asks.
+        `stopping` holds nothing although it still counts as a live run. */
+    @Test func heldPortsFollowThePhase() {
+        let claim = PortClaim.resolve(spec: spanSpec, effectivePort: 45_200).claim
+        let named = ["admin": 45_300]
+        let whole: Set<Int> = [45_200, 45_201, 45_202, 45_300]
+        var held: [ServerPhase: Set<Int>] = [:]
+        for phase in [ServerPhase.crashed, .failed, .running, .starting, .stopped, .stopping, .unhealthy] {
+            held[phase] = status(observedPort: 45_201, phase: phase, pid: 7, ports: named)
+                .heldPorts(claim: claim)
+        }
+        #expect(
+            held == [
+                .crashed: [], .failed: [45_201], .running: whole, .starting: whole, .stopped: [],
+                .stopping: [], .unhealthy: whole,
+            ])
+        #expect(status(observedPort: 45_201, phase: .failed).heldPorts(claim: claim) == [])
+        #expect(status(phase: .failed, pid: 7).heldPorts(claim: claim) == [])
+    }
+
+    /** A port failure keeps its process, so it is the one terminal-looking
+        phase that can still have a live run. */
+    @Test func hasLiveRunCountsALivePortFailedRun() {
+        var live: [ServerPhase: [Bool]] = [:]
+        for phase in [ServerPhase.crashed, .failed, .running, .starting, .stopped, .stopping, .unhealthy] {
+            live[phase] = [phase.hasLiveRun(pid: nil), phase.hasLiveRun(pid: 7)]
+        }
+        #expect(
+            live == [
+                .crashed: [false, false], .failed: [false, true], .running: [true, true],
+                .starting: [true, true], .stopped: [false, false], .stopping: [true, true],
+                .unhealthy: [true, true],
+            ])
+        #expect(status(phase: .failed, pid: 7).hasLiveRun)
+        #expect(!status(phase: .failed).hasLiveRun)
+    }
 }

@@ -59,12 +59,7 @@ final class KeyNavModel {
         for project in projects {
             for server in project.servers {
                 var actions: [KeyNavRow.Action] = [.open]
-                switch server.phase {
-                case .running, .unhealthy, .starting:
-                    actions += [.restart, .stop]
-                case .stopped, .crashed, .failed, .stopping:
-                    actions += [.start]
-                }
+                actions += server.offersStop ? [.restart, .stop] : [.start]
                 next.append(KeyNavRow(kind: .server(project: project.path, server: server.server), actions: actions))
                 if let heads = server.heads {
                     for name in heads.keys.sorted() {
@@ -792,6 +787,12 @@ struct KeyNavCell: ViewModifier {
     }
 }
 
+extension ServerStatus {
+    /** A live run a person can stop or restart, a port-failed one included.
+        A stopping run is left to finish, so it offers a disabled Start. */
+    var offersStop: Bool { hasLiveRun && phase != .stopping }
+}
+
 /** Start / stop / restart icon strip shared by the popover rows and the
     dashboard detail header. `reserveSlot` keeps popover rows from jumping
     when the phase swaps play for restart+stop. */
@@ -806,15 +807,14 @@ struct ServerLifecycleControls: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            switch server.phase {
-            case .running, .unhealthy, .starting:
+            if server.offersStop {
                 iconButton("arrow.clockwise", help: "Restart", action: .restart) {
                     model.restartServer(server)
                 }
                 iconButton("stop.fill", help: "Stop", action: .stop) {
                     model.stopServer(server)
                 }
-            case .stopped, .crashed, .failed, .stopping:
+            } else {
                 if reserveSlot {
                     Color.clear.frame(width: size, height: size)
                 }

@@ -197,3 +197,51 @@ public struct PortClaim: Equatable, Sendable {
         return errors
     }
 }
+
+/** Where a linked worktree's server lands when the same server in another
+    checkout of the repository already holds its declared ports. Pure: the
+    caller gathers every port a live managed server holds and supplies the
+    listen probe, so the whole search is testable without a socket. */
+public enum SiblingRebind {
+    /** How many candidates the search tries before giving up and handing back
+        the next one, which then fails the ordinary port-held way. A bound
+        rather than a budget: the search walks consecutive ports, so needing
+        more than this many means the range is genuinely full and a wider
+        search would only take longer to say so. */
+    public static let attempts = 200
+
+    /** Where a rebind is allowed to land. Stays clear of the low ports a
+        project actually declares and stops short of the ephemeral range the
+        kernel hands to outbound connections, which a listener cannot hold
+        reliably. */
+    public static let range = 10_000...65_000
+
+    /** The first base port from `start` whose whole claim is disjoint from
+        `reserved` and has no listener. `reserved` must hold every port a live
+        managed server claims, not only the ones it listens on: a server
+        declaring a span listens on its base alone until it needs the rest, and
+        a block landing inside that span collides later. */
+    public static func search(
+        isListening: (Int) async -> Bool, reserved: Set<Int>, spec: ServerSpec, start: Int
+    ) async -> Int {
+        var candidate = start
+        for _ in 0..<attempts {
+            if let claim = PortClaim.resolve(spec: spec, effectivePort: candidate).claim,
+                reserved.isDisjoint(with: claim.allPorts)
+            {
+                let busy = await anyListening(claim.allPorts, isListening: isListening)
+                if !busy { return candidate }
+            }
+            candidate = candidate >= range.upperBound ? range.lowerBound : candidate + 1
+        }
+        return candidate
+    }
+
+    private static func anyListening(_ ports: [Int], isListening: (Int) async -> Bool) async -> Bool {
+        for port in ports {
+            let listening = await isListening(port)
+            if listening { return true }
+        }
+        return false
+    }
+}

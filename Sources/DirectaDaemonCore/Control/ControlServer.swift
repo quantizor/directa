@@ -16,6 +16,7 @@ public actor Router {
     private let events: EventStore
     private let launcher: any ProcessLauncher
     private let paths: DirectaPaths
+    private let portProbe: PortProbe
     private let registry: Registry
     /** Handed to every supervisor this router creates. */
     private let stopTiming: StopTiming
@@ -37,7 +38,8 @@ public actor Router {
 
     public init(
         agentJobs: AgentJobs? = LaunchdJobLauncher.runningAsAgent ? .live : nil,
-        launcher: any ProcessLauncher, paths: DirectaPaths, registry: Registry,
+        launcher: any ProcessLauncher, paths: DirectaPaths, portProbe: PortProbe = .live,
+        registry: Registry,
         stopTiming: StopTiming = .standard,
         watchEnabled: Bool = ProcessInfo.processInfo.environment["DIRECTA_NO_WATCH"] != "1"
     ) {
@@ -46,6 +48,7 @@ public actor Router {
         self.events = EventStore(url: paths.eventsFile)
         self.launcher = launcher
         self.paths = paths
+        self.portProbe = portProbe
         self.registry = registry
         self.stopTiming = stopTiming
         self.resourceLocks =
@@ -1002,14 +1005,7 @@ public actor Router {
                     up also retires the row, so that late recordOutcome
                     cannot recreate it after `removeState` below. */
                 let before = await supervisor.status()
-                let wasTerminal: Bool
-                switch before.phase {
-                case .crashed, .stopped: wasTerminal = true
-                /** A port-failed run is still alive, so its stop lands a
-                    `recordOutcome` of its own. */
-                case .failed: wasTerminal = before.pid == nil
-                case .running, .starting, .stopping, .unhealthy: wasTerminal = false
-                }
+                let wasTerminal = !before.hasLiveRun
                 if await supervisor.stopForRemoval(reason: "project path gone") {
                     await retireRemovedState(
                         name: name, project: project, writer: supervisor.writerID)
@@ -1266,13 +1262,10 @@ public actor Router {
         force: Bool = false, userInitiated: Bool = false
     ) async throws {
         if !force {
+            /** Phase, not `hasLiveRun`: a live port-failed run still resolves
+                afresh, since `start` replaces it. */
             let current = await supervisor.status()
-            switch current.phase {
-            case .running, .starting, .stopping, .unhealthy:
-                return
-            case .crashed, .failed, .stopped:
-                break
-            }
+            if current.phase.isActive { return }
         }
         let merged = try await mergedSpecs(project: target.project)
         guard var spec = merged.specs.first(where: { $0.name == target.name }) else {
@@ -1388,65 +1381,52 @@ public actor Router {
         port: Int, managed: Bool
     )? {
         for port in claim.allPorts {
-            if await managedHolder(port: port, excluding: targetID) != nil {
+            /** Probed before either ownership read. Every run has its phase set
+                before it spawns, so a listener seen here belongs to a run the
+                reads below already find. Reading the phase first let a run
+                spawned between the read and the probe (a concurrent ensure of
+                this very server winning the single flight) look like an
+                unmanaged squatter. */
+            let listening = await portProbe.isListening(port)
+            let holder = await managedHolder(port: port, excluding: targetID)
+            if holder != nil {
                 return (port: port, managed: true)
             }
-            /** A listener the target itself owns is not a conflict for the
-                target: it is the run about to be replaced, or a sibling ensure
-                that just won the single flight. `managedHolder` excludes the
-                target by id, so without this the target's own socket falls
-                through to the unmanaged-squatter branch and one server reports
-                its own port as held. */
-            if await targetOwnsPort(port, id: targetID) { continue }
-            if PortGuard.isListening(port: port) {
+            guard listening else { continue }
+            /** A listener the target itself holds is not a conflict for the
+                target: it is the run about to be replaced (`start` stops a
+                live port-failed run first), or a concurrent ensure that just
+                won the single flight. `managedHolder` excludes the target by
+                id, so without this the target's own socket falls through to
+                the unmanaged-squatter branch. */
+            let own = await heldPorts(id: targetID).contains(port)
+            if !own {
                 return (port: port, managed: false)
             }
         }
         return nil
     }
 
-    private func targetOwnsPort(_ port: Int, id: String) async -> Bool {
-        guard let supervisor = supervisors[id] else { return false }
-        let status = await supervisor.status()
-        switch status.phase {
-        case .running, .starting, .unhealthy:
-            break
-        case .crashed, .failed, .stopped, .stopping:
-            return false
-        }
-        return status.declaredPort == port || status.effectivePort == port
-            || status.observedPort == port || (status.ports?.values.contains(port) ?? false)
+    /** The ports one resident server holds right now; empty when it has no
+        supervisor or holds nothing. */
+    private func heldPorts(id: String) async -> Set<Int> {
+        guard let supervisor = supervisors[id] else { return [] }
+        let snapshot = await supervisor.portSnapshot()
+        return snapshot.status.heldPorts(claim: snapshot.claim)
     }
 
-    /** How many candidates a sibling rebind tries before giving up and handing
-        back the last one, which then fails the ordinary port-held way. A bound
-        rather than a budget: the search walks consecutive ports, so needing more
-        than this many means the range is genuinely full and a wider search would
-        only take longer to say so. */
-    private static let siblingRebindAttempts = 200
-
-    /** Where a rebind is allowed to land. Stays clear of the low ports a project
-        actually declares and stops short of the ephemeral range the kernel hands
-        to outbound connections, which a listener cannot hold reliably. */
-    private static let siblingPortRange = 10_000...65_000
-
+    /** The whole rebound block must clear every port a live managed server
+        holds, span members included, not only the ports it listens on. */
     private func allocateSiblingPort(
         declared: Int, excluding: String, project: String, spec: ServerSpec
     ) async -> Int {
-        var candidate = CheckoutIdentity.siblingPortCandidate(declared: declared, project: project)
-        for _ in 0..<Self.siblingRebindAttempts {
-            let resolved = PortClaim.resolve(spec: spec, effectivePort: candidate)
-            if let claim = resolved.claim, resolved.error == nil,
-                await firstBusyPort(in: claim, excluding: excluding) == nil
-            {
-                return candidate
-            }
-            candidate += 1
-            if candidate > Self.siblingPortRange.upperBound {
-                candidate = Self.siblingPortRange.lowerBound
-            }
+        var reserved: Set<Int> = []
+        for hold in await managedHolds(excluding: excluding) {
+            reserved.formUnion(hold.ports)
         }
-        return candidate
+        return await SiblingRebind.search(
+            isListening: portProbe.isListening, reserved: reserved, spec: spec,
+            start: CheckoutIdentity.siblingPortCandidate(declared: declared, project: project))
     }
 
     /** Wait until every claimed port is free, or return the first still-busy port. */
@@ -1454,9 +1434,12 @@ public actor Router {
         let deadline = ContinuousClock.now.advanced(by: .seconds(budgetSeconds))
         while true {
             var busy: Int?
-            for port in claim.allPorts where PortGuard.isListening(port: port) {
-                busy = port
-                break
+            for port in claim.allPorts {
+                let listening = await portProbe.isListening(port)
+                if listening {
+                    busy = port
+                    break
+                }
             }
             if busy == nil { return nil }
             if ContinuousClock.now >= deadline { return busy }
@@ -1464,47 +1447,48 @@ public actor Router {
         }
     }
 
-    /** Which managed server holds `port`, if any. The resident supervisor pool
-        answers for servers this daemon has been asked about; state.json answers
-        for the rest, since the pool is built lazily and a server started before
-        this daemon's first request for it has no entry there at all. A persisted
-        row counts only while its recorded pid is still alive. */
+    /** Which managed server holds `port`, if any. */
     private func managedHolder(port: Int, excluding targetID: String) async -> (
         project: String, server: String
     )? {
+        for hold in await managedHolds(excluding: targetID) where hold.ports.contains(port) {
+            return (project: hold.project, server: hold.server)
+        }
+        return nil
+    }
+
+    /** Every managed server other than `targetID` that holds ports right now,
+        with the ports it holds. The resident supervisor pool answers for
+        servers this daemon has been asked about; state.json answers for the
+        rest, since the pool is built lazily and a server started before this
+        daemon's first request for it has no entry there at all. A persisted row
+        counts only while its phase holds ports and its recorded pid is still
+        alive. */
+    private func managedHolds(excluding targetID: String) async -> [(
+        ports: Set<Int>, project: String, server: String
+    )] {
+        var holds: [(ports: Set<Int>, project: String, server: String)] = []
         for (id, other) in supervisors where id != targetID {
-            let status = await other.status()
-            let active =
-                status.phase == .running || status.phase == .starting || status.phase == .unhealthy
-            if active,
-                status.effectivePort == port || status.declaredPort == port
-                    || status.observedPort == port
-                    || (status.ports?.values.contains(port) ?? false)
-            {
-                return (project: status.project, server: status.server)
-            }
+            let snapshot = await other.portSnapshot()
+            let ports = snapshot.status.heldPorts(claim: snapshot.claim)
+            guard !ports.isEmpty else { continue }
+            holds.append(
+                (ports: ports, project: snapshot.status.project, server: snapshot.status.server))
         }
         for (id, persisted) in await registry.allPersistedState() where id != targetID {
             guard supervisors[id] == nil else { continue }
-            let active =
-                persisted.phase == .running || persisted.phase == .starting
-                || persisted.phase == .unhealthy
-            guard active, let pid = persisted.pid, ProcessTree.isAlive(pid) else { continue }
+            guard persisted.phase.holdsPort, let pid = persisted.pid, ProcessTree.isAlive(pid)
+            else { continue }
             guard let parsed = parseServerID(id) else { continue }
-            let project = parsed.project
-            let name = parsed.name
-            guard let merged = try? await mergedSpecs(project: project),
-                let spec = merged.specs.first(where: { $0.name == name })
+            guard let merged = try? await mergedSpecs(project: parsed.project),
+                let spec = merged.specs.first(where: { $0.name == parsed.name })
             else { continue }
             let bound = persisted.boundPort ?? spec.port
-            let resolved = PortClaim.resolve(spec: spec, effectivePort: bound)
-            if let claim = resolved.claim, claim.allPorts.contains(port) {
-                return (project: project, server: name)
-            }
-            guard bound == port else { continue }
-            return (project: project, server: name)
+            var ports = Set(PortClaim.resolve(spec: spec, effectivePort: bound).claim?.allPorts ?? [])
+            if let bound { ports.insert(bound) }
+            holds.append((ports: ports, project: parsed.project, server: parsed.name))
         }
-        return nil
+        return holds
     }
 
     /** The merged project view: committed devservers.json specs (source of
@@ -1598,25 +1582,21 @@ public actor Router {
         where LockResource.declares(resource: params.resource, spec: spec) {
             let supervisor = await supervisor(project: params.project, spec: spec)
             let status = await supervisor.status()
-            switch status.phase {
-            case .running, .starting, .unhealthy, .stopping:
-                guard shouldPause else {
-                    /** Sound for the whole hold: lockGate refuses to start a
-                        declarer while a live holder owns the resource, so this
-                        set can only shrink. */
-                    live.append(spec.name)
-                    continue
-                }
-                /** Non-retiring stop: boot intent survives so a daemon crash
-                    mid-hold can still bring the server back if the holder is gone. */
-                _ = await supervisor.stop(
-                    deliberate: false, reason: "paused for lock \(params.resource)")
-                paused.append(spec.name)
-                DirectaLog.daemon.info(
-                    "lock \(params.resource) paused \(spec.name)@\(params.project)")
-            case .stopped, .crashed, .failed:
-                break
+            guard status.hasLiveRun else { continue }
+            guard shouldPause else {
+                /** Sound for the whole hold: lockGate refuses to start a
+                    declarer while a live holder owns the resource, so this set
+                    can only shrink. */
+                live.append(spec.name)
+                continue
             }
+            /** Non-retiring stop: boot intent survives so a daemon crash
+                mid-hold can still bring the server back if the holder is gone. */
+            _ = await supervisor.stop(
+                deliberate: false, reason: "paused for lock \(params.resource)")
+            paused.append(spec.name)
+            DirectaLog.daemon.info(
+                "lock \(params.resource) paused \(spec.name)@\(params.project)")
         }
         live.sort()
         paused.sort()
@@ -1810,15 +1790,11 @@ public actor Router {
     /** When a server is not up but its declared port is held, surface a latent
         conflict so session context warns before the agent runs ensure. */
     private func annotateLatentPortConflict(_ status: ServerStatus, excluding: String) async -> ServerStatus {
-        guard status.portConflict == nil else { return status }
-        switch status.phase {
-        case .stopped, .crashed, .failed:
-            break
-        case .running, .starting, .stopping, .unhealthy:
-            return status
-        }
+        guard status.portConflict == nil, !status.hasLiveRun else { return status }
         guard let port = status.declaredPort ?? status.effectivePort else { return status }
         var annotated = status
+        /** Probed before the holder read, for the reason `firstBusyPort` gives. */
+        let listening = await portProbe.isListening(port)
         if let holder = await managedHolder(port: port, excluding: excluding) {
             let sibling = CheckoutIdentity.shareCommonDir(status.project, holder.project)
             annotated.portConflict = PortConflict(
@@ -1828,7 +1804,7 @@ public actor Router {
                     ? "port \(port) held by sibling '\(holder.server)' in \(holder.project); ensure will auto-rebind"
                     : "port \(port) held by '\(holder.server)' in \(holder.project); run: directa stop \(ShellWord.argument(holder.server)) --project \(ShellWord.argument(holder.project))",
                 state: .held)
-        } else if PortGuard.isListening(port: port) {
+        } else if listening {
             let detail = PortGuard.listenerInfo(port: port).map {
                 "unmanaged pid \($0.pid) (\($0.command))"
             } ?? "an unmanaged listener"
@@ -2058,10 +2034,8 @@ public actor Router {
                 status must not clobber that, or agents see the committed port in
                 status while the child listens on the rebind, and a stale flag
                 fires for a config that matches what was actually spawned. */
-            switch await existing.status().phase {
-            case .running, .starting, .unhealthy, .stopping:
-                break
-            case .stopped, .crashed, .failed:
+            let current = await existing.status()
+            if !current.hasLiveRun {
                 await existing.updateSpec(spec)
             }
             return existing

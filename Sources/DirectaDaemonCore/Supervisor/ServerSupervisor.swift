@@ -309,7 +309,10 @@ public actor ServerSupervisor {
         self.portConflict = portConflict
     }
 
-    public func clearBoundPortMeta() {        portConflict = nil
+    /** The status and the claim resolved at spawn, read in one actor turn so a
+        port check sees a phase and a claim that belong together. */
+    public func portSnapshot() -> (claim: PortClaim?, status: ServerStatus) {
+        (claim: portClaim, status: status())
     }
 
     /** Starts the server if not already starting/running; otherwise joins the
@@ -659,15 +662,9 @@ public actor ServerSupervisor {
     public func stopForRemoval(reason: String) async -> Bool {
         removalReason = reason
         _ = await stop(reason: reason)
-        switch phase {
-        case .crashed, .stopped:
-            return false
-        case .failed where pid == nil:
-            return false
-        case .failed, .running, .starting, .stopping, .unhealthy:
-            stateWritesAbandoned = true
-            return true
-        }
+        guard phase.hasLiveRun(pid: pid.map(Int.init)) else { return false }
+        stateWritesAbandoned = true
+        return true
     }
 
     /** One revalidated teardown pass. Descendants come from every source at once

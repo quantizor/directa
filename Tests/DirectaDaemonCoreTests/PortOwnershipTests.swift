@@ -380,6 +380,182 @@ import Testing
         #expect(events.events.filter { $0.kind == .stopped }.map(\.detail) == ["project path gone"])
     }
 
+    /** Brings a router-started server to a port failure with its run still
+        alive: a thief (another managed server) binds the victim's effective
+        port after the victim's pre-check passed, answers its healthcheck, and
+        the listen scan fails the victim for it. Polls through the router's
+        status handler, the path every reader takes. */
+    private func portFailedVictim(
+        router: Router, registry: Registry, env: Env, port: Int, overridePort: Int? = nil
+    ) async throws -> (failed: ServerStatus, thief: ServerSupervisor) {
+        let fixture = try #require(fixtureServerExecutable())
+        let target = ServerTargetParams(name: "web", port: overridePort, project: env.projectA)
+        let start = await handle(router, .serverStart, target, ServerResult.self)
+        guard case .success(let started) = start else {
+            Issue.record("the victim did not start: \(start)")
+            throw WireError(code: .internalError, message: "victim did not start")
+        }
+        #expect(started.server.pid != nil)
+        let thiefPort = overridePort ?? port
+        let thiefSpec = ServerSpec(
+            command: [fixture, "--listen-tcp", String(thiefPort)], name: "web", port: thiefPort)
+        let thief = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectB,
+            registry: registry, spec: thiefSpec)
+        _ = await thief.start()
+        var latest: ServerStatus?
+        for _ in 0..<60 where latest?.phase != .failed {
+            try await Task.sleep(for: .milliseconds(100))
+            let listed = await handle(
+                router, .serverStatus, ProjectParams(name: "web", project: env.projectA),
+                ServerListResult.self)
+            if case .success(let result) = listed {
+                latest = result.servers.first
+            }
+        }
+        let failed = try #require(latest)
+        #expect(failed.phase == .failed)
+        #expect(failed.pid != nil)
+        return (failed: failed, thief: thief)
+    }
+
+    /** A port-failed run is still a live process holding whatever the resource
+        guards, so a pausing lock stops it and a non-pausing lock reports it as
+        live, exactly like a running declarer. */
+    @Test(arguments: [(45014, true), (45015, false)])
+    func aLockPausesOrReportsALivePortFailedDeclarer(port: Int, pause: Bool) async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(
+            project: env.projectA,
+            spec: ServerSpec(
+                command: ["/bin/sh", "-c", "sleep 30"], locks: [LockDeclaration(name: "data")],
+                name: "web", port: port))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let (failed, thief) = try await portFailedVictim(
+            router: router, registry: registry, env: env, port: port)
+        let victim = try #require(failed.pid)
+        defer { kill(pid_t(victim), SIGKILL) }
+        _ = await thief.stop(graceSeconds: 2, reason: "test cleanup")
+
+        let acquired = await handle(
+            router, .lockAcquire,
+            LockParams(
+                holderPid: Int(getpid()), pause: pause, project: env.projectA, resource: "data",
+                resumeTimeoutSeconds: 1),
+            LockResult.self)
+        guard case .success(let lock) = acquired else {
+            Issue.record("lock acquire failed: \(acquired)")
+            return
+        }
+        if pause {
+            #expect(lock.paused == ["web"])
+            #expect(lock.live == nil)
+            var gone = kill(pid_t(victim), 0) != 0
+            for _ in 0..<50 where !gone {
+                try await Task.sleep(for: .milliseconds(20))
+                gone = kill(pid_t(victim), 0) != 0
+            }
+            #expect(gone, "the paused port-failed run \(victim) kept running")
+        } else {
+            #expect(lock.paused == [])
+            #expect(lock.live == ["web"])
+        }
+        _ = await handle(
+            router, .lockRelease,
+            LockParams(
+                holderPid: Int(getpid()), project: env.projectA, resource: "data",
+                resumeTimeoutSeconds: 1),
+            LockResult.self)
+        await teardown(router, env.projectA, "web")
+    }
+
+    /** A drifted run listens on a claimed secondary port instead of its
+        primary. Ensuring it again must read that listener as the server's own
+        live run (which `start` then replaces), never as an unmanaged squatter
+        named by its own pid. */
+    @Test func ensuringADriftedServerDoesNotCallItsOwnListenerUnmanaged() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeEnv()
+        let port = 45016
+        let registry = Registry(paths: env.paths)
+        try await registry.register(
+            project: env.projectA,
+            spec: ServerSpec(
+                command: [fixture, "--listen-tcp", String(port + 1)],
+                healthcheck: HealthCheckSpec(type: .none), name: "web", port: port,
+                portSpan: 2))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let target = ServerTargetParams(name: "web", project: env.projectA)
+        _ = await handle(router, .serverStart, target, ServerResult.self)
+        var latest: ServerStatus?
+        for _ in 0..<60 where latest?.phase != .failed {
+            try await Task.sleep(for: .milliseconds(100))
+            let listed = await handle(
+                router, .serverStatus, ProjectParams(name: "web", project: env.projectA),
+                ServerListResult.self)
+            if case .success(let result) = listed {
+                latest = result.servers.first
+            }
+        }
+        let drifted = try #require(latest)
+        #expect(drifted.phase == .failed)
+        #expect(drifted.portConflict?.state == .drift)
+        #expect(drifted.observedPort == port + 1)
+        let oldPid = try #require(drifted.pid)
+        defer { kill(pid_t(oldPid), SIGKILL) }
+
+        let again = await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "web", project: env.projectA, timeoutSeconds: 5), EnsureResult.self)
+        guard case .success(let result) = again else {
+            Issue.record("ensure refused the server's own live run: \(again)")
+            return
+        }
+        let newPid = try #require(result.server.pid)
+        #expect(newPid != oldPid)
+        #expect(kill(pid_t(oldPid), 0) != 0, "the drifted run \(oldPid) kept running")
+        await teardown(router, env.projectA, "web")
+    }
+
+    /** A status read re-resolves committed config for a server with no live
+        run. A port-failed run is live and was spawned from a materialized spec
+        (here an overridden port rewrote the url), so reading its status must
+        leave that spec alone. Its own foreign conflict also stays in place of
+        a latent-conflict annotation. */
+    @Test func aStatusReadKeepsALivePortFailedRunsSpawnSpec() async throws {
+        let env = try makeEnv()
+        let port = 45018
+        let overridePort = 45019
+        let registry = Registry(paths: env.paths)
+        try await registry.register(
+            project: env.projectA,
+            spec: ServerSpec(
+                command: ["/bin/sh", "-c", "sleep 30"], name: "web", port: port,
+                url: "http://127.0.0.1:{port}/"))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let (failed, thief) = try await portFailedVictim(
+            router: router, registry: registry, env: env, port: port, overridePort: overridePort)
+        let victim = try #require(failed.pid)
+        defer { kill(pid_t(victim), SIGKILL) }
+        /** Read again: the read that first saw `.failed` may have checked the
+            phase a moment before the failure landed. */
+        let reread = await handle(
+            router, .serverStatus, ProjectParams(name: "web", project: env.projectA),
+            ServerListResult.self)
+        guard case .success(let list) = reread else {
+            Issue.record("status read failed: \(reread)")
+            return
+        }
+        let status = try #require(list.servers.first)
+        #expect(status.phase == .failed)
+        #expect(status.url == "http://127.0.0.1:\(overridePort)/")
+        #expect(status.specStale != true)
+        #expect(status.portConflict?.state == .foreign)
+        _ = await thief.stop(graceSeconds: 2, reason: "test cleanup")
+        await teardown(router, env.projectA, "web")
+    }
+
     /** The control. Same shape, except the supervised process owns the port, so
         the check must stay silent. Without this a probe that always reported a
         foreign owner would pass the test above and look like a working feature. */

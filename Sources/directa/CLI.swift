@@ -1961,10 +1961,9 @@ struct Doctor: AsyncParsableCommand {
                     let managedOwner = all.servers.first { other in
                         (other.effectivePort ?? other.declaredPort) == port
                             && !(other.project == server.project && other.server == server.server)
-                            && (other.phase == .running || other.phase == .starting
-                                || other.phase == .unhealthy)
+                            && other.phase.holdsPort
                     }
-                    if server.phase == .stopped || server.phase == .crashed,
+                    if !server.hasLiveRun,
                         managedOwner == nil,
                         LoopbackProbe.isListening(port: port) {
                         findings.append(

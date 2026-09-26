@@ -207,8 +207,16 @@ import Testing
         let base = FileManager.default.temporaryDirectory
             .appending(path: "directa-span-\(UUID().uuidString)")
         let main = base.appending(path: "main")
-        let worktree = base.appending(path: "worktrees/review")
         try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
+        /** Named so the sibling search starts one past main's base port, inside
+            main's span: only a search that reserves the whole span clears it. */
+        let parent = canonicalProjectPath(base.path)
+        let label = try #require(
+            (0..<100_000).lazy.map { "review-\($0)" }.first {
+                CheckoutIdentity.siblingPortCandidate(
+                    declared: 45200, project: "\(parent)/worktrees/\($0)") == 45201
+            })
+        let worktree = base.appending(path: "worktrees/\(label)")
         try run(in: main.path, "/usr/bin/git", "init", "-b", "main")
         try run(in: main.path, "/usr/bin/git", "config", "user.email", "directa@test")
         try run(in: main.path, "/usr/bin/git", "config", "user.name", "directa")
@@ -253,9 +261,8 @@ import Testing
             router, .serverEnsure,
             EnsureParams(name: "web", project: worktree.path, timeoutSeconds: 10), EnsureResult.self)
         let rebound = try #require(wtResult.server.effectivePort)
-        #expect(rebound != 45200)
-        /** Rebound base must clear the whole span away from main's 45200..45202. */
-        #expect(Set(rebound..<(rebound + 3)).isDisjoint(with: Set(45200..<45203)))
+        /** The first block clear of main's 45200..45202. */
+        #expect(rebound == 45203)
         #expect(PortGuard.isListening(port: rebound))
         #expect(PortGuard.isListening(port: 45200))
         _ = try await handle(

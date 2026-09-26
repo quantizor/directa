@@ -17,6 +17,37 @@ public enum ServerPhase: String, Codable, Sendable {
     case stopped
     case stopping
     case unhealthy
+
+    /** A run is in flight: up, on its way up, or on its way down. Start-shaped
+        paths join or skip such a run rather than spawning beside it. The phase
+        alone cannot see a port-failed run that is still alive; ask
+        `hasLiveRun(pid:)` whenever the question is whether a process exists. */
+    public var isActive: Bool {
+        switch self {
+        case .running, .starting, .stopping, .unhealthy: true
+        case .crashed, .failed, .stopped: false
+        }
+    }
+
+    /** The run is expected to be the listener on every port it claims.
+        `stopping` is deliberately excluded although `isActive` counts it: a
+        server tearing down is releasing its ports, so a port check neither
+        credits it with a listener nor names it as the holder, while start
+        still waits for it rather than spawning beside it. */
+    public var holdsPort: Bool {
+        switch self {
+        case .running, .starting, .unhealthy: true
+        case .crashed, .failed, .stopped, .stopping: false
+        }
+    }
+
+    /** Whether a process of this server is alive, given the run's pid. The one
+        home for that question: an active phase, or a port failure (drift, or a
+        port another managed server owns), which is a finding rather than a
+        teardown and so leaves the run alive with its pid. */
+    public func hasLiveRun(pid: Int?) -> Bool {
+        isActive || (self == .failed && pid != nil)
+    }
 }
 
 /** Healthcheck configuration. Absent spec + declared port implies a TCP probe;
@@ -439,6 +470,29 @@ extension ServerStatus {
         effective port, so the menu bar and the statusline disagreed with the
         agent context about where the same server was. */
     public var displayPort: Int? { observedPort ?? effectivePort ?? declaredPort }
+
+    /** Whether a process of this server is alive; see `ServerPhase.hasLiveRun`. */
+    public var hasLiveRun: Bool { phase.hasLiveRun(pid: pid) }
+
+    /** The ports this server's run holds right now. A holding phase answers
+        for its whole claim: the status port fields plus `claim`, the full set
+        resolved at spawn, whose span members no status field names. A live
+        port-failed run holds only the port it was seen listening on, since its
+        failure says the claim is not what it holds. Empty otherwise. */
+    public func heldPorts(claim: PortClaim?) -> Set<Int> {
+        if phase.holdsPort {
+            var ports = Set(claim?.allPorts ?? [])
+            for port in [declaredPort, effectivePort, observedPort] {
+                if let port { ports.insert(port) }
+            }
+            if let named = self.ports { ports.formUnion(named.values) }
+            return ports
+        }
+        if phase == .failed, pid != nil, let observedPort {
+            return [observedPort]
+        }
+        return []
+    }
 }
 
 /** The unified event feed: lifecycle transitions, health changes, and marks as
