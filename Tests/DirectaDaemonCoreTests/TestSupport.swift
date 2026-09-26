@@ -72,7 +72,13 @@ func spawnBare(
     particular never the test runner's own group. The process's lifetime is
     not tied to the test process, so every caller must kill it explicitly. */
 func spawnSurvivor() throws -> pid_t {
-    let pid = try spawnBare(["/bin/sh", "-c", "sleep 30"], flags: POSIX_SPAWN_SETSID)
+    try spawnReapedSessionLeader(["/bin/sh", "-c", "sleep 30"])
+}
+
+/** `argv` as a session leader nothing supervises, reaped the moment it exits.
+    The caller owns killing it. */
+func spawnReapedSessionLeader(_ argv: [String]) throws -> pid_t {
+    let pid = try spawnBare(argv, flags: POSIX_SPAWN_SETSID)
     /** `swift-subprocess` reaps its own children as part of awaiting their
         termination status; a bare `posix_spawn` here has no one else doing
         that. Without a reaper, a test's `kill(pid, 0)` liveness check can
@@ -206,17 +212,19 @@ struct ExitedBeforeWatchLauncher: ProcessLauncher {
     the deterministic stand-in for "the child exited but recordOutcome was
     never told," which is what lets a bounded wait for that outcome be tested
     without a real multi-second sleep or a race against how fast a flood
-    drains. */
+    drains. `spawnRoot` picks the real process `run` reports, a long-lived
+    session leader by default. */
 struct StuckRunLauncher: ProcessLauncher {
     let gate: AdoptGate
+    var spawnRoot: @Sendable () throws -> pid_t = spawnSurvivor
 
     func run(
         argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
         onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
         onSpawn: @escaping @Sendable (pid_t) async -> Void
     ) async -> ProcessOutcome {
-        guard let pid = try? spawnSurvivor() else {
-            return .spawnFailed(SpawnError(message: "spawnSurvivor failed"))
+        guard let pid = try? spawnRoot() else {
+            return .spawnFailed(SpawnError(message: "the stuck run's root failed to spawn"))
         }
         await onSpawn(pid)
         return await gate.outcome()

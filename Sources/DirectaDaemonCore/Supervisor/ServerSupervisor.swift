@@ -453,10 +453,9 @@ public actor ServerSupervisor {
         runningSpecHash = Self.specHash(spec)
         let id = serverID(project: projectPath, name: spec.name)
         pid = childPid
-        /** Same rationale as `recordSpawn`: read now, since `getsid` on a
-            reaped pid answers -1 once the process is gone. */
-        let session = getsid(childPid)
-        rootSessionID = session > 0 ? session : nil
+        /** The launchd launcher that spawned this job made it a session
+            leader; same rule as `recordSpawn`. */
+        rootSessionID = childPid
         refreshDescendantSnapshot()
         let spawnedAt = runStartedAt ?? Date()
         startedAt = spawnedAt
@@ -1086,10 +1085,15 @@ public actor ServerSupervisor {
 
     private func recordSpawn(pid childPid: pid_t, id: String) async {
         pid = childPid
-        /** Read now rather than at teardown: once the root exits, getsid on its
-            pid answers -1 and the escaped-descendant sweep loses its key. */
-        let session = getsid(childPid)
-        rootSessionID = session > 0 ? session : nil
+        /** From the launcher contract, never from `getsid`: `onSpawn` reports a
+            pid that leads its own session, and this hop can run after a
+            short-lived root has already exited, when `getsid` answers ESRCH (a
+            zombie included) and the escaped-descendant sweep would lose its
+            only key. A pid that somehow did not lead a session names no live
+            session, since the kernel never hands out a pid that is still some
+            session's id, so the sweep then finds nothing rather than a
+            stranger. */
+        rootSessionID = childPid
         refreshDescendantSnapshot()
         if let removalReason {
             await stopRemovedSpawn(target: childPid, reason: removalReason)
@@ -1190,9 +1194,23 @@ public actor ServerSupervisor {
         await logStore.append(stream: .sys, text: "\(subject) exited before directa could watch it")
     }
 
+    /** Merges rather than replaces. A refresh that runs after the root has
+        exited but before `recordOutcome` walks a parent chain the root no
+        longer heads, since its children reparent to launchd at exit, and
+        replacing the snapshot with that empty walk erased the only record of
+        a setsid descendant, which neither the group nor the session reaches.
+        An earlier entry stays while its pid still names the same process, so
+        exited and recycled entries drop out and the snapshot never grows past
+        the live tree. */
     private func refreshDescendantSnapshot() {
         guard let pid else { return }
-        lastDescendantSnapshot = ProcessTree.descendants(of: pid).identities
+        let fresh = ProcessTree.descendants(of: pid).identities
+        let freshPids = Set(fresh.map(\.pid))
+        let stillLive = lastDescendantSnapshot.filter { recorded in
+            !freshPids.contains(recorded.pid)
+                && ProcessTree.shouldSignal(snapshotted: recorded, live: ProcessTree.identity(of: recorded.pid))
+        }
+        lastDescendantSnapshot = fresh + stillLive
     }
 
     /** Re-snapshots descendants across the startup window, which is the only

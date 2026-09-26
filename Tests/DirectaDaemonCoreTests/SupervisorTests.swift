@@ -761,6 +761,108 @@ private func makeEnv() throws -> TestEnv {
         #expect(reaped, "grandchild \(child) survived the crash teardown (pgid \(getpgid(child)))")
     }
 
+    /** The launcher publishes the pid through an async hop, and under load
+        that hop can land after a short-lived root has already exited. By then
+        `getsid` on the root answers ESRCH (a zombie included) and the root no
+        longer parents anything, so neither the session key nor the snapshot
+        can be read from the live process: the session has to come from the
+        spawn contract itself. The gate holds the hop until the root is gone,
+        which makes that ordering deterministic. */
+    @Test func crashSweepReachesTheSessionWhenThePidArrivesAfterTheRootExited() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeEnv()
+        let gate = SpawnGate()
+        let launcher = DelayedSpawnLauncher(gate: gate)
+        let supervisor = ServerSupervisor(
+            launcher: launcher, paths: env.paths, projectPath: env.projectPath,
+            registry: Registry(paths: env.paths),
+            spec: ServerSpec(
+                command: [fixture, "--spawn-grandchild", "--exit-after", "0.2", "--code", "1"],
+                name: "late-pid"))
+
+        async let started = supervisor.start()
+        for _ in 0..<100 where launcher.pids.isEmpty {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let root = try #require(launcher.pids.first)
+        let spool = env.paths.spoolOutFile(project: env.projectPath, server: "late-pid")
+        var grandchild: pid_t?
+        for _ in 0..<100 where grandchild == nil {
+            let text = (try? String(contentsOf: spool, encoding: .utf8)) ?? ""
+            if let match = text.range(of: #"grandchild pid (\d+)"#, options: .regularExpression) {
+                grandchild = String(text[match]).split(separator: " ").last.flatMap { pid_t($0) }
+            }
+            if grandchild == nil { try await Task.sleep(for: .milliseconds(20)) }
+        }
+        let child = try #require(grandchild, "fixture never reported a grandchild pid")
+        defer { kill(child, SIGKILL) }
+        for _ in 0..<250 where getsid(root) != -1 {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try #require(getsid(root) == -1, "root \(root) never exited")
+
+        await gate.open()
+        _ = await started
+        #expect(try await waitForPhase(supervisor, .crashed, tries: 80).phase == .crashed)
+        var reaped = false
+        for _ in 0..<100 where !reaped {
+            if kill(child, 0) != 0 { reaped = true; break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(
+            reaped,
+            "grandchild \(child) survived a crash whose pid arrived after the root exited (pgid \(getpgid(child)))")
+    }
+
+    /** A setsid descendant has left the root's group and session, so once the
+        root exits the snapshot is its only handle. A refresh that lands after
+        the root exits but before its outcome is recorded walks a parent chain
+        the root no longer heads (its children reparent to launchd at exit),
+        and must not erase what earlier refreshes recorded. `StuckRunLauncher`
+        withholds the outcome while the starting-phase watch keeps refreshing
+        over the dead root; the pause spans several watch intervals. */
+    @Test func aRefreshAfterTheRootExitsKeepsTheSetsidDescendantItRecorded() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeEnv()
+        let gate = AdoptGate()
+        let port = 45_487
+        let launcher = StuckRunLauncher(
+            gate: gate,
+            spawnRoot: {
+                try spawnReapedSessionLeader(
+                    [fixture, "--setsid-listener", "\(port)", "--exit-after", "1"])
+            })
+        let supervisor = ServerSupervisor(
+            launcher: launcher, paths: env.paths, projectPath: env.projectPath,
+            registry: Registry(paths: env.paths),
+            spec: ServerSpec(command: ["/bin/true"], name: "setsid"))
+        let root = try #require(await supervisor.start().pid.flatMap { pid_t(exactly: $0) })
+        var listener: pid_t?
+        for _ in 0..<100 where listener == nil {
+            listener = ProcessTree.descendants(of: root).pids.first
+            if listener == nil { try await Task.sleep(for: .milliseconds(20)) }
+        }
+        let child = try #require(listener, "root \(root) never spawned its setsid listener")
+        defer { kill(child, SIGKILL) }
+        /** The premise: a session of its own, so the session sweep cannot
+            stand in for the snapshot. */
+        #expect(getsid(child) == child)
+        for _ in 0..<250 where getsid(root) != -1 {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try #require(getsid(root) == -1, "root \(root) never exited")
+        try await Task.sleep(for: .milliseconds(600))
+
+        await gate.signal(.exited(code: 1))
+        #expect(try await waitForPhase(supervisor, .crashed, tries: 80).phase == .crashed)
+        var reaped = false
+        for _ in 0..<100 where !reaped {
+            if kill(child, 0) != 0 { reaped = true; break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(reaped, "setsid listener \(child) survived a crash its snapshot had recorded")
+    }
+
     /** Poll the supervisor until it reaches `phase` or the budget runs out. */
     private func waitForPhase(
         _ supervisor: ServerSupervisor, _ phase: ServerPhase, tries: Int = 50

@@ -40,8 +40,11 @@ public protocol ProcessLauncher: Sendable {
     /** Spawns `argv` in a fresh session with stdout and stderr on the spool
         capture, then returns only when the process has terminated. Exactly one
         callback runs before that return unless the spawn itself failed.
-        `onSpawn` reports a pid whose exit is being watched: the run is
-        supervised from that moment on. An implementation that can learn of
+        `onSpawn` reports a pid whose exit is being watched and that leads its
+        own session (its session id is the pid): the run is supervised from
+        that moment on, and teardown keys its session sweep on that pid
+        without asking a process that may already have exited. An
+        implementation that can learn of
         the process only after it already exited (the launchd path, when the
         job dies before its exit watch is armed, or before launchd ever
         showed its pid, which is then nil) calls `onExitedBeforeWatch`

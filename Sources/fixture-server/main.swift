@@ -8,9 +8,15 @@ import Foundation
                            Foundation's Process puts it in its OWN process group,
                            so a group-directed kill cannot reach it and only the
                            daemon's descendant snapshot can find it
-    --grandchild-after S   delay that spawn, which is what puts it past the
-                           supervisor's early snapshot and makes the teardown
-                           race deterministic instead of load-dependent
+    --grandchild-after S   delay that spawn (or the --setsid-listener spawn),
+                           which is what puts it past the supervisor's early
+                           snapshot and makes the teardown race deterministic
+                           instead of load-dependent
+    --setsid-listener PORT spawn a copy of this fixture listening on PORT in a
+                           session of its own (POSIX_SPAWN_SETSID), so neither
+                           the root's group nor its session can reach it and
+                           only a descendant snapshot taken while the root
+                           still parents it can. Prints `setsid listener pid N`
     --orphan-grandchild    background a `sleep 1000` through a shell that then
                            exits, so the sleep reparents away from this process
                            but keeps its session. A parent-chain sweep can no
@@ -38,6 +44,7 @@ var spawnGrandchild = false
 var grandchildAfter: Double?
 var orphanGrandchild = false
 var orphanGrandchildIgnoresTerm = false
+var setsidListenerPort: UInt16?
 var ignoreSigterm = false
 var emitBinary = false
 var errLines = 0
@@ -62,6 +69,8 @@ while let arg = argIterator.next() {
         orphanGrandchild = true
     case "--orphan-grandchild-ignterm":
         orphanGrandchildIgnoresTerm = true
+    case "--setsid-listener":
+        setsidListenerPort = argIterator.next().flatMap { UInt16($0) }
     case "--ignore-sigterm":
         ignoreSigterm = true
     case "--emit-binary":
@@ -113,14 +122,43 @@ func launchOrphanGrandchild(ignoreTerm: Bool) {
     shell.waitUntilExit()
 }
 
-if spawnGrandchild {
-    if let grandchildAfter {
-        /** On a background queue so the heartbeat loop below still runs and the
-            supervisor sees a normal, healthy-looking server for the whole delay. */
-        DispatchQueue.global().asyncAfter(deadline: .now() + grandchildAfter) { launchGrandchild() }
-    } else {
-        launchGrandchild()
+/** posix_spawn rather than Foundation's `Process`, which cannot set
+    POSIX_SPAWN_SETSID. The child inherits this process's stdout and stderr, so
+    its own lines land in the same spool. */
+func launchSetsidListener(port: UInt16) {
+    var attr: posix_spawnattr_t?
+    posix_spawnattr_init(&attr)
+    defer { posix_spawnattr_destroy(&attr) }
+    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
+    let argv = [CommandLine.arguments[0], "--listen-tcp", String(port)]
+    let cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
+    defer { for arg in cArgs { free(arg) } }
+    var child: pid_t = 0
+    let status = posix_spawn(&child, argv[0], nil, &attr, cArgs, environ)
+    guard status == 0 else {
+        FileHandle.standardError.write(
+            Data("fixture-server: setsid listener spawn failed: \(String(cString: strerror(status)))\n".utf8))
+        return
     }
+    print("setsid listener pid \(child)")
+}
+
+/** On a background queue so the heartbeat loop below still runs and the
+    supervisor sees a normal, healthy-looking server for the whole delay. */
+func launch(after delay: Double?, _ body: @escaping @Sendable () -> Void) {
+    if let delay {
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { body() }
+    } else {
+        body()
+    }
+}
+
+if spawnGrandchild {
+    launch(after: grandchildAfter) { launchGrandchild() }
+}
+
+if let port = setsidListenerPort {
+    launch(after: grandchildAfter) { launchSetsidListener(port: port) }
 }
 
 if orphanGrandchild {
