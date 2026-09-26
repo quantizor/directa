@@ -2207,14 +2207,22 @@ struct Switch: AsyncParsableCommand {
             ensure makes. Recording it before the lifecycle runs keeps the state
             coherent from the moment the branch's committed argv executes, so a
             crash mid-switch still leaves the project approved for a later
-            autonomous boot restore rather than half-trusted. */
+            autonomous boot restore rather than half-trusted.
+
+            A failed write is deliberately non-fatal, the same bargain
+            `prepareSpawn` makes for an explicit ensure/start whose own
+            `setTrusted` write fails: this invocation already is the approval,
+            and refusing to run the branch's lifecycle here would not undo the
+            git switch or the drained servers that already happened above, it
+            would just leave both half-done. `WireEmpty` carries no payload, so
+            the success result itself has nothing worth reading; only the
+            thrown error on failure does. */
         do {
-            try await CLIRunner.client().request(
+            _ = try await CLIRunner.client().request(
                 .projectTrust, params: ProjectOnlyParams(project: project),
                 expecting: WireEmpty.self)
         } catch {
-            print(
-                "warning: trust was not recorded for this project (\(error)); run: directa trust")
+            print(Self.trustRecordingFailedWarning(error))
         }
         let playbook =
             validated == nil
@@ -2272,6 +2280,14 @@ struct Switch: AsyncParsableCommand {
 
     static func git(_ arguments: [String], in project: String) -> (status: Int32, output: String) {
         LaunchdAdmin.shell("/usr/bin/git", ["-C", project] + arguments)
+    }
+
+    /** Printed when the daemon could not durably record trust for this
+        project; names the exact remediation so a later refusal (an
+        autonomous boot restore or watch sweep declining an unapproved
+        project) has somewhere to point back to. */
+    static func trustRecordingFailedWarning(_ error: Error) -> String {
+        "warning: trust was not recorded for this project (\(error)); run: directa trust"
     }
 }
 
