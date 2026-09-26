@@ -1020,6 +1020,91 @@ import Testing
         }
     }
 
+    /** Stands in for a harness whose detection state and install outcome are
+        both controllable, for `HookInstall.resolveTargets`/`installAll`. */
+    private struct DetectableStub: HarnessAdapter {
+        var installError: WireError?
+        var installSummary: String = ""
+        let name: String
+        let settingsURL: URL
+        var state: HarnessHookState
+        func install(cliPath: String) throws -> String {
+            if let installError { throw installError }
+            return installSummary
+        }
+        func uninstall() throws -> String { "" }
+        func hookState() -> HarnessHookState { state }
+    }
+
+    /** `hook install` with no `--harness` used to default to `claude` alone;
+        it now installs every harness `hookState()` reads as present, skipping
+        (never touching) one that reads `.harnessAbsent`. */
+    @Test func resolveTargetsWithNoHarnessInstallsOnlyDetectedOnes() {
+        let claude = DetectableStub(name: "claude", settingsURL: URL(fileURLWithPath: "/a"), state: .notInstalled)
+        let cursor = DetectableStub(name: "cursor", settingsURL: URL(fileURLWithPath: "/b"), state: .harnessAbsent)
+        let grok = DetectableStub(
+            name: "grok", settingsURL: URL(fileURLWithPath: "/c"),
+            state: .installed(path: "/x", pathExists: true))
+        guard case .success(let resolved) = HookInstall.resolveTargets(
+            harness: nil, adapters: [claude, cursor, grok])
+        else {
+            Issue.record("expected resolveTargets to succeed")
+            return
+        }
+        #expect(resolved.install.map(\.name) == ["claude", "grok"])
+        #expect(resolved.skipped.map(\.name) == ["cursor"])
+    }
+
+    @Test func resolveTargetsFailsUsageWhenNothingIsDetected() {
+        let absent = DetectableStub(name: "a", settingsURL: URL(fileURLWithPath: "/a"), state: .harnessAbsent)
+        guard case .failure(let error) = HookInstall.resolveTargets(harness: nil, adapters: [absent])
+        else {
+            Issue.record("expected resolveTargets to fail")
+            return
+        }
+        #expect(error.code == .usage)
+        #expect(error.message.contains("no supported harness detected on this machine"))
+        #expect(error.message.contains("(checked: a)"))
+    }
+
+    /** An explicit `--harness` is unconditional: it installs even a harness
+        this machine has never run, the same as every prior version did. */
+    @Test func resolveTargetsWithAnExplicitHarnessIgnoresDetection() {
+        let absent = DetectableStub(name: "a", settingsURL: URL(fileURLWithPath: "/a"), state: .harnessAbsent)
+        guard case .success(let resolved) = HookInstall.resolveTargets(harness: "a", adapters: [absent])
+        else {
+            Issue.record("expected resolveTargets to succeed")
+            return
+        }
+        #expect(resolved.install.map(\.name) == ["a"])
+        #expect(resolved.skipped.isEmpty)
+    }
+
+    @Test func resolveTargetsFailsUsageForAnUnknownExplicitHarness() {
+        guard case .failure(let error) = HookInstall.resolveTargets(harness: "bogus", adapters: [])
+        else {
+            Issue.record("expected resolveTargets to fail")
+            return
+        }
+        #expect(error.code == .usage)
+        #expect(error.message == "unknown harness 'bogus'")
+    }
+
+    /** The same collect-rather-than-abort shape as `HookUninstall.uninstallAll`. */
+    @Test func installAllCollectsFailuresInsteadOfAborting() {
+        let good = DetectableStub(
+            installSummary: "installed good", name: "good", settingsURL: URL(fileURLWithPath: "/g"),
+            state: .notInstalled)
+        let bad = DetectableStub(
+            installError: WireError(code: .configInvalid, message: "nope"), name: "bad",
+            settingsURL: URL(fileURLWithPath: "/b"), state: .notInstalled)
+        let result = HookInstall.installAll([good, bad, good], cliPath: "/bin/directa")
+        #expect(result.summaries == ["installed good", "installed good"])
+        #expect(result.failures.count == 1)
+        #expect(result.failures.first?.name == "bad")
+        #expect(result.failures.first?.message == "nope")
+    }
+
     /** OpenCode's own preference order decides which global config file wins:
         jsonc over json over the legacy config.json, and opencode.jsonc is what
         OpenCode seeds on a fresh machine. */

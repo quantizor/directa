@@ -834,20 +834,77 @@ struct HookInstall: AsyncParsableCommand {
 
     @OptionGroup var global: GlobalOptions
 
-    @Option(help: "Harness to install for: \(harnessAdapters.map(\.name).joined(separator: ", ")) (default: claude).")
-    var harness: String = "claude"
+    @Option(
+        help:
+            "Harness to install for: \(harnessAdapters.map(\.name).joined(separator: ", ")) (default: every harness detected on this machine)."
+    )
+    var harness: String?
 
     @Flag(help: "Also print the statusline wiring suggestion.")
     var statusline = false
 
-    func run() async throws {
-        guard let adapter = harnessAdapters.first(where: { $0.name == harness }) else {
-            CLIRunner.fail(
+    /** Which adapters `hook install` acts on, and which it silently leaves alone.
+        An explicit `--harness` is unconditional, the same single adapter every
+        prior version installed regardless of detection. Omitted, it installs
+        every harness whose `hookState()` reads as present (installed or
+        `notInstalled`, never `harnessAbsent`), so a harness this machine has
+        never run stays untouched rather than gaining a settings file for a tool
+        that was never there. Pure so the exact decision is asserted with stub
+        adapters, without touching a harness's real settings file. */
+    static func resolveTargets(harness: String?, adapters: [any HarnessAdapter]) -> Result<
+        (install: [any HarnessAdapter], skipped: [any HarnessAdapter]), WireError
+    > {
+        if let harness {
+            guard let adapter = adapters.first(where: { $0.name == harness }) else {
+                return .failure(
+                    WireError(
+                        code: .usage,
+                        hint: "supported: \(adapters.map(\.name).joined(separator: ", ")) (adding one: CONTRIBUTING.md)",
+                        message: "unknown harness '\(harness)'"))
+            }
+            return .success((install: [adapter], skipped: []))
+        }
+        let detected = adapters.filter { $0.hookState() != .harnessAbsent }
+        let skipped = adapters.filter { $0.hookState() == .harnessAbsent }
+        guard !detected.isEmpty else {
+            return .failure(
                 WireError(
                     code: .usage,
-                    hint: "supported: \(harnessAdapters.map(\.name).joined(separator: ", ")) (adding one: CONTRIBUTING.md)",
-                    message: "unknown harness '\(harness)'"),
-                json: global.json)
+                    hint: "run: directa hook install --harness <name>",
+                    message:
+                        "no supported harness detected on this machine (checked: \(adapters.map(\.name).joined(separator: ", ")))"
+                ))
+        }
+        return .success((install: detected, skipped: skipped))
+    }
+
+    /** One install pass over the adapters, collecting rather than aborting: the
+        same shape as `HookUninstall.uninstallAll`, since a refusal from one
+        harness has already left every earlier adapter's file rewritten. */
+    static func installAll(_ adapters: [any HarnessAdapter], cliPath: String) -> (
+        summaries: [String], failures: [(name: String, message: String)]
+    ) {
+        var summaries: [String] = []
+        var failures: [(name: String, message: String)] = []
+        for adapter in adapters {
+            do {
+                summaries.append(try adapter.install(cliPath: cliPath))
+            } catch let error as WireError {
+                failures.append((adapter.name, error.message))
+            } catch {
+                failures.append((adapter.name, String(describing: error)))
+            }
+        }
+        return (summaries, failures)
+    }
+
+    func run() async throws {
+        let targets: (install: [any HarnessAdapter], skipped: [any HarnessAdapter])
+        switch Self.resolveTargets(harness: harness, adapters: harnessAdapters) {
+        case .failure(let error):
+            CLIRunner.fail(error, json: global.json)
+        case .success(let resolved):
+            targets = resolved
         }
         if let override = cliPath, !override.hasPrefix("/") {
             CLIRunner.fail(
@@ -858,28 +915,41 @@ struct HookInstall: AsyncParsableCommand {
                 json: global.json)
         }
         let cliPath = cliPath ?? CLISelf.path
-        do {
-            let summary = try adapter.install(cliPath: cliPath)
-            var output = summary
-            if statusline {
-                output += "\n\nStatusline: pipe your statusline script through `directa statusline` to append server presence, e.g.\n  directa statusline <<< \"$STDIN_JSON\"  ->  myproj:3000 ok · api crashed"
+        let result = Self.installAll(targets.install, cliPath: cliPath)
+        if !result.failures.isEmpty {
+            var message = "hook install finished with errors"
+            let succeeded = targets.install.map(\.name).filter { name in
+                !result.failures.contains { $0.name == name }
             }
-            /** The discovery tip is printed, never appended to CLAUDE.md/AGENTS.md:
-                directa does not edit a project's files. Server names come from the
-                nearest devservers.json (empty when there is none yet). */
-            let serverNames: [String]
-            if let view = try? ProjectConfigLoader.load(project: global.resolvedProject()) {
-                serverNames = view.specs.map(\.name)
-            } else {
-                serverNames = []
+            if !succeeded.isEmpty {
+                message += "; installed \(succeeded.joined(separator: ", "))"
             }
-            output += "\n\nDiscovery tip: paste this bullet into the project's CLAUDE.md/AGENTS.md so agents find directa on their own (directa never edits those files):\n\(DiscoveryStanza.render(serverNames: serverNames))"
-            CLIRunner.emit(WireEmpty(), json: global.json) { _ in output }
-        } catch {
+            message +=
+                ". Failed: "
+                + result.failures.map { "\($0.name) (\($0.message))" }.joined(separator: "; ")
+            message += " Fix each cause and rerun directa hook install."
             CLIRunner.fail(
-                WireError(code: .internalError, message: "hook install failed: \(error)"),
+                WireError(code: .internalError, hint: "directa hook install", message: message),
                 json: global.json)
         }
+        var lines = result.summaries
+        lines.append(
+            contentsOf: targets.skipped.map { "\($0.name): not detected on this machine, skipped" })
+        var output = lines.joined(separator: "\n")
+        if statusline {
+            output += "\n\nStatusline: pipe your statusline script through `directa statusline` to append server presence, e.g.\n  directa statusline <<< \"$STDIN_JSON\"  ->  myproj:3000 ok · api crashed"
+        }
+        /** The discovery tip is printed, never appended to CLAUDE.md/AGENTS.md:
+            directa does not edit a project's files. Server names come from the
+            nearest devservers.json (empty when there is none yet). */
+        let serverNames: [String]
+        if let view = try? ProjectConfigLoader.load(project: global.resolvedProject()) {
+            serverNames = view.specs.map(\.name)
+        } else {
+            serverNames = []
+        }
+        output += "\n\nDiscovery tip: paste this bullet into the project's CLAUDE.md/AGENTS.md so agents find directa on their own (directa never edits those files):\n\(DiscoveryStanza.render(serverNames: serverNames))"
+        CLIRunner.emit(WireEmpty(), json: global.json) { _ in output }
     }
 }
 
