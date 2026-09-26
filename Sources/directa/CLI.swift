@@ -1593,6 +1593,38 @@ struct Doctor: AsyncParsableCommand {
         var severity: String
     }
 
+    /** Turns one `project.forget` outcome into the `stale-project` finding
+        `doctor --fix` reports. Pure so the plural grammar and the old-daemon
+        rewrite are asserted without a live socket. A daemon built before
+        `project.forget` existed refuses it with the exact `usage` message
+        `Router.handle` writes for any unrecognized method; that specific
+        refusal is rewritten into a restart hint instead of the raw wire
+        error, since "unknown method" means nothing to whoever reads the
+        report. */
+    static func staleProjectFixFinding(
+        project: String, outcome: Result<ProjectForgetResult, WireError>
+    ) -> Finding {
+        switch outcome {
+        case .success(let result):
+            let count = result.servers.count
+            return Finding(
+                detail: "forgot \(project) (\(count) server\(count == 1 ? "" : "s"))",
+                kind: "stale-project", severity: "fixed")
+        case .failure(let error):
+            if error.code == .usage,
+                error.message == WireError.unknownMethodMessage(WireMethod.projectForget.rawValue)
+            {
+                return Finding(
+                    detail:
+                        "could not forget \(project): the running daemon predates project.forget; run: directa daemon restart",
+                    kind: "stale-project", severity: "error")
+            }
+            return Finding(
+                detail: "could not forget \(project): \(error.message)",
+                kind: "stale-project", severity: "error")
+        }
+    }
+
     func run() async throws {
         var findings: [Finding] = []
         let client = CLIRunner.client()
@@ -1736,7 +1768,7 @@ struct Doctor: AsyncParsableCommand {
                     /** `project.forget` runs the same daemon-side teardown the
                         automatic missing-project sweep uses (stop supervisors,
                         drop locks/state/registry row/trust, remove the log
-                        directory), bypassing that sweep's two-consecutive-miss
+                        directory), bypassing that sweep's elapsed-interval
                         debounce since the caller asked explicitly for this one
                         project. No `try?`: a failure here (the project still
                         exists, or the daemon refused for another reason) is a
@@ -1745,15 +1777,9 @@ struct Doctor: AsyncParsableCommand {
                         let result = try await client.request(
                             .projectForget, params: ProjectOnlyParams(project: project),
                             expecting: ProjectForgetResult.self)
-                        findings.append(
-                            Finding(
-                                detail: "forgot \(project) (\(result.servers.count) servers)",
-                                kind: "stale-project", severity: "fixed"))
+                        findings.append(Self.staleProjectFixFinding(project: project, outcome: .success(result)))
                     } catch let error as WireError {
-                        findings.append(
-                            Finding(
-                                detail: "could not forget \(project): \(error.message)",
-                                kind: "stale-project", severity: "error"))
+                        findings.append(Self.staleProjectFixFinding(project: project, outcome: .failure(error)))
                     } catch {
                         findings.append(
                             Finding(

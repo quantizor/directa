@@ -116,6 +116,17 @@ public struct WireError: Codable, Equatable, Error, Sendable {
         self.hint = hint
         self.message = message
     }
+
+    /** The exact `usage` message `Router.handle` writes when `head.method`
+        names no case this build's `WireMethod` recognizes: a CLI talking to a
+        daemon built before a method existed, or the reverse. Shared by the
+        writer and any reader that wants to tell that specific refusal apart
+        from every other `usage` failure (a daemon needing a restart to learn
+        a new method, rather than a malformed request) without guessing at a
+        substring. */
+    public static func unknownMethodMessage(_ rawMethod: String) -> String {
+        "unknown method \(rawMethod)"
+    }
 }
 
 /** Without this, `localizedDescription` renders a WireError as "The operation

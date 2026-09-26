@@ -102,7 +102,7 @@ public actor Router {
         }
         do {
             guard let method = WireMethod(rawValue: head.method) else {
-                throw WireError(code: .usage, message: "unknown method \(head.method)")
+                throw WireError(code: .usage, message: WireError.unknownMethodMessage(head.method))
             }
             guard !restoring || Self.isServableWhileRestoring(method) else {
                 throw WireError(
