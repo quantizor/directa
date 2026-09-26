@@ -240,15 +240,19 @@ import Testing
         own, isolating the count to the draining threads specifically). */
     @Test func gitFailureDoesNotLeakFileDescriptorsAcrossRepeatedFailures() {
         let before = autoreleasepool { openFileDescriptorCount() }
-        for _ in 0..<30 {
+        for _ in 0..<60 {
             autoreleasepool {
                 _ = CheckoutIdentity.gitCommonDir(project: nonexistentProject())
             }
         }
         /** The leaked threads (when the bug is present) are already blocked in
-            a syscall by the time `run()` returns; no amount of waiting recovers
-            them, so this is not a race the test can flake on either side. */
+            a syscall by the time `run()` returns, so waiting longer never
+            recovers them; the leak itself cannot flake either direction.
+            The threshold is loose (measured: a real leak is 4 fds per
+            failure, 240 across 60 here) because Swift Testing runs suites in
+            parallel, and a sibling suite's own transient fds can nudge this
+            process's count by a handful at the exact moment this reads it. */
         let after = autoreleasepool { openFileDescriptorCount() }
-        #expect(after - before < 8, "leaked \(after - before) file descriptors across 30 failures")
+        #expect(after - before < 60, "leaked \(after - before) file descriptors across 60 failures")
     }
 }
