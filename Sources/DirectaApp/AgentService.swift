@@ -122,8 +122,12 @@ enum AgentService {
     nonisolated static func unregisterLoginItem() {
         let item = SMAppService.mainApp
         if item.status != .notRegistered {
-            try? item.unregister()
-            DirectaLog.app.info("Start at Login unregistered on request")
+            do {
+                try item.unregister()
+                DirectaLog.app.info("Start at Login unregistered on request")
+            } catch {
+                DirectaLog.app.error("Start at Login unregister on request: \(error.localizedDescription)")
+            }
         }
         AppAgentService.unregister()
     }
