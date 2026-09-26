@@ -65,27 +65,50 @@ import Testing
 
     static let allStatuses: [Status] = [.enabled, .notFound, .notRegistered, .requiresApproval, .unknown]
 
-    /** The legacy login item is retired only once the agent holds the
-        user's choice; a registration that did not take leaves it for the
-        next launch to carry forward again. */
-    @Test func legacyLoginItemRetiresOnlyWhenTheAgentCarriesTheChoice() {
+    /** The legacy login item is retired only once the agent is enabled. An
+        agent waiting on approval does not start the app at login yet, so
+        retiring the legacy item then would leave nothing starting it. */
+    @Test func legacyLoginItemRetiresOnlyOnceTheAgentIsEnabled() {
         let retired = Self.allStatuses.filter {
             AppAgentPolicy.retiresLegacyLoginItem(agentStatusAfterRegister: $0)
         }
-        #expect(retired == [.enabled, .requiresApproval])
+        #expect(retired == [.enabled])
     }
 
-    /** A kept legacy item plus an unregistered agent must read as `.register`
-        on the next launch, never `.recordOff`, or a failed registration would
-        turn Start at login off for good. */
-    @Test func aFailedRegistrationRetriesOnTheNextLaunch() {
-        for status: Status in [.notFound, .notRegistered] {
+    /** A kept legacy item plus an agent that is not enabled must read as
+        `.register` on the next launch, never `.recordOff` or `.leaveAlone`,
+        so the carry-forward is retried until the agent takes over. */
+    @Test func aRegistrationThatDidNotEnableRetriesOnTheNextLaunch() {
+        for status: Status in [.notFound, .notRegistered, .requiresApproval] {
             #expect(!AppAgentPolicy.retiresLegacyLoginItem(agentStatusAfterRegister: status), "\(status)")
             let next = AppAgentPolicy.launchAction(
                 agentStatus: status, bundleHasPlist: true, legacyLoginItemEnabled: true,
                 markerPresent: false, runningOutsideApplications: false)
             #expect(next == .register, "\(status)")
         }
+    }
+
+    /** The Settings toggle reads On whenever something starts the app at
+        login: the enabled agent, or a legacy item kept while the agent is not
+        enabled. An agent waiting on approval alone starts nothing. */
+    @Test func startAtLoginReadsOnWhenTheAgentOrTheLegacyItemIsEnabled() {
+        var on: [String] = []
+        for agentStatus in Self.allStatuses {
+            for legacyLoginItemEnabled in [false, true]
+            where AppAgentPolicy.startsAtLogin(
+                agentStatus: agentStatus, legacyLoginItemEnabled: legacyLoginItemEnabled)
+            {
+                on.append("\(agentStatus) legacy=\(legacyLoginItemEnabled)")
+            }
+        }
+        #expect(on == [
+            "enabled legacy=false",
+            "enabled legacy=true",
+            "notFound legacy=true",
+            "notRegistered legacy=true",
+            "requiresApproval legacy=true",
+            "unknown legacy=true",
+        ])
     }
 
     /** Every input combination: registering happens only to carry forward a

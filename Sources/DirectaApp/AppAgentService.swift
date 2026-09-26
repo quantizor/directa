@@ -81,25 +81,38 @@ enum AppAgentService {
         }
     }
 
-    /** Idempotent when never registered. */
+    /** Idempotent when never registered. A failure is logged, not thrown:
+        every caller goes on to its next step either way. */
     nonisolated static func unregister() {
         guard agent.status != .notRegistered else { return }
-        try? agent.unregister()
-        DirectaLog.app.info("app agent unregistered")
+        do {
+            try agent.unregister()
+            DirectaLog.app.info("app agent unregistered")
+        } catch {
+            DirectaLog.app.error("app agent unregister: \(error.localizedDescription)")
+        }
     }
 
-    /** Drop the pre-migration login item once the app agent carries Start at
-        login. Best effort: `mainApp`'s own `unregister()` can throw for
-        reasons that do not matter here (already gone, a transient Service
-        Management error), and the app agent already registered is what
-        matters going forward, so a failure here is not worth surfacing.
-        Idempotent: a copy with no legacy item registered is a fast no-op
-        status read. */
-    nonisolated static func migrateFromLoginItem() {
+    nonisolated static var legacyLoginItemEnabled: Bool { SMAppService.mainApp.status == .enabled }
+
+    /** What the Settings toggle shows; see `AppAgentPolicy.startsAtLogin`. */
+    nonisolated static var startsAtLogin: Bool {
+        AppAgentPolicy.startsAtLogin(agentStatus: policyStatus, legacyLoginItemEnabled: legacyLoginItemEnabled)
+    }
+
+    /** Unregister the pre-migration `SMAppService.mainApp` login item when it
+        is enabled; a no-op status read otherwise. A failure is logged, not
+        thrown: a kept legacy item is read again at the next launch, which
+        retries this. */
+    nonisolated static func unregisterLegacyLoginItem(because reason: String) {
         let item = SMAppService.mainApp
         guard item.status == .enabled else { return }
-        try? item.unregister()
-        DirectaLog.app.info("migrated off the Start at Login item to the app agent")
+        do {
+            try item.unregister()
+            DirectaLog.app.info("Start at Login item unregistered: \(reason)")
+        } catch {
+            DirectaLog.app.error("Start at Login item unregister (\(reason)): \(error.localizedDescription)")
+        }
     }
 
     nonisolated static var policyStatus: AppAgentPolicy.AgentStatus {
@@ -113,12 +126,11 @@ enum AppAgentService {
     }
 
     /** At launch, act on `AppAgentPolicy.launchAction`. The legacy login
-        item's status is read before `migrateFromLoginItem()`, which
-        unregisters it: a read after would always be false and record Off for
-        someone who had Start at login on. Registration runs before that
-        migration, so a registration that fails keeps the legacy item. */
+        item's status is read before `unregisterLegacyLoginItem`: a read after
+        would always be false and record Off for someone who had Start at
+        login on. Registration runs before that unregister, so a registration
+        that does not end with the agent enabled keeps the legacy item. */
     nonisolated static func ensureRegisteredAtLaunch(paths: DirectaPaths = DirectaPaths()) {
-        let legacyLoginItemEnabled = SMAppService.mainApp.status == .enabled
         let action = AppAgentPolicy.launchAction(
             agentStatus: policyStatus,
             bundleHasPlist: bundleHasPlist,
@@ -146,7 +158,7 @@ enum AppAgentService {
                 DirectaLog.app.error("app agent register at launch: \(error.localizedDescription)")
             }
             if AppAgentPolicy.retiresLegacyLoginItem(agentStatusAfterRegister: policyStatus) {
-                migrateFromLoginItem()
+                unregisterLegacyLoginItem(because: "the app agent now starts directa at login")
             } else {
                 DirectaLog.app.error(
                     "app agent register at launch left the agent \(statusDescription); kept the Start at Login item so the next launch retries"
@@ -155,10 +167,13 @@ enum AppAgentService {
         }
     }
 
-    /** Settings toggle Off: unregister and record the marker so a later
-        launch does not silently turn it back on. */
+    /** Settings toggle Off: unregister the agent and any legacy item a
+        registration kept (either one alone would still start the app at
+        login), then record the marker so a later launch does not silently
+        turn it back on. */
     nonisolated static func disableAtUserRequest(paths: DirectaPaths = DirectaPaths()) {
         unregister()
+        unregisterLegacyLoginItem(because: "Start at login turned off in Settings")
         do {
             try AtomicFile.write(Data(), to: paths.appAutostartDisabledFile)
         } catch {

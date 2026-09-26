@@ -101,27 +101,37 @@ public enum OrphanProjectLogs {
             }
     }
 
-    /** Gathers the disk facts and runs `detect`. Impure (directory listing,
-        file sizes); the decision it feeds is the pure `detect` above. A
-        symbolic link is skipped even when it points at a directory: directa
-        never creates one here, `remove` refuses it, and sizing it would count
-        whatever the link points at. A name `detect` would drop is skipped
-        before sizing, so a logs root shared with other apps never has their
+    /** The unclaimed directories directly under the logs root, sorted by
+        path, with nothing sized: what `doctor --fix` removes from, since a
+        removal needs no size and walking every file would widen the window
+        between its claimed-set re-read and the removal. A symbolic link is
+        skipped even when it points at a directory: directa never creates one
+        here, `remove` refuses it, and sizing it would count whatever the link
+        points at. A name without the `DirectaPaths.isProjectLogDirName` shape
+        is skipped, so a logs root shared with other apps never has their
         trees walked. */
-    public static func scan(
+    public static func unclaimedDirectories(
         paths: DirectaPaths, claimedSlugDirs: Set<String>, fileManager: FileManager = .default
-    ) -> [Finding] {
+    ) -> [URL] {
         guard let names = try? fileManager.contentsOfDirectory(atPath: paths.logsDir.path) else {
             return []
         }
-        let entries: [(apparentBytes: Int64, path: URL)] = names.compactMap { name in
-            guard DirectaPaths.isProjectLogDirName(name), !claimedSlugDirs.contains(name) else {
-                return nil
-            }
-            let url = paths.logsDir.appending(path: name)
-            guard fileType(at: url) == S_IFDIR else { return nil }
-            return (apparentBytes: apparentSize(of: url, fileManager: fileManager), path: url)
-        }
+        return names
+            .filter { DirectaPaths.isProjectLogDirName($0) && !claimedSlugDirs.contains($0) }
+            .map { paths.logsDir.appending(path: $0) }
+            .filter { fileType(at: $0) == S_IFDIR }
+            .sorted { $0.path < $1.path }
+    }
+
+    /** `unclaimedDirectories` with each one sized, run through `detect`.
+        Impure (directory listing, file sizes); the decision it feeds is the
+        pure `detect` above. */
+    public static func scan(
+        paths: DirectaPaths, claimedSlugDirs: Set<String>, fileManager: FileManager = .default
+    ) -> [Finding] {
+        let entries = unclaimedDirectories(
+            paths: paths, claimedSlugDirs: claimedSlugDirs, fileManager: fileManager
+        ).map { (apparentBytes: apparentSize(of: $0, fileManager: fileManager), path: $0) }
         return detect(entries: entries, claimedSlugDirs: claimedSlugDirs)
     }
 

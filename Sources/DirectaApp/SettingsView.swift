@@ -25,7 +25,7 @@ struct SettingsView: View {
     @State private var offers: [HarnessOffer] = []
     @State private var busyHarness: String?
     @State private var hookError: String?
-    @State private var launchAtLogin = AppAgentService.status == .enabled
+    @State private var launchAtLogin = AppAgentService.startsAtLogin
     @State private var checkForUpdates = UpdatePreference.enabled
     @State private var confirmingUninstall = false
 
@@ -102,19 +102,26 @@ struct SettingsView: View {
                 the plain SMAppService.mainApp login item it replaced: a login
                 item does not relaunch mid-session after a TAL idle-cull or a
                 jetsam kill, so "Start at login" now also means "and stay
-                running." The user-facing label and meaning are unchanged. */
+                running." The user-facing label and meaning are unchanged.
+                `onChange` acts only when the new value differs from what
+                actually starts the app at login, and then resyncs the toggle
+                to that, so the resync after a failed enable never reaches
+                the Off path and never records Off for someone who asked for
+                On. */
             Toggle("Start at login", isOn: $launchAtLogin)
                 .toggleStyle(.checkbox)
                 .onChange(of: launchAtLogin) { _, wanted in
-                    do {
-                        if wanted {
+                    guard wanted != AppAgentService.startsAtLogin else { return }
+                    if wanted {
+                        do {
                             try AppAgentService.enableAtUserRequest()
-                        } else {
-                            AppAgentService.disableAtUserRequest()
+                        } catch {
+                            DirectaLog.app.error("Start at login on: \(error.localizedDescription)")
                         }
-                    } catch {
-                        launchAtLogin = AppAgentService.status == .enabled
+                    } else {
+                        AppAgentService.disableAtUserRequest()
                     }
+                    launchAtLogin = AppAgentService.startsAtLogin
                 }
             Toggle("Check for updates in the background", isOn: $checkForUpdates)
                 .toggleStyle(.checkbox)

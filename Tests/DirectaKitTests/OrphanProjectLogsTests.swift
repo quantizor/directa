@@ -101,6 +101,29 @@ import Testing
         #expect(findings.map(\.path) == [fixture.orphaned])
     }
 
+    /** `unclaimedDirectories`, the listing `doctor --fix` removes from
+        without sizing anything, names exactly the directories `scan` reports,
+        in the same order. */
+    @Test func unclaimedDirectoriesNameExactlyWhatScanReports() throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let second = fixture.logsDir.appending(path: "another-33333333")
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+        try Data(repeating: 0x41, count: 100).write(to: fixture.orphaned.appending(path: "current.log"))
+        try Data().write(to: fixture.logsDir.appending(path: "stray.log"))
+        try FileManager.default.createDirectory(
+            at: fixture.logsDir.appending(path: "DiagnosticReports"), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: fixture.logsDir.appending(path: "link-44444444"), withDestinationURL: fixture.claimed)
+
+        let unclaimed = OrphanProjectLogs.unclaimedDirectories(
+            paths: fixture.paths, claimedSlugDirs: [Fixture.claimedName])
+        let scanned = OrphanProjectLogs.scan(paths: fixture.paths, claimedSlugDirs: [Fixture.claimedName])
+
+        #expect(unclaimed == [second, fixture.orphaned])
+        #expect(scanned.map(\.path) == unclaimed)
+    }
+
     @Test func scanAnswersEmptyForAMissingLogsDirectory() {
         let missing = FileManager.default.temporaryDirectory
             .appending(path: "directa-orphanlogs-missing-\(UUID().uuidString)")

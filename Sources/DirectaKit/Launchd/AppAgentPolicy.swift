@@ -43,8 +43,10 @@ public enum AppAgentPolicy {
         before any migration runs, since migrating unregisters that item.
         `legacyLoginItemEnabled` wins over `agentStatus`: an agent already
         enabled beside a legacy item still migrates, or the legacy item stays
-        registered next to it. `requiresApproval` records nothing, so the next
-        launch decides again once the user answers the approval prompt. */
+        registered next to it, and an agent waiting on approval beside a kept
+        legacy item registers again. `requiresApproval` alone records nothing,
+        so the next launch decides again once the user answers the approval
+        prompt. */
     public static func launchAction(
         agentStatus: AgentStatus,
         bundleHasPlist: Bool,
@@ -63,16 +65,23 @@ public enum AppAgentPolicy {
 
     /** After a `.register` launch action, whether the legacy login item may
         be unregistered, read from the agent's status once registration has
-        run. `enabled` and `requiresApproval` both carry the user's Start at
-        login choice forward (approval pending is the same choice waiting on
-        System Settings). Any other status means registration did not take:
-        the legacy item stays, so the user keeps Start at login and the next
-        launch reads it on and retries, where retiring it would have that
-        launch record Start at login off for good. */
+        run. Only `enabled` retires it. An agent waiting on approval starts
+        nothing at login until the user allows it in System Settings, so
+        retiring the legacy item then would silently turn Start at login off.
+        Any status but `enabled` keeps the legacy item, so the user keeps
+        Start at login and the next launch reads it on and retries. */
     public static func retiresLegacyLoginItem(agentStatusAfterRegister: AgentStatus) -> Bool {
         switch agentStatusAfterRegister {
-        case .enabled, .requiresApproval: true
-        case .notFound, .notRegistered, .unknown: false
+        case .enabled: true
+        case .notFound, .notRegistered, .requiresApproval, .unknown: false
         }
+    }
+
+    /** Whether anything starts the app at login, which is what the Settings
+        toggle shows. A legacy item still enabled means a registration has not
+        taken over yet, and it still starts the app. An agent waiting on
+        approval starts nothing until the user allows it. */
+    public static func startsAtLogin(agentStatus: AgentStatus, legacyLoginItemEnabled: Bool) -> Bool {
+        agentStatus == .enabled || legacyLoginItemEnabled
     }
 }

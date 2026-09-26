@@ -1788,9 +1788,10 @@ struct Doctor: AsyncParsableCommand {
         the claimed set from `info`, the `daemon.info` fetched when doctor
         began. `fix` never deletes on that set: seconds of other checks run
         after it, and a project first started in that window would have its
-        new log directory deleted under a live server. It calls `refetchInfo`
-        and scans and removes against that fresh claimed set and logs root
-        with no other wait in between; when the re-fetch fails or lacks
+        new log directory deleted under a live server. It calls `refetchInfo`,
+        then lists the unclaimed directories without sizing them and removes
+        each against that fresh claimed set and logs root; when the re-fetch
+        fails or lacks
         `claimedProjects`, nothing is removed and one `error` finding says so. */
     static func orphanLogDirFindings(
         fix: Bool, info: DaemonInfo, refetchInfo: () async throws -> DaemonInfo
@@ -1827,13 +1828,14 @@ struct Doctor: AsyncParsableCommand {
         }
         let claimedSlugDirs = claimedLogDirNames(claimedProjects)
         let logsDir = URL(fileURLWithPath: fresh.logsDir)
-        return OrphanProjectLogs.scan(paths: DirectaPaths(logsDir: logsDir), claimedSlugDirs: claimedSlugDirs)
-            .map { orphan in
-                orphanLogDirFixFinding(
-                    path: orphan.path,
-                    outcome: OrphanProjectLogs.remove(
-                        orphan.path, logsDir: logsDir, claimedSlugDirs: claimedSlugDirs))
-            }
+        return OrphanProjectLogs.unclaimedDirectories(
+            paths: DirectaPaths(logsDir: logsDir), claimedSlugDirs: claimedSlugDirs
+        ).map { directory in
+            orphanLogDirFixFinding(
+                path: directory,
+                outcome: OrphanProjectLogs.remove(
+                    directory, logsDir: logsDir, claimedSlugDirs: claimedSlugDirs))
+        }
     }
 
     private static func claimedLogDirNames(_ projects: [String]) -> Set<String> {
