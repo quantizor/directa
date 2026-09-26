@@ -394,6 +394,44 @@ private func tempDir() throws -> URL {
         #expect(finding?.evidence.contains(where: { $0.contains("REFUSAL-TOKEN") }) == true)
     }
 
+    @Test func stoppedWithNoEventHistoryStaysABareNotRunning() {
+        let stopped = status("web", .stopped, exit: 0)
+        let result = WhyEngine.diagnose(
+            target: "web",
+            statuses: ["web": stopped],
+            specs: ["web": ServerSpec(command: ["w"], name: "web")],
+            evidenceLines: { _ in [] })
+        #expect(result.findings.first?.summary == "not running (stopped)")
+    }
+
+    @Test func ordinaryDirectaStopStaysABareNotRunning() {
+        var stopped = status("web", .stopped, exit: 0)
+        stopped.lastExit = LastExit(
+            at: Date(timeIntervalSince1970: 1_700_000_000), signal: 15)
+        let result = WhyEngine.diagnose(
+            target: "web",
+            statuses: ["web": stopped],
+            specs: ["web": ServerSpec(command: ["w"], name: "web")],
+            evidenceLines: { _ in [] },
+            lastStopDetail: { $0 == "web" ? "requested by stop" : nil })
+        #expect(result.findings.first?.summary == "not running (stopped)")
+    }
+
+    @Test func externallySignaledStopNamesTheSignalAndThatItWasExternal() {
+        var stopped = status("web", .stopped, exit: 0)
+        stopped.lastExit = LastExit(
+            at: Date(timeIntervalSince1970: 1_700_000_000), signal: 15)
+        let result = WhyEngine.diagnose(
+            target: "web",
+            statuses: ["web": stopped],
+            specs: ["web": ServerSpec(command: ["w"], name: "web")],
+            evidenceLines: { _ in [] },
+            lastStopDetail: { $0 == "web" ? "signal=15 (external)" : nil })
+        #expect(
+            result.findings.first?.summary
+                == "not running (stopped by signal 15 sent from outside directa)")
+    }
+
     @Test func prefersTerminalEvidenceWhenTailCleared() {
         var crashed = status("web", .crashed, exit: 0)
         crashed.terminalEvidence = ["[out] persisted REFUSAL-TOKEN"]

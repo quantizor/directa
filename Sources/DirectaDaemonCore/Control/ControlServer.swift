@@ -399,6 +399,19 @@ public actor Router {
                     specsByName[spec.name] = spec
                 }
                 let paths = self.paths
+                /** One shot at the project's event history, read before the
+                    diagnosis runs rather than from inside a closure `describe`
+                    calls per server: `EventStore.query` is an actor method,
+                    `WhyEngine` stays a plain synchronous rule engine over data
+                    the caller already assembled. Last write per server wins,
+                    which is the most recent `stopped` event since `query`
+                    returns oldest first. */
+                var lastStoppedDetail: [String: String] = [:]
+                for event in await events.query(project: project) where event.kind == .stopped {
+                    if let detail = event.detail {
+                        lastStoppedDetail[event.server] = detail
+                    }
+                }
                 let result = WhyEngine.diagnose(
                     target: request.params.name,
                     statuses: statuses,
@@ -414,7 +427,8 @@ public actor Router {
                             options: LogQueryOptions(
                                 since: since, streams: [.err, .out, .sys], tail: 40)
                         ).map(\.contextLine)
-                    })
+                    },
+                    lastStopDetail: { lastStoppedDetail[$0] })
                 return try respond(id: head.id, result: result)
             case .serverUnregister:
                 let request = try decoder.decode(WireRequest<ServerTargetParams>.self, from: line)
