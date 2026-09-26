@@ -170,8 +170,13 @@ import os
         /** 30k lines across one rotate is still under the 10 MB file cap, but
             two orders past the 200-line queries this suite used. Whole-file
             parse, `since` skip of the rotated file, tail-after-filter, and a
-            literal grep all have to stay correct and return; a hang here is
-            the log actor wedging on a real noisy server. */
+            literal grep all have to stay correct and bounded; unbounded work
+            here is the log actor wedging on a real noisy server. The bound is
+            the bytes each query reads, never elapsed time, which a loaded
+            machine stretches whether or not the code is correct: a tail reads
+            a window off the end, a `since` query reads its search probes and
+            the lines from its searched start (so less than current.log alone),
+            and grep reads each byte once. */
         func stream(for offset: Int) -> LogStream { offset % 500 == 0 ? .err : .out }
         let rotated = (0..<10_000).map {
             record(Double($0), stream(for: $0), "old \($0)")
@@ -181,24 +186,42 @@ import os
         }
         recent[5_000] = record(15_000, .out, "NEEDLE-MID")
         let current = try writeFamily([rotated, recent])
-        let started = ContinuousClock.now
+        let currentBytes = recent.map { $0.formatted().utf8.count + 1 }.reduce(0, +)
+        let familyBytes = rotated.map { $0.formatted().utf8.count + 1 }.reduce(currentBytes, +)
+        func measured<Result>(_ query: (@escaping @Sendable (Int) -> Void) -> Result) -> (Result, Int) {
+            let read = OSAllocatedUnfairLock<Int>(initialState: 0)
+            let result = query { bytes in read.withLock { $0 += bytes } }
+            return (result, read.withLock { $0 })
+        }
 
-        let tail = LogQuery.run(current: current, options: LogQueryOptions(tail: 5))
+        let (tail, tailBytes) = measured {
+            LogQuery.runMeasured(current: current, options: LogQueryOptions(tail: 5), onDiskRead: $0)
+        }
         #expect(tail.map(\.text) == ["new 29995", "new 29996", "new 29997", "new 29998", "new 29999"])
+        #expect(tailBytes < 256 * 1024)
 
         let since = Date(timeIntervalSince1970: 1_700_000_000 + 25_000)
-        let window = LogQuery.run(current: current, options: LogQueryOptions(since: since))
+        let (window, windowRead) = measured {
+            LogQuery.runMeasured(current: current, options: LogQueryOptions(since: since), onDiskRead: $0)
+        }
         #expect(window.count == 5_000)
         #expect(window.first?.text == "new 25000")
         #expect(window.last?.text == "new 29999")
+        /** The window starts inside current.log, so its search and scan never
+            open the rotated file and never read current.log whole. */
+        #expect(windowRead < currentBytes)
 
-        let hits = LogQuery.run(current: current, options: LogQueryOptions(grep: "NEEDLE-MID"))
+        let (hits, grepRead) = measured {
+            LogQuery.runMeasured(current: current, options: LogQueryOptions(grep: "NEEDLE-MID"), onDiskRead: $0)
+        }
         #expect(hits.map(\.text) == ["NEEDLE-MID"])
+        #expect(grepRead < familyBytes + 64 * 1024)
 
-        let summary = LogQuery.summarize(current: current, streams: [.err], since: since)
+        let (summary, summaryRead) = measured {
+            LogQuery.summarizeMeasured(current: current, streams: [.err], since: since, onDiskRead: $0)
+        }
         #expect(summary?.count == 10)
-
-        #expect(ContinuousClock.now - started < Duration.seconds(2))
+        #expect(summaryRead < currentBytes)
     }
 
     @Test func tailCrossesARotationBoundary() throws {

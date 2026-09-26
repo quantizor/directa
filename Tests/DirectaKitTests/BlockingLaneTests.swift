@@ -104,11 +104,17 @@ import os
         threads must leave that pool free to run other work: a trivial task
         submitted after every caller still completes while all of them hang.
         Measured from a dedicated thread, since the test body itself runs on
-        the pool it is measuring. */
+        the pool it is measuring. Nothing releases the repository until the
+        trivial task has run, so the callers can only finish on their own at
+        git's timeout: the task counts how many had finished when it ran, and
+        any nonzero count means it waited for the pool to drain rather than
+        running beside the hung calls, however loaded the machine is. The
+        wait outlasts git's timeout so a blocked pool fails rather than hangs. */
     @Test func hungGitCallsLeaveTheCooperativePoolFree() async throws {
         let repo = try HungRepository()
         let callers = ProcessInfo.processInfo.activeProcessorCount * 2
         let finished = OSAllocatedUnfairLock(initialState: 0)
+        let finishedWhenTaskRan = OSAllocatedUnfairLock<Int?>(initialState: nil)
         let path = repo.path
         let calls = (0..<callers).map { _ in
             Task.detached {
@@ -117,13 +123,16 @@ import os
                 return answer
             }
         }
-        let responded = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let thread = Thread {
                 let ran = DispatchSemaphore(value: 0)
-                Task.detached { ran.signal() }
-                let result = ran.wait(timeout: .now() + 1.5) == .success
+                Task.detached {
+                    finishedWhenTaskRan.withLock { $0 = finished.withLock { $0 } }
+                    ran.signal()
+                }
+                _ = ran.wait(timeout: .now() + CheckoutIdentity.gitTimeoutSeconds * 2)
                 repo.release(until: { finished.withLock { $0 } == callers })
-                continuation.resume(returning: result)
+                continuation.resume()
             }
             thread.name = "blocking-lane-test-probe"
             thread.start()
@@ -131,7 +140,10 @@ import os
         for call in calls {
             #expect(await call.value == nil)
         }
-        #expect(responded, "a trivial task could not run while \(callers) git calls hung")
+        let seen = finishedWhenTaskRan.withLock { $0 }
+        #expect(
+            seen == 0,
+            "a trivial task ran only after \(seen.map(String.init) ?? "none") of \(callers) hung git calls had finished")
     }
 
     /** A git that never returns is terminated at its timeout and answers nil,
