@@ -213,8 +213,11 @@ private func makeEnv() throws -> TestEnv {
     /** A `start()` that joins a stop which never lands gives up with the
         stop's own bound (grace plus overtime, 0.15 s here) and reports the
         honest `.stopping`, rather than holding its caller until the run
-        finally exits. The gate opens after 1 s on its own, so an unbounded
-        join is observed as a late return that restarted the server. */
+        finally exits. The run stays stuck until the test releases it after
+        `start()` returns, so a bounded join returns while it is still stuck
+        and an unbounded one can only return once the safety valve releases
+        it, however loaded the machine is. The valve exists so a regression
+        fails instead of hanging. */
     @Test func startJoiningAStuckStopGivesUpWithTheStopsOwnBound() async throws {
         let env = try makeEnv()
         let gate = AdoptGate()
@@ -226,19 +229,20 @@ private func makeEnv() throws -> TestEnv {
 
         async let stopped = supervisor.stop(graceSeconds: 0.05, reason: "test")
         try await awaitPhase(.stopping, of: supervisor)
-        let release = Task {
-            try? await Task.sleep(for: .seconds(1))
+        let valveOpened = OSAllocatedUnfairLock(initialState: false)
+        let safetyValve = Task {
+            try? await Task.sleep(for: .seconds(10))
+            valveOpened.withLock { $0 = true }
             await gate.signal(.signaled(signal: Int(SIGKILL)))
         }
 
-        let joinStart = ContinuousClock.now
         let joined = await supervisor.start()
-        let waited = joinStart.duration(to: .now)
+        let returnedWhileStuck = !valveOpened.withLock { $0 }
         #expect(joined.phase == .stopping)
-        #expect(waited < .milliseconds(700), "start waited \(waited) on a stop bounded at 0.15 s")
+        #expect(returnedWhileStuck, "start held its caller until the stuck run was released")
 
-        release.cancel()
-        await release.value
+        safetyValve.cancel()
+        await safetyValve.value
         _ = await stopped
     }
 
@@ -373,10 +377,19 @@ private func makeEnv() throws -> TestEnv {
             try await Task.sleep(for: .milliseconds(100))
         }
         let pid = try #require(grandchildPid)
-        /** The escalation grace plus margin: a SIGTERM-obedient tree is already
-            gone by here; this one answered the first pass by ignoring it. */
-        try await Task.sleep(for: .milliseconds(2500))
-        #expect(kill(pid, 0) != 0)
+        /** This grandchild ignores SIGTERM, so its death is itself the proof the
+            SIGKILL pass ran. Polled rather than checked at one instant: the
+            pass fires on the product's own grace timer after the phase turns,
+            and a fixed sleep raced that timer under load. */
+        var reaped = false
+        for _ in 0..<100 where !reaped {
+            if kill(pid, 0) != 0 { reaped = true; break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(
+            reaped,
+            "grandchild \(pid) survived the crash escalation (pgid \(getpgid(pid)), state \(processState(of: pid)))")
+        if !reaped { kill(pid, SIGKILL) }
     }
 
     @Test func crashRecordsExitForensics() async throws {
