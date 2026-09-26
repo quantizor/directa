@@ -605,7 +605,7 @@ public struct MonitorStream: Sendable {
         let window = Self.formatWindow(record.at.timeIntervalSince(entry.firstShownAt))
         let suppressedBefore = entry.pendingSuppressed
         var text = "\(displayText) (again, \(Self.ordinalLabel(ordinal)) in \(window)"
-        text += suppressedBefore > 0 ? "; +\(suppressedBefore) lines seen before)" : ")"
+        text += suppressedBefore > 0 ? "; +\(Self.lines(suppressedBefore)) seen before)" : ")"
         if suppressedBefore > 0 {
             summaryTotal -= suppressedBefore
             summaryDistinct.remove(key)
@@ -675,7 +675,7 @@ public struct MonitorStream: Sendable {
     private func trimmedSkippedEvent(stream: LogStream, at: Date, count: Int) -> MonitorEvent {
         let since = JSONCoding.formatISO8601(at)
         let text =
-            "\(count) \(stream.rawValue) lines skipped (more than \(MonitorLimits.perTickFetchCap) in one tick); "
+            "\(Self.lines(count, of: stream)) skipped (more than \(MonitorLimits.perTickFetchCap) in one tick); "
             + "read them: directa logs \(sanitizedServerName) --since \(since) --stream \(stream.rawValue) --head 200"
         return MonitorEvent(at: at, count: count, kind: .suppressed, label: sanitizedLabel, stream: stream, text: text)
     }
@@ -695,7 +695,12 @@ public struct MonitorStream: Sendable {
         }
 
         budget.refill(at: at, ratePerMinute: perMinuteCap(for: stream), capacity: burstCapacity(for: stream))
-        if budget.tokens < 1 {
+        /** Hysteresis: once over, a stream stays withheld until its bucket
+            refills to the full burst. Resuming on the first refilled token
+            would alternate an over-budget and a resume marker on every tick
+            of a steadily chatty server, more noise than the lines withheld. */
+        let resumeAt = budget.minuteOverBudget ? Double(burstCapacity(for: stream)) : 1
+        if budget.tokens < resumeAt {
             budget.withheldSinceMarker += 1
             if !budget.minuteOverBudget {
                 budget.minuteOverBudget = true
@@ -746,7 +751,8 @@ public struct MonitorStream: Sendable {
     private func overBudgetEvent(stream: LogStream, at: Date, cap: Int, scope: BudgetScope) -> MonitorEvent {
         let scopeText =
             scope == .minute
-            ? "\(cap) lines this minute" : "\(cap) lines for the rest of this monitor; re-arm to reset"
+            ? "more than \(Self.lines(cap)) a minute"
+            : "\(Self.lines(cap)) for the rest of this monitor; re-arm to reset"
         let since = JSONCoding.formatISO8601(at)
         let text =
             "\(stream.rawValue) over budget (\(scopeText)); read what was skipped: "
@@ -754,8 +760,18 @@ public struct MonitorStream: Sendable {
         return MonitorEvent(at: at, count: cap, kind: .budget, label: sanitizedLabel, stream: stream, text: text)
     }
 
+    /** "1 line", "3 lines", "1 out line", "3 repeated lines". */
+    private static func lines(_ count: Int, of qualifier: String? = nil) -> String {
+        let noun = count == 1 ? "line" : "lines"
+        return [String(count), qualifier, noun].compactMap { $0 }.joined(separator: " ")
+    }
+
+    private static func lines(_ count: Int, of stream: LogStream) -> String {
+        lines(count, of: stream.rawValue)
+    }
+
     private func resumeEvent(stream: LogStream, at: Date, suppressed: Int) -> MonitorEvent {
-        let text = "\(stream.rawValue) resumed (\(suppressed) lines suppressed while over budget)"
+        let text = "\(stream.rawValue) resumed (\(Self.lines(suppressed)) suppressed while over budget)"
         return MonitorEvent(
             at: at, count: suppressed, kind: .budget, label: sanitizedLabel, stream: stream, text: text)
     }
@@ -777,7 +793,7 @@ public struct MonitorStream: Sendable {
     private func summaryEvent(at: Date) -> MonitorEvent {
         let since = JSONCoding.formatISO8601(at)
         let text =
-            "\(summaryTotal) repeated lines suppressed (\(summaryDistinct.count) distinct); "
+            "\(Self.lines(summaryTotal, of: "repeated")) suppressed (\(summaryDistinct.count) distinct); "
             + "directa logs \(sanitizedServerName) --since \(since) --head 200"
         return MonitorEvent(at: at, count: summaryTotal, kind: .suppressed, label: sanitizedLabel, text: text)
     }

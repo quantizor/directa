@@ -298,7 +298,7 @@ import Testing
         _ = stream.ingest(tick(0, records: [record(0, .err, "TypeError: X")]))
         _ = stream.ingest(tick(1, records: [record(1, .err, "TypeError: X")]))
         let events = stream.ingest(tick(15, records: [record(15, .err, "TypeError: X")]))
-        #expect(events.map(\MonitorEvent.humanLine) == ["web err| TypeError: X (again, 2nd in 15s; +1 lines seen before)"])
+        #expect(events.map(\MonitorEvent.humanLine) == ["web err| TypeError: X (again, 2nd in 15s; +1 line seen before)"])
     }
 
     @Test func noDoubleCountBetweenARepeatedFlushAndTheSummary() {
@@ -341,7 +341,7 @@ import Testing
             block continuation forces every other line into burst-repeat
             handling regardless of their own timers, so only line 0 shows. */
         let thirdPrint = stream.ingest(tick(20.4, records: block(startingAt: 20)))
-        #expect(thirdPrint.map(\MonitorEvent.humanLine) == ["web err| trace line 0 (again, 2nd in 20s; +1 lines seen before)"])
+        #expect(thirdPrint.map(\MonitorEvent.humanLine) == ["web err| trace line 0 (again, 2nd in 20s; +1 line seen before)"])
     }
 
     @Test func lruCapacityEvictsTheOldestEntry() {
@@ -390,7 +390,7 @@ import Testing
             the 30 s cadence: the quiet trigger fires the summary early. */
         let events = stream.ingest(tick(6))
         #expect(events.map(\MonitorEvent.humanLine) == [
-            "directa web: 1 repeated lines suppressed (1 distinct); directa logs web --since "
+            "directa web: 1 repeated line suppressed (1 distinct); directa logs web --since "
                 + "\(JSONCoding.formatISO8601(date(6))) --head 200"
         ])
     }
@@ -407,7 +407,7 @@ import Testing
         let events = stream.ingest(tick(0.02, records: records))
         var expected = (0..<15).map { "web out| line \($0)" }
         expected.append(
-            "directa web: out over budget (60 lines this minute); read what was skipped: "
+            "directa web: out over budget (more than 60 lines a minute); read what was skipped: "
                 + "directa logs web --since \(JSONCoding.formatISO8601(date(0.015))) --stream out --head 200")
         #expect(events.map(\MonitorEvent.humanLine) == expected)
     }
@@ -415,13 +415,33 @@ import Testing
     @Test func stdoutPerMinuteExhaustionRefillsAndReportsWhatWasSkipped() {
         var stream = makeStream(budgets: MonitorBudgets(linesPerArm: 1_000, linesPerMinute: 60))
         _ = stream.ingest(tick(0.02, records: distinctOutTexts(20)))
-        /** 2 s later at 1 token/s the bucket has 2 tokens: enough for the
-            next line to show, transitioning out of the over-budget state. */
-        let events = stream.ingest(tick(2.02, records: [record(2.02, .out, "resumed line")]))
+        /** At 1 token/s the stream stays withheld until the bucket is back to
+            its full burst of 15: a line at 14 s is still withheld, one at
+            15.1 s resumes. */
+        let held = stream.ingest(tick(14.02, records: [record(14.02, .out, "held line")]))
+        #expect(held.isEmpty)
+        let events = stream.ingest(tick(15.12, records: [record(15.12, .out, "resumed line")]))
         #expect(events.map(\MonitorEvent.humanLine) == [
-            "directa web: out resumed (5 lines suppressed while over budget)",
+            "directa web: out resumed (6 lines suppressed while over budget)",
             "web out| resumed line",
         ])
+    }
+
+    /** A server steadily printing faster than its budget produces at most one
+        over-budget marker per refill period, never one per tick. */
+    @Test func aSteadilyChattyServerDoesNotFlapBetweenOverBudgetAndResumed() {
+        var stream = makeStream(budgets: MonitorBudgets(linesPerArm: 20_000, linesPerMinute: 60))
+        var markers = 0
+        for step in 0..<300 {
+            let at = Double(step) * 0.2
+            let events = stream.ingest(tick(at + 0.01, records: [record(at, .out, "line \(step)")]))
+            markers += events.filter { $0.kind == .budget }.count
+        }
+        /** 60 s at 5 lines/s against 1 line/s with a 15-line burst: one
+            crossing, then each resume and re-crossing needs a 15 s refill, so
+            at most 4 crossings and 3 resumes. */
+        #expect(markers <= 7)
+        #expect(markers >= 2)
     }
 
     @Test func stdoutPerArmExhaustionIsPermanentAndNeverRefills() {
@@ -455,7 +475,7 @@ import Testing
                     record(0.03, .err, "err 1"),
                 ]))
         #expect(events.map(\MonitorEvent.humanLine) == [
-            "directa web: out over budget (1 lines for the rest of this monitor; re-arm to reset); "
+            "directa web: out over budget (1 line for the rest of this monitor; re-arm to reset); "
                 + "read what was skipped: directa logs web --since \(JSONCoding.formatISO8601(date(0.01))) "
                 + "--stream out --head 200",
             "web err| err 0",
@@ -470,8 +490,8 @@ import Testing
         /** The daemon separately trimmed 7 more out lines this tick while
             the stream is already over budget; no line arrives to show. */
         _ = stream.ingest(tick(0.5, trimmed: [.out: 7]))
-        /** 2 s later, enough tokens refill for the next line to show. */
-        let events = stream.ingest(tick(2.016, records: [record(2.016, .out, "resumed")]))
+        /** 15.1 s later the bucket is back to its full 15-line burst. */
+        let events = stream.ingest(tick(15.116, records: [record(15.116, .out, "resumed")]))
         #expect(events.map(\MonitorEvent.humanLine) == [
             "directa web: out resumed (8 lines suppressed while over budget)",
             "web out| resumed",
