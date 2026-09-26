@@ -51,6 +51,7 @@ await_daemon() {
 # Arrays, never space-joined strings: zsh does not word-split an unquoted
 # parameter, so a loop over a joined string runs once with the whole string,
 # and `kill` rejects it as an illegal pid while the processes live on.
+CLIENT_PIDS=()
 STRAY_PIDS=()
 MONITOR_PIDS=()
 
@@ -66,6 +67,10 @@ cleanup() {
   # tracked here too, so a `fail` partway through that section (which exits and
   # runs this trap) cannot leave one running past this script.
   for mon in "${MONITOR_PIDS[@]}"; do kill -9 "$mon" 2>/dev/null || true; done
+  # Other CLI invocations a section backgrounds (a lock holder, a restart that
+  # rides out a daemon kill) are normally waited on; a `fail` before that wait
+  # leaves them running.
+  for client in "${CLIENT_PIDS[@]}"; do kill -9 "$client" 2>/dev/null || true; done
   # A fixture-server the daemon spawned leads its own session, and a
   # --spawn-grandchild child sits in a process group of its own inside that
   # session, so neither a group kill nor the pkill below reaches it. A failure
@@ -514,6 +519,7 @@ pass "lock options before -- do not reach the guarded command"
 rm -f "$WORK/held"
 "$DIRECTA" lock data -- sh -c "touch '$WORK/held'; sleep 6" >/dev/null 2>&1 &
 HOLDER_JOB=$!
+CLIENT_PIDS+=("$HOLDER_JOB")
 for _ in $(seq 1 100); do
   [[ -f "$WORK/held" ]] && break
   /bin/sleep 0.1
@@ -617,6 +623,7 @@ SLOW_PORT=$((44500 + (RANDOM % 400)))
 set +e
 "$DIRECTA" restart slowboot --timeout 30 --json > "$WORK/slow-restart.json" 2> "$WORK/slow-restart.err" &
 SLOW_RESTART_PID=$!
+CLIENT_PIDS+=("$SLOW_RESTART_PID")
 set -e
 sleep 1.5
 kill -9 "$DAEMON_PID"
