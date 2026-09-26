@@ -59,6 +59,10 @@ public enum LaunchdAdmin {
         shell("/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(label)"]).status == 0
     }
 
+    public static func isAgentLoaded() async -> Bool {
+        await shell("/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(label)"]).status == 0
+    }
+
     /** Wait until launchd drops the agent after an unregister, then idle so BTM
         can drop the prior launch constraint. Returns false if the job is still
         loaded after the timeout (and a last-resort bootout); callers must not
@@ -68,22 +72,26 @@ public enum LaunchdAdmin {
         timeoutSeconds: Double = 10,
         settleSeconds: Double = AgentRebindPolicy.settleSeconds
     ) async -> Bool {
+        var loaded = await isAgentLoaded()
         let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline, isAgentLoaded() {
+        while loaded, Date() < deadline {
             try? await Task.sleep(for: .milliseconds(50))
+            loaded = await isAgentLoaded()
         }
-        if isAgentLoaded() {
-            _ = shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
+        if loaded {
+            _ = await shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
+            loaded = await isAgentLoaded()
             let bootoutDeadline = Date().addingTimeInterval(3)
-            while Date() < bootoutDeadline, isAgentLoaded() {
+            while loaded, Date() < bootoutDeadline {
                 try? await Task.sleep(for: .milliseconds(50))
+                loaded = await isAgentLoaded()
             }
         }
-        guard !isAgentLoaded() else { return false }
+        guard !loaded else { return false }
         if settleSeconds > 0 {
             try? await Task.sleep(for: .seconds(settleSeconds))
         }
-        return !isAgentLoaded()
+        return await !isAgentLoaded()
     }
 
     /** Marker for the Applications copy: settle, then register, after a DMG
@@ -268,8 +276,8 @@ public enum LaunchdAdmin {
         try fm.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(plist.utf8).write(to: plistURL)
         try? fm.removeItem(at: paths.stoppedIntentFile)
-        _ = shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
-        let bootstrap = shell("/bin/launchctl", ["bootstrap", "\(LaunchdJobs.guiDomain)", plistURL.path])
+        _ = await shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
+        let bootstrap = await shell("/bin/launchctl", ["bootstrap", "\(LaunchdJobs.guiDomain)", plistURL.path])
         /** A concurrent session bootstrapping first reports already-bootstrapped;
             the socket poll below is the actual success signal. */
         if bootstrap.status != 0, !bootstrap.output.contains("already bootstrapped"),
@@ -300,7 +308,7 @@ public enum LaunchdAdmin {
             }
             _ = await waitUntilAgentUnloaded()
         }
-        _ = shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
+        _ = await shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
         try? FileManager.default.removeItem(at: plistURL)
         if purge {
             try? FileManager.default.removeItem(at: paths.dataDir)
@@ -317,9 +325,9 @@ public enum LaunchdAdmin {
                 hint: "run: directa daemon install",
                 message: "no LaunchAgent installed at \(plistURL.path)")
         }
-        let result = shell("/bin/launchctl", ["kickstart", "\(LaunchdJobs.guiDomain)/\(label)"])
+        let result = await shell("/bin/launchctl", ["kickstart", "\(LaunchdJobs.guiDomain)/\(label)"])
         if result.status != 0 {
-            _ = shell("/bin/launchctl", ["bootstrap", "\(LaunchdJobs.guiDomain)", plistURL.path])
+            _ = await shell("/bin/launchctl", ["bootstrap", "\(LaunchdJobs.guiDomain)", plistURL.path])
         }
         try await pollHello(paths: paths)
     }
@@ -331,7 +339,7 @@ public enum LaunchdAdmin {
         let client = DaemonClient(socketPath: paths.socketPath)
         let runningServers = await captureActiveServers(client: client)
         try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
-        let result = shell("/bin/launchctl", ["kickstart", "-k", "\(LaunchdJobs.guiDomain)/\(label)"])
+        let result = await shell("/bin/launchctl", ["kickstart", "-k", "\(LaunchdJobs.guiDomain)/\(label)"])
         if result.status != 0 {
             throw WireError(
                 code: .internalError,
@@ -533,6 +541,28 @@ public enum LaunchdAdmin {
         """
     }
 
+    /** The form async code calls: runs the synchronous `shell` on
+        `BlockingLane.system`, so a slow `launchctl` parks a lane thread
+        instead of a cooperative-pool thread. Swift picks this over the
+        synchronous form in any async context. */
+    @discardableResult
+    public static func shell(
+        _ path: String, _ arguments: [String], environment: [String: String]? = nil,
+        timeoutSeconds: Double? = nil
+    ) async -> (status: Int32, output: String) {
+        let result = await BlockingLane.system.run {
+            let (status, output) = shell(
+                path, arguments, environment: environment, timeoutSeconds: timeoutSeconds)
+            return ShellResult(output: output, status: status)
+        }
+        return (status: result.status, output: result.output)
+    }
+
+    private struct ShellResult: Sendable {
+        var output: String
+        var status: Int32
+    }
+
     @discardableResult
     /** `environment` nil inherits this process's, which is what most callers
         want. Pass one to make the child's answer independent of who asked.
@@ -553,22 +583,23 @@ public enum LaunchdAdmin {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
-        /** Drained on another thread because the timeout path below waits on
-            termination first, and a read to EOF on this thread would block until
-            the child closed the pipe, which is the thing being timed out. The
-            untimed path could read inline as it always did; it shares this one
-            so both return output the same way. */
-        let collected = OSAllocatedUnfairLock(initialState: Data())
-        let drained = DispatchSemaphore(value: 0)
-        DispatchQueue.global(qos: .userInitiated).async {
+        guard let timeoutSeconds else {
+            /** Read to end of file on this thread before the wait, so a child
+                that fills the pipe buffer always has a reader and the call
+                needs no second thread. */
+            do {
+                try process.run()
+            } catch {
+                return (status: -1, output: String(describing: error))
+            }
             let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
-            collected.withLock { $0 = data }
-            drained.signal()
+            process.waitUntilExit()
+            return (status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
         }
         /** Installed before `run()`, not after: a child that exits in the window
             between `run()` returning and a later assignment is already terminated
             when the handler is set, and Foundation does not fire terminationHandler
-            for an already-dead process. The timeout path below would then wait out
+            for an already-dead process. The timeout below would then wait out
             its full ceiling and SIGKILL a pid the kernel may have recycled, and the
             PATH capture that rides this would silently fall back to `pathFloor`. */
         let exited = DispatchSemaphore(value: 0)
@@ -576,16 +607,19 @@ public enum LaunchdAdmin {
         do {
             try process.run()
         } catch {
-            drained.signal()
             return (status: -1, output: String(describing: error))
         }
-        guard let timeoutSeconds else {
-            process.waitUntilExit()
-            drained.wait()
-            return (
-                status: process.terminationStatus,
-                output: String(decoding: collected.withLock { $0 }, as: UTF8.self)
-            )
+        /** Drained on another thread because this path waits on termination
+            first, and a read to end of file on this thread would block until the
+            child closed the pipe, which is the thing being timed out. Started
+            only once a child exists: before that, this process holds the only
+            write end, and the reader would never see end of file. */
+        let collected = OSAllocatedUnfairLock(initialState: Data())
+        let drained = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
+            collected.withLock { $0 = data }
+            drained.signal()
         }
         if exited.wait(timeout: .now() + timeoutSeconds) == .timedOut {
             /** SIGKILL rather than SIGTERM: this is already the path where the

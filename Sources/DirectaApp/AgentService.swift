@@ -238,7 +238,8 @@ enum AgentService {
         }
         guard !LaunchdAdmin.deliberatelyStopped(paths: paths) else { return }
 
-        if !LaunchdAdmin.isAgentLoaded() {
+        let loaded = await LaunchdAdmin.isAgentLoaded()
+        if !loaded {
             guard escalate else { return }
             DirectaLog.app.info("agent enabled but not loaded; re-registering")
             try await reregister()

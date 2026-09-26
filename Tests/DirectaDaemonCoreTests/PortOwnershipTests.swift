@@ -615,7 +615,7 @@ import Testing
         }
         _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
         /** The reparented listener outlives the supervised tree by construction. */
-        for stray in PortGuard.listenerPids(port: port) { kill(pid_t(stray), SIGKILL) }
+        for stray in await PortGuard.listenerPids(port: port) { kill(pid_t(stray), SIGKILL) }
         #expect(settled.phase != .failed)
     }
 

@@ -311,7 +311,8 @@ import Testing
         #expect(await router.pruneMissingProjects(now: afterInterval) == 1)
         #expect(await registry.project(projectKey) == nil)
         #expect(kill(pid_t(pid), 0) != 0)
-        #expect(!PortGuard.isListening(port: try #require(started.server.effectivePort)))
+        let port = try #require(started.server.effectivePort)
+        #expect(await !PortGuard.isListening(port: port))
     }
 
     @Test func discardedWorktreeIsPrunedOnMachineWideStatus() async throws {

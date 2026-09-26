@@ -229,6 +229,7 @@ public actor Router {
                             id: head.id, result: CheckResult(errors: ["cannot read \(url.path)"]))
                     }
                     let hosts = await effectiveHosts(project: project, view: view)
+                    let worktree = await CheckoutIdentity.worktreeDisplay(project: project)
                     return try respond(
                         id: head.id,
                         result: CheckResult(
@@ -237,7 +238,7 @@ public actor Router {
                             serverHosts: hosts.isEmpty ? nil : hosts,
                             servers: view.specs.map(\.name),
                             warnings: view.warnings,
-                            worktree: CheckoutIdentity.worktreeDisplay(project: project)?.label))
+                            worktree: worktree?.label))
                 } catch let error as WireError {
                     return try respond(id: head.id, result: CheckResult(errors: [error.message]))
                 }
@@ -638,12 +639,13 @@ public actor Router {
             snapshot. Empty outside agent mode (`agentJobs == nil`), which is
             what makes every match below fail closed to the pre-existing
             bounce+respawn path. */
-        let adoptableChildJobs: [pid_t: LaunchdJobs.ChildJob] =
-            agentJobs.map { jobs in
-                Dictionary(
-                    jobs.listChildJobs().compactMap { job in job.pid.map { ($0, job) } },
-                    uniquingKeysWith: { first, _ in first })
-            } ?? [:]
+        var adoptableChildJobs: [pid_t: LaunchdJobs.ChildJob] = [:]
+        if let agentJobs {
+            let listed = await agentJobs.listChildJobs()
+            adoptableChildJobs = Dictionary(
+                listed.compactMap { job in job.pid.map { ($0, job) } },
+                uniquingKeysWith: { first, _ in first })
+        }
         var toStart: [(project: String, spec: ServerSpec)] = []
         for (id, persisted) in await registry.allPersistedState() {
             guard let parsed = parseServerID(id) else { continue }
@@ -785,9 +787,10 @@ public actor Router {
                     keepingPids.insert(pid)
                 }
             }
-            let staleJobs = LaunchdJobs.stale(agentJobs.listChildJobs(), keepingPids: keepingPids)
+            let listed = await agentJobs.listChildJobs()
+            let staleJobs = LaunchdJobs.stale(listed, keepingPids: keepingPids)
             for job in staleJobs {
-                agentJobs.bootOut(job)
+                await agentJobs.bootOut(job)
             }
             if !staleJobs.isEmpty {
                 DirectaLog.daemon.info("reaped \(staleJobs.count) leftover child launchd job(s)")
@@ -1202,13 +1205,14 @@ public actor Router {
         let data = try JSONCoding.fileEncoder().encode(config)
         let content = String(decoding: data, as: UTF8.self) + "\n"
         let hosts = await effectiveHosts(project: project, view: view)
+        let worktree = await CheckoutIdentity.worktreeDisplay(project: project)
         let check = CheckResult(
             errors: view.errors,
             host: view.host,
             serverHosts: hosts.isEmpty ? nil : hosts,
             servers: view.specs.map(\.name),
             warnings: view.warnings,
-            worktree: CheckoutIdentity.worktreeDisplay(project: project)?.label)
+            worktree: worktree?.label)
         guard params.dryRun != true else {
             return InitConfigResult(
                 check: check, content: content,
@@ -1317,9 +1321,11 @@ public actor Router {
             }
             if let busy = await firstBusyPort(in: draftClaim, excluding: targetID) {
                 let holder = await managedHolder(port: busy.port, excluding: targetID)
-                if let holder, CheckoutIdentity.shareCommonDir(target.project, holder.project),
-                    draftClaim.relative.contains(busy.port)
-                {
+                var holderIsSibling = false
+                if let holder, draftClaim.relative.contains(busy.port) {
+                    holderIsSibling = await CheckoutIdentity.shareCommonDir(target.project, holder.project)
+                }
+                if let holder, holderIsSibling {
                     let rebound = await allocateSiblingPort(
                         declared: declaredPort ?? port, excluding: targetID, project: target.project,
                         spec: spec)
@@ -1341,14 +1347,16 @@ public actor Router {
                         message:
                             "port \(busy.port) is held by managed server '\(holder.server)' in \(holder.project)"
                     )
-                } else if let squatter = PortGuard.listenerInfo(port: busy.port) {
-                    throw WireError(
-                        code: .portHeld,
-                        hint: "run: kill \(squatter.pid)  (verify first: ps -p \(squatter.pid))",
-                        message:
-                            "port \(busy.port) is held by unmanaged pid \(squatter.pid) (\(squatter.command))"
-                    )
                 } else {
+                    let squatter = await PortGuard.listenerInfo(port: busy.port)
+                    if let squatter {
+                        throw WireError(
+                            code: .portHeld,
+                            hint: "run: kill \(squatter.pid)  (verify first: ps -p \(squatter.pid))",
+                            message:
+                                "port \(busy.port) is held by unmanaged pid \(squatter.pid) (\(squatter.command))"
+                        )
+                    }
                     throw WireError(
                         code: .portHeld,
                         message: "port \(busy.port) already has a listener that directa does not manage"
@@ -1796,7 +1804,7 @@ public actor Router {
         /** Probed before the holder read, for the reason `firstBusyPort` gives. */
         let listening = await portProbe.isListening(port)
         if let holder = await managedHolder(port: port, excluding: excluding) {
-            let sibling = CheckoutIdentity.shareCommonDir(status.project, holder.project)
+            let sibling = await CheckoutIdentity.shareCommonDir(status.project, holder.project)
             annotated.portConflict = PortConflict(
                 declaredPort: port,
                 holder: "\(holder.server)@\(holder.project)",
@@ -1805,9 +1813,8 @@ public actor Router {
                     : "port \(port) held by '\(holder.server)' in \(holder.project); run: directa stop \(ShellWord.argument(holder.server)) --project \(ShellWord.argument(holder.project))",
                 state: .held)
         } else if listening {
-            let detail = PortGuard.listenerInfo(port: port).map {
-                "unmanaged pid \($0.pid) (\($0.command))"
-            } ?? "an unmanaged listener"
+            let listener = await PortGuard.listenerInfo(port: port)
+            let detail = listener.map { "unmanaged pid \($0.pid) (\($0.command))" } ?? "an unmanaged listener"
             annotated.portConflict = PortConflict(
                 declaredPort: port,
                 holder: detail,
@@ -2040,9 +2047,17 @@ public actor Router {
             }
             return existing
         }
+        let worktree = await CheckoutIdentity.worktreeDisplay(project: project)
+        /** The git read above suspends this actor, so a concurrent call for
+            the same server may have created its supervisor meanwhile; that
+            one wins and goes through the existing-supervisor path, so one
+            server never has two supervisors. */
+        if supervisors[id] != nil {
+            return await supervisor(project: project, spec: spec)
+        }
         let created = ServerSupervisor(
             events: events, launcher: launcher, paths: paths, projectPath: project,
-            registry: registry, spec: spec, stopTiming: stopTiming)
+            registry: registry, spec: spec, stopTiming: stopTiming, worktree: worktree)
         supervisors[id] = created
         return created
     }

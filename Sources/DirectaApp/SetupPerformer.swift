@@ -380,7 +380,7 @@ enum SetupPerformer: Sendable {
                 leaveMountedVolume()
                 return
             }
-            let open = LaunchdAdmin.shell("/usr/bin/open", [SetupPlanner.applicationsAppPath])
+            let open = await LaunchdAdmin.shell("/usr/bin/open", [SetupPlanner.applicationsAppPath])
             if open.status == 0 {
                 _ = await waitForPeer(atPath: appsPath, otherThan: selfPID, seconds: 5)
             }

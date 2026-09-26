@@ -10,5 +10,5 @@ public struct PortProbe: Sendable {
         self.isListening = isListening
     }
 
-    public static let live = PortProbe { LoopbackProbe.isListening(port: $0) }
+    public static let live = PortProbe { await PortGuard.isListening(port: $0) }
 }

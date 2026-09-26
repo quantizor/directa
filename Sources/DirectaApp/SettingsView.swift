@@ -232,7 +232,7 @@ struct SettingsView: View {
         Task { @MainActor in
             _ = await Task.detached(priority: .userInitiated) {
                 try? await AgentService.unregisterAllLaunchItems()
-                LaunchdAdmin.shell(cli.path, ["uninstall"])
+                await LaunchdAdmin.shell(cli.path, ["uninstall"])
             }.value
             try? FileManager.default.trashItem(
                 at: Bundle.main.bundleURL, resultingItemURL: nil)

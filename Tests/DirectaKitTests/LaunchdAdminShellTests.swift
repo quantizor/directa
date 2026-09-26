@@ -27,4 +27,28 @@ import Testing
         #expect(result.status == 0)
         #expect(result.output.utf8.count == target)
     }
+
+    /** The timed path drains on a helper thread while it waits on
+        termination; it returns the same full output. */
+    @Test func aTimedChildWritingPastOnePipeBufferStillReturnsInFull() {
+        let target = 200_000
+        let result = LaunchdAdmin.shell(
+            "/bin/sh", ["-c", "yes | head -c \(target)"], timeoutSeconds: 10)
+        #expect(result.status == 0)
+        #expect(result.output.utf8.count == target)
+    }
+
+    @Test func aCommandThatCannotStartReportsMinusOneOnEitherPath() {
+        let missing = "/nonexistent/directa-shell-\(UUID().uuidString)"
+        #expect(LaunchdAdmin.shell(missing, []).status == -1)
+        #expect(LaunchdAdmin.shell(missing, [], timeoutSeconds: 1).status == -1)
+    }
+
+    /** The form async code calls answers exactly like the synchronous one. */
+    @Test func theAsyncFormReturnsStatusAndFullOutput() async {
+        let target = 200_000
+        let result = await LaunchdAdmin.shell("/bin/sh", ["-c", "yes | head -c \(target); exit 4"])
+        #expect(result.status == 4)
+        #expect(result.output.utf8.count == target)
+    }
 }

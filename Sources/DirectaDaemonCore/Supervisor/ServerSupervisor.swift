@@ -157,11 +157,14 @@ public actor ServerSupervisor {
     private var stopReason = ""
     /** Durable why evidence across ensure truncate / daemon rehydrate. */
     private var terminalEvidence: [String]?
-    /** Linked-worktree display identity, computed once at creation:
-        status.worktree and status.mainProject. Nil for a main checkout; the
-        pair never alters the host. */
-    private var worktreeLabel: String?
-    private var mainProjectSlug: String?
+    /** Linked-worktree display identity, fixed at creation from the `worktree`
+        the creator resolved (`CheckoutIdentity.worktreeDisplay`, which runs
+        git, so never per status read or per spawn): status.worktree and
+        status.mainProject. A worktree project whose servers are stopped or
+        restored still reports its label. Nil for a main checkout; the pair
+        never alters the host. */
+    private let worktreeLabel: String?
+    private let mainProjectSlug: String?
     /** Identifies this supervisor's state writes to `Registry.updateState`, so
         `Registry.retireState` refuses a dropped supervisor's late write
         without blocking a later supervisor for the same server. */
@@ -176,7 +179,8 @@ public actor ServerSupervisor {
         registry: Registry,
         spec: ServerSpec,
         stallBounds: (minSeconds: Int, maxSeconds: Int) = (10, 300),
-        stopTiming: StopTiming = .standard
+        stopTiming: StopTiming = .standard,
+        worktree: WorktreeDisplay? = nil
     ) {
         self.events = events
         self.launcher = launcher
@@ -191,13 +195,8 @@ public actor ServerSupervisor {
         self.stallBounds = stallBounds
         self.stopTiming = stopTiming
         self.stoppingWaitBound = .seconds(stopTiming.graceSeconds + stopTiming.overtimeSeconds)
-        /** Computed once at creation, not per status read (it shells out to git)
-            and not per spawn: a worktree project whose servers are stopped or
-            restored still reports its label. */
-        if let display = CheckoutIdentity.worktreeDisplay(project: project) {
-            self.worktreeLabel = display.label
-            self.mainProjectSlug = display.mainProject
-        }
+        self.worktreeLabel = worktree?.label
+        self.mainProjectSlug = worktree?.mainProject
         let id = serverID(project: project, name: spec.name)
         if let persisted = AtomicFile.loadDefensively(StateFile.self, from: paths.stateFile)?
             .servers[id] {
@@ -846,7 +845,7 @@ public actor ServerSupervisor {
         let generation = listenScanGeneration
         Task { [weak self] in
             let pids = [rootPid] + ProcessTree.descendants(of: rootPid).pids
-            let ports = PortGuard.listeningPorts(pids: pids)
+            let ports = await PortGuard.listeningPorts(pids: pids)
             await self?.applyListenScan(
                 expected: expected, generation: generation, ours: pids.map(Int.init),
                 ports: ports)
@@ -859,7 +858,7 @@ public actor ServerSupervisor {
         guard generation == listenScanGeneration else { return }
         await recordObservedPort(ports: ports)
         guard let expected else { return }
-        let owners = PortGuard.listenerPids(port: expected)
+        let owners = await PortGuard.listenerPids(port: expected)
         await recordPortOwnership(expected: expected, owners: owners, ours: ours)
     }
 
@@ -917,9 +916,9 @@ public actor ServerSupervisor {
         let mine = Set(ours)
         let foreign = owners.filter { !mine.contains($0) }
         guard !foreign.isEmpty else { return }
-        let described = foreign
-            .map { "pid \($0) (\(PortGuard.commandForPid($0)))" }
-            .joined(separator: ", ")
+        let described = await BlockingLane.system.run {
+            foreign.map { "pid \($0) (\(PortGuard.commandForPid($0)))" }.joined(separator: ", ")
+        }
         let thief = await managedOwner(among: foreign)
         /** We hold a listener too, so the server is serving; the port is just
             not exclusively ours and a probe may reach either side. */

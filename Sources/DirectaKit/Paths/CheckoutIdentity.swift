@@ -1,5 +1,4 @@
 import Foundation
-import os
 
 /** Git checkout identity helpers for sibling port rebind, the worktree
     display label, and project resolution. The linked-worktree checks read
@@ -91,7 +90,7 @@ public enum CheckoutIdentity {
         (callback allow lists, cookie domains, trusted origins) pins one
         origin. Sibling checkouts are told apart by the rebound port instead.
         Nil for main checkouts and non-git trees. */
-    public static func worktreeDisplay(project: String) -> (label: String, mainProject: String)? {
+    public static func worktreeDisplay(project: String) -> WorktreeDisplay? {
         guard isLinkedWorktree(project: project),
             let listing = git(project: project, args: ["worktree", "list", "--porcelain"])
         else { return nil }
@@ -100,10 +99,9 @@ public enum CheckoutIdentity {
             .first(where: { $0.hasPrefix("worktree ") })
         else { return nil }
         let main = canonicalProjectPath(String(line.dropFirst("worktree ".count)))
-        return (
+        return WorktreeDisplay(
             label: sanitizeLabel((project as NSString).lastPathComponent),
-            mainProject: ProjectConfigLoader.defaultSlug(project: main)
-        )
+            mainProject: ProjectConfigLoader.defaultSlug(project: main))
     }
 
     /** Stable free-port candidate near the declared port for sibling rebind. */
@@ -131,50 +129,78 @@ public enum CheckoutIdentity {
         return URL(fileURLWithPath: project).appending(path: path).path
     }
 
-    private static func git(project: String, args: [String]) -> String? {
+    /** How long one git read may run before it is terminated and answers nil.
+        The async forms share a fixed-width lane, so a git that never returns
+        would otherwise hold a lane thread, and every project's reads queued
+        behind it, forever. */
+    static let gitTimeoutSeconds: Double = 10
+
+    /** Blocks the calling thread until git exits. stderr goes to /dev/null
+        (only stdout answers the caller, and a git warning must not mix in),
+        which leaves one pipe, read to end of file on this same thread before
+        the wait: a git that fills the stdout buffer never blocks on a write
+        nothing is reading, and no helper thread is needed. */
+    static func git(
+        project: String, args: [String], timeoutSeconds: Double = gitTimeoutSeconds
+    ) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = args
         process.currentDirectoryURL = URL(fileURLWithPath: project)
         let out = Pipe()
-        let err = Pipe()
         process.standardOutput = out
-        process.standardError = err
+        process.standardError = FileHandle.nullDevice
         do {
             try process.run()
         } catch {
             return nil
         }
-        /** Both pipes are drained on background threads started only once
-            `run()` has actually spawned a process, never before: starting
-            them unconditionally left two threads blocked forever reading a
-            pipe this process itself still held the write end of whenever
-            `run()` threw before spawning anything to eventually close it.
-            Once spawned, draining before `waitUntilExit` (not after) is still
-            required: a git that fills either buffer (a long "detached HEAD"
-            or "unsafe repository" warning on stderr counts) would block on a
-            write nothing is reading, and this call would then block forever
-            waiting for an exit that write can no longer reach. stderr's bytes
-            are discarded once drained; only stdout answers the caller, unlike
-            a git warning mixed in. */
-        let stdout = OSAllocatedUnfairLock(initialState: Data())
-        let drained = DispatchGroup()
-        drained.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
-            stdout.withLock { $0 = (try? out.fileHandleForReading.readToEnd()) ?? Data() }
-            drained.leave()
-        }
-        drained.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
-            _ = try? err.fileHandleForReading.readToEnd()
-            drained.leave()
-        }
+        /** Terminating git closes its end of the pipe, which ends the read
+            below. A timer, not a thread: nothing waits for it. */
+        let deadline = DispatchWorkItem { process.terminate() }
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + timeoutSeconds, execute: deadline)
+        let data = (try? out.fileHandleForReading.readToEnd()) ?? Data()
         process.waitUntilExit()
-        drained.wait()
-        guard process.terminationStatus == 0 else { return nil }
-        guard let text = String(data: stdout.withLock { $0 }, encoding: .utf8)?
+        deadline.cancel()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else { return nil }
+        guard let text = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty
         else { return nil }
         return text
+    }
+}
+
+/** A linked worktree's checkout-directory label and its main checkout's slug. */
+public struct WorktreeDisplay: Equatable, Sendable {
+    public var label: String
+    public var mainProject: String
+
+    public init(label: String, mainProject: String) {
+        self.label = label
+        self.mainProject = mainProject
+    }
+}
+
+/** The forms async code calls: each runs its synchronous namesake on
+    `BlockingLane.repository`, so a git stuck on a slow or locked repository
+    parks one lane thread instead of a cooperative-pool thread. Swift picks
+    these over the synchronous forms in any async context, and the synchronous
+    forms remain for the CLI and app code that is not on the pool. */
+extension CheckoutIdentity {
+    public static func gitCommonDir(project: String) async -> String? {
+        await BlockingLane.repository.run { gitCommonDir(project: project) }
+    }
+
+    public static func isLinkedWorktree(project: String) async -> Bool {
+        await BlockingLane.repository.run { isLinkedWorktree(project: project) }
+    }
+
+    public static func shareCommonDir(_ a: String, _ b: String) async -> Bool {
+        await BlockingLane.repository.run { shareCommonDir(a, b) }
+    }
+
+    public static func worktreeDisplay(project: String) async -> WorktreeDisplay? {
+        await BlockingLane.repository.run { worktreeDisplay(project: project) }
     }
 }

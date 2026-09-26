@@ -55,7 +55,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                 SpawnError(
                     errno: nil, message: "cannot write job plist: \(error.localizedDescription)"))
         }
-        let bootstrap = LaunchdAdmin.shell(
+        let bootstrap = await LaunchdAdmin.shell(
             "/bin/launchctl", ["bootstrap", domain, plistURL.path])
         if bootstrap.status != 0 {
             try? FileManager.default.removeItem(at: plistURL)
@@ -64,10 +64,28 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                     errno: nil,
                     message: "launchctl bootstrap failed: \(bootstrap.output)"))
         }
-        defer {
-            _ = LaunchdAdmin.shell("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
-            try? FileManager.default.removeItem(at: plistURL)
-        }
+        let outcome = await watchBootstrapped(
+            domain: domain, label: label, onExitedBeforeWatch: onExitedBeforeWatch, onSpawn: onSpawn)
+        await Self.bootOut(domain: domain, label: label)
+        return outcome
+    }
+
+    /** `launchctl bootout` for a finished job, then best-effort removal of its
+        temp plist. */
+    private static func bootOut(domain: String, label: String) async {
+        _ = await LaunchdAdmin.shell("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
+        let plistURL = FileManager.default.temporaryDirectory.appending(path: "\(label).plist")
+        try? FileManager.default.removeItem(at: plistURL)
+    }
+
+    /** Everything `run` does between a successful bootstrap and the bootout:
+        the job stays bootstrapped throughout, which is what keeps launchd's
+        exit record readable on every path here. */
+    private func watchBootstrapped(
+        domain: String, label: String,
+        onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
+        onSpawn: @escaping @Sendable (pid_t) async -> Void
+    ) async -> ProcessOutcome {
         let pid: pid_t
         switch await Self.waitUntilPidPublished(domain: domain, label: label) {
         case .published(let published):
@@ -123,8 +141,8 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                 lingering zombie and an already-reaped pid, so arming here
                 could only ever succeed by matching a *different*, recycled
                 process that reused the pid number, never the one that just
-                died. The job is still bootstrapped (the bootout is in the
-                defer), so launchd's own record of the exit is read instead of
+                died. The job is still bootstrapped (`run` boots it out only
+                after this returns), so launchd's own record of the exit is read instead of
                 risking a watch on the wrong process. `onExitedBeforeWatch`
                 runs so the tailers drain whatever the child already wrote to its
                 spool files before dying: skipping it, as every other
@@ -162,22 +180,19 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         }
     }
 
-    /** Waits on the surviving half of a jetsam SIGKILL, where `run`'s defer
+    /** Waits on the surviving half of a jetsam SIGKILL, where `run`'s
         bootout never ran. `label` is the job's existing registration,
         discovered by the caller through `LaunchdJobs.loadChildJobs()` matching
         on pid; nothing is bootstrapped here. Once the process exits, replicates
-        `run`'s defer cleanup: `launchctl bootout` the label and best-effort
+        `run`'s cleanup: `launchctl bootout` the label and best-effort
         remove its temp plist (already gone in the common case, since the
         daemon that spawned it wrote and removed that file itself; the removal
         here only covers a plist a crashed prior daemon left behind). */
     public func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
-        defer {
-            let domain = LaunchdJobs.guiDomain
-            _ = LaunchdAdmin.shell("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
-            let plistURL = FileManager.default.temporaryDirectory.appending(path: "\(label).plist")
-            try? FileManager.default.removeItem(at: plistURL)
-        }
-        return await ExitWatcher.shared.wait(pid: pid)
+        let domain = LaunchdJobs.guiDomain
+        let outcome = await ExitWatcher.shared.wait(pid: pid)
+        await Self.bootOut(domain: domain, label: label)
+        return outcome
     }
 
     /** launchd places the job in process group 1. Group teardown needs
@@ -252,7 +267,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         job not running with an exit record. */
     private static func launchdExitRecord(domain: String, label: String) async -> ProcessOutcome {
         await exitRecord(attempts: exitRecordAttempts, interval: exitRecordInterval) {
-            let printed = LaunchdAdmin.shell("/bin/launchctl", ["print", "\(domain)/\(label)"])
+            let printed = await LaunchdAdmin.shell("/bin/launchctl", ["print", "\(domain)/\(label)"])
             return printed.status == 0 ? LaunchdJobs.parseAgentPrint(printed.output) : nil
         }
     }
@@ -280,7 +295,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
 
     private static func waitUntilPidPublished(domain: String, label: String) async -> PidPoll {
         for _ in 0..<40 {
-            let printed = LaunchdAdmin.shell("/bin/launchctl", ["print", "\(domain)/\(label)"])
+            let printed = await LaunchdAdmin.shell("/bin/launchctl", ["print", "\(domain)/\(label)"])
             if printed.status == 0 {
                 let status = LaunchdJobs.parseAgentPrint(printed.output)
                 if let pid = status.pid { return .published(pid) }

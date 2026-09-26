@@ -115,7 +115,12 @@ public struct DeepLinkRunner: Sendable {
         for status in list.servers where seen.insert(status.project).inserted {
             paths.append(status.project)
         }
-        switch DeepLink.resolveProject(slug: slug, against: paths) {
+        /** Telling a main checkout from a linked worktree can run `git`. */
+        let candidates = paths
+        let resolved = await BlockingLane.repository.run {
+            DeepLink.resolveProject(slug: slug, against: candidates)
+        }
+        switch resolved {
         case .success(let path):
             return path
         case .failure(let error):

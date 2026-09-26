@@ -1476,7 +1476,7 @@ struct Open: AsyncParsableCommand {
                     message: "\(name) has no URL (no port declared and no url configured)"),
                 json: global.json)
         }
-        LaunchdAdmin.shell("/usr/bin/open", [url])
+        await LaunchdAdmin.shell("/usr/bin/open", [url])
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in "opened \(url)" }
     }
 }
@@ -1573,7 +1573,7 @@ struct CLIDeepLinkEffects: DeepLinkEffects {
     }
 
     func openBrowser(_ url: URL) async {
-        _ = LaunchdAdmin.shell("/usr/bin/open", [url.absoluteString])
+        _ = await LaunchdAdmin.shell("/usr/bin/open", [url.absoluteString])
     }
 }
 
@@ -1867,7 +1867,7 @@ struct Doctor: AsyncParsableCommand {
             findings.append(
                 Finding(detail: "daemon not responding (run: directa daemon status)", kind: "daemon", severity: "error"))
         }
-        let printed = LaunchdAdmin.shell(
+        let printed = await LaunchdAdmin.shell(
             "/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)"])
         findings.append(
             Finding(

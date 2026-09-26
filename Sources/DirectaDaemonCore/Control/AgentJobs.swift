@@ -13,24 +13,24 @@ import Foundation
     this seam entirely. */
 public struct AgentJobs: Sendable {
     /** `launchctl bootout` for one child-job label. */
-    public var bootOut: @Sendable (LaunchdJobs.ChildJob) -> Void
+    public var bootOut: @Sendable (LaunchdJobs.ChildJob) async -> Void
     /** `launchctl list`, filtered to directa's child-job labels. */
-    public var listChildJobs: @Sendable () -> [LaunchdJobs.ChildJob]
+    public var listChildJobs: @Sendable () async -> [LaunchdJobs.ChildJob]
 
     public init(
-        bootOut: @escaping @Sendable (LaunchdJobs.ChildJob) -> Void,
-        listChildJobs: @escaping @Sendable () -> [LaunchdJobs.ChildJob]
+        bootOut: @escaping @Sendable (LaunchdJobs.ChildJob) async -> Void,
+        listChildJobs: @escaping @Sendable () async -> [LaunchdJobs.ChildJob]
     ) {
         self.bootOut = bootOut
         self.listChildJobs = listChildJobs
     }
 
     /** The real seam: `launchctl list` and `launchctl bootout` against the gui
-        domain. `Router`'s default builds this only when
-        `LaunchdJobLauncher.runningAsAgent` is true, so a directly constructed
-        Router (every test, any embedder) never touches real launchd state
-        unless it opts in explicitly. */
+        domain, each on `BlockingLane.system`. `Router`'s default builds this
+        only when `LaunchdJobLauncher.runningAsAgent` is true, so a directly
+        constructed Router (every test, any embedder) never touches real
+        launchd state unless it opts in explicitly. */
     public static let live = AgentJobs(
-        bootOut: LaunchdJobs.bootOut,
-        listChildJobs: LaunchdJobs.loadChildJobs)
+        bootOut: { job in await BlockingLane.system.run { LaunchdJobs.bootOut(job) } },
+        listChildJobs: { await BlockingLane.system.run(LaunchdJobs.loadChildJobs) })
 }

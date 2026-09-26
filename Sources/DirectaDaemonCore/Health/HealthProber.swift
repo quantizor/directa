@@ -100,7 +100,10 @@ public struct NetworkHealthProber: HealthProber {
                 return (try? await Self.httpResponds(v6)) ?? false
             }
         case .tcp(let port, let timeoutMs):
-            return LoopbackProbe.isListening(port: port, timeoutMs: timeoutMs)
+            /** The connect waits in `poll(2)` for up to the configured timeout. */
+            return await BlockingLane.system.run {
+                LoopbackProbe.isListening(port: port, timeoutMs: timeoutMs)
+            }
         }
     }
 
@@ -202,5 +205,31 @@ public enum PortGuard {
         let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
         process.waitUntilExit()
         return String(data: data, encoding: .utf8)
+    }
+}
+
+/** The forms async code calls: each runs its synchronous namesake on
+    `BlockingLane.system`, since `lsof` and `ps` block their caller until they
+    exit and a loopback connect waits in `poll(2)`. Swift picks these over the
+    synchronous forms in any async context. */
+extension PortGuard {
+    public static func commandForPid(_ pid: Int) async -> String {
+        await BlockingLane.system.run { commandForPid(pid) }
+    }
+
+    public static func isListening(port: Int) async -> Bool {
+        await BlockingLane.system.run { isListening(port: port) }
+    }
+
+    public static func listenerInfo(port: Int) async -> (pid: Int, command: String)? {
+        await BlockingLane.system.run { listenerInfo(port: port) }
+    }
+
+    public static func listenerPids(port: Int) async -> [Int] {
+        await BlockingLane.system.run { listenerPids(port: port) }
+    }
+
+    public static func listeningPorts(pids: [pid_t]) async -> [Int] {
+        await BlockingLane.system.run { listeningPorts(pids: pids) }
     }
 }
