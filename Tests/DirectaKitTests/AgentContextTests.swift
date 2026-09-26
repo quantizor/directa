@@ -430,3 +430,37 @@ import Testing
         #expect(text.hasSuffix("</directa-servers>"))
     }
 }
+
+/** The shared check every agent-facing command hint runs a server name
+    through, and the quoting a path gets. */
+@Suite struct ShellWordTests {
+    @Test func anArgumentStaysBareOnlyWhenEveryCharacterIsPlain() {
+        #expect(ShellWord.argument("web") == "web")
+        #expect(ShellWord.argument("/Users/me/app-v2/.claude/worktrees/x_1") == "/Users/me/app-v2/.claude/worktrees/x_1")
+        #expect(ShellWord.argument("/Users/me/my app") == "'/Users/me/my app'")
+        #expect(ShellWord.argument("web; rm -rf ~") == "'web; rm -rf ~'")
+        #expect(ShellWord.argument("it's") == "'it'\\''s'")
+        #expect(ShellWord.argument("") == "''")
+    }
+
+    @Test(arguments: ["web", "api-v2", "my_app.dev", String(repeating: "a", count: 64)])
+    func anInertWordPassesThrough(word: String) {
+        #expect(ShellWord.isInert(word))
+        #expect(ShellWord.inertOr(word) == word)
+    }
+
+    @Test(arguments: [
+        "", "web; rm -rf ~", "web\"x", "my server", "$(id)", "web`id`", "wéb", "a|b", "it's",
+        String(repeating: "a", count: 65),
+    ])
+    func anythingElseBecomesThePlaceholder(word: String) {
+        #expect(!ShellWord.isInert(word))
+        #expect(ShellWord.inertOr(word) == "<name>")
+    }
+
+    @Test func singleQuotingEscapesEmbeddedQuotes() {
+        #expect(ShellWord.singleQuoted("/Users/me/app") == "'/Users/me/app'")
+        #expect(ShellWord.singleQuoted("/tmp/it's here") == #"'/tmp/it'\''s here'"#)
+        #expect(ShellWord.singleQuoted("$(id) `x`") == "'$(id) `x`'")
+    }
+}

@@ -200,6 +200,81 @@ private func makeEnv() throws -> TestEnv {
         #expect(cleared, "server never left .stopping after the bounded wait gave up")
     }
 
+    private func awaitPhase(_ phase: ServerPhase, of supervisor: ServerSupervisor) async throws {
+        for _ in 0..<50 where await supervisor.status().phase != phase {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(await supervisor.status().phase == phase)
+    }
+
+    /** A `start()` that joins a stop which never lands gives up with the
+        stop's own bound (grace plus overtime, 0.15 s here) and reports the
+        honest `.stopping`, rather than holding its caller until the run
+        finally exits. The gate opens after 1 s on its own, so an unbounded
+        join is observed as a late return that restarted the server. */
+    @Test func startJoiningAStuckStopGivesUpWithTheStopsOwnBound() async throws {
+        let env = try makeEnv()
+        let gate = AdoptGate()
+        let supervisor = ServerSupervisor(
+            launcher: StuckRunLauncher(gate: gate), paths: env.paths, projectPath: env.projectPath,
+            registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "stuck"),
+            stopWaitOvertimeSeconds: 0.1)
+        #expect(await supervisor.start().pid != nil)
+
+        async let stopped = supervisor.stop(graceSeconds: 0.05, reason: "test")
+        try await awaitPhase(.stopping, of: supervisor)
+        let release = Task {
+            try? await Task.sleep(for: .seconds(1))
+            await gate.signal(.signaled(signal: Int(SIGKILL)))
+        }
+
+        let joinStart = ContinuousClock.now
+        let joined = await supervisor.start()
+        let waited = joinStart.duration(to: .now)
+        #expect(joined.phase == .stopping)
+        #expect(waited < .milliseconds(700), "start waited \(waited) on a stop bounded at 0.15 s")
+
+        release.cancel()
+        await release.value
+        _ = await stopped
+    }
+
+    /** An `ensure()` that first waits out a stop spends only what is left of
+        its timeout afterwards: the stop clears at 0.6 s, the fresh run (no
+        healthcheck, so a 2 s stabilization window) cannot turn healthy, and
+        the whole call times out near its 1 s budget rather than 0.6 s plus
+        a second full second. */
+    @Test func ensureAfterAStopClearsSpendsOnlyTheRemainingTimeout() async throws {
+        let env = try makeEnv()
+        let gate = AdoptGate()
+        let supervisor = ServerSupervisor(
+            launcher: StuckRunLauncher(gate: gate), paths: env.paths, projectPath: env.projectPath,
+            registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "stuck"),
+            stopWaitOvertimeSeconds: 0.1)
+        #expect(await supervisor.start().pid != nil)
+
+        async let stopped = supervisor.stop(graceSeconds: 0.05, reason: "test")
+        try await awaitPhase(.stopping, of: supervisor)
+        let release = Task {
+            try? await Task.sleep(for: .milliseconds(600))
+            await gate.signal(.signaled(signal: Int(SIGKILL)))
+        }
+
+        let ensureStart = ContinuousClock.now
+        let result = await supervisor.ensure(timeoutSeconds: 1)
+        let waited = ensureStart.duration(to: .now)
+        #expect(result.reason == .timeout)
+        #expect(waited < .milliseconds(1_350), "ensure took \(waited) against a 1 s timeout")
+
+        await release.value
+        _ = await stopped
+        /** The fresh run's survivor dies to this stop's SIGKILL; the gate's
+            second signal lets its fake `run()` return. */
+        async let cleanup = supervisor.stop(graceSeconds: 0.05, reason: "test cleanup")
+        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        _ = await cleanup
+    }
+
     /** Two self-exits in the stall window (nonzero, bounded lifetime, never
         healthy) are the crash-loop an interactive credential prompt produces:
         surfaced as blockedOn, persisted across a daemon restart, and cleared

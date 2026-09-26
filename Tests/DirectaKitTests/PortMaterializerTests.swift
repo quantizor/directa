@@ -232,9 +232,9 @@ import Testing
         let worktreeSubmodule: URL
     }
 
-    private func makeGitLayout() throws -> GitLayout {
+    private func makeGitLayout(prefix: String = "directa-gitlayout-") throws -> GitLayout {
         let base = URL(fileURLWithPath: canonicalProjectPath(FileManager.default.temporaryDirectory.path))
-            .appending(path: "directa-gitlayout-\(UUID().uuidString)")
+            .appending(path: "\(prefix)\(UUID().uuidString)")
         let main = base.appending(path: "main")
         let source = base.appending(path: "sub-source")
         for dir in [main, source] {
@@ -311,9 +311,10 @@ import Testing
             declared
                 == WireError(
                     code: .notFound,
-                    hint: "commit or copy devservers.json from \(main) into this worktree, or pass --project \(main)",
+                    hint: "run: directa status --project '\(main)'",
                     message:
-                        "no server named 'web' in \(worktree): this linked worktree has no devservers.json, and its main checkout \(main) declares 'web'"
+                        "no server named 'web' in \(worktree): this linked worktree has no devservers.json, and its main checkout \(main) declares 'web'; "
+                        + "commit or copy devservers.json into this worktree, or pass --project with the main checkout's path"
                 ))
         #expect(
             ProjectConfigLoader.serverNotFound(name: "api", project: worktree)
@@ -326,6 +327,19 @@ import Testing
         try JSONCoding.fileEncoder().encode(ProjectFileConfig(servers: [:]))
             .write(to: layout.worktree.appending(path: "devservers.json"))
         #expect(ProjectConfigLoader.serverNotFound(name: "web", project: worktree).hint == "run: directa status --json")
+    }
+
+    /** The hint is a command a reader pastes, so a main checkout path with a
+        quote and a space still arrives as one argument. */
+    @Test func serverNotFoundQuotesAMainCheckoutPathHoldingAQuoteAndASpace() throws {
+        let layout = try makeGitLayout(prefix: "it's a checkout ")
+        defer { try? FileManager.default.removeItem(at: layout.base) }
+        let config = ProjectFileConfig(servers: ["web": ProjectFileServer(command: ["bun", "dev"])])
+        try JSONCoding.fileEncoder().encode(config).write(to: layout.main.appending(path: "devservers.json"))
+        let quoted = layout.main.path.replacing("'", with: #"'\''"#)
+        #expect(
+            ProjectConfigLoader.serverNotFound(name: "web", project: layout.worktree.path).hint
+                == "run: directa status --project '\(quoted)'")
     }
 
     @Test func worktreeDisplayAnswersNilForAMissingWorkingDirectory() {

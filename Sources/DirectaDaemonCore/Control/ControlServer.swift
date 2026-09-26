@@ -352,7 +352,7 @@ public actor Router {
                     guard let markDate = await supervisor.resolveMark(markID) else {
                         throw WireError(
                             code: .notFound,
-                            hint: "run: directa logs \(request.params.name) --stream mark",
+                            hint: "run: directa logs \(ShellWord.argument(request.params.name)) --stream mark",
                             message: "no mark with id '\(markID)' in \(request.params.name)'s log")
                     }
                     since = markDate
@@ -1065,7 +1065,7 @@ public actor Router {
                 else {
                     throw WireError(
                         code: .alreadyExists,
-                        hint: "run: directa register --name \(name) --write --force",
+                        hint: "run: directa register --name \(ShellWord.argument(name)) --write --force",
                         message: "\(url.path) already declares '\(name)'; pass --force to replace that entry")
                 }
                 merged = next
@@ -1184,7 +1184,7 @@ public actor Router {
             } else if !trusted {
                 throw WireError(
                     code: .notTrusted,
-                    hint: "run: directa ensure \(target.name) --project \(target.project)",
+                    hint: "run: directa ensure \(ShellWord.argument(target.name)) --project \(ShellWord.argument(target.project))",
                     message:
                         "refusing to start '\(target.name)' from \(target.project)/devservers.json: this project's committed config has not been approved. Start a server there once by hand to approve it.")
             }
@@ -1232,7 +1232,7 @@ public actor Router {
                         "port-held \(busy.port) by \(holder.server)@\(holder.project) for \(target.name)")
                     throw WireError(
                         code: .portHeld,
-                        hint: "run: directa stop \(holder.server) --project \(holder.project)",
+                        hint: "run: directa stop \(ShellWord.argument(holder.server)) --project \(ShellWord.argument(holder.project))",
                         message:
                             "port \(busy.port) is held by managed server '\(holder.server)' in \(holder.project)"
                     )
@@ -1714,7 +1714,7 @@ public actor Router {
                 holder: "\(holder.server)@\(holder.project)",
                 message: sibling
                     ? "port \(port) held by sibling '\(holder.server)' in \(holder.project); ensure will auto-rebind"
-                    : "port \(port) held by '\(holder.server)' in \(holder.project); run: directa stop \(holder.server) --project \(holder.project)",
+                    : "port \(port) held by '\(holder.server)' in \(holder.project); run: directa stop \(ShellWord.argument(holder.server)) --project \(ShellWord.argument(holder.project))",
                 state: .held)
         } else if PortGuard.isListening(port: port) {
             let detail = PortGuard.listenerInfo(port: port).map {

@@ -52,12 +52,16 @@ final class LogFileReader {
 
     /** Calls `body` with every non-empty line from `start` to the end of the
         file and its byte offset, including a final line with no trailing
-        newline. Lines are read in fixed chunks, never the whole file. */
-    func forEachLine(from start: Int, _ body: (UnsafeBufferPointer<UInt8>, Int) -> Void) {
+        newline, until `body` answers false. Lines are read in fixed chunks,
+        never the whole file, and no chunk past the stopping line is read.
+        Returns false when `body` stopped the walk. */
+    @discardableResult
+    func forEachLine(from start: Int, _ body: (UnsafeBufferPointer<UInt8>, Int) -> Bool) -> Bool {
         var offset = start
         var pending: [UInt8] = []
         var pendingBase = start
-        while offset < size {
+        var going = true
+        while going, offset < size {
             let chunk = read(at: offset, count: min(LogScan.chunkBytes, size - offset))
             guard !chunk.isEmpty else { break }
             offset += chunk.count
@@ -66,12 +70,12 @@ final class LogFileReader {
             pending.withUnsafeBufferPointer { buffer in
                 guard let base = buffer.baseAddress else { return }
                 var lineStart = 0
-                while lineStart < buffer.count,
+                while going, lineStart < buffer.count,
                     let hit = memchr(base + lineStart, Int32(LogScan.newline), buffer.count - lineStart)
                 {
                     let end = UnsafeRawPointer(base).distance(to: UnsafeRawPointer(hit))
                     if end > lineStart {
-                        body(UnsafeBufferPointer(rebasing: buffer[lineStart..<end]), pendingBase + lineStart)
+                        going = body(UnsafeBufferPointer(rebasing: buffer[lineStart..<end]), pendingBase + lineStart)
                     }
                     lineStart = end + 1
                 }
@@ -80,9 +84,10 @@ final class LogFileReader {
             pending.removeFirst(consumed)
             pendingBase += consumed
         }
-        if !pending.isEmpty {
-            pending.withUnsafeBufferPointer { body($0, pendingBase) }
+        if going, !pending.isEmpty {
+            going = pending.withUnsafeBufferPointer { body($0, pendingBase) }
         }
+        return going
     }
 
     /** Where the line holding the byte before `offset` begins: just past the
@@ -128,7 +133,8 @@ final class LogFileReader {
     each file from a binary-searched start, keeps only the positions of the
     lines a trim can still return (a fixed-size ring per stream for a tail,
     the first N for a head), and reads those lines back once the scan ends,
-    so memory tracks the answer rather than the window. Timestamps are parsed
+    so memory tracks the answer rather than the window. A head that reports
+    no totals stops reading at its Nth line. Timestamps are parsed
     only where a decision needs one: the binary search, the first line of a
     file under a lower bound (per-file monotonic timestamps make every later
     line pass), and the records a cursor skips. */
@@ -153,7 +159,11 @@ enum LogScan {
         var totals = LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0)
         var readers: [LogFileReader?] = Array(repeating: nil, count: files.count)
         var sequence = 0
+        /** A head that reports no totals has its whole answer once it holds
+            its lines; reading on would only count what nobody asked for. */
+        let stopsWhenFull = !options.reportsTotals
         for (fileIndex, url) in files.enumerated() {
+            if stopsWhenFull, collector.headIsFull { break }
             /** Whole-file skip: a file whose last line predates the bound
                 cannot contribute. */
             if let boundMs, let last = LogQuery.lastLineTimestamp(of: url), milliseconds(of: last) < boundMs {
@@ -165,34 +175,36 @@ enum LogScan {
             readers[fileIndex] = reader
             let start = boundMs.map { firstLineStart(atOrAfter: $0, in: reader) } ?? 0
             var passedBound = boundMs == nil
-            reader.forEachLine(from: start) { line, offset in
-                guard let shape = LineShape(line) else { return }
+            let finished = !reader.forEachLine(from: start) { line, offset in
+                guard let shape = LineShape(line) else { return true }
                 if !passedBound || skipRemaining > 0 {
                     guard let ms = epochMilliseconds(UnsafeBufferPointer(rebasing: line[..<shape.firstTab]))
-                    else { return }
+                    else { return true }
                     if let boundMs, !passedBound {
-                        guard ms >= boundMs else { return }
+                        guard ms >= boundMs else { return true }
                         passedBound = true
                     }
                     if skipRemaining > 0 {
                         if ms == cursorMs {
                             skipRemaining -= 1
-                            return
+                            return true
                         }
                         skipRemaining = 0
                     }
                 }
-                if let streams = options.streams, !streams.contains(shape.stream) { return }
+                if let streams = options.streams, !streams.contains(shape.stream) { return true }
                 if let grep {
                     let text = String(decoding: UnsafeBufferPointer(rebasing: line[(shape.secondTab + 1)...]), as: UTF8.self)
-                    guard (try? grep.firstMatch(in: text)) != nil else { return }
+                    guard (try? grep.firstMatch(in: text)) != nil else { return true }
                 }
                 totals[shape.stream] = (totals[shape.stream] ?? 0) + 1
                 sequence += 1
                 collector.add(
                     Retained(file: fileIndex, length: line.count, offset: offset, sequence: sequence),
                     stream: shape.stream)
+                return !(stopsWhenFull && collector.headIsFull)
             }
+            if finished { break }
         }
         return (readBack(collector.ordered(), readers: readers), totals)
     }
@@ -445,6 +457,12 @@ private struct Collector {
             perStream = false
             rings = [LineRing(capacity: options.tail)]
         }
+    }
+
+    /** True once a head trim holds every line it will keep. */
+    var headIsFull: Bool {
+        guard let headLimit else { return false }
+        return headItems.count >= headLimit
     }
 
     mutating func add(_ item: Retained, stream: LogStream) {

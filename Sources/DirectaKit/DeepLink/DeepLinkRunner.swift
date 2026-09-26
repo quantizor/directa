@@ -99,7 +99,7 @@ public struct DeepLinkRunner: Sendable {
             let list = try await daemon.statusList(project: project, name: link.server)
             guard let server = list.servers.first else {
                 throw ProjectConfigLoader.serverNotFound(
-                    name: link.server, project: project, hint: "run: directa status --project \(project) --json")
+                    name: link.server, project: project, hint: "run: directa status --project \(ShellWord.argument(project)) --json")
             }
             let target = try resolveOpenURL(server: server, head: link.head)
             await effects.openBrowser(target)
@@ -134,7 +134,7 @@ public struct DeepLinkRunner: Sendable {
                     : "known heads: \(known)"
                 throw WireError(
                     code: .notFound,
-                    hint: "run: directa status \(server.server) --json",
+                    hint: "run: directa status \(ShellWord.argument(server.server)) --json",
                     message: "no head named '\(head)' on \(server.server); \(detail)")
             }
             raw = headURL

@@ -648,15 +648,24 @@ wait "$DAEMON_PID" 2>/dev/null || true
   >>"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 await_daemon "monitor daemon-kill recovery"
-AFTER_LINES="$BEFORE_LINES"
-for i in {1..50}; do
-  AFTER_LINES="$(wc -l < "$KEEP_OUT" | tr -d ' ')"
-  [[ "$AFTER_LINES" -gt "$BEFORE_LINES" ]] && break
+# Resumed means a child line printed AFTER the unreachable line: the transient
+# line alone grows the file, so a line count cannot tell a reconnect from a
+# client stuck on its dead socket. The backoff ceiling is 10 s, so 20 s covers
+# the first successful poll after the restart.
+UNREACHABLE_AT=""
+RESUMED=0
+for i in {1..100}; do
+  UNREACHABLE_AT="$(grep -n "the daemon is unreachable, retrying" "$KEEP_OUT" | head -1 | cut -d: -f1 || true)"
+  if [[ -n "$UNREACHABLE_AT" ]] && tail -n "+$((UNREACHABLE_AT + 1))" "$KEEP_OUT" | grep -q "monweb out| heartbeat"; then
+    RESUMED=1
+    break
+  fi
   sleep 0.2
 done
-[[ "$AFTER_LINES" -gt "$BEFORE_LINES" ]] || fail "monitor did not resume streaming after the daemon restarted"
-grep -q "the daemon is unreachable, retrying" "$KEEP_OUT" || fail "monitor never reported the daemon as unreachable across the kill"
-pass "monitor survives a daemon kill and restart, resuming with a transient line ($BEFORE_LINES -> $AFTER_LINES lines)"
+[[ -n "$UNREACHABLE_AT" ]] || fail "monitor never reported the daemon as unreachable across the kill"
+[[ "$RESUMED" -eq 1 ]] || fail "monitor printed no heartbeat after its unreachable line (line $UNREACHABLE_AT); it did not reconnect to the restarted daemon: $(tail -3 "$KEEP_OUT")"
+AFTER_LINES="$(wc -l < "$KEEP_OUT" | tr -d ' ')"
+pass "monitor survives a daemon kill and restart, streaming heartbeats after its transient line ($BEFORE_LINES -> $AFTER_LINES lines)"
 kill -9 "$KEEP_MON_PID" 2>/dev/null || true
 wait "$KEEP_MON_PID" 2>/dev/null || true
 

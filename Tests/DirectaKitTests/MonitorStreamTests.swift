@@ -87,9 +87,9 @@ import Testing
 
     private func tick(
         _ offset: TimeInterval, health: String? = nil, records: [LogRecord] = [],
-        trimmed: [LogStream: Int] = [:]
+        trimmed: [LogStream: Int] = [:], windowStart: Date? = nil
     ) -> MonitorTick {
-        MonitorTick(at: date(offset), health: health, records: records, trimmed: trimmed)
+        MonitorTick(at: date(offset), health: health, records: records, trimmed: trimmed, windowStart: windowStart)
     }
 
     private func makeStream(
@@ -148,17 +148,19 @@ import Testing
     }
 
     /** The 29-minute hard cap reads as a next step, not a parenthetical
-        status, and flushes exactly what `ended(reason:)` flushes: a pending
+        status, names the command that reads whatever lands after the final
+        cursor, and flushes exactly what `ended(reason:)` flushes: a pending
         lifecycle run and a live repeated-lines summary. */
     @Test func endedAtHardCapWordsItsLineAsANextStepAndStillFlushesPending() {
         var stream = makeStream()
         _ = stream.ingest(tick(0, records: [record(0, .err, "boom")]))
         let repeats = (0..<14).map { record(0.1 + Double($0) * 0.1, LogStream.err, "boom") }
         _ = stream.ingest(tick(1.5, records: repeats))
-        let events = stream.endedAtHardCap()
+        let events = stream.endedAtHardCap(resumeFrom: date(1.4))
         #expect(events.map(\MonitorEvent.humanLine) == [
             "web err| boom (repeated x14)",
-            "directa web: ended after 29 minutes; run the same command again to keep watching",
+            "directa web: ended after 29 minutes; run the same command again to keep watching; "
+                + "anything after this: directa logs web --since \(JSONCoding.formatISO8601(date(1.4))) --head 200",
         ])
     }
 
@@ -266,17 +268,42 @@ import Testing
         ])
     }
 
-    @Test func hostileServerNameIsSanitizedEverywhereItAppears() {
-        /** ANSI red plus a BEL, the exact place a stray escape or control
-            byte reaching the "earlier output" hint would land in a
-            terminal. */
-        let hostileName = "we\u{1B}[31mb\u{0007}"
-        var stream = makeStream(serverName: hostileName)
-        let events = stream.attached(
+    /** A server name only appears inside a `directa logs <name> ...`
+        command the reader may run, so a name that is not shell-inert
+        (`ShellWord.isInert`) is never pasted there, in any hint: the reader
+        gets `<name>` to fill from the server list. Sanitizing it instead
+        would name a different server (an escape stripped from `we\e[31mb`
+        leaves `web`). */
+    @Test(arguments: ["web; rm -rf ~", "we\u{1B}[31mb\u{0007}", "$(id)", "my server"])
+    func aHostileServerNameBecomesAPlaceholderInEveryHint(hostileName: String) {
+        var stream = makeStream(
+            budgets: MonitorBudgets(errorsPerArm: 1_000, errorsPerMinute: 1, linesPerArm: 1),
+            serverName: hostileName)
+        let attached = stream.attached(
             MonitorAttachSummary(checkoutPath: "/tmp/app", statusDescription: "running, pid=1"))
-        #expect(events.map(\MonitorEvent.humanLine) == [
-            "directa web: monitoring /tmp/app (running, pid=1; budget 120/min and 600/arm, "
-                + "errors 30/min and 300/arm); earlier output: directa logs web --tail 200"
+        let armCrossing = stream.ingest(tick(0.02, records: [record(0, .out, "o1"), record(0.01, .out, "o2")]))
+        let trimmed = stream.ingest(tick(0.5, trimmed: [.err: 400], windowStart: date(0.4)))
+        _ = stream.ingest(tick(1, records: [record(1, .err, "boom")]))
+        _ = stream.ingest(tick(2, records: [record(2, .err, "boom")]))
+        let summary = stream.ingest(tick(8))
+        let minuteCrossing = stream.ingest(
+            tick(9, records: (0..<11).map { record(9 + Double($0) * 0.01, LogStream.err, "distinct \($0)") }))
+        let ended = stream.endedAtHardCap(resumeFrom: date(9.5))
+        let lines = (attached + armCrossing + trimmed + summary + minuteCrossing + ended).map(\.humanLine)
+            .filter { $0.hasPrefix("directa web: ") }
+        let iso = { (offset: TimeInterval) in JSONCoding.formatISO8601(self.date(offset)) }
+        #expect(lines == [
+            "directa web: monitoring /tmp/app (running, pid=1; budget 120/min and 1/arm, "
+                + "errors 1/min and 1000/arm); earlier output: directa logs <name> --tail 200",
+            "directa web: out over budget (1 line for the rest of this monitor; re-arm to reset); "
+                + "read what was skipped: directa logs <name> --since \(iso(0.01)) --stream out --head 200",
+            "directa web: 400 err lines skipped (more than 300 in one tick); read them: "
+                + "directa logs <name> --since \(iso(0.4)) --stream err --head 200",
+            "directa web: 1 repeated line suppressed (1 distinct); directa logs <name> --since \(iso(2)) --head 200",
+            "directa web: err over budget (more than 1 line a minute); read what was skipped: "
+                + "directa logs <name> --since \(iso(9.09)) --stream err --head 200",
+            "directa web: ended after 29 minutes; run the same command again to keep watching; "
+                + "anything after this: directa logs <name> --since \(iso(9.5)) --head 200",
         ])
     }
 
@@ -344,6 +371,70 @@ import Testing
         #expect(thirdPrint.map(\MonitorEvent.humanLine) == ["web err| trace line 0 (again, 2nd in 20s; +1 line seen before)"])
     }
 
+    /** Only a line seen before continues a reprinted block: a line that
+        was never printed, arriving right after a recurrence, is new output
+        and shows normally, and it ends the block, so a known line after it
+        is judged on its own timer again. */
+    @Test func aNewDistinctLineDuringABlockShowsNormally() {
+        var stream = makeStream(budgets: MonitorBudgets(errorsPerArm: 10_000, errorsPerMinute: 10_000))
+        _ = stream.ingest(tick(0.1, records: [record(0, .err, "trace 0"), record(0.01, .err, "trace 1")]))
+        let events = stream.ingest(
+            tick(
+                20.1,
+                records: [
+                    record(20, .err, "trace 0"), record(20.01, .err, "trace 1"), record(20.02, .err, "brand new"),
+                    record(20.03, .err, "trace 1"),
+                ]))
+        #expect(events.map(\MonitorEvent.humanLine) == [
+            "web err| trace 0 (again, 2nd in 20s)",
+            "web err| brand new",
+        ])
+    }
+
+    /** A flood of never-seen lines after a recurrence is ordinary output
+        under the ordinary budget: the per-minute burst (10 for stderr's
+        default 30/min) shows, including the recurrence line itself, then one
+        over-budget marker, and nothing else reaches the reader later as
+        `(repeated x1)` collapses of lines it never saw once. */
+    @Test func aFloodOfDistinctLinesAfterARecurrenceStaysWithinTheBudget() {
+        var stream = makeStream()
+        _ = stream.ingest(tick(0, records: [record(0, .err, "boom")]))
+        let flood = (0..<100).map { record(20.001 + Double($0) * 0.001, LogStream.err, "flood \($0)") }
+        let events = stream.ingest(tick(20.2, records: [record(20, .err, "boom")] + flood))
+        var expected = ["web err| boom (again, 2nd in 20s)"]
+        expected += (0..<9).map { "web err| flood \($0)" }
+        expected.append(
+            "directa web: err over budget (more than 30 lines a minute); read what was skipped: "
+                + "directa logs web --since \(JSONCoding.formatISO8601(flood[9].at)) --stream err --head 200")
+        #expect(events.map(\MonitorEvent.humanLine) == expected)
+        #expect(stream.ingest(tick(40)).isEmpty)
+    }
+
+    /** A flushed `(repeated xN)` spends one token like any shown line; with
+        the bucket empty it is withheld, crosses the budget with the usual
+        marker, and counts toward the resume total as one line. */
+    @Test func aFlushedRepeatSpendsBudgetAndIsWithheldWhenOver() {
+        var stream = makeStream(budgets: MonitorBudgets(errorsPerArm: 1_000, errorsPerMinute: 1))
+        _ = stream.ingest(tick(0, records: [record(0, .err, "boom")]))
+        _ = stream.ingest(tick(1, records: [record(1, .err, "boom"), record(1.5, .err, "boom")]))
+        let fill = (0..<9).map { record(2 + Double($0) * 0.01, LogStream.err, "distinct \($0)") }
+        #expect(stream.ingest(tick(2.1, records: fill)).count == 9)
+
+        let flushed = stream.ingest(tick(12))
+        #expect(flushed.map(\MonitorEvent.humanLine) == [
+            "directa web: err over budget (more than 1 line a minute); read what was skipped: "
+                + "directa logs web --since \(JSONCoding.formatISO8601(date(1.5))) --stream err --head 200"
+        ])
+
+        /** Ten minutes refill the ten-token burst; the one withheld flush is
+            the whole suppressed count. */
+        let resumed = stream.ingest(tick(620, records: [record(620, .err, "later")]))
+        #expect(resumed.map(\MonitorEvent.humanLine) == [
+            "directa web: err resumed (1 line suppressed while over budget)",
+            "web err| later",
+        ])
+    }
+
     @Test func lruCapacityEvictsTheOldestEntry() {
         var stream = makeStream()
         let capacity = MonitorLimits.lruCapacity
@@ -375,10 +466,45 @@ import Testing
             were active 4 s ago (25 s), so the 5 s quiet trigger has not
             tripped either. */
         #expect(stream.ingest(tick(29)).isEmpty)
+        /** The command starts at the oldest suppressed repeat (5 s), not the
+            tick that printed the summary: every counted line is inside what
+            it reads. */
         let events = stream.ingest(tick(30))
         #expect(events.map(\MonitorEvent.humanLine) == [
             "directa web: 5 repeated lines suppressed (1 distinct); directa logs web --since "
-                + "\(JSONCoding.formatISO8601(date(30))) --head 200"
+                + "\(JSONCoding.formatISO8601(date(5))) --head 200"
+        ])
+    }
+
+    /** Repeats a summary has reported are never reported again: once the
+        burst goes stale there is nothing left to flush as `(repeated xN)`,
+        and a later recurrence carries no `seen before` count for them. */
+    @Test func noDoubleCountBetweenTheSummaryAndALaterFlushOrRecurrence() {
+        var stream = makeStream()
+        _ = stream.ingest(tick(0, records: [record(0, .err, "boom")]))
+        for offset: TimeInterval in [5, 10, 15, 20, 25] {
+            _ = stream.ingest(tick(offset, records: [record(offset, .err, "boom")]))
+        }
+        let summary = stream.ingest(tick(30))
+        #expect(summary.map(\MonitorEvent.kind) == [.suppressed])
+        /** 36 s: the burst window (last hit at 25 s) has closed. */
+        #expect(stream.ingest(tick(36)).isEmpty)
+        let recurrence = stream.ingest(tick(40, records: [record(40, .err, "boom")]))
+        #expect(recurrence.map(\MonitorEvent.humanLine) == ["web err| boom (again, 2nd in 40s)"])
+    }
+
+    /** Each summary's command starts at the oldest repeat counted since the
+        previous summary, never at an earlier one already reported. */
+    @Test func aSecondSummaryStartsAtItsOwnOldestRepeat() {
+        var stream = makeStream()
+        _ = stream.ingest(tick(0, records: [record(0, .err, "boom")]))
+        _ = stream.ingest(tick(1, records: [record(1, .err, "boom")]))
+        _ = stream.ingest(tick(6))
+        _ = stream.ingest(tick(8, records: [record(7, .err, "boom"), record(8, .err, "boom")]))
+        let events = stream.ingest(tick(13))
+        #expect(events.map(\MonitorEvent.humanLine) == [
+            "directa web: 2 repeated lines suppressed (1 distinct); directa logs web --since "
+                + "\(JSONCoding.formatISO8601(date(7))) --head 200"
         ])
     }
 
@@ -391,7 +517,7 @@ import Testing
         let events = stream.ingest(tick(6))
         #expect(events.map(\MonitorEvent.humanLine) == [
             "directa web: 1 repeated line suppressed (1 distinct); directa logs web --since "
-                + "\(JSONCoding.formatISO8601(date(6))) --head 200"
+                + "\(JSONCoding.formatISO8601(date(1))) --head 200"
         ])
     }
 
@@ -505,13 +631,32 @@ import Testing
             this stream ever saw them. Neither stream is over its client
             budget, so this must not be silently folded away. */
         var stream = makeStream()
-        let events = stream.ingest(tick(0.5, trimmed: [.out: 400, .err: 12]))
+        let events = stream.ingest(tick(0.5, trimmed: [.out: 400, .err: 12], windowStart: date(0.1)))
         #expect(events.map(\MonitorEvent.humanLine) == [
             "directa web: 400 out lines skipped (more than 300 in one tick); read them: "
-                + "directa logs web --since \(JSONCoding.formatISO8601(date(0.5))) --stream out --head 200",
+                + "directa logs web --since \(JSONCoding.formatISO8601(date(0.1))) --stream out --head 200",
             "directa web: 12 err lines skipped (more than 300 in one tick); read them: "
-                + "directa logs web --since \(JSONCoding.formatISO8601(date(0.5))) --stream err --head 200",
+                + "directa logs web --since \(JSONCoding.formatISO8601(date(0.1))) --stream err --head 200",
         ])
+    }
+
+    /** The daemon keeps the newest lines of a trimmed window, so the skipped
+        ones start at the cursor the query read past: the marker's command
+        starts there, and the marker sorts ahead of the lines this tick did
+        return, never after them. */
+    @Test func aSkippedMarkerStartsAtTheWindowAndPrecedesTheReturnedLines() {
+        var stream = makeStream()
+        let events = stream.ingest(
+            tick(
+                2, records: [record(1.5, .out, "newest kept"), record(1.9, .out, "last kept")],
+                trimmed: [.out: 350], windowStart: date(0.25)))
+        #expect(events.map(\MonitorEvent.humanLine) == [
+            "directa web: 350 out lines skipped (more than 300 in one tick); read them: "
+                + "directa logs web --since \(JSONCoding.formatISO8601(date(0.25))) --stream out --head 200",
+            "web out| newest kept",
+            "web out| last kept",
+        ])
+        #expect(events.first?.at == date(0.25))
     }
 
     @Test func daemonTrimmingInsideAnOverBudgetWindowNeverGetsTheSkippedMarker() {

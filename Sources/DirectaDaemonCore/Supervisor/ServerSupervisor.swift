@@ -2,13 +2,11 @@ import DirectaKit
 import Foundation
 
 /** One registration in `ServerSupervisor.stoppingWaiters`. `deadlineTask` is
-    nil for an unbounded wait (`start()`/`ensure()` joining someone else's
-    stop); a bounded wait (`stop()`'s own waits) carries the sleeping task that
-    calls `expireStoppingWaiter(id:)` if the real transition never lands
-    first. */
+    the sleeping task that calls `expireStoppingWaiter(id:)` if the real
+    transition never lands first. */
 private struct StoppingWaiter {
     let continuation: CheckedContinuation<Void, Never>
-    let deadlineTask: Task<Void, Never>?
+    let deadlineTask: Task<Void, Never>
     let id: UUID
 }
 
@@ -118,6 +116,14 @@ public actor ServerSupervisor {
         Overridable so tests can reach that deadline path without a real 10s
         wait. */
     private let stopWaitOvertimeSeconds: Double
+    /** The bound the stop in flight gives its own wait for the phase to
+        clear (its grace plus `stopWaitOvertimeSeconds`), set when that stop
+        moves the phase to `.stopping`. `start()` joining that stop waits no
+        longer than the stop itself does. */
+    private var stoppingWaitBound: Duration
+    /** The SIGTERM-to-SIGKILL window `stop()` gives a server when its
+        caller names none. */
+    public static let defaultStopGraceSeconds: Double = 7
     /** Carries the stop()'s intent into recordOutcome: deliberate clears the
         resume-on-boot flag, a launchd drain keeps it. */
     private var stopWasDeliberate = true
@@ -157,6 +163,7 @@ public actor ServerSupervisor {
         self.spec = spec
         self.stallBounds = stallBounds
         self.stopWaitOvertimeSeconds = stopWaitOvertimeSeconds
+        self.stoppingWaitBound = .seconds(Self.defaultStopGraceSeconds + stopWaitOvertimeSeconds)
         /** Computed once at creation, not per status read (it shells out to git)
             and not per spawn: a worktree project whose servers are stopped or
             restored still reports its label. */
@@ -289,7 +296,12 @@ public actor ServerSupervisor {
             await waitForSpawnSettled()
             return status()
         case .stopping:
-            await waitForStoppingToClear()
+            /** Bounded like the stop being joined: a stop that never lands
+                reports an honest `.stopping` here too, instead of holding
+                this request (and the wire call behind it) forever. */
+            guard await waitForStoppingToClear(timeout: stoppingWaitBound) else {
+                return status()
+            }
             return await start()
         case .crashed, .failed, .stopped:
             break
@@ -435,11 +447,16 @@ public actor ServerSupervisor {
         case .starting:
             break
         case .stopping:
-            let bound = Duration.seconds(Self.boundedTimeoutSeconds(timeoutSeconds))
-            guard await waitForStoppingToClear(timeout: bound) else {
+            let budget = Self.boundedTimeoutSeconds(timeoutSeconds)
+            let waitStart = ContinuousClock.now
+            guard await waitForStoppingToClear(timeout: .seconds(budget)) else {
                 return EnsureResult(reason: .timeout, server: status())
             }
-            return await ensure(timeoutSeconds: timeoutSeconds)
+            /** The caller's timeout covers the whole ensure, so the rest of
+                it (start and the health wait) gets only what the stop wait
+                left over. */
+            let waitedSeconds = waitStart.duration(to: .now) / .seconds(1)
+            return await ensure(timeoutSeconds: max(0, budget - waitedSeconds))
         case .crashed, .failed, .stopped:
             let started = await start()
             if started.phase == .failed {
@@ -493,7 +510,9 @@ public actor ServerSupervisor {
         carried onto the `stopped` event's detail: it is the only durable record
         of why directa tore the process down, since OSLog does not persist and
         the log otherwise only ever says `exited code=N`. */
-    public func stop(graceSeconds: Double = 7, deliberate: Bool = true, reason: String) async -> ServerStatus {
+    public func stop(
+        graceSeconds: Double = ServerSupervisor.defaultStopGraceSeconds, deliberate: Bool = true, reason: String
+    ) async -> ServerStatus {
         /** stopWaitOvertimeSeconds past the grace window: comfortably past the
             SIGKILL escalation below (which fires at the grace deadline) and
             past the crash path's own 1s escalation grace, so an ordinary
@@ -519,6 +538,7 @@ public actor ServerSupervisor {
         stopRequested = true
         stopWasDeliberate = deliberate
         stopReason = reason
+        stoppingWaitBound = stopWaitTimeout
         phase = .stopping
         /** Capture the run's identity and its session before any signal and
             before any await: after the grace window the pid number may name a
@@ -844,7 +864,7 @@ public actor ServerSupervisor {
             effectivePort: expected,
             holder: "\(thief.name)@\(thief.project)",
             message:
-                "healthcheck passed but managed server '\(thief.name)' in \(thief.project) owns port \(expected), not this server; run: directa stop \(thief.name) --project \(thief.project)",
+                "healthcheck passed but managed server '\(thief.name)' in \(thief.project) owns port \(expected), not this server; run: directa stop \(ShellWord.argument(thief.name)) --project \(ShellWord.argument(thief.project))",
             state: .foreign)
         phase = .failed
         spawnError = SpawnError(
@@ -1271,7 +1291,7 @@ public actor ServerSupervisor {
         let waiters = stoppingWaiters
         stoppingWaiters = []
         for waiter in waiters {
-            waiter.deadlineTask?.cancel()
+            waiter.deadlineTask.cancel()
             waiter.continuation.resume()
         }
     }
@@ -1329,16 +1349,14 @@ public actor ServerSupervisor {
         inside the continuation closure to guard the same lost-wakeup window
         `waitForSpawnSettled` guards.
 
-        `timeout`, when given, bounds only the CALLER's wait: only
-        recordOutcome ever moves `phase` off `.stopping`, so a caller whose
-        deadline fires still reports an honest `.stopping`, never a phase this
-        function invents. `stop()` bounds its waits so a stop recordOutcome
-        never lands on cannot hang the wire request that asked for it;
-        `ensure()` bounds by its own timeout; `start()` has no timeout of its
-        own and joins unbounded. Returns false only when the deadline fired
-        first. */
-    @discardableResult
-    private func waitForStoppingToClear(timeout: Duration? = nil) async -> Bool {
+        `timeout` bounds only the CALLER's wait: only recordOutcome ever
+        moves `phase` off `.stopping`, so a caller whose deadline fires still
+        reports an honest `.stopping`, never a phase this function invents.
+        Every caller is bounded so a stop recordOutcome never lands on cannot
+        hang the wire request that asked for it: `stop()` and `start()` by
+        the stop's own wait bound, `ensure()` by its own timeout. Returns
+        false only when the deadline fired first. */
+    private func waitForStoppingToClear(timeout: Duration) async -> Bool {
         guard phase == .stopping else { return true }
         let id = UUID()
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -1346,11 +1364,9 @@ public actor ServerSupervisor {
                 continuation.resume()
                 return
             }
-            let deadlineTask: Task<Void, Never>? = timeout.map { bound in
-                Task { [weak self] in
-                    try? await Task.sleep(for: bound)
-                    await self?.expireStoppingWaiter(id: id)
-                }
+            let deadlineTask = Task { [weak self] in
+                try? await Task.sleep(for: timeout)
+                await self?.expireStoppingWaiter(id: id)
             }
             stoppingWaiters.append(
                 StoppingWaiter(continuation: continuation, deadlineTask: deadlineTask, id: id))

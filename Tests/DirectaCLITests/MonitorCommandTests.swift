@@ -16,17 +16,17 @@ import Testing
 private actor FakeMonitorRequester: MonitorRequesting {
     private(set) var logsCallCount = 0
     private(set) var logsParamsSeen: [LogsQueryParams] = []
-    private var logsQueue: [Result<LogsQueryResult, WireError>] = []
-    private var lastLogs: Result<LogsQueryResult, WireError>?
+    private var logsQueue: [Result<LogsQueryResult, any Error>] = []
+    private var lastLogs: Result<LogsQueryResult, any Error>?
     private(set) var statusCallCount = 0
-    private var statusQueue: [Result<ServerListResult, WireError>] = []
-    private var lastStatus: Result<ServerListResult, WireError>?
+    private var statusQueue: [Result<ServerListResult, any Error>] = []
+    private var lastStatus: Result<ServerListResult, any Error>?
 
-    func enqueueLogs(_ result: Result<LogsQueryResult, WireError>) {
+    func enqueueLogs(_ result: Result<LogsQueryResult, any Error>) {
         logsQueue.append(result)
     }
 
-    func enqueueStatus(_ result: Result<ServerListResult, WireError>) {
+    func enqueueStatus(_ result: Result<ServerListResult, any Error>) {
         statusQueue.append(result)
     }
 
@@ -100,16 +100,58 @@ private actor FakeMonitorClock: MonitorClock {
 
     // MARK: - Feature gate
 
-    @Test func featureGateExitsWhenAttachLacksCursorOrTotals() async {
+    @Test func featureGateExitsWhenAttachLacksTheCursor() async {
         let requester = FakeMonitorRequester()
         await requester.enqueueLogs(.success(LogsQueryResult(cursor: nil, lines: [], totals: nil)))
         var session = MonitorSession(
             client: requester, clock: FakeMonitorClock(start: Self.epoch), config: config())
         guard case .exit(let error) = await session.step() else {
-            Issue.record("expected .exit for a daemon missing cursor/totals")
+            Issue.record("expected .exit for a daemon missing cursor")
             return
         }
         #expect(error == Logs.olderDaemon)
+    }
+
+    /** Attach asks for the tail fast path (`tail: 0`: the end cursor, no
+        scan of the log's history), never a per-stream trim of zero, which
+        the daemon answers by reading the whole family forward to count
+        totals. */
+    @Test func attachQueriesAZeroTailAndNothingElse() async {
+        let requester = FakeMonitorRequester()
+        await requester.enqueueLogs(.success(LogsQueryResult(cursor: LogCursor(at: Self.epoch, count: 0), lines: [])))
+        await requester.enqueueStatus(.success(ServerListResult(servers: [serverStatus(name: "web", phase: .running, pid: 812)])))
+        var session = MonitorSession(
+            client: requester, clock: FakeMonitorClock(start: Self.epoch), config: config())
+        guard case .events = await session.step() else {
+            Issue.record("expected the attach marker from a cursor-only answer")
+            return
+        }
+        #expect(await requester.logsParamsSeen == [LogsQueryParams(name: "web", project: "/tmp/proj", tail: 0)])
+    }
+
+    /** `totals` is gated on the first tick, the first query shaped to carry
+        it: a daemon that answers without it ends the run with the same
+        version-mismatch message and exit status the attach gate uses. */
+    @Test func aFirstTickWithoutTotalsEndsTheRunAsAVersionMismatch() async {
+        let requester = FakeMonitorRequester()
+        let clock = FakeMonitorClock(start: Self.epoch)
+        let cursor = LogCursor(at: Self.epoch, count: 0)
+        await requester.enqueueLogs(.success(LogsQueryResult(cursor: cursor, lines: [])))
+        await requester.enqueueStatus(.success(ServerListResult(servers: [serverStatus(name: "web", phase: .running, pid: 812)])))
+        var session = MonitorSession(client: requester, clock: clock, config: config())
+        _ = await session.step()
+
+        await clock.advance(by: 2)
+        await requester.enqueueLogs(.success(LogsQueryResult(cursor: cursor, lines: [], totals: nil)))
+        guard case .endedWithError(let events, let error) = await session.step() else {
+            Issue.record("expected the run to end on a tick without totals")
+            return
+        }
+        #expect(error == Logs.olderDaemon)
+        #expect(events.map(\.humanLine) == [
+            "directa web: ended (the daemon is older than this CLI and cannot answer this command; run: directa daemon restart)"
+        ])
+        #expect(CLIRunner.exitStatus(for: error.code) == 3)
     }
 
     @Test func featureGatePassesWhenBothFieldsArePresentEvenWithNoLines() async {
@@ -236,6 +278,165 @@ private actor FakeMonitorClock: MonitorClock {
         }
         #expect(fourth.isEmpty)
         #expect(fourthDelay == 2)
+    }
+
+    // MARK: - Errors that are not transient
+
+    private let refusal = WireError(
+        code: .notTrusted, hint: "run: directa trust", message: "this project's config is not trusted")
+
+    private func attachedSession(
+        _ requester: FakeMonitorRequester, clock: FakeMonitorClock, cursor: LogCursor = LogCursor(at: epoch, count: 0)
+    ) async -> MonitorSession {
+        await requester.enqueueLogs(.success(attachLogsResult(cursor: cursor)))
+        await requester.enqueueStatus(.success(ServerListResult(servers: [serverStatus(name: "web", phase: .running, pid: 812)])))
+        var session = MonitorSession(client: requester, clock: clock, config: config())
+        guard case .events = await session.step() else {
+            Issue.record("expected the attach marker")
+            return session
+        }
+        return session
+    }
+
+    /** Only an unreachable, starting, or config-invalid daemon is a state
+        to wait out; any other refusal before attaching exits through
+        `CLIRunner.fail` with the daemon's own error. */
+    @Test func aRefusalBeforeAttachingExitsWithTheDaemonsError() async {
+        let requester = FakeMonitorRequester()
+        await requester.enqueueLogs(.failure(refusal))
+        var session = MonitorSession(
+            client: requester, clock: FakeMonitorClock(start: Self.epoch), config: config())
+        guard case .exit(let error) = await session.step() else {
+            Issue.record("expected .exit for a refusal that is not transient")
+            return
+        }
+        #expect(error == refusal)
+    }
+
+    /** After attaching, the same refusal ends the stream with a line naming
+        the message and its fix, and the process exits with the status
+        `CLIRunner` maps the code to. */
+    @Test func aRefusalAfterAttachingEndsTheRunNamingTheMessage() async {
+        let requester = FakeMonitorRequester()
+        let clock = FakeMonitorClock(start: Self.epoch)
+        var session = await attachedSession(requester, clock: clock)
+        await clock.advance(by: 2)
+        await requester.enqueueLogs(.failure(refusal))
+        guard case .endedWithError(let events, let error) = await session.step() else {
+            Issue.record("expected the run to end on a refusal")
+            return
+        }
+        #expect(error == refusal)
+        #expect(events.map(\.humanLine) == ["directa web: ended (this project's config is not trusted; run: directa trust)"])
+        #expect(CLIRunner.exitStatus(for: error.code) == 1)
+    }
+
+    private struct GarbledFrame: Error, CustomStringConvertible {
+        var description: String { "unexpected end of frame" }
+    }
+
+    /** An answer that does not decode is reported once, then shares the
+        unreachable clock: 60 s of it ends the run. */
+    @Test func anUnreadableAnswerIsReportedOnceAndCountsTowardTheGiveUp() async {
+        let requester = FakeMonitorRequester()
+        let clock = FakeMonitorClock(start: Self.epoch)
+        var session = await attachedSession(requester, clock: clock)
+
+        await requester.enqueueLogs(.failure(GarbledFrame()))
+        guard case .events(let first, _) = await session.step() else {
+            Issue.record("expected a transient tick")
+            return
+        }
+        #expect(first.map(\.humanLine) == [
+            "directa web: the daemon's answer could not be read (unexpected end of frame), retrying"
+        ])
+
+        await clock.advance(by: 30)
+        guard case .events(let second, _) = await session.step() else {
+            Issue.record("expected a second transient tick")
+            return
+        }
+        #expect(second.isEmpty)
+
+        await clock.advance(by: 30)
+        guard case .ended(let events) = await session.step() else {
+            Issue.record("expected 60 s of unreadable answers to end the stream")
+            return
+        }
+        #expect(events.map(\.humanLine) == ["directa web: ended (daemon answers unreadable for 60s)"])
+    }
+
+    @Test func anUnreadableAnswerBeforeAttachingGivesUpAfterSixtySeconds() async {
+        let requester = FakeMonitorRequester()
+        let clock = FakeMonitorClock(start: Self.epoch)
+        var session = MonitorSession(client: requester, clock: clock, config: config())
+        await requester.enqueueLogs(.failure(GarbledFrame()))
+        guard case .events(let first, _) = await session.step() else {
+            Issue.record("expected the first unreadable answer to retry attaching")
+            return
+        }
+        #expect(first.map(\.humanLine) == [
+            "directa web: the daemon's answer could not be read (unexpected end of frame), retrying"
+        ])
+        await clock.advance(by: 60)
+        guard case .exit(let error) = await session.step() else {
+            Issue.record("expected 60 s of unreadable answers to give up on attaching")
+            return
+        }
+        #expect(
+            error
+                == WireError(
+                    code: .internalError, hint: "run: directa daemon restart",
+                    message: "the daemon's answers could not be read for 60s: unexpected end of frame"))
+    }
+
+    // MARK: - The 29-minute cap
+
+    /** The cap reads past the cursor once more and shows what arrived since
+        the last tick before its end marker, whose command starts at the
+        final cursor. */
+    @Test func theHardCapDrainsOnceMoreAndNamesTheFinalCursor() async {
+        let requester = FakeMonitorRequester()
+        let clock = FakeMonitorClock(start: Self.epoch)
+        let attachCursor = LogCursor(at: Self.epoch, count: 0)
+        var session = await attachedSession(requester, clock: clock, cursor: attachCursor)
+
+        await clock.advance(by: MonitorRunTuning.hardCapSeconds)
+        let lineAt = Self.epoch.addingTimeInterval(1_739.5)
+        await requester.enqueueLogs(
+            .success(
+                tickLogsResult(
+                    cursor: LogCursor(at: lineAt, count: 1), lines: [LogRecord(at: lineAt, stream: .out, text: "last words")],
+                    totals: LogStreamCounts(err: 0, mark: 0, out: 1, sys: 0))))
+        guard case .ended(let events) = await session.step() else {
+            Issue.record("expected the hard cap to end the run")
+            return
+        }
+        #expect(events.map(\.humanLine) == [
+            "web out| last words",
+            "directa web: ended after 29 minutes; run the same command again to keep watching; "
+                + "anything after this: directa logs web --since \(JSONCoding.formatISO8601(lineAt)) --head 200",
+        ])
+        #expect(await requester.logsParamsSeen.last?.after == attachCursor)
+    }
+
+    /** A drain that fails still ends the run, naming the cursor it held. */
+    @Test func theHardCapEndsOnTheHeldCursorWhenTheDrainFails() async {
+        let requester = FakeMonitorRequester()
+        let clock = FakeMonitorClock(start: Self.epoch)
+        let attachCursor = LogCursor(at: Self.epoch.addingTimeInterval(0.25), count: 3)
+        var session = await attachedSession(requester, clock: clock, cursor: attachCursor)
+
+        await clock.advance(by: MonitorRunTuning.hardCapSeconds)
+        await requester.enqueueLogs(.failure(WireError(code: .daemonUnreachable, message: "cannot connect")))
+        guard case .ended(let events) = await session.step() else {
+            Issue.record("expected the hard cap to end the run")
+            return
+        }
+        #expect(events.map(\.humanLine) == [
+            "directa web: ended after 29 minutes; run the same command again to keep watching; "
+                + "anything after this: directa logs web --since \(JSONCoding.formatISO8601(attachCursor.at)) --head 200"
+        ])
     }
 
     // MARK: - 60 s of continuous unreachable
@@ -499,5 +700,52 @@ private actor FakeMonitorClock: MonitorClock {
                 {"at":"\(lineAtISO)","kind":"line","label":"web","stream":"out","text":"hello"}
                 {"at":"\(endedAtISO)","kind":"ended","label":"web","text":"ended (server unregistered)"}
                 """)
+    }
+}
+
+/** Which signal ends a monitor run, and the fallback when the preferred
+    signal's registration fails. */
+@Suite struct MonitorLifetimeTests {
+    @Test func aStreamStdoutIsWatchedForItsReaderLeaving() {
+        #expect(
+            MonitorLifetime.choose(
+                claudePID: 4242, registerProcessExit: { _ in 7 }, registerStdoutEOF: { 9 }, stdoutIsStream: true)
+                == .stdoutEOF(kqueue: 9))
+    }
+
+    @Test func aFileOrTerminalStdoutWatchesClaudePID() {
+        #expect(
+            MonitorLifetime.choose(
+                claudePID: 4242, registerProcessExit: { _ in 7 }, registerStdoutEOF: { 9 }, stdoutIsStream: false)
+                == .processExit(kqueue: 7))
+    }
+
+    /** A `CLAUDE_PID` whose exit watch the kernel refuses (the process is
+        already gone) falls back to the parent-change poll, never to no
+        watch at all; so does a stdout watch that will not register. */
+    @Test func aWatchThatCannotRegisterFallsBackToTheParentPoll() {
+        #expect(
+            MonitorLifetime.choose(
+                claudePID: 4242, registerProcessExit: { _ in nil }, registerStdoutEOF: { 9 }, stdoutIsStream: false)
+                == .parentChange)
+        #expect(
+            MonitorLifetime.choose(
+                claudePID: nil, registerProcessExit: { _ in 7 }, registerStdoutEOF: { nil }, stdoutIsStream: true)
+                == .parentChange)
+        #expect(
+            MonitorLifetime.choose(
+                claudePID: 4242, registerProcessExit: { _ in 7 }, registerStdoutEOF: { nil }, stdoutIsStream: true)
+                == .processExit(kqueue: 7))
+    }
+
+    @Test func registeringAnExitedProcessFailsAndALiveOneSucceeds() throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try process.run()
+        process.waitUntilExit()
+        #expect(MonitorLifetime.registerProcessExit(process.processIdentifier) == nil)
+
+        let live = try #require(MonitorLifetime.registerProcessExit(getpid()))
+        close(live)
     }
 }

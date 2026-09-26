@@ -411,8 +411,70 @@ import os
         let window = LogQuery.window(
             current: current, options: LogQueryOptions(head: 3, since: stamped(5, .out, "").at, streams: [.err]))
         #expect(window.lines.map(\.text) == ["line 5", "line 7", "line 9"])
-        #expect(window.totals == LogStreamCounts(err: 8, mark: 0, out: 0, sys: 0))
+        #expect(window.totals == nil)
         #expect(LogQuery.window(current: current, options: LogQueryOptions(head: 0)).lines.isEmpty)
+        /** Past a cursor, a head still counts the whole window. */
+        let afterCursor = LogQuery.window(
+            current: current, options: LogQueryOptions(after: LogCursor(at: stamped(4, .out, "").at, count: 1), head: 2))
+        #expect(afterCursor.lines.map(\.text) == ["line 5", "line 6"])
+        #expect(afterCursor.totals == LogStreamCounts(err: 8, mark: 0, out: 7, sys: 0))
+    }
+
+    /** A head with no cursor stops reading once it holds its lines: the
+        read-what-was-skipped shape (`--since <ts> --head 200`) near the
+        start of a multi-megabyte family reads a few chunks, not the rest of
+        the family. */
+    @Test func aHeadStopsReadingOnceItHoldsItsLines() throws {
+        let files = (0..<3).map { file in
+            (0..<8_000).map { index in
+                stamped(file * 8_000 + index, .out, "GET /api/items/\(file * 8_000 + index) 200 12ms padding-padding")
+            }
+        }
+        let current = try writeFamily(files)
+        let familyBytes = try LogQuery.familyFiles(current: current)
+            .map { try FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int ?? 0 }
+            .reduce(0, +)
+        let bytesRead = OSAllocatedUnfairLock<Int>(initialState: 0)
+        let window = LogQuery.windowMeasured(
+            current: current, options: LogQueryOptions(head: 200, since: stamped(100, .out, "").at),
+            onDiskRead: { bytes in bytesRead.withLock { $0 += bytes } })
+        #expect(window.lines.map(\.text) == (100..<300).map { "GET /api/items/\($0) 200 12ms padding-padding" })
+        #expect(window.totals == nil)
+        #expect(familyBytes > 1536 * 1024)
+        /** One 256 KB scan chunk plus the binary search, the read-back, and
+            the end cursor: a third of a family over 1.5 MB. */
+        #expect(bytesRead.withLock { $0 } < 512 * 1024)
+    }
+
+    /** `tail: 0` is how `directa monitor` attaches: the tail fast path
+        answers the family's end cursor from the last bytes of current.log,
+        while the same zero trim spelled per stream scans the whole family
+        forward to count totals. */
+    @Test func aZeroTailAnswersTheEndCursorFromTheEndOfTheFamily() throws {
+        let files = (0..<3).map { file in
+            (0..<5_000).map { index in stamped(file * 5_000 + index, .out, "line \(file * 5_000 + index) padding") }
+        }
+        let current = try writeFamily(files)
+        let familyBytes = try LogQuery.familyFiles(current: current)
+            .map { try FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int ?? 0 }
+            .reduce(0, +)
+        #expect(familyBytes > 512 * 1024)
+        let tailRead = OSAllocatedUnfairLock<Int>(initialState: 0)
+        let tail = LogQuery.windowMeasured(
+            current: current, options: LogQueryOptions(tail: 0),
+            onDiskRead: { bytes in tailRead.withLock { $0 += bytes } })
+        #expect(tail == LogWindow(cursor: LogCursor(at: stamped(14_999, .out, "").at, count: 1), lines: []))
+        /** One 64 KB window off the end of current.log (plus the byte
+            before it, to tell a clean line start): the other two files are
+            never opened. */
+        #expect(tailRead.withLock { $0 } < 128 * 1024)
+
+        let perStreamRead = OSAllocatedUnfairLock<Int>(initialState: 0)
+        let perStream = LogQuery.windowMeasured(
+            current: current, options: LogQueryOptions(tailByStream: LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0)),
+            onDiskRead: { bytes in perStreamRead.withLock { $0 += bytes } })
+        #expect(perStream.cursor == tail.cursor)
+        #expect(perStreamRead.withLock { $0 } >= familyBytes)
     }
 
     @Test func maxLineCharactersCutsEachTextWithAnEllipsis() throws {
@@ -432,7 +494,7 @@ import os
         let current = try writeFamily([[stamped(1, .out, "a"), stamped(2, .err, "b")]])
         for options in [
             LogQueryOptions(), LogQueryOptions(tail: 1), LogQueryOptions(since: stamped(0, .out, "").at),
-            LogQueryOptions(grep: "a"),
+            LogQueryOptions(grep: "a"), LogQueryOptions(head: 1),
         ] {
             let window = LogQuery.window(current: current, options: options)
             #expect(window.totals == nil)
@@ -593,7 +655,7 @@ import os
         let cursor = records.last.map { last in
             LogCursor(at: last.at, count: records.reversed().prefix { $0.at == last.at }.count)
         } ?? .origin
-        let reportsTotals = options.after != nil || options.head != nil || options.tailByStream != nil
+        let reportsTotals = options.after != nil || options.tailByStream != nil
         return LogWindow(cursor: cursor, lines: matched, totals: reportsTotals ? totals : nil)
     }
 }

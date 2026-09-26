@@ -347,8 +347,10 @@ public enum ProjectConfigLoader {
 
     /** The one `not-found` for a server name a project does not have. Asked
         from a linked worktree with no devservers.json of its own, for a name
-        its main checkout declares, it names why (the worktree does not see
-        that file, which is often untracked) and both ways out. */
+        its main checkout declares, the message names why (the worktree does
+        not see that file, which is often untracked) and both ways out, and
+        the hint is the command that lists the main checkout's servers, its
+        path single-quoted since a checkout path can hold any character. */
     public static func serverNotFound(
         name: String, project: String, hint: String = "run: directa status --json"
     ) -> WireError {
@@ -359,9 +361,10 @@ public enum ProjectConfigLoader {
         else { return WireError(code: .notFound, hint: hint, message: message) }
         return WireError(
             code: .notFound,
-            hint: "commit or copy devservers.json from \(main) into this worktree, or pass --project \(main)",
+            hint: "run: directa status --project \(ShellWord.singleQuoted(main))",
             message:
-                "\(message): this linked worktree has no devservers.json, and its main checkout \(main) declares '\(name)'"
+                "\(message): this linked worktree has no devservers.json, and its main checkout \(main) declares '\(name)'; "
+                + "commit or copy devservers.json into this worktree, or pass --project with the main checkout's path"
         )
     }
 

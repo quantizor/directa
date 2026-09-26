@@ -134,16 +134,23 @@ enum CLIRunner {
 
     static func fail(_ error: WireError, json: Bool) -> Never {
         emitFailure(error, json: json)
-        switch error.code {
+        Foundation.exit(exitStatus(for: error.code))
+    }
+
+    /** The one mapping from an error code to the process exit status, for
+        `fail` and for a command that reports its failure some other way
+        (`monitor`'s ended line) but must still exit the same. */
+    static func exitStatus(for code: WireErrorCode) -> Int32 {
+        switch code {
         case .daemonStarting, .daemonUnreachable, .versionMismatch:
-            Foundation.exit(3)
+            3
         case .notFound:
-            Foundation.exit(4)
+            4
         case .usage:
-            Foundation.exit(2)
+            2
         case .alreadyExists, .configInvalid, .internalError, .notTrusted, .portDrift, .portHeld,
             .projectStillExists, .requestTooLarge, .resourceLocked, .resourceMutated, .spawnFailed:
-            Foundation.exit(1)
+            1
         }
     }
 
@@ -433,7 +440,7 @@ struct Start: AsyncParsableCommand {
             CLIRunner.fail(
                 WireError(
                     code: .spawnFailed,
-                    hint: "run: directa status \(name) --json",
+                    hint: "run: directa status \(ShellWord.argument(name)) --json",
                     message: result.server.spawnError?.message ?? "spawn failed"),
                 json: global.json)
         }
@@ -1328,7 +1335,7 @@ struct Up: AsyncParsableCommand {
         guard let name, only != nil else { return nil }
         return WireError(
             code: .usage,
-            hint: "run: directa up \(name)",
+            hint: "run: directa up \(ShellWord.argument(name))",
             message: "pass a server name or --only, not both")
     }
 
@@ -1621,7 +1628,7 @@ struct ConfigInit: AsyncParsableCommand {
             guard !cmd.isEmpty else {
                 CLIRunner.fail(
                     WireError(
-                        code: .usage, hint: "run: directa config init --name \(name) --cmd <word>",
+                        code: .usage, hint: "run: directa config init --name \(ShellWord.argument(name)) --cmd <word>",
                         message: "--name needs a --cmd to run"),
                     json: global.json)
             }

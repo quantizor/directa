@@ -61,6 +61,12 @@ public actor DaemonClient {
             )
         }
         fd = sock
+        /** A write to a daemon that died mid-connection must fail with EPIPE
+            (which disconnects, so the next request reconnects), not raise
+            SIGPIPE, whose default action kills a CLI or app process that
+            never ignored the signal. */
+        var noSigPipe: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
         setResponseTimeout(Self.defaultResponseTimeout)
         /** The socket is open but unproven from here, and `fd >= 0` is what the
             guard above reads as "already connected". So every failing exit has
@@ -162,23 +168,33 @@ public actor DaemonClient {
         }
     }
 
+    /** Every failure here disconnects before it throws, as `writeAll` does:
+        `connect()` treats a live fd as connected, so a dead socket left in
+        place would be written to forever by a client that outlives one
+        daemon (the monitor loop, `lock`), never reaching the reconnect and
+        hello check a daemon restart needs. A timed-out read disconnects too,
+        since its late answer would otherwise sit in the socket ahead of the
+        next request's. */
     private func readLine() throws -> Data {
         var scratch = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
             if let line = pendingLine() { return line }
             let n = read(fd, &scratch, scratch.count)
             if n == 0 {
+                disconnect()
                 throw WireError(code: .daemonUnreachable, message: "daemon closed the connection")
             }
             if n < 0 {
-                if errno == EINTR { continue }
-                if errno == EAGAIN || errno == EWOULDBLOCK {
+                let err = errno
+                if err == EINTR { continue }
+                disconnect()
+                if err == EAGAIN || err == EWOULDBLOCK {
                     throw WireError(
                         code: .daemonUnreachable,
                         hint: "run: directa daemon restart",
                         message: "the daemon did not answer in time; it may be wedged")
                 }
-                throw WireError(code: .daemonUnreachable, message: "read failed: \(String(cString: strerror(errno)))")
+                throw WireError(code: .daemonUnreachable, message: "read failed: \(String(cString: strerror(err)))")
             }
             pending.append(contentsOf: buffer.feed(Data(scratch[0..<n])))
         }
@@ -195,8 +211,10 @@ public actor DaemonClient {
         while !remaining.isEmpty {
             let n = remaining.withUnsafeBufferPointer { write(fd, $0.baseAddress, $0.count) }
             if n < 0 {
-                if errno == EINTR { continue }
-                throw WireError(code: .daemonUnreachable, message: "write failed: \(String(cString: strerror(errno)))")
+                let err = errno
+                if err == EINTR { continue }
+                disconnect()
+                throw WireError(code: .daemonUnreachable, message: "write failed: \(String(cString: strerror(err)))")
             }
             remaining.removeFirst(n)
         }

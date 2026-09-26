@@ -36,8 +36,10 @@ public struct LogQueryOptions: Sendable {
         self.tailByStream = tailByStream
     }
 
-    /** The shapes that carry per-stream totals in their answer. */
-    var reportsTotals: Bool { after != nil || head != nil || tailByStream != nil }
+    /** The shapes that carry per-stream totals in their answer: the ones a
+        poller reads past a cursor or trims per stream. A `head` alone does
+        not, so it can stop reading once it holds its lines. */
+    var reportsTotals: Bool { after != nil || tailByStream != nil }
 }
 
 /** A query's answer: the lines, the family's end position when it ran, and

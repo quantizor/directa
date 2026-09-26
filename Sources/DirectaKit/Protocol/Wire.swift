@@ -750,7 +750,8 @@ public struct LogsQueryResult: Codable, Equatable, Sendable {
     public var cursor: LogCursor?
     public var lines: [LogRecord]
     /** Records matched per stream before trimming, present when the query
-        carried `after`, `head`, or `tailByStream`. */
+        carried `after` or `tailByStream`. A `head` without `after` omits it,
+        so the daemon can stop reading at the Nth line. */
     public var totals: LogStreamCounts?
 
     public init(cursor: LogCursor? = nil, lines: [LogRecord], totals: LogStreamCounts? = nil) {

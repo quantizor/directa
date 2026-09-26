@@ -158,16 +158,7 @@ public enum AgentContext {
         `render` would already have returned nil (no servers). */
     private static func monitorLine(harness: Harness, server: String?) -> String? {
         guard let server else { return nil }
-        /** The line is a command the agent runs, and a server name comes from
-            committed config: a name outside a shell-inert alphabet (`web; rm`,
-            a quote, a space) is never pasted in, the agent gets a placeholder
-            to fill from the server list instead. */
-        let shellInert = !server.isEmpty && server.count <= 64
-            && server.unicodeScalars.allSatisfy {
-                ("a"..."z").contains($0) || ("A"..."Z").contains($0) || ("0"..."9").contains($0)
-                    || $0 == "-" || $0 == "_" || $0 == "."
-            }
-        let name = shellInert ? server : "<name>"
+        let name = ShellWord.inertOr(server)
         switch harness {
         case .claude:
             return

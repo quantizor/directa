@@ -86,6 +86,9 @@ struct Monitor: AsyncParsableCommand {
                 case .ended(let events):
                     Self.emit(events, json: json)
                     return .success
+                case .endedWithError(let events, let error):
+                    Self.emit(events, json: json)
+                    return .endedWithError(error)
                 case .events(let events, let delaySeconds):
                     /** A write that fails (EPIPE, since SIGPIPE is ignored
                         above) means the reader is already gone; the kqueue
@@ -110,6 +113,8 @@ struct Monitor: AsyncParsableCommand {
         switch await loopTask.value {
         case .success:
             return
+        case .endedWithError(let error):
+            Foundation.exit(CLIRunner.exitStatus(for: error.code))
         case .failure(let error):
             CLIRunner.fail(error, json: json)
         }
@@ -239,12 +244,30 @@ struct MonitorRunConfig: Sendable {
 /** How the daemon last failed to answer, so the loop reports it once per
     transition rather than once per retry, and applies the right recovery
     rule: `configInvalid` and `restoring` retry until the daemon resolves
-    them on its own; `unreachable` also ends the run past
-    `MonitorRunTuning.unreachableGiveUpSeconds` of continuous failure. */
-private enum MonitorTransient: Equatable {
+    them on its own; `unreachable` (nothing answered) and `unreadable` (an
+    answer this client could not decode) share one clock that ends the run
+    past `MonitorRunTuning.unreachableGiveUpSeconds` of continuous failure.
+    Every other daemon error is not transient: it ends the run. */
+enum MonitorTransient: Equatable {
     case configInvalid
     case restoring
     case unreachable
+    case unreadable
+
+    /** Nil for a code that is not a transient state of the daemon. */
+    init?(_ code: WireErrorCode) {
+        switch code {
+        case .configInvalid: self = .configInvalid
+        case .daemonStarting: self = .restoring
+        case .daemonUnreachable: self = .unreachable
+        case .alreadyExists, .internalError, .notFound, .notTrusted, .portDrift, .portHeld,
+            .projectStillExists, .requestTooLarge, .resourceLocked, .resourceMutated, .spawnFailed,
+            .usage, .versionMismatch:
+            return nil
+        }
+    }
+
+    var countsTowardGiveUp: Bool { self == .unreachable || self == .unreadable }
 }
 
 /** Tunables for the loop itself, distinct from `MonitorLimits` (the budget
@@ -280,6 +303,11 @@ struct MonitorSession: Sendable {
             unreachable, or the 29-minute cap); `events` include the
             `MonitorStream.ended`/`endedAtHardCap` marker. */
         case ended([MonitorEvent])
+        /** The run is over because the daemon refused it after attaching
+            (an error that is not a transient state, or a daemon too old to
+            report `totals`): `events` end with a line naming the message,
+            and the process exits with the status that error maps to. */
+        case endedWithError([MonitorEvent], WireError)
         case events([MonitorEvent], delaySeconds: Double)
         /** Only ever produced before attaching: the caller may still exit
             through `CLIRunner.fail`, since nothing has printed yet. */
@@ -318,19 +346,20 @@ struct MonitorSession: Sendable {
         }
     }
 
-    /** One query with every stream trimmed to 0 (the cursor without any
-        lines) plus one status call, in that order: the query alone both
-        feature-gates the daemon (`cursor`/`totals` present) and, via
-        `not-found`, confirms the name exists before the status call ever
-        needs to compose the marker. */
+    /** One `tail: 0` query plus one status call, in that order. `tail: 0`
+        takes the daemon's tail fast path: the family's end cursor, no
+        lines, and no read of the log's history (a per-stream trim of 0
+        would scan the whole family forward to count totals nobody reads).
+        The query feature-gates the daemon on `cursor` and, via `not-found`,
+        confirms the name exists before the status call composes the
+        marker; `totals` is checked on the first tick, the first query that
+        carries it. */
     private mutating func attachStep() async -> StepOutcome {
         let now = await clock.now()
         do {
             let logsResult = try await client.queryLogs(
-                LogsQueryParams(
-                    maxLineCharacters: MonitorLimits.truncationCharacterLimit, name: config.name,
-                    project: config.project, tailByStream: LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0)))
-            guard let cursor = logsResult.cursor, logsResult.totals != nil else {
+                LogsQueryParams(name: config.name, project: config.project, tail: 0))
+            guard let cursor = logsResult.cursor else {
                 return .exit(Logs.olderDaemon)
             }
             let statusResult = try await client.fetchStatus(
@@ -355,17 +384,67 @@ struct MonitorSession: Sendable {
             if error.code == .notFound {
                 return .exit(ProjectConfigLoader.serverNotFound(name: config.name, project: config.project))
             }
-            let outcome = handleTransient(error, at: now)
-            if outcome.giveUpUnreachable {
-                return .exit(
-                    WireError(
-                        code: .daemonUnreachable, hint: "run: directa daemon status",
-                        message: "the daemon has been unreachable for \(Int(MonitorRunTuning.unreachableGiveUpSeconds))s"))
-            }
-            return .events(outcome.events, delaySeconds: outcome.delaySeconds)
+            guard let kind = MonitorTransient(error.code) else { return .exit(error) }
+            return attachTransient(kind, detail: error.message, at: now)
         } catch {
-            return .exit(WireError(code: .internalError, message: String(describing: error)))
+            return attachTransient(.unreadable, detail: String(describing: error), at: now)
         }
+    }
+
+    private mutating func attachTransient(_ kind: MonitorTransient, detail: String, at now: Date) -> StepOutcome {
+        let outcome = handleTransient(kind, detail: detail, at: now)
+        guard outcome.giveUp else { return .events(outcome.events, delaySeconds: outcome.delaySeconds) }
+        let seconds = Int(MonitorRunTuning.unreachableGiveUpSeconds)
+        if kind == .unreadable {
+            return .exit(
+                WireError(
+                    code: .internalError, hint: "run: directa daemon restart",
+                    message: "the daemon's answers could not be read for \(seconds)s: \(detail)"))
+        }
+        return .exit(
+            WireError(
+                code: .daemonUnreachable, hint: "run: directa daemon status",
+                message: "the daemon has been unreachable for \(seconds)s"))
+    }
+
+    private func tickParams(after cursor: LogCursor) -> LogsQueryParams {
+        LogsQueryParams(
+            after: cursor, maxLineCharacters: MonitorLimits.truncationCharacterLimit, name: config.name,
+            project: config.project,
+            tailByStream: LogStreamCounts(
+                err: MonitorLimits.perTickFetchCap, mark: MonitorRunTuning.lifecycleFetchCap,
+                out: MonitorLimits.perTickFetchCap, sys: MonitorRunTuning.lifecycleFetchCap))
+    }
+
+    /** What the daemon matched on out and err past `cursor` but did not
+        return (its per-stream trim), stamped at the cursor it read past. */
+    private static func tick(
+        _ result: LogsQueryResult, totals: LogStreamCounts, after cursor: LogCursor, at now: Date,
+        health: String? = nil
+    ) -> MonitorTick {
+        var trimmed: [LogStream: Int] = [:]
+        for streamKind in [LogStream.out, .err] {
+            let returned = result.lines.count { $0.stream == streamKind }
+            let total = totals[streamKind] ?? 0
+            if total > returned { trimmed[streamKind] = total - returned }
+        }
+        return MonitorTick(at: now, health: health, records: result.lines, trimmed: trimmed, windowStart: cursor.at)
+    }
+
+    /** The cap's last word: one more read past the cursor, so lines that
+        landed since the previous tick show before the end marker, whose
+        command then starts where this read stopped. A failed read is an
+        accepted loss here (the run is ending either way): the marker names
+        the cursor already held, so its command still covers those lines. */
+    private func finalDrain(cursor: LogCursor, stream: inout MonitorStream, at now: Date) async -> [MonitorEvent] {
+        var events: [MonitorEvent] = []
+        var resumeFrom = cursor
+        let drained = try? await client.queryLogs(tickParams(after: cursor))
+        if let drained, let next = drained.cursor, let totals = drained.totals {
+            events = stream.ingest(Self.tick(drained, totals: totals, after: cursor, at: now))
+            resumeFrom = next
+        }
+        return events + stream.endedAtHardCap(resumeFrom: resumeFrom.at)
     }
 
     private mutating func tickStep() async -> StepOutcome {
@@ -374,32 +453,25 @@ struct MonitorSession: Sendable {
         }
         let now = await clock.now()
         if now.timeIntervalSince(startedAt) >= MonitorRunTuning.hardCapSeconds {
-            return .ended(stream.endedAtHardCap())
+            let events = await finalDrain(cursor: cursor, stream: &stream, at: now)
+            return .ended(events)
         }
 
         let logsResult: LogsQueryResult
         do {
-            logsResult = try await client.queryLogs(
-                LogsQueryParams(
-                    after: cursor, maxLineCharacters: MonitorLimits.truncationCharacterLimit, name: config.name,
-                    project: config.project,
-                    tailByStream: LogStreamCounts(
-                        err: MonitorLimits.perTickFetchCap, mark: MonitorRunTuning.lifecycleFetchCap,
-                        out: MonitorLimits.perTickFetchCap, sys: MonitorRunTuning.lifecycleFetchCap)))
+            logsResult = try await client.queryLogs(tickParams(after: cursor))
         } catch let error as WireError {
             state = .streaming(cursor: cursor, stream: stream, lastHealthDescription: lastHealth, startedAt: startedAt)
             if error.code == .notFound {
                 return .ended(stream.ended(reason: "server unregistered"))
             }
-            let outcome = handleTransient(error, at: now)
-            if outcome.giveUpUnreachable {
-                return .ended(
-                    stream.ended(reason: "daemon unreachable for \(Int(MonitorRunTuning.unreachableGiveUpSeconds))s"))
+            guard let kind = MonitorTransient(error.code) else {
+                return .endedWithError(stream.ended(reason: Self.reason(error)), error)
             }
-            return .events(outcome.events, delaySeconds: outcome.delaySeconds)
+            return tickTransient(kind, detail: error.message, stream: &stream, at: now)
         } catch {
             state = .streaming(cursor: cursor, stream: stream, lastHealthDescription: lastHealth, startedAt: startedAt)
-            return .events([], delaySeconds: config.tickSeconds)
+            return tickTransient(.unreadable, detail: String(describing: error), stream: &stream, at: now)
         }
 
         transientKind = nil
@@ -407,19 +479,11 @@ struct MonitorSession: Sendable {
         currentBackoff = config.tickSeconds
 
         guard let nextCursor = logsResult.cursor, let totals = logsResult.totals else {
-            /** Should not happen once the feature gate at attach has passed
-                (a running daemon does not lose the field mid-session); kept
-                as a no-op tick rather than a crash, holding the old cursor
-                so nothing is skipped once the daemon answers normally again. */
-            state = .streaming(cursor: cursor, stream: stream, lastHealthDescription: lastHealth, startedAt: startedAt)
-            return .events([], delaySeconds: config.tickSeconds)
-        }
-
-        var trimmed: [LogStream: Int] = [:]
-        for streamKind in [LogStream.out, .err] {
-            let returned = logsResult.lines.count { $0.stream == streamKind }
-            let total = totals[streamKind] ?? 0
-            if total > returned { trimmed[streamKind] = total - returned }
+            /** The first query shaped to carry `totals`, or a daemon swapped
+                for an older one mid-run: either way the per-tick accounting
+                cannot be trusted, so the run ends the way attach refuses. */
+            return .endedWithError(
+                stream.ended(reason: Self.reason(Logs.olderDaemon)), Logs.olderDaemon)
         }
 
         var health: String?
@@ -455,7 +519,7 @@ struct MonitorSession: Sendable {
         }
 
         let tickEvents = stream.ingest(
-            MonitorTick(at: now, health: health, records: logsResult.lines, trimmed: trimmed))
+            Self.tick(logsResult, totals: totals, after: cursor, at: now, health: health))
         lastStatusPollAt = polledAt
         state = .streaming(
             cursor: nextCursor, stream: stream, lastHealthDescription: updatedLastHealth, startedAt: startedAt)
@@ -466,17 +530,26 @@ struct MonitorSession: Sendable {
         return .events(tickEvents, delaySeconds: config.tickSeconds)
     }
 
-    /** Shared by attach and every tick: classifies a daemon failure into the
-        transient state an agent should see, tracks how long "unreachable"
-        has been continuous, and computes the next backoff delay.
-        `giveUpUnreachable` means unreachable for
+    private mutating func tickTransient(
+        _ kind: MonitorTransient, detail: String, stream: inout MonitorStream, at now: Date
+    ) -> StepOutcome {
+        let outcome = handleTransient(kind, detail: detail, at: now)
+        guard outcome.giveUp else { return .events(outcome.events, delaySeconds: outcome.delaySeconds) }
+        let seconds = Int(MonitorRunTuning.unreachableGiveUpSeconds)
+        let reason = kind == .unreadable ? "daemon answers unreadable for \(seconds)s" : "daemon unreachable for \(seconds)s"
+        return .ended(stream.ended(reason: reason))
+    }
+
+    /** Shared by attach and every tick: reports a transient state once per
+        transition, tracks how long the daemon has continuously failed to
+        answer (unreachable or unreadable), and computes the next backoff
+        delay. `giveUp` means that failure has lasted
         `MonitorRunTuning.unreachableGiveUpSeconds`: the caller ends the run
         (a tick) or exits (still attaching) instead of retrying again. */
     private mutating func handleTransient(
-        _ error: WireError, at now: Date
-    ) -> (events: [MonitorEvent], delaySeconds: Double, giveUpUnreachable: Bool) {
-        let kind = Self.classify(error.code)
-        if kind == .unreachable {
+        _ kind: MonitorTransient, detail: String, at now: Date
+    ) -> (events: [MonitorEvent], delaySeconds: Double, giveUp: Bool) {
+        if kind.countsTowardGiveUp {
             let since = unreachableSince ?? now
             unreachableSince = since
             if now.timeIntervalSince(since) >= MonitorRunTuning.unreachableGiveUpSeconds {
@@ -487,7 +560,9 @@ struct MonitorSession: Sendable {
         }
         var events: [MonitorEvent] = []
         if transientKind != kind {
-            events = [MonitorEvent(at: now, kind: .transient, label: label, text: Self.transientText(kind))]
+            events = [
+                MonitorEvent(at: now, kind: .transient, label: label, text: Self.transientText(kind, detail: detail))
+            ]
             transientKind = kind
         }
         let delay = currentBackoff
@@ -495,20 +570,25 @@ struct MonitorSession: Sendable {
         return (events, delay, false)
     }
 
-    private static func classify(_ code: WireErrorCode) -> MonitorTransient {
-        switch code {
-        case .configInvalid: return .configInvalid
-        case .daemonStarting: return .restoring
-        default: return .unreachable
-        }
-    }
-
-    private static func transientText(_ kind: MonitorTransient) -> String {
+    private static func transientText(_ kind: MonitorTransient, detail: String) -> String {
         switch kind {
         case .configInvalid: return "config is invalid, waiting (directa config check)"
         case .restoring: return "the daemon is restoring supervised servers, waiting"
         case .unreachable: return "the daemon is unreachable, retrying"
+        case .unreadable: return "the daemon's answer could not be read (\(reason(detail))), retrying"
         }
+    }
+
+    /** A daemon message or a decoding error's description, made safe to
+        print in the `directa <label>:` namespace. */
+    private static func reason(_ text: String) -> String {
+        MonitorSanitizer.truncate(MonitorSanitizer.sanitize(text), limit: MonitorLimits.truncationCharacterLimit)
+    }
+
+    /** The ended line for a refusal carries its fix: the message, then the
+        hint command when the error has one. */
+    private static func reason(_ error: WireError) -> String {
+        reason(error.hint.map { "\(error.message); \($0)" } ?? error.message)
     }
 
     private static func rawLabel(name: String, server: ServerStatus) -> String {
@@ -532,8 +612,11 @@ struct MonitorSession: Sendable {
 /** How a `directa monitor` process ended, decided inside the loop's own
     `Task` and read once by `run()` after awaiting it: `.failure` is the only
     case that still exits through `CLIRunner.fail`, and only because nothing
-    has printed yet (it can only come from `MonitorSession.attachStep`). */
+    has printed yet (it can only come from `MonitorSession.attachStep`).
+    `.endedWithError` has already printed its ended line and exits with the
+    status `CLIRunner` maps the error's code to, without a second report. */
 private enum MonitorRunOutcome: Sendable {
+    case endedWithError(WireError)
     case failure(WireError)
     case success
 }
@@ -549,6 +632,14 @@ private enum MonitorRunOutcome: Sendable {
     watches `CLAUDE_PID` (`EVFILT_PROC`/`NOTE_EXIT`) when the harness set it,
     or falls back to polling `getppid()` for a change. */
 final class MonitorLifetime: @unchecked Sendable {
+    /** The signal that ends the run; a kqueue signal carries its descriptor,
+        already registered. */
+    enum Watch: Equatable {
+        case parentChange
+        case processExit(kqueue: Int32)
+        case stdoutEOF(kqueue: Int32)
+    }
+
     private let lock = NSLock()
     private var onGone: (() -> Void)?
 
@@ -569,28 +660,66 @@ final class MonitorLifetime: @unchecked Sendable {
 
     private func arm() {
         var st = stat()
-        guard fstat(1, &st) == 0 else { return }
-        switch mode_t(st.st_mode) & S_IFMT {
-        case S_IFIFO, S_IFSOCK:
-            watchStdoutEOF()
-        default:
-            if let raw = ProcessInfo.processInfo.environment["CLAUDE_PID"], let pid = pid_t(raw) {
-                watchClaudeExit(pid)
-            } else {
-                watchParentChange()
-            }
+        let stdoutIsStream =
+            fstat(1, &st) == 0 && [S_IFIFO, S_IFSOCK].contains(mode_t(st.st_mode) & S_IFMT)
+        let claudePID = ProcessInfo.processInfo.environment["CLAUDE_PID"].flatMap { pid_t($0) }
+        let watch = Self.choose(
+            claudePID: claudePID, registerProcessExit: Self.registerProcessExit,
+            registerStdoutEOF: Self.registerStdoutEOF, stdoutIsStream: stdoutIsStream)
+        switch watch {
+        case .parentChange:
+            watchParentChange()
+        case .processExit(let kq):
+            watchProcessExit(kqueue: kq)
+        case .stdoutEOF(let kq):
+            watchStdoutEOF(kqueue: kq)
         }
     }
 
-    private func watchStdoutEOF() {
-        let thread = Thread { [self] in
-            let kq = kqueue()
-            guard kq >= 0 else { return }
-            defer { close(kq) }
-            var change = kevent(
+    /** The first signal whose registration succeeds, most direct first. A
+        `CLAUDE_PID` naming a process that already exited (the kernel
+        refuses the registration with ESRCH), or a kqueue the kernel will
+        not create, falls through to the parent-change poll instead of
+        leaving the run with no lifetime watch at all. */
+    static func choose(
+        claudePID: pid_t?, registerProcessExit: (pid_t) -> Int32?, registerStdoutEOF: () -> Int32?,
+        stdoutIsStream: Bool
+    ) -> Watch {
+        if stdoutIsStream, let kq = registerStdoutEOF() { return .stdoutEOF(kqueue: kq) }
+        if let claudePID, let kq = registerProcessExit(claudePID) { return .processExit(kqueue: kq) }
+        return .parentChange
+    }
+
+    /** A kqueue with `pid`'s `NOTE_EXIT` registered, or nil (nothing left
+        open) when the kernel refuses either step. */
+    static func registerProcessExit(_ pid: pid_t) -> Int32? {
+        register(
+            kevent(
+                ident: UInt(pid), filter: Int16(EVFILT_PROC), flags: UInt16(EV_ADD | EV_ONESHOT),
+                fflags: UInt32(NOTE_EXIT), data: 0, udata: nil))
+    }
+
+    static func registerStdoutEOF() -> Int32? {
+        register(
+            kevent(
                 ident: UInt(1), filter: Int16(EVFILT_WRITE), flags: UInt16(EV_ADD | EV_CLEAR), fflags: 0,
-                data: 0, udata: nil)
-            guard kevent(kq, &change, 1, nil, 0, nil) == 0 else { return }
+                data: 0, udata: nil))
+    }
+
+    private static func register(_ change: kevent) -> Int32? {
+        let kq = kqueue()
+        guard kq >= 0 else { return nil }
+        var change = change
+        guard kevent(kq, &change, 1, nil, 0, nil) == 0 else {
+            close(kq)
+            return nil
+        }
+        return kq
+    }
+
+    private func watchStdoutEOF(kqueue kq: Int32) {
+        let thread = Thread { [self] in
+            defer { close(kq) }
             var events: [kevent] = Array(repeating: kevent(), count: 1)
             while true {
                 let n = kevent(kq, nil, 0, &events, 1, nil)
@@ -608,17 +737,16 @@ final class MonitorLifetime: @unchecked Sendable {
         thread.start()
     }
 
-    private func watchClaudeExit(_ pid: pid_t) {
+    private func watchProcessExit(kqueue kq: Int32) {
         let thread = Thread { [self] in
-            let kq = kqueue()
-            guard kq >= 0 else { return }
             defer { close(kq) }
-            var change = kevent(
-                ident: UInt(pid), filter: Int16(EVFILT_PROC), flags: UInt16(EV_ADD | EV_ONESHOT),
-                fflags: UInt32(NOTE_EXIT), data: 0, udata: nil)
-            guard kevent(kq, &change, 1, nil, 0, nil) == 0 else { return }
             var events: [kevent] = Array(repeating: kevent(), count: 1)
-            if kevent(kq, nil, 0, &events, 1, nil) > 0 { fire() }
+            while true {
+                let n = kevent(kq, nil, 0, &events, 1, nil)
+                if n < 0, errno == EINTR { continue }
+                if n > 0 { fire() }
+                return
+            }
         }
         thread.name = "dev.quantizor.directa.monitor-lifetime-claude"
         thread.start()
