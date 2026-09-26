@@ -147,6 +147,21 @@ import Testing
         ])
     }
 
+    /** The 29-minute hard cap reads as a next step, not a parenthetical
+        status, and flushes exactly what `ended(reason:)` flushes: a pending
+        lifecycle run and a live repeated-lines summary. */
+    @Test func endedAtHardCapWordsItsLineAsANextStepAndStillFlushesPending() {
+        var stream = makeStream()
+        _ = stream.ingest(tick(0, records: [record(0, .err, "boom")]))
+        let repeats = (0..<14).map { record(0.1 + Double($0) * 0.1, LogStream.err, "boom") }
+        _ = stream.ingest(tick(1.5, records: repeats))
+        let events = stream.endedAtHardCap()
+        #expect(events.map(\MonitorEvent.humanLine) == [
+            "web err| boom (repeated x14)",
+            "directa web: ended after 29 minutes; run the same command again to keep watching",
+        ])
+    }
+
     @Test func emptyTicksEmitNothing() {
         var stream = makeStream()
         #expect(stream.ingest(tick(0)).isEmpty)

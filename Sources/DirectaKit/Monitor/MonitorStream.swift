@@ -227,8 +227,11 @@ public struct MonitorEvent: Codable, Equatable, Sendable {
 }
 
 /** Sanitizes text and labels before either reaches a terminal or an agent's
-    context: child output is attacker-influenceable. */
-enum MonitorSanitizer {
+    context: child output is attacker-influenceable. Public: the CLI's monitor
+    loop constructs a `.transient` `MonitorEvent` directly (there is no
+    `MonitorStream` method for a connection-level failure), and needs the same
+    guarantees on the label it renders that as `directa <label>:`. */
+public enum MonitorSanitizer {
     /** ANSI/OSC escapes (a terminal-injection surface, stripped by the same
         routine `LogSanitizer` already uses for spool output), the Unicode
         control/format/line-and-paragraph-separator categories (Cc, Cf, Zl,
@@ -236,7 +239,7 @@ enum MonitorSanitizer {
         overrides, none of which a `.whitespacesAndNewlines` check would
         catch), and a tab folded to a space before the category sweep so it
         does not also get removed as Cc. */
-    static func sanitize(_ raw: String) -> String {
+    public static func sanitize(_ raw: String) -> String {
         let stripped = LogSanitizer.stripEscapes(raw)
         let tabsFolded = stripped.replacing("\t", with: " ")
         let scalars = tabsFolded.unicodeScalars.filter { !isRemovedCategory($0) }
@@ -255,14 +258,14 @@ enum MonitorSanitizer {
     /** The label additionally folds `|`, `:`, and whitespace to `_`: those
         are exactly the characters the out|/err|/directa: namespaces are built
         from, so a label cannot manufacture a fake namespace boundary. */
-    static func sanitizeLabel(_ raw: String) -> String {
+    public static func sanitizeLabel(_ raw: String) -> String {
         String(
             sanitize(raw).map { character in
                 character == "|" || character == ":" || character.isWhitespace ? "_" : character
             })
     }
 
-    static func truncate(_ text: String, limit: Int) -> String {
+    public static func truncate(_ text: String, limit: Int) -> String {
         guard text.count > limit else { return text }
         return String(text.prefix(limit)) + "…"
     }
@@ -459,6 +462,29 @@ public struct MonitorStream: Sendable {
     }
 
     public mutating func ended(reason: String) -> [MonitorEvent] {
+        var events = flushForEnd()
+        events.append(MonitorEvent(at: lastKnownAt, kind: .ended, label: sanitizedLabel, text: "ended (\(reason))"))
+        return events
+    }
+
+    /** The 29-minute hard cap (below Claude Code's 30-minute Monitor kill, so
+        this line is delivered before the tool would drop the process
+        itself): worded as a next step rather than `ended(reason:)`'s
+        parenthetical, since re-arming is the whole point of this ending. */
+    public mutating func endedAtHardCap() -> [MonitorEvent] {
+        var events = flushForEnd()
+        events.append(
+            MonitorEvent(
+                at: lastKnownAt, kind: .ended, label: sanitizedLabel,
+                text: "ended after 29 minutes; run the same command again to keep watching"))
+        return events
+    }
+
+    /** Shared by both endings: flushes every burst repeat still pending, the
+        lifecycle/mark run still pending, and the periodic summary, in that
+        order, so nothing counted along the way is silently dropped when the
+        run stops. */
+    private mutating func flushForEnd() -> [MonitorEvent] {
         var events: [MonitorEvent] = []
         events += flushPendingBurstRuns(at: lastKnownAt, onlyStale: false)
         for stream in [LogStream.sys, .mark] {
@@ -475,9 +501,7 @@ public struct MonitorStream: Sendable {
             summaryTotal = 0
             summaryDistinct.removeAll()
         }
-        events = events.sorted { $0.at < $1.at }
-        events.append(MonitorEvent(at: lastKnownAt, kind: .ended, label: sanitizedLabel, text: "ended (\(reason))"))
-        return events
+        return events.sorted { $0.at < $1.at }
     }
 
     // MARK: - Record classification

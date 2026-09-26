@@ -50,13 +50,13 @@ enum CLISelf {
     free: a session start must stay fast, must never bootstrap the daemon, and
     stays silent when the daemon is unreachable. */
 enum HookContext {
-    static func render(project: String) async -> String? {
+    static func render(project: String, harness: AgentContext.Harness) async -> String? {
         let client = DaemonClient(socketPath: DirectaPaths().socketPath)
         guard
             let list = try? await client.request(
                 .serverStatus, params: ProjectParams(project: project), expecting: ServerListResult.self)
         else { return nil }
-        return AgentContext.render(list: list)
+        return AgentContext.render(list: list, harness: harness)
     }
 }
 

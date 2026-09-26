@@ -14,7 +14,7 @@ struct Directa: AsyncParsableCommand {
         version: DirectaVersion.version,
         subcommands: [
             ConfigCommand.self, Context.self, Doctor.self, Down.self, Ensure.self, Events.self,
-            HookCommand.self, Link.self, Logs.self, Mark.self, Open.self, Register.self,
+            HookCommand.self, Link.self, Logs.self, Mark.self, Monitor.self, Open.self, Register.self,
             Restart.self, Start.self,
             Lock.self, Statusline.self, Status.self, Stop.self, Switch.self, Trust.self,
             Uninstall.self, Unregister.self, Up.self,
@@ -904,7 +904,7 @@ struct Context: AsyncParsableCommand {
     @OptionGroup var global: GlobalOptions
 
     func run() async throws {
-        if let text = await HookContext.render(project: global.resolvedProject()) {
+        if let text = await HookContext.render(project: global.resolvedProject(), harness: .neutral) {
             print(text)
         }
     }
@@ -1141,7 +1141,7 @@ struct HookAntigravitySessionStart: AsyncParsableCommand {
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         FileManager.default.changeCurrentDirectoryPath(cwd)
         let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await HookContext.render(project: project) else {
+        guard let text = await HookContext.render(project: project, harness: .antigravity) else {
             let empty: [String: Any] = ["injectSteps": []]
             if let data = try? JSONSerialization.data(withJSONObject: empty) {
                 FileHandle.standardOutput.write(data)
@@ -1173,7 +1173,7 @@ struct HookClaudeSessionStart: AsyncParsableCommand {
             hook cwd by chdir-ing there first. */
         FileManager.default.changeCurrentDirectoryPath(cwd)
         let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await HookContext.render(project: project) else { return }
+        guard let text = await HookContext.render(project: project, harness: .claude) else { return }
         let output: [String: Any] = [
             "hookSpecificOutput": [
                 "additionalContext": text,
@@ -1197,7 +1197,7 @@ struct HookCursorSessionStart: AsyncParsableCommand {
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         FileManager.default.changeCurrentDirectoryPath(cwd)
         let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await HookContext.render(project: project) else { return }
+        guard let text = await HookContext.render(project: project, harness: .cursor) else { return }
         let output: [String: Any] = ["additional_context": text]
         if let data = try? JSONSerialization.data(withJSONObject: output) {
             FileHandle.standardOutput.write(data)
@@ -1252,7 +1252,7 @@ struct HookGrokSessionStart: AsyncParsableCommand {
         let cwd = HookSessionCwd.resolve(stdin: stdin)
         FileManager.default.changeCurrentDirectoryPath(cwd)
         let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await HookContext.render(project: project) else { return false }
+        guard let text = await HookContext.render(project: project, harness: .grok) else { return false }
         let output: [String: Any] = [
             "hookSpecificOutput": [
                 "additionalContext": text,

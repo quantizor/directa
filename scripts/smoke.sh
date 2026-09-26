@@ -54,6 +54,10 @@ cleanup() {
   # Grandchildren escape the process group on purpose (that is what the teardown
   # assertions exercise), so a group kill leaves them behind. Reap them by pid.
   for stray in ${STRAY_PIDS:-}; do kill -9 "$stray" 2>/dev/null || true; done
+  # Every `directa monitor` invocation started for the monitor checks below is
+  # tracked here too, so a `fail` partway through that section (which exits and
+  # runs this trap) cannot leave one running past this script.
+  for mon in ${MONITOR_PIDS:-}; do kill -9 "$mon" 2>/dev/null || true; done
   # Orphans from a mid-smoke abort can hold fixed listen ports across reruns.
   pkill -f "$BIN/fixture-server" 2>/dev/null || true
   rm -rf "$WORK"
@@ -571,6 +575,202 @@ sleep 1
 kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon (pid $DAEMON_PID) died restarting a flooding server"
 pass "restarting a flooding server completes and the daemon (pid $DAEMON_PID) stays up"
 "$DIRECTA" stop flood --json > /dev/null
+
+# directa monitor: a client-side polling loop over logs.query/server.status
+# shaped for an agent's own streaming tool. Every check below runs against
+# this script's own temp daemon/socket, never a live one.
+MONPROJ="$WORK/monitor-project"
+mkdir -p "$MONPROJ"
+cd "$MONPROJ"
+"$DIRECTA" register --name monweb --cmd "$BIN/fixture-server" --json > /dev/null
+"$DIRECTA" ensure monweb --timeout 10 --json > /dev/null || fail "monitor fixture never became healthy"
+
+MON_OUT="$WORK/monitor-out.log"
+"$DIRECTA" monitor monweb --tick 0.5 > "$MON_OUT" 2>/dev/null &
+MON_PID=$!
+MONITOR_PIDS="${MONITOR_PIDS:-} $MON_PID"
+for i in {1..50}; do grep -q "^directa monweb: monitoring" "$MON_OUT" && break; sleep 0.1; done
+grep -q "^directa monweb: monitoring" "$MON_OUT" || fail "monitor never printed its start marker"
+for i in {1..30}; do grep -q "monweb out| heartbeat" "$MON_OUT" && break; sleep 0.1; done
+grep -q "monweb out| heartbeat" "$MON_OUT" || fail "monitor never showed a line through the pipe within a tick"
+pass "monitor shows a line through a pipe within one tick"
+kill -9 "$MON_PID" 2>/dev/null || true
+wait "$MON_PID" 2>/dev/null || true
+
+# Lifecycle survives an over-cap burst, and RSS stays bounded under a flood
+# at max budget flags. One 20 s run covers both: a restart 2 s in exercises
+# the lifecycle lines, then 18 s of RSS sampling.
+# The RSS ceiling was set by measuring this exact scenario: peak observed
+# while writing this check was ~12 MB (11.6-12.1 MB), settling near 11.5 MB;
+# 40 MB leaves wide headroom while still catching a real leak, since nothing
+# in the design accumulates for the life of a run (a fixed-size LRU, bounded
+# token-bucket budgets, one query and at most one status call per tick).
+"$DIRECTA" register --name monflood --cmd "$BIN/fixture-server" --cmd --flood --json > /dev/null
+"$DIRECTA" ensure monflood --timeout 10 --json > /dev/null || fail "flooding fixture for monitor never became healthy"
+FLOOD_MON_OUT="$WORK/monitor-flood.log"
+"$DIRECTA" monitor monflood --tick 0.5 --lines-per-minute 1200 --lines-per-arm 20000 \
+  --errors-per-minute 600 --errors-per-arm 5000 > "$FLOOD_MON_OUT" 2>/dev/null &
+FLOOD_MON_PID=$!
+MONITOR_PIDS="${MONITOR_PIDS:-} $FLOOD_MON_PID"
+sleep 2
+"$DIRECTA" restart monflood --timeout 15 --json > /dev/null || fail "restart under a flooding monitor failed"
+MON_RSS_CEILING_KB=40000
+MAX_RSS=0
+for i in $(seq 1 18); do
+  RSS="$(ps -o rss= -p "$FLOOD_MON_PID" 2>/dev/null | tr -d ' ')"
+  [[ -n "$RSS" ]] || fail "monitor process died during the flood RSS check"
+  [[ "$RSS" -gt "$MAX_RSS" ]] && MAX_RSS="$RSS"
+  sleep 1
+done
+kill -9 "$FLOOD_MON_PID" 2>/dev/null || true
+wait "$FLOOD_MON_PID" 2>/dev/null || true
+grep -q "stopping: requested by restart" "$FLOOD_MON_OUT" || fail "lifecycle 'stopping' line lost inside an over-cap burst"
+grep -q "started pid=" "$FLOOD_MON_OUT" || fail "lifecycle 'started' line lost inside an over-cap burst"
+pass "lifecycle lines survive an over-cap flood burst across a restart"
+[[ "$MAX_RSS" -le "$MON_RSS_CEILING_KB" ]] || fail "monitor RSS peaked at ${MAX_RSS}KB under flood, over the ${MON_RSS_CEILING_KB}KB ceiling"
+pass "monitor RSS stays under ${MON_RSS_CEILING_KB}KB (peaked ${MAX_RSS}KB) through a flood at max budget flags"
+"$DIRECTA" stop monflood --json > /dev/null 2>&1 || true
+"$DIRECTA" unregister monflood --json > /dev/null 2>&1 || true
+
+# Daemon kill and restart keeps streaming: the client's persistent connection
+# goes unreachable across the kill, reports it once, and resumes once the
+# daemon (restored from the same registry/data dirs) answers again.
+KEEP_OUT="$WORK/monitor-keepalive.log"
+"$DIRECTA" monitor monweb --tick 0.5 > "$KEEP_OUT" 2>/dev/null &
+KEEP_MON_PID=$!
+MONITOR_PIDS="${MONITOR_PIDS:-} $KEEP_MON_PID"
+for i in {1..30}; do grep -q "monweb out| heartbeat" "$KEEP_OUT" && break; sleep 0.1; done
+grep -q "monweb out| heartbeat" "$KEEP_OUT" || fail "monitor never streamed before the daemon kill"
+BEFORE_LINES="$(wc -l < "$KEEP_OUT" | tr -d ' ')"
+kill -9 "$DAEMON_PID"
+wait "$DAEMON_PID" 2>/dev/null || true
+"$BIN/ddirecta" --foreground --socket "$DIRECTA_SOCKET" --data-dir "$WORK/data" --logs-dir "$WORK/logs" \
+  >>"$DAEMON_LOG" 2>&1 &
+DAEMON_PID=$!
+await_daemon "monitor daemon-kill recovery"
+AFTER_LINES="$BEFORE_LINES"
+for i in {1..50}; do
+  AFTER_LINES="$(wc -l < "$KEEP_OUT" | tr -d ' ')"
+  [[ "$AFTER_LINES" -gt "$BEFORE_LINES" ]] && break
+  sleep 0.2
+done
+[[ "$AFTER_LINES" -gt "$BEFORE_LINES" ]] || fail "monitor did not resume streaming after the daemon restarted"
+grep -q "the daemon is unreachable, retrying" "$KEEP_OUT" || fail "monitor never reported the daemon as unreachable across the kill"
+pass "monitor survives a daemon kill and restart, resuming with a transient line ($BEFORE_LINES -> $AFTER_LINES lines)"
+kill -9 "$KEEP_MON_PID" 2>/dev/null || true
+wait "$KEEP_MON_PID" 2>/dev/null || true
+
+# Linked-worktree cwd: a worktree under <repo>/.claude/worktrees/ attaches to
+# its OWN server while a same-named main-checkout server keeps running, with
+# a distinct label.
+MON_WT_ROOT="$WORK/monitor-wt"
+mkdir -p "$MON_WT_ROOT/main"
+cd "$MON_WT_ROOT/main"
+git init -b main >/dev/null
+git config user.email "smoke@directa.test"
+git config user.name "directa-smoke"
+echo ok > README
+git add README
+git commit -m init >/dev/null
+mkdir -p "$MON_WT_ROOT/main/.claude/worktrees"
+git worktree add -b review "$MON_WT_ROOT/main/.claude/worktrees/review" >/dev/null
+MON_WT_PORT=$((49000 + (RANDOM % 400)))
+cat > "$MON_WT_ROOT/main/devservers.json" <<CFG
+{
+  "host": "monitorwt.localhost",
+  "servers": {
+    "web": {
+      "command": ["$BIN/fixture-server", "--listen-tcp", "{port}"],
+      "healthcheck": { "type": "tcp", "port": $MON_WT_PORT },
+      "port": $MON_WT_PORT
+    }
+  },
+  "version": 1
+}
+CFG
+cp "$MON_WT_ROOT/main/devservers.json" "$MON_WT_ROOT/main/.claude/worktrees/review/devservers.json"
+"$DIRECTA" ensure web --timeout 15 --json > /dev/null || fail "monitor worktree main ensure failed"
+cd "$MON_WT_ROOT/main/.claude/worktrees/review"
+"$DIRECTA" ensure web --timeout 15 --json > /dev/null || fail "monitor worktree review ensure failed"
+WT_MON_OUT="$WORK/monitor-wt.log"
+"$DIRECTA" monitor web --tick 1 > "$WT_MON_OUT" 2>/dev/null &
+WT_MON_PID=$!
+MONITOR_PIDS="${MONITOR_PIDS:-} $WT_MON_PID"
+for i in {1..30}; do grep -q "^directa web@review: monitoring" "$WT_MON_OUT" && break; sleep 0.1; done
+grep -q "^directa web@review: monitoring" "$WT_MON_OUT" || fail "monitor from a linked worktree cwd did not attach with the @review label: $(head -3 "$WT_MON_OUT" 2>/dev/null)"
+pass "monitor from a linked-worktree cwd attaches to that worktree's server with a distinct label"
+kill -9 "$WT_MON_PID" 2>/dev/null || true
+wait "$WT_MON_PID" 2>/dev/null || true
+
+# --project overrides cwd.
+cd "$MONPROJ"
+PROJ_OVERRIDE_OUT="$WORK/monitor-project-override.log"
+# directa canonicalizes the project path (resolving /tmp -> /private/tmp);
+# pwd -P matches that so the comparison below is exact, not a near-miss.
+MON_WT_MAIN_CANONICAL="$(cd "$MON_WT_ROOT/main" && pwd -P)"
+"$DIRECTA" monitor web --project "$MON_WT_ROOT/main" --tick 1 > "$PROJ_OVERRIDE_OUT" 2>/dev/null &
+PROJ_OVERRIDE_PID=$!
+MONITOR_PIDS="${MONITOR_PIDS:-} $PROJ_OVERRIDE_PID"
+for i in {1..30}; do grep -q "^directa web: monitoring $MON_WT_MAIN_CANONICAL" "$PROJ_OVERRIDE_OUT" && break; sleep 0.1; done
+grep -q "^directa web: monitoring $MON_WT_MAIN_CANONICAL" "$PROJ_OVERRIDE_OUT" || fail "--project did not override cwd for monitor: $(head -3 "$PROJ_OVERRIDE_OUT" 2>/dev/null)"
+pass "--project overrides cwd for monitor"
+kill -9 "$PROJ_OVERRIDE_PID" 2>/dev/null || true
+wait "$PROJ_OVERRIDE_PID" 2>/dev/null || true
+cd "$MON_WT_ROOT/main"
+"$DIRECTA" stop web --json > /dev/null 2>&1 || true
+cd "$MON_WT_ROOT/main/.claude/worktrees/review"
+"$DIRECTA" stop web --json > /dev/null 2>&1 || true
+
+# Reader-gone exit: the pipe's read end closes after 1 s, well inside the 2 s
+# budget; polls for the real `directa monitor` process (a child of the
+# pipeline below, not this job's own pid) so the timing is measured against
+# the process whose lifetime is actually under test.
+cd "$MONPROJ"
+READER_START=$SECONDS
+"$DIRECTA" monitor monweb | ( sleep 1; exit 0 ) &
+READER_MON_PID=""
+for i in {1..30}; do
+  READER_MON_PID="$(pgrep -f "$BIN/directa monitor monweb" | head -1)"
+  [[ -n "$READER_MON_PID" ]] && break
+  sleep 0.05
+done
+[[ -n "$READER_MON_PID" ]] || fail "reader-gone check never saw the monitor process start"
+MONITOR_PIDS="${MONITOR_PIDS:-} $READER_MON_PID"
+for i in {1..30}; do
+  kill -0 "$READER_MON_PID" 2>/dev/null || break
+  sleep 0.1
+done
+READER_ELAPSED=$((SECONDS - READER_START))
+kill -0 "$READER_MON_PID" 2>/dev/null && fail "monitor did not exit within 2 s of its reader closing (still alive after ${READER_ELAPSED}s)"
+[[ "$READER_ELAPSED" -le 2 ]] || fail "monitor took ${READER_ELAPSED}s to exit after its reader closed, wanted <= 2s"
+pass "monitor exits within 2 s once its stdout reader is gone"
+
+# One poll per tick, and idle CPU, both over a quiet server (no flood
+# processing overhead to skew either number): DIRECTA_MONITOR_DEBUG=1 prints
+# one stderr line per logs.query call (documented at its callsite in
+# MonitorCommand.swift), so 20 s at --tick 0.5 is nominally 40; negligible
+# cumulative CPU time over the same real wall-clock window means the loop is
+# sleeping between ticks (and the lifetime watcher blocking in the kernel),
+# not spinning.
+IDLE_OUT="$WORK/monitor-idle.log"
+IDLE_DEBUG="$WORK/monitor-idle-debug.log"
+DIRECTA_MONITOR_DEBUG=1 "$DIRECTA" monitor monweb --tick 0.5 > "$IDLE_OUT" 2>"$IDLE_DEBUG" &
+IDLE_MON_PID=$!
+MONITOR_PIDS="${MONITOR_PIDS:-} $IDLE_MON_PID"
+sleep 20
+IDLE_TIME_RAW="$(ps -o time= -p "$IDLE_MON_PID" | tr -d ' ')"
+kill -9 "$IDLE_MON_PID" 2>/dev/null || true
+wait "$IDLE_MON_PID" 2>/dev/null || true
+[[ -n "$IDLE_TIME_RAW" ]] || fail "could not read monitor's CPU time"
+IDLE_UNDER_ONE_SECOND=$(awk -F: -v t="$IDLE_TIME_RAW" 'BEGIN{n=split(t,a,":"); s=0; for(i=1;i<=n;i++) s=s*60+a[i]; print (s<1.0)?1:0}')
+[[ "$IDLE_UNDER_ONE_SECOND" -eq 1 ]] || fail "monitor used ${IDLE_TIME_RAW} of CPU over 20 idle seconds, wanted well under 1s"
+pass "monitor stays near-idle (<1s CPU) over 20 s attached to a quiet server"
+POLL_COUNT="$(wc -l < "$IDLE_DEBUG" | tr -d ' ')"
+[[ "$POLL_COUNT" -ge 34 && "$POLL_COUNT" -le 44 ]] || fail "expected ~40 polls over 20s at --tick 0.5 against a quiet server, got $POLL_COUNT"
+pass "one poll per tick over 20 s at --tick 0.5 ($POLL_COUNT polls)"
+
+cd "$MONPROJ"
+"$DIRECTA" stop monweb --json > /dev/null 2>&1 || true
 
 # watch: a config the server reads at boot changes, and the server comes back
 # having read it. The pid moving is not the point; the new value in the log is.

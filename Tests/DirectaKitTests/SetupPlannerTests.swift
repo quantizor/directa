@@ -139,7 +139,7 @@ struct SetupPlannerTests {
                     .split(separator: ":").map(String.init))
         }
         let interactive = try pathFrom(["-ilc", "echo $PATH"])
-        try withKnownIssue("no .zshrc on this machine, so there is nothing to miss", isIntermittent: true) {
+        withKnownIssue("no .zshrc on this machine, so there is nothing to miss", isIntermittent: true) {
             try #require(FileManager.default.fileExists(atPath: "\(home)/.zshrc"))
         }
         guard FileManager.default.fileExists(atPath: "\(home)/.zshrc") else { return }
@@ -147,7 +147,7 @@ struct SetupPlannerTests {
             or this machine cannot demonstrate the bug and the assertion below
             would pass against the old implementation too. */
         let loginOnly = try pathFrom(["-lc", "echo $PATH"])
-        try withKnownIssue(".zshrc adds nothing to PATH here", isIntermittent: true) {
+        withKnownIssue(".zshrc adds nothing to PATH here", isIntermittent: true) {
             try #require(!interactive.subtracting(loginOnly).isEmpty)
         }
         guard !interactive.subtracting(loginOnly).isEmpty else { return }
