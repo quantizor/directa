@@ -711,7 +711,8 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
         let supervisor = ServerSupervisor(
-            launcher: LaunchdJobLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix), paths: paths,
+            projectPath: env.projectPath,
             registry: registry, spec: spec)
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
@@ -736,7 +737,8 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
         let supervisor = ServerSupervisor(
-            launcher: LaunchdJobLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix), paths: paths,
+            projectPath: env.projectPath,
             registry: registry, spec: spec)
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
@@ -830,7 +832,8 @@ private func makeEnv() throws -> TestEnv {
         let child = try #require(grandchild)
         #expect(kill(child, 0) == 0)
         let supervisor = ServerSupervisor(
-            launcher: LaunchdJobLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix), paths: paths,
+            projectPath: env.projectPath,
             registry: registry, spec: spec)
         let adopted = await supervisor.adopt(
             pid: root, label: "dev.quantizor.directa.job.teardown-test", boundPort: nil,
@@ -868,7 +871,8 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: ["/bin/sh", "-c", "echo boom >&2; exit 7"], name: "web")
         let supervisor = ServerSupervisor(
-            launcher: LaunchdJobLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix), paths: paths,
+            projectPath: env.projectPath,
             registry: registry, spec: spec)
         _ = await supervisor.start()
         let status = try await waitForPhase(supervisor, .crashed)

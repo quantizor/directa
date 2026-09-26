@@ -11,9 +11,17 @@ import Foundation
     every pid this launches or adopts goes through the shared `ExitWatcher`,
     never a launcher-owned kqueue. */
 public struct LaunchdJobLauncher: ProcessLauncher {
-    public static let labelPrefix = LaunchdJobs.childLabelPrefix
+    /** Prefix given to every one-shot job this launcher bootstraps, defaulting
+        to the production namespace `LaunchdJobs.parseChildJobs` matches (and
+        `doctor`/leftover-job reap read through that same parse). Tests pass a
+        distinct prefix so a job bootstrapped under test is never mistaken for
+        one the live daemon supervises, and never visible to that daemon's own
+        leftover-job logic either. */
+    public let labelPrefix: String
 
-    public init() {}
+    public init(labelPrefix: String = LaunchdJobs.childLabelPrefix) {
+        self.labelPrefix = labelPrefix
+    }
 
     /** True when this process is the SMAppService agent, the only spawn that
         needs a coalition split. */
@@ -33,7 +41,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         }
         let stdoutPath = capture.stdoutPath
         let stderrPath = capture.stderrPath
-        let label = Self.labelPrefix + UUID().uuidString.lowercased()
+        let label = labelPrefix + UUID().uuidString.lowercased()
         let domain = LaunchdJobs.guiDomain
         let plistURL = FileManager.default.temporaryDirectory.appending(
             path: "\(label).plist")

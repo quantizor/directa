@@ -63,6 +63,19 @@ import Testing
         ])
     }
 
+    /** A job bootstrapped under test uses a distinct label prefix
+        (`dev.quantizor.directa.test-job.`, injected on `LaunchdJobLauncher`),
+        never the production `dev.quantizor.directa.job.` this parse matches,
+        so a concurrently running real daemon's `doctor` and leftover-job reap
+        never see a test's throwaway jobs as their own leftovers. */
+    @Test func parseChildJobsNeverMatchesATestPrefixedJob() {
+        let listed = """
+            PID\tStatus\tLabel
+            48080\t0\tdev.quantizor.directa.test-job.abc
+            """
+        #expect(LaunchdJobs.parseChildJobs(fromList: listed).isEmpty)
+    }
+
     @Test func staleWithNoLivePidsReapsEveryChildJob() {
         let jobs = [
             LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.a", pid: 10),

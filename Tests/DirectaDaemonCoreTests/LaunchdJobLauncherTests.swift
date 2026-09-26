@@ -21,7 +21,7 @@ struct LaunchdJobLauncherTests {
             try? FileManager.default.removeItem(at: errURL)
         }
         let spawned = OSAllocatedUnfairLock(initialState: pid_t(0))
-        let outcome = await LaunchdJobLauncher().run(
+        let outcome = await LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix).run(
             argv: ["/bin/sleep", "8"],
             capture: SpawnCapture(
                 stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),
@@ -68,7 +68,7 @@ struct LaunchdJobLauncherTests {
             try? FileManager.default.removeItem(at: outURL)
             try? FileManager.default.removeItem(at: errURL)
         }
-        let outcome = await LaunchdJobLauncher().run(
+        let outcome = await LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix).run(
             argv: ["/bin/sh", "-c", "sleep 0.3; exit 3"],
             capture: SpawnCapture(
                 stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),
@@ -113,7 +113,7 @@ struct LaunchdJobLauncherTests {
             try? FileManager.default.removeItem(at: outURL)
             try? FileManager.default.removeItem(at: errURL)
         }
-        let outcome = await LaunchdJobLauncher().run(
+        let outcome = await LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix).run(
             argv: ["/bin/sh", "-c", "exit 7"],
             capture: SpawnCapture(
                 stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),

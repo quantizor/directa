@@ -8,6 +8,14 @@ import Foundation
     looked in one location instead of two), so a suite could fail to find a
     binary its neighbour found. */
 
+/** Every `LaunchdJobLauncher` a test constructs passes this instead of the
+    production `LaunchdJobs.childLabelPrefix`, so a job bootstrapped under
+    test is never matched by `LaunchdJobs.parseChildJobs`: the live daemon's
+    `doctor` and leftover-job reap both read the real gui domain through that
+    same parse, and a test job carrying the production prefix would be visible
+    to them, and to a concurrently running smoke.sh, as a real leftover. */
+let testLaunchdJobLabelPrefix = "dev.quantizor.directa.test-job."
+
 /** Spawns a bare, throwaway long-lived process to stand in for "a server pid a
     prior daemon recorded", independent of any supervisor or registry (a test
     that adopts it owns the only bookkeeping). `POSIX_SPAWN_SETSID` makes the
