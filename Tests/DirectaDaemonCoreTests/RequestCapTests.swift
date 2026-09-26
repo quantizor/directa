@@ -104,6 +104,10 @@ import Testing
         let decoded = try JSONCoding.decoder().decode(WireResponseHead.self, from: response)
         #expect(decoded.ok == false)
         #expect(decoded.error?.code == .requestTooLarge)
+        /** No literal command fixes a client writing raw NDJSON to the
+            socket without a newline; the CLI and app never trigger this, so
+            a hint here would name a remediation that does not exist. */
+        #expect(decoded.error?.hint == nil)
 
         /** The connection closes after the refusal: a further read reaches EOF
             (0) rather than blocking forever or answering more requests. */

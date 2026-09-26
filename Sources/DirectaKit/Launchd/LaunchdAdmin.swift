@@ -202,7 +202,7 @@ public enum LaunchdAdmin {
             throw WireError(
                 code: .internalError,
                 hint: "run: make install  (or open the setup panel from the DMG)",
-                message: "no LaunchAgent and no ddirecta binary found to install")
+                message: "no LaunchAgent and no daemon binary found to install")
         }
         _ = try await install(daemonBinary: binary, paths: paths, forceLegacy: true)
     }
@@ -250,7 +250,7 @@ public enum LaunchdAdmin {
                     code: .daemonUnreachable,
                     hint: "open \"x-apple.systempreferences:com.apple.LoginItems-Settings.extension\"",
                     message:
-                        "asked \(SetupPlanner.applicationsAppPath) to start ddirecta, but it never answered. If macOS is waiting for permission, turn on quantizor/directa in System Settings > General > Login Items & Extensions, or run: directa daemon install --legacy")
+                        "asked \(SetupPlanner.applicationsAppPath) to start the daemon, but it never answered. If macOS is waiting for permission, turn on quantizor/directa in System Settings > General > Login Items & Extensions, or run: directa daemon install --legacy")
             }
             await reensure(runningServers, paths: paths)
             return runningServers

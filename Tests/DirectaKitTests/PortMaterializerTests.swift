@@ -194,4 +194,61 @@ import Testing
         #expect(port <= 65_000)
         #expect(port != 3000)
     }
+
+    private func nonexistentProject() -> String {
+        FileManager.default.temporaryDirectory
+            .appending(path: "directa-checkout-identity-missing-\(UUID().uuidString)").path
+    }
+
+    /** Every fd this process has open right now, by listing `/dev/fd`. Used to
+        detect the leak below: it must be read inside an `autoreleasepool`
+        (both here and around each call under test), or Swift's own deferred
+        release of the `Process`/`Pipe` objects themselves inflates the count
+        independently of anything `git()` does, measured directly against a
+        version of `git()` with no draining code at all. */
+    private func openFileDescriptorCount() -> Int {
+        (try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd"))?.count ?? -1
+    }
+
+    @Test func gitCommonDirAnswersNilForAMissingWorkingDirectory() {
+        #expect(CheckoutIdentity.gitCommonDir(project: nonexistentProject()) == nil)
+    }
+
+    @Test func isLinkedWorktreeAnswersFalseForAMissingWorkingDirectory() {
+        #expect(CheckoutIdentity.isLinkedWorktree(project: nonexistentProject()) == false)
+    }
+
+    @Test func worktreeDisplayAnswersNilForAMissingWorkingDirectory() {
+        #expect(CheckoutIdentity.worktreeDisplay(project: nonexistentProject()) == nil)
+    }
+
+    @Test func shareCommonDirAnswersFalseWhenBothProjectsAreMissing() {
+        #expect(!CheckoutIdentity.shareCommonDir(nonexistentProject(), nonexistentProject()))
+    }
+
+    /** The private `git()` helper used to start its two pipe-draining threads
+        before `process.run()`, so a `run()` failure (an invalid working
+        directory, here) left both threads blocked forever reading a pipe
+        this process itself still held the write end of: nothing ever spawned
+        to close it, and each draining closure kept its pipe's fds open by
+        capturing the whole `Pipe` object for as long as the thread runs,
+        which is forever. Every public caller answers `nil` quickly either
+        way, so the regression is invisible at the call site; it shows up
+        only as leaked threads and file descriptors that never come back,
+        measured directly here (repeated real failures against a bare
+        Process+Pipe pair with no draining at all confirm 0 fds leak on their
+        own, isolating the count to the draining threads specifically). */
+    @Test func gitFailureDoesNotLeakFileDescriptorsAcrossRepeatedFailures() {
+        let before = autoreleasepool { openFileDescriptorCount() }
+        for _ in 0..<30 {
+            autoreleasepool {
+                _ = CheckoutIdentity.gitCommonDir(project: nonexistentProject())
+            }
+        }
+        /** The leaked threads (when the bug is present) are already blocked in
+            a syscall by the time `run()` returns; no amount of waiting recovers
+            them, so this is not a race the test can flake on either side. */
+        let after = autoreleasepool { openFileDescriptorCount() }
+        #expect(after - before < 8, "leaked \(after - before) file descriptors across 30 failures")
+    }
 }

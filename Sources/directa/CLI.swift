@@ -859,8 +859,10 @@ struct HookInstall: AsyncParsableCommand {
                 return .failure(
                     WireError(
                         code: .usage,
-                        hint: "supported: \(adapters.map(\.name).joined(separator: ", ")) (adding one: CONTRIBUTING.md)",
-                        message: "unknown harness '\(harness)'"))
+                        hint: "run: directa hook install --harness <name>",
+                        message:
+                            "unknown harness '\(harness)' (supported: \(adapters.map(\.name).joined(separator: ", ")); adding one: CONTRIBUTING.md)"
+                    ))
             }
             return .success((install: [adapter], skipped: []))
         }
@@ -972,8 +974,10 @@ struct HookUninstall: AsyncParsableCommand {
                 CLIRunner.fail(
                     WireError(
                         code: .usage,
-                        hint: "supported: \(harnessAdapters.map(\.name).joined(separator: ", "))",
-                        message: "unknown harness '\(harness)'"),
+                        hint: "run: directa hook uninstall --harness <name>",
+                        message:
+                            "unknown harness '\(harness)' (supported: \(harnessAdapters.map(\.name).joined(separator: ", ")))"
+                    ),
                     json: global.json)
             }
             adapters = [adapter]
@@ -2191,7 +2195,7 @@ struct DaemonInfoCommand: AsyncParsableCommand {
             try await client.request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
         }
         CLIRunner.emit(result, json: global.json) { info in
-            "ddirecta v\(info.daemonVersion) (proto \(info.proto)) pid \(info.pid)\nsocket \(info.socketPath)\ndata \(info.dataDir)\nlogs \(info.logsDir)"
+            "daemon v\(info.daemonVersion) (proto \(info.proto)) pid \(info.pid)\nsocket \(info.socketPath)\ndata \(info.dataDir)\nlogs \(info.logsDir)"
         }
     }
 }

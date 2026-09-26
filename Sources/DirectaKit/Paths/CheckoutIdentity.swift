@@ -86,13 +86,23 @@ public enum CheckoutIdentity {
         let err = Pipe()
         process.standardOutput = out
         process.standardError = err
-        /** Both pipes are drained on background threads started before
-            `waitUntilExit`, not read from afterward: a git that fills either
-            buffer (a long "detached HEAD" or "unsafe repository" warning on
-            stderr counts) would block on a write nothing is reading, and this
-            call would then block forever waiting for an exit that write can
-            no longer reach. stderr's bytes are discarded once drained; only
-            stdout answers the caller, unlike a git warning mixed in. */
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        /** Both pipes are drained on background threads started only once
+            `run()` has actually spawned a process, never before: starting
+            them unconditionally left two threads blocked forever reading a
+            pipe this process itself still held the write end of whenever
+            `run()` threw before spawning anything to eventually close it.
+            Once spawned, draining before `waitUntilExit` (not after) is still
+            required: a git that fills either buffer (a long "detached HEAD"
+            or "unsafe repository" warning on stderr counts) would block on a
+            write nothing is reading, and this call would then block forever
+            waiting for an exit that write can no longer reach. stderr's bytes
+            are discarded once drained; only stdout answers the caller, unlike
+            a git warning mixed in. */
         let stdout = OSAllocatedUnfairLock(initialState: Data())
         let drained = DispatchGroup()
         drained.enter()
@@ -104,11 +114,6 @@ public enum CheckoutIdentity {
         DispatchQueue.global(qos: .userInitiated).async {
             _ = try? err.fileHandleForReading.readToEnd()
             drained.leave()
-        }
-        do {
-            try process.run()
-        } catch {
-            return nil
         }
         process.waitUntilExit()
         drained.wait()

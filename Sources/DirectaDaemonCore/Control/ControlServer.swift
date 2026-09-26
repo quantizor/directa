@@ -821,7 +821,22 @@ public actor Router {
         guard await registry.project(project) == nil else { return }
         let prefix = "\(project)::"
         guard !supervisors.keys.contains(where: { $0.hasPrefix(prefix) }) else { return }
-        try? FileManager.default.removeItem(at: paths.projectLogDir(project: project))
+        /** Suppressed on purpose past this existence check: a permissions
+            error or a file another process still has open leaves the
+            directory behind rather than crashing the daemon over a cleanup
+            step, and doctor's orphan-log-dir finding catches whatever this
+            leaves; but a genuine failure must not vanish silently, so it is
+            logged at error level (which persists), and the common case of a
+            project with no log directory at all is not logged as one. */
+        let logDir = paths.projectLogDir(project: project)
+        if FileManager.default.fileExists(atPath: logDir.path) {
+            do {
+                try FileManager.default.removeItem(at: logDir)
+            } catch {
+                DirectaLog.daemon.error(
+                    "could not remove log directory for \(project): \(error.localizedDescription)")
+            }
+        }
     }
 
     /** Stop and forget one vanished checkout. Config is unreadable once the path
@@ -906,8 +921,22 @@ public actor Router {
         /** Safe only here, after every supervisor above is stopped and dropped:
             nothing is left writing into this directory. Only `uninstall --purge`
             removed it before, so a discarded checkout's logs sat under
-            `logsDir` forever with no project left to claim them. */
-        try? FileManager.default.removeItem(at: paths.projectLogDir(project: project))
+            `logsDir` forever with no project left to claim them. Past this
+            existence check the failure is suppressed on purpose (a
+            permissions error must not crash the daemon over a cleanup step;
+            doctor's orphan-log-dir finding catches whatever this leaves),
+            but not silently: it is logged at error level, which persists,
+            and the common case of a project with no log directory at all is
+            not logged as one. */
+        let logDir = paths.projectLogDir(project: project)
+        if FileManager.default.fileExists(atPath: logDir.path) {
+            do {
+                try FileManager.default.removeItem(at: logDir)
+            } catch {
+                DirectaLog.daemon.error(
+                    "could not remove log directory for \(project): \(error.localizedDescription)")
+            }
+        }
         for name in sortedNames {
             await events.post(
                 kind: .unregistered, project: project, server: name, detail: "project path gone")
@@ -2125,7 +2154,11 @@ public final class ControlServer: Sendable {
                         WireResponse<WireEmpty>(
                             error: WireError(
                                 code: .requestTooLarge,
-                                hint: "send one request per line, under the size limit, with a single trailing newline",
+                                /** No hint: the cause is a client writing raw
+                                    NDJSON to the socket without a directa
+                                    command to run as the fix (the CLI and app
+                                    never trigger this), so a literal
+                                    remediation command would be dishonest. */
                                 message: "request line exceeded \(maxPendingRequestBytes) bytes with no newline"),
                             id: "?", ok: false))) ?? Data()
                 connection.send(

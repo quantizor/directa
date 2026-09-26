@@ -35,11 +35,7 @@ cd your-project
 directa register --name myproj --cmd bun --cmd run --cmd dev --port 3000
 directa ensure myproj  # idempotent: healthy is a no-op
 directa why myproj     # root cause when something breaks
-directa hook install --harness antigravity # Antigravity sessions rediscover servers automatically
-directa hook install --harness claude      # same for Claude Code (default harness)
-directa hook install --harness cursor      # same for Cursor
-directa hook install --harness grok        # Grok Build: live snapshot after the first tool, plus a home rule
-directa hook install --harness opencode    # OpenCode: standing instruction wired into its global config
+directa hook install   # wires every agent harness this machine has (Antigravity, Claude Code, Cursor, Grok Build, OpenCode) to rediscover servers automatically; pass --harness to install just one
 ```
 
 Name each server after the project (`myproj`, not a generic `web`) so it is easy to spot in Spotlight and search, and give it a `<project>.localhost` host rather than bare `localhost`: the per-project subdomain keeps browser cookies, storage, and service workers isolated between projects.

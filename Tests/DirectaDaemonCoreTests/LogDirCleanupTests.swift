@@ -186,6 +186,44 @@ import Testing
                 atPath: env.paths.projectLogDir(project: env.project).path))
     }
 
+    /** A log directory removal that fails (a permission error, here, from a
+        read-only logs root) must not vanish silently: the daemon leaves the
+        directory for doctor's orphan-log-dir finding to catch, but logs the
+        failure at error level so it is not lost entirely. */
+    @Test func unregisterLogsAFailedLogDirectoryRemovalRatherThanSwallowingIt() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
+        try plantLogFile(paths: env.paths, project: env.project, server: "web")
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        let logsRoot = env.paths.logsDir
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: logsRoot.path)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: logsRoot.path)
+        }
+
+        guard let recorder = DirectaLog.backend as? RecordingBackend else {
+            Issue.record("expected the swift-test host's default backend to be a RecordingBackend")
+            return
+        }
+
+        _ = try await handle(
+            router, .serverUnregister, ServerTargetParams(name: "web", project: env.project),
+            WireEmpty.self)
+
+        #expect(
+            FileManager.default.fileExists(
+                atPath: env.paths.projectLogDir(project: env.project).path),
+            "the read-only logs root should have blocked removal")
+        #expect(
+            recorder.entries.contains { entry in
+                entry.level == .error && entry.message.contains(env.project)
+                    && entry.message.contains("could not remove log directory")
+            })
+    }
+
     @Test func missingProjectSweepRemovesTheProjectLogDirectory() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
@@ -208,5 +246,46 @@ import Testing
             now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
 
         #expect(!FileManager.default.fileExists(atPath: logDir))
+    }
+
+    /** Same failure mode as the unregister path, for `forgetMissingProject`'s
+        own log directory removal: a permission error must not vanish
+        silently. */
+    @Test func missingProjectSweepLogsAFailedLogDirectoryRemovalRatherThanSwallowingIt() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
+        try plantLogFile(paths: env.paths, project: env.project, server: "web")
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        let canonicalProject = canonicalProjectPath(env.project)
+        let logDir = env.paths.projectLogDir(project: env.project).path
+        try FileManager.default.removeItem(atPath: env.project)
+
+        let logsRoot = env.paths.logsDir
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: logsRoot.path)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: logsRoot.path)
+        }
+
+        guard let recorder = DirectaLog.backend as? RecordingBackend else {
+            Issue.record("expected the swift-test host's default backend to be a RecordingBackend")
+            return
+        }
+
+        let now = Date()
+        await router.pruneMissingProjects(now: now)
+        await router.pruneMissingProjects(
+            now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
+
+        #expect(
+            FileManager.default.fileExists(atPath: logDir),
+            "the read-only logs root should have blocked removal")
+        #expect(
+            recorder.entries.contains { entry in
+                entry.level == .error && entry.message.contains(canonicalProject)
+                    && entry.message.contains("could not remove log directory")
+            })
     }
 }

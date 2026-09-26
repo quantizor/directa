@@ -1087,7 +1087,10 @@ import Testing
             return
         }
         #expect(error.code == .usage)
-        #expect(error.message == "unknown harness 'bogus'")
+        #expect(error.hint == "run: directa hook install --harness <name>")
+        #expect(
+            error.message
+                == "unknown harness 'bogus' (supported: ; adding one: CONTRIBUTING.md)")
     }
 
     /** The same collect-rather-than-abort shape as `HookUninstall.uninstallAll`. */

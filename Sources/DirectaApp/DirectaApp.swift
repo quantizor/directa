@@ -624,9 +624,9 @@ struct DaemonDownRow: View {
     private var message: String {
         if model.daemonRecovering { return "Starting the daemon…" }
         if model.daemonNeedsApproval { return "directa needs your approval" }
-        if model.daemonStoppedOnPurpose { return "the daemon is stopped" }
-        if model.daemonRecoveryError != nil { return "the daemon is not running" }
-        return "the daemon is not running; restarting"
+        if model.daemonStoppedOnPurpose { return "The daemon is stopped" }
+        if model.daemonRecoveryError != nil { return "The daemon is not running" }
+        return "The daemon is not running; restarting"
     }
 
     private var glyph: String {
