@@ -126,9 +126,11 @@ private func spawnManyWithOneReaper(_ argv: [String], count: Int) throws -> [pid
         for waiter in waiters { _ = await waiter.value }
     }
 
-    /** A child that exits nonzero reports its real exit code. */
+    /** A child that exits nonzero reports its real exit code. The pause keeps
+        the child alive until it is armed: a child that exits first is refused
+        with ESRCH, which is a different case. */
     @Test func exitCodeIsReported() async throws {
-        let child = try spawnAndReap(["/bin/sh", "-c", "exit 3"])
+        let child = try spawnAndReap(["/bin/sh", "-c", "sleep 0.3; exit 3"])
         guard case .armed = ExitWatcher.shared.arm(pid: child.pid) else {
             Issue.record("failed to arm pid \(child.pid)")
             return
@@ -163,9 +165,10 @@ private func spawnManyWithOneReaper(_ argv: [String], count: Int) throws -> [pid
         status: the exit is not lost between arming and the eventual await.
         `exited.wait()` blocks on the reaper thread's real `waitpid` return, so
         the process is confirmed dead (not merely presumed dead after a guessed
-        delay) before `wait(pid:)` runs. */
+        delay) before `wait(pid:)` runs. The pause only keeps the child alive
+        until it is armed. */
     @Test func exitBeforeTheAwaitIsNotLost() async throws {
-        let child = try spawnAndReap(["/bin/sh", "-c", "exit 7"])
+        let child = try spawnAndReap(["/bin/sh", "-c", "sleep 0.3; exit 7"])
         guard case .armed = ExitWatcher.shared.arm(pid: child.pid) else {
             Issue.record("failed to arm pid \(child.pid)")
             return
