@@ -1740,13 +1740,28 @@ public actor Router {
     /** Reverse-wave parallel stop. */
     private func groupDown(_ params: GroupParams) async throws -> GroupResult {
         let merged = try await mergedSpecs(project: params.project)
-        guard case .success(let waves) = DependencyGraph.waves(specs: merged.specs) else {
+        var wanted = merged.specs
+        /** `only` scopes the teardown to the named server(s) alone, never their
+            dependents: `directa down <name>` stops just that server, the same
+            reuse of the field `directa up <name>` makes (shorthand for
+            `--only <name>`), but down never pulls in the transitive closure up
+            does, since a name here is what to stop, not what to bring along. */
+        if let only = params.only, !only.isEmpty {
+            for name in only where !merged.specs.contains(where: { $0.name == name }) {
+                throw WireError(
+                    code: .notFound,
+                    hint: "run: directa status --json",
+                    message: "no server named '\(name)' in \(params.project)")
+            }
+            wanted = wanted.filter { only.contains($0.name) }
+        }
+        guard case .success(let waves) = DependencyGraph.waves(specs: wanted) else {
             throw WireError(
                 code: .configInvalid,
                 hint: "run: directa config check",
                 message: "dependency cycle in devservers.json")
         }
-        let specsByName = Dictionary(uniqueKeysWithValues: merged.specs.map { ($0.name, $0) })
+        let specsByName = Dictionary(uniqueKeysWithValues: wanted.map { ($0.name, $0) })
         var results: [EnsureResult] = []
         for wave in waves.reversed() {
             let waveResults = await withTaskGroup(of: EnsureResult.self) { group in

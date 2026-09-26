@@ -1134,6 +1134,9 @@ struct Up: AsyncParsableCommand {
 
     @OptionGroup var global: GlobalOptions
 
+    @Argument(help: "Server name (shorthand for --only; omit for the whole project).")
+    var name: String?
+
     @Option(help: "Comma-separated server names (their dependencies come along).")
     var only: String?
 
@@ -1143,9 +1146,23 @@ struct Up: AsyncParsableCommand {
     @Option(help: "Per-server seconds to wait for health.", transform: TimeoutOption.parse)
     var timeout: Double = 60
 
+    /** Pure so the exact message is asserted without spawning the CLI: the
+        positional name is shorthand for `--only <name>`, so both at once names
+        two conflicting subsets rather than one. */
+    static func usageError(name: String?, only: String?) -> WireError? {
+        guard let name, only != nil else { return nil }
+        return WireError(
+            code: .usage,
+            hint: "run: directa up \(name)",
+            message: "pass a server name or --only, not both")
+    }
+
     func run() async throws {
+        if let usage = Self.usageError(name: name, only: only) {
+            CLIRunner.fail(usage, json: global.json)
+        }
         let params = GroupParams(
-            only: only.map { $0.split(separator: ",").map(String.init) },
+            only: name.map { [$0] } ?? only.map { $0.split(separator: ",").map(String.init) },
             port: port,
             project: global.resolvedProject(),
             timeoutSeconds: timeout)
@@ -1168,12 +1185,15 @@ struct Up: AsyncParsableCommand {
 
 struct Down: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Stop the whole project in reverse dependency order.")
+        abstract: "Stop the whole project (or one server) in reverse dependency order.")
 
     @OptionGroup var global: GlobalOptions
 
+    @Argument(help: "Server name (stops only this one; omit to stop the whole project).")
+    var name: String?
+
     func run() async throws {
-        let params = GroupParams(project: global.resolvedProject())
+        let params = GroupParams(only: name.map { [$0] }, project: global.resolvedProject())
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
             /** A deep dependency chain drains one wave at a time, each with its own
                 stop grace, so the client waits well past a single stop. */
