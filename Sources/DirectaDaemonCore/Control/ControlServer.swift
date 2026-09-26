@@ -426,6 +426,7 @@ public actor Router {
                 supervisors[serverID(project: project, name: request.params.name)] = nil
                 await events.post(
                     kind: .unregistered, project: project, server: request.params.name)
+                await removeLogDirIfProjectIsForgotten(project)
                 return try respond(id: head.id, result: WireEmpty())
             }
         } catch let error as WireError {
@@ -728,6 +729,21 @@ public actor Router {
             detail: "daemon-restart: orphan pid \(pid) bounced")
     }
 
+    /** Removes a project's log directory once `serverUnregister` has dropped
+        its last ad hoc server AND nothing supervised is still resident for it.
+        The registry only tracks ad hoc servers and trust, not the config-defined
+        servers `devservers.json` declares, so a project can still have a live,
+        merely un-registered supervisor even after its registry row disappears;
+        deleting the directory out from under that supervisor's spool files
+        would be the exact bug this guards against. Never stops or signals
+        anything itself: a live supervisor means "not yet", not "force it". */
+    private func removeLogDirIfProjectIsForgotten(_ project: String) async {
+        guard await registry.project(project) == nil else { return }
+        let prefix = "\(project)::"
+        guard !supervisors.keys.contains(where: { $0.hasPrefix(prefix) }) else { return }
+        try? FileManager.default.removeItem(at: paths.projectLogDir(project: project))
+    }
+
     /** Stop and forget one vanished checkout. Config is unreadable once the path
         is gone, so this walks supervisors + registry + state directly instead of
         groupDown / mergedSpecs. `project` must be the registry key as stored
@@ -789,6 +805,11 @@ public actor Router {
         }
         try? await registry.removeState(forProject: project)
         try? await registry.removeProject(project)
+        /** Safe only here, after every supervisor above is stopped and dropped:
+            nothing is left writing into this directory. Only `uninstall --purge`
+            removed it before, so a discarded checkout's logs sat under
+            `logsDir` forever with no project left to claim them. */
+        try? FileManager.default.removeItem(at: paths.projectLogDir(project: project))
         for name in sortedNames {
             await events.post(
                 kind: .unregistered, project: project, server: name, detail: "project path gone")

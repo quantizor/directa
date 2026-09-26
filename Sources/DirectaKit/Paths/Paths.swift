@@ -86,13 +86,20 @@ public struct DirectaPaths: Sendable {
         return flattened == server ? flattened : "\(flattened)-\(hash8(server))"
     }
 
-    /** Per-server log directory: `<slug>-<hash8>/<server>`. The slug keeps paths
-        human-readable; the hash keeps distinct projects with one basename apart. */
-    public func serverLogDir(project: String, server: String) -> URL {
+    /** The project's log directory root, `<slug>-<hash8>`: every server's log
+        directory lives under this one. The slug keeps it human-readable; the
+        hash keeps distinct projects with one basename apart. The single home
+        for that name, so removing it (an explicit unregister down to zero
+        servers, the missing-project sweep) deletes exactly what a fresh spawn
+        would recreate. */
+    public func projectLogDir(project: String) -> URL {
         let project = canonicalProjectPath(project)
-        return logsDir
-            .appending(path: "\(projectSlug(project))-\(Self.hash8(project))")
-            .appending(path: Self.serverPathComponent(server))
+        return logsDir.appending(path: "\(projectSlug(project))-\(Self.hash8(project))")
+    }
+
+    /** Per-server log directory: `<slug>-<hash8>/<server>`. */
+    public func serverLogDir(project: String, server: String) -> URL {
+        projectLogDir(project: project).appending(path: Self.serverPathComponent(server))
     }
 
     public var eventsFile: URL { dataDir.appending(path: "events.log") }

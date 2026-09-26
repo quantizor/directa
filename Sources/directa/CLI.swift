@@ -1638,8 +1638,14 @@ struct Doctor: AsyncParsableCommand {
                         kind: "jetsam", severity: "warning"))
             }
         }
+        /** nil only when `serverStatus` itself failed; feeds the orphan-log-dir
+            finding after this block, which must run whether or not it does.
+            Distinct from an empty set, which is a real "nothing registered"
+            answer and must still let every slug directory report as orphaned. */
+        var registeredProjects: Set<String>?
         if let all = try? await client.request(
             .serverStatus, params: ProjectParams(project: ""), expecting: ServerListResult.self) {
+            registeredProjects = Set(all.servers.map(\.project))
             var signatureHolders: [String: String] = [:]
             var staleProjects: Set<String> = []
             /** Host-keyed signatures miss a real collision: two projects on one
@@ -1794,6 +1800,23 @@ struct Doctor: AsyncParsableCommand {
                 Finding(
                     detail: "\(shadow.detail) (run: \(shadow.remedy))",
                     kind: "install-shadow", severity: "warning"))
+        }
+        /** Log directories a project no longer claims: `ControlServer` removes
+            one when it forgets the project (unregister down to zero servers,
+            the missing-project sweep), but a directory predating that fix, or
+            orphaned some other way, sits under the logs root forever until
+            `directa uninstall --purge`. Report-only, with the exact command to
+            remove it; skipped entirely when `serverStatus` itself failed, since
+            every slug directory would otherwise misreport as orphaned. */
+        if let registeredProjects {
+            let claimedSlugDirs = Set(
+                registeredProjects.map { DirectaPaths().projectLogDir(project: $0).lastPathComponent })
+            for orphan in OrphanProjectLogs.scan(paths: DirectaPaths(), claimedSlugDirs: claimedSlugDirs) {
+                findings.append(
+                    Finding(
+                        detail: "\(orphan.detail) (run: \(orphan.remedy))",
+                        kind: "orphan-log-dir", severity: "warning"))
+            }
         }
         if global.json {
             struct Report: Codable {
