@@ -1262,14 +1262,40 @@ struct Down: AsyncParsableCommand {
     @Argument(help: "Server name (stops only this one; omit to stop the whole project).")
     var name: String?
 
+    /** Which wire request `down` makes. A named server never pulls in
+        dependents (the opposite of `up`'s `--only`, which does), so it goes
+        straight to `server.stop`: every daemon build understands that
+        method, unlike `group.down`'s `only`, a proto addition an older
+        daemon silently ignores, stopping the whole project instead of just
+        the named server. */
+    enum DownRequest: Equatable {
+        case group(GroupParams)
+        case server(ServerTargetParams)
+    }
+
+    /** Pure so the choice of wire request is asserted without a live daemon. */
+    static func request(name: String?, project: String) -> DownRequest {
+        guard let name else { return .group(GroupParams(project: project)) }
+        return .server(ServerTargetParams(name: name, project: project))
+    }
+
     func run() async throws {
-        let params = GroupParams(only: name.map { [$0] }, project: global.resolvedProject())
+        let request = Self.request(name: name, project: global.resolvedProject())
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-            /** A deep dependency chain drains one wave at a time, each with its own
-                stop grace, so the client waits well past a single stop. */
-            try await client.request(
-                .groupDown, params: params, expecting: GroupResult.self,
-                operationTimeoutSeconds: 120)
+            switch request {
+            case .server(let target):
+                let stopped = try await client.request(
+                    .serverStop, params: target, expecting: ServerResult.self,
+                    operationTimeoutSeconds: 120)
+                return GroupResult(results: [EnsureResult(server: stopped.server)])
+            case .group(let params):
+                /** A deep dependency chain drains one wave at a time, each with
+                    its own stop grace, so the client waits well past a single
+                    stop. */
+                return try await client.request(
+                    .groupDown, params: params, expecting: GroupResult.self,
+                    operationTimeoutSeconds: 120)
+            }
         }
         CLIRunner.emit(result, json: global.json) { r in
             r.results.isEmpty

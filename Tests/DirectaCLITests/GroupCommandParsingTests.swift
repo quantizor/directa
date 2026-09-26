@@ -52,4 +52,21 @@ import Testing
         let down = try Down.parse([])
         #expect(down.name == nil)
     }
+
+    /** `down <name>` never pulls in dependents (the opposite of `up`'s
+        `--only`), so a named server goes straight to `server.stop`, which
+        every daemon build understands, rather than `group.down`'s `only`
+        (a proto addition an older daemon ignores, silently stopping the
+        whole project instead of just the one server). */
+    @Test func downWithANameBuildsAServerStopRequest() {
+        let request = Down.request(name: "api", project: "/p")
+        #expect(
+            request
+                == .server(ServerTargetParams(name: "api", project: "/p")))
+    }
+
+    @Test func downWithNoNameBuildsAnUnscopedGroupDownRequest() {
+        let request = Down.request(name: nil, project: "/p")
+        #expect(request == .group(GroupParams(project: "/p")))
+    }
 }
