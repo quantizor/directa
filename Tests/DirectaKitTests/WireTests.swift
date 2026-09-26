@@ -289,6 +289,23 @@ import Testing
         #expect(result.effectiveHost == "worktree-review.app.localhost")
         #expect(result.effectiveHostReason == .linkedWorktree)
     }
+
+    /** An events response from a daemon newer than this build can carry a kind
+        this build predates. Decoding must not fail the whole response over one
+        unrecognized string, the rest of the events must stay intact, and the
+        unrecognized kind must round-trip byte-identical (a client that only
+        relays events, rather than interpreting them, must never mutate data it
+        does not understand). */
+    @Test func unknownEventKindDecodesAndRoundTripsWithTheRestOfTheEvents() throws {
+        let json =
+            #"{"events":[{"at":"2025-07-18T19:46:40.000Z","kind":"started","project":"/tmp/proj","server":"web"},{"at":"2025-07-18T19:46:40.000Z","kind":"rebalanced","project":"/tmp/proj","server":"web"}]}"#
+        let result = try JSONCoding.decoder().decode(EventsQueryResult.self, from: Data(json.utf8))
+        #expect(result.events.count == 2)
+        #expect(result.events[0].kind == .started)
+        #expect(result.events[1].kind == .unknown("rebalanced"))
+        let reencoded = String(data: try JSONCoding.encoder().encode(result), encoding: .utf8)
+        #expect(reencoded == json)
+    }
 }
 
 @Suite struct PathTests {

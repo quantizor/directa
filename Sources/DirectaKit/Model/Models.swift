@@ -442,8 +442,15 @@ extension ServerStatus {
 }
 
 /** The unified event feed: lifecycle transitions, health changes, and marks as
-    one queryable stream. */
-public enum EventKind: String, Codable, Sendable {
+    one queryable stream.
+
+    Decoding is hand-written rather than the raw-value synthesis a plain
+    `String` enum would get, so a kind this build predates falls back to
+    `.unknown` instead of failing the whole events response: a client one
+    version behind the daemon must still show every other event in the feed.
+    `.rawValue` stays available (not just `Codable`) since callers outside this
+    file print it directly. */
+public enum EventKind: Codable, Equatable, Sendable {
     case crashed
     case failed
     case healthy
@@ -453,6 +460,45 @@ public enum EventKind: String, Codable, Sendable {
     case stopped
     case unhealthy
     case unregistered
+    /** A kind a newer daemon emits that this build does not recognize. Carries
+        the original wire string so encoding round-trips it byte-identical. */
+    case unknown(String)
+
+    public var rawValue: String {
+        switch self {
+        case .crashed: "crashed"
+        case .failed: "failed"
+        case .healthy: "healthy"
+        case .marked: "marked"
+        case .registered: "registered"
+        case .started: "started"
+        case .stopped: "stopped"
+        case .unhealthy: "unhealthy"
+        case .unregistered: "unregistered"
+        case .unknown(let raw): raw
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        switch raw {
+        case "crashed": self = .crashed
+        case "failed": self = .failed
+        case "healthy": self = .healthy
+        case "marked": self = .marked
+        case "registered": self = .registered
+        case "started": self = .started
+        case "stopped": self = .stopped
+        case "unhealthy": self = .unhealthy
+        case "unregistered": self = .unregistered
+        default: self = .unknown(raw)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 public struct EventRecord: Codable, Equatable, Sendable {
