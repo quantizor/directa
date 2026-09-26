@@ -29,7 +29,8 @@ import Testing
     private func physicalPath(_ path: String) -> String {
         var buffer = [Int8](repeating: 0, count: Int(PATH_MAX))
         guard realpath(path, &buffer) != nil else { return path }
-        return String(cString: buffer)
+        let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     /** The guarded command writes its own cwd to a marker file rather than
