@@ -81,18 +81,7 @@ import Testing
         createSession. The shell then backgrounds a sleep, giving the session a
         second member that the sweep must find. */
     @Test func sessionSweepFindsAMemberThatIsNotTheLeader() throws {
-        var attributes = posix_spawnattr_t(bitPattern: 0)
-        posix_spawnattr_init(&attributes)
-        defer { posix_spawnattr_destroy(&attributes) }
-        #expect(posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID)) == 0)
-
-        var leader: pid_t = 0
-        let script = "/bin/sleep 5 & sleep 5"
-        let argv: [String] = ["/bin/sh", "-c", script]
-        var cArgs = argv.map { strdup($0) } + [nil]
-        defer { for arg in cArgs where arg != nil { free(arg) } }
-        let spawned = posix_spawn(&leader, "/bin/sh", nil, &attributes, &cArgs, environ)
-        try #require(spawned == 0, "posix_spawn failed: \(spawned)")
+        let leader = try spawnBare(["/bin/sh", "-c", "/bin/sleep 5 & sleep 5"], flags: POSIX_SPAWN_SETSID)
         defer {
             kill(-leader, SIGKILL)
             kill(leader, SIGKILL)
@@ -230,11 +219,8 @@ import Testing
     }
 
     private func spawnSleep(disclaim: Bool) throws -> pid_t {
-        var attributes = posix_spawnattr_t(bitPattern: 0)
-        posix_spawnattr_init(&attributes)
-        defer { posix_spawnattr_destroy(&attributes) }
-        #expect(posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID)) == 0)
-        if disclaim {
+        try spawnBare(["/bin/sleep", "8"], flags: POSIX_SPAWN_SETSID) { attributes in
+            guard disclaim else { return }
             typealias DisclaimFn =
                 @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>, Int32) -> Int32
             let symbol = dlsym(
@@ -244,13 +230,6 @@ import Testing
             let rc = fn(&attributes, 1)
             try #require(rc == 0, "disclaim returned \(rc)")
         }
-        var child: pid_t = 0
-        let argv: [String] = ["/bin/sleep", "8"]
-        var cArgs = argv.map { strdup($0) } + [nil]
-        defer { for arg in cArgs where arg != nil { free(arg) } }
-        let spawned = posix_spawn(&child, "/bin/sleep", nil, &attributes, &cArgs, environ)
-        try #require(spawned == 0, "posix_spawn failed: \(spawned)")
-        return child
     }
 
     private func reap(_ pid: pid_t) {

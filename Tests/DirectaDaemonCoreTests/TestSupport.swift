@@ -19,6 +19,45 @@ import os
     to them, and to a concurrently running smoke.sh, as a real leftover. */
 let testLaunchdJobLabelPrefix = "dev.quantizor.directa.test-job."
 
+/** The one raw `posix_spawn` for tests that need spawn attributes Foundation's
+    `Process` cannot set (a new session, a signal mask, a Darwin SPI). The
+    child inherits no descriptor but stdin, stdout, and stderr, each on
+    /dev/null (`POSIX_SPAWN_CLOEXEC_DEFAULT`, the flag `swift-subprocess`
+    passes on every spawn): a plain `posix_spawn` copies every descriptor the
+    test process has open at that instant, including the write end of any
+    pipe a concurrent test is draining, and that reader then waits for this
+    child to exit rather than for the process it started. `flags` joins the
+    close-on-exec default; `configure` sets any other attribute. The caller
+    owns reaping. */
+func spawnBare(
+    _ argv: [String], flags: Int32 = 0,
+    configure: (inout posix_spawnattr_t?) throws -> Void = { _ in }
+) throws -> pid_t {
+    var attr: posix_spawnattr_t?
+    posix_spawnattr_init(&attr)
+    defer { posix_spawnattr_destroy(&attr) }
+    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | flags))
+    try configure(&attr)
+
+    var actions: posix_spawn_file_actions_t?
+    posix_spawn_file_actions_init(&actions)
+    defer { posix_spawn_file_actions_destroy(&actions) }
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
+
+    var pid: pid_t = 0
+    let cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
+    defer { for arg in cArgs where arg != nil { free(arg) } }
+    let status = posix_spawn(&pid, argv[0], &actions, &attr, cArgs, environ)
+    guard status == 0 else {
+        throw NSError(
+            domain: "directa.test", code: Int(status),
+            userInfo: [NSLocalizedDescriptionKey: "posix_spawn failed: \(String(cString: strerror(status)))"])
+    }
+    return pid
+}
+
 /** Spawns a bare, throwaway long-lived process to stand in for "a server pid a
     prior daemon recorded", independent of any supervisor or registry (a test
     that adopts it owns the only bookkeeping). `POSIX_SPAWN_SETSID` makes the
@@ -28,21 +67,7 @@ let testLaunchdJobLabelPrefix = "dev.quantizor.directa.test-job."
     particular never the test runner's own group. The process's lifetime is
     not tied to the test process, so every caller must kill it explicitly. */
 func spawnSurvivor() throws -> pid_t {
-    var pid: pid_t = 0
-    var attr: posix_spawnattr_t?
-    posix_spawnattr_init(&attr)
-    defer { posix_spawnattr_destroy(&attr) }
-    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
-    let argv: [UnsafeMutablePointer<CChar>?] = [
-        strdup("/bin/sh"), strdup("-c"), strdup("sleep 30"), nil,
-    ]
-    defer { for arg in argv where arg != nil { free(arg) } }
-    let status = posix_spawn(&pid, "/bin/sh", nil, &attr, argv, environ)
-    guard status == 0 else {
-        throw NSError(
-            domain: "directa.test", code: Int(status),
-            userInfo: [NSLocalizedDescriptionKey: "posix_spawn failed: \(String(cString: strerror(status)))"])
-    }
+    let pid = try spawnBare(["/bin/sh", "-c", "sleep 30"], flags: POSIX_SPAWN_SETSID)
     /** `swift-subprocess` reaps its own children as part of awaiting their
         termination status; a bare `posix_spawn` here has no one else doing
         that. Without a reaper, a test's `kill(pid, 0)` liveness check can

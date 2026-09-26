@@ -58,6 +58,25 @@ import Testing
                 binaryName: binary) == false)
     }
 
+    /** A bare spawn that inherits a pipe's write end keeps that pipe open for
+        its whole life, so a reader elsewhere in the run (every supervisor's
+        git call drains to end of file) waits on the child instead of on the
+        process it started. Enough of those at once fill the cooperative pool
+        and stall every test for the child's full lifetime. */
+    @Test func aBareSpawnHoldsNoPipeTheTestProcessHasOpen() throws {
+        let pipe = Pipe()
+        let survivor = try spawnSurvivor()
+        defer { kill(survivor, SIGKILL) }
+        try pipe.fileHandleForWriting.close()
+
+        let reader = pipe.fileHandleForReading.fileDescriptor
+        var poller = pollfd(fd: reader, events: Int16(POLLIN), revents: 0)
+        let ready = poll(&poller, 1, 2000)
+        var byte: UInt8 = 0
+        #expect(ready == 1, "the survivor still holds the pipe's write end")
+        #expect(ready == 1 && read(reader, &byte, 1) == 0)
+    }
+
     /** The literals, and the randomized ports `ResourceLockTests` draws, must
         all fall inside the block; smoke.sh's two ranges must all fall outside
         it. An earlier version of this test asserted 41000 was outside and
