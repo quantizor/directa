@@ -246,8 +246,8 @@ import Testing
         /** Names the managed server, not just a pid, so the reader can act. */
         #expect(conflict.holder?.contains(env.projectB) == true)
         #expect(settled.spawnError?.message.contains("\(port)") == true)
-        _ = await supervisor.stop(graceSeconds: 2)
-        _ = await thief.stop(graceSeconds: 2)
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
+        _ = await thief.stop(graceSeconds: 2, reason: "test cleanup")
     }
 
     /** The control. Same shape, except the supervised process owns the port, so
@@ -275,7 +275,7 @@ import Testing
         #expect(settled.phase == .running)
         #expect(settled.portConflict == nil)
         #expect(settled.observedPort == port)
-        _ = await supervisor.stop(graceSeconds: 2)
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
     }
 
     /** ATTACK: the server's own listener lives outside its process tree. A
@@ -307,7 +307,7 @@ import Testing
         let settled = await settle(supervisor) {
             $0.phase == .failed || ($0.phase == .running && $0.portConflict != nil)
         }
-        _ = await supervisor.stop(graceSeconds: 2)
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
         /** The reparented listener outlives the supervised tree by construction. */
         for stray in PortGuard.listenerPids(port: port) { kill(pid_t(stray), SIGKILL) }
         #expect(settled.phase != .failed)
@@ -355,7 +355,7 @@ import Testing
         let settled = await settle(supervisor) {
             $0.phase == .failed || ($0.phase == .running && $0.portConflict != nil)
         }
-        _ = await supervisor.stop(graceSeconds: 2)
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
         /** Annotated, never failed: the accusation could not be substantiated. */
         #expect(settled.phase != .failed)
         #expect(settled.portConflict?.state == .foreign)

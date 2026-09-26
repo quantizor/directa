@@ -276,7 +276,7 @@ public actor Router {
                     name: request.params.name, port: request.params.port,
                     project: canonicalProjectPath(request.params.project))
                 let supervisor = try await resolvedSupervisor(target)
-                let stopped = await supervisor.stop()
+                let stopped = await supervisor.stop(reason: "requested by stop")
                 DirectaLog.daemon.info("stop \(target.name)@\(target.project)")
                 return try respond(id: head.id, result: ServerResult(server: stopped))
             case .serverRestart:
@@ -285,7 +285,8 @@ public actor Router {
                 params.project = canonicalProjectPath(params.project)
                 return try respond(
                     id: head.id,
-                    result: try await restartServers(params, userInitiated: true))
+                    result: try await restartServers(
+                        params, reason: "requested by restart", userInitiated: true))
             case .serverWait:
                 let request = try decoder.decode(WireRequest<WaitParams>.self, from: line)
                 let target = ServerTargetParams(
@@ -446,7 +447,9 @@ public actor Router {
     public func drainAll() async {
         await withTaskGroup(of: Void.self) { group in
             for supervisor in supervisors.values {
-                group.addTask { _ = await supervisor.stop(deliberate: false) }
+                group.addTask {
+                    _ = await supervisor.stop(deliberate: false, reason: "daemon shutting down")
+                }
             }
         }
     }
@@ -783,7 +786,7 @@ public actor Router {
         for name in sortedNames {
             let id = serverID(project: project, name: name)
             if let supervisor = supervisors[id] {
-                _ = await supervisor.stop()
+                _ = await supervisor.stop(reason: "project path gone")
                 await events.post(
                     kind: .stopped, project: project, server: name, detail: "project path gone")
             }
@@ -1355,7 +1358,8 @@ public actor Router {
                 }
                 /** Non-retiring stop: boot intent survives so a daemon crash
                     mid-hold can still bring the server back if the holder is gone. */
-                _ = await supervisor.stop(deliberate: false)
+                _ = await supervisor.stop(
+                    deliberate: false, reason: "paused for lock \(params.resource)")
                 paused.append(spec.name)
                 DirectaLog.daemon.info(
                     "lock \(params.resource) paused \(spec.name)@\(params.project)")
@@ -1596,7 +1600,7 @@ public actor Router {
         non-retiring because the server is coming straight back, so resume-on-boot
         survives what `stop` would otherwise clear. */
     private func restartServers(
-        _ params: RestartParams, rearm: Bool = true, userInitiated: Bool = false
+        _ params: RestartParams, rearm: Bool = true, reason: String, userInitiated: Bool = false
     ) async throws -> GroupResult {
         let merged = try await mergedSpecs(project: params.project)
         var wanted = merged.specs
@@ -1635,7 +1639,7 @@ public actor Router {
                 reads it, and clearing it here made that a no-op for every
                 refusal raised after this point. */
             if rearm { await entry.supervisor.rearmWatch() }
-            _ = await entry.supervisor.stop(deliberate: false)
+            _ = await entry.supervisor.stop(deliberate: false, reason: reason)
             results.append(await entry.supervisor.ensure(timeoutSeconds: params.timeoutSeconds))
             DirectaLog.daemon.info("restart \(entry.spec.name)@\(params.project)")
         }
@@ -1653,14 +1657,24 @@ public actor Router {
                 continue
             }
             guard let split = parseServerID(id) else { continue }
+            /** `changed` comes out of WatchPaths.resolve, which builds both the
+                project root and every watched path through `.standardizedFileURL`;
+                for a real, existing project directory that quietly rewrites a
+                `/private/var` (or `/private/tmp`, `/private/etc`) prefix to its
+                shorter symlinked form. Stripping against `split.project` (built by
+                the fuller `canonicalProjectPath`, which keeps the `/private`
+                spelling) would silently fail to match and leave the reason
+                showing the whole absolute path, so the prefix is rebuilt with the
+                exact same standardization WatchPaths used. */
+            let projectRoot = URL(fileURLWithPath: split.project).standardizedFileURL.path
             let relative = changed.map {
-                $0.replacingOccurrences(of: split.project + "/", with: "")
+                $0.replacingOccurrences(of: projectRoot + "/", with: "")
             }
             do {
                 _ = try await restartServers(
                     RestartParams(
                         names: [split.name], project: split.project, timeoutSeconds: 60),
-                    rearm: false)
+                    rearm: false, reason: "watch change in \(relative.joined(separator: ", "))")
                 await supervisor.recordWatchRestart(now)
                 restarted.append(id)
                 DirectaLog.daemon.info(
@@ -1794,7 +1808,7 @@ public actor Router {
                                 server: ServerStatus(logPath: "", phase: .stopped, project: params.project, server: name))
                         }
                         let supervisor = await self.supervisor(project: params.project, spec: spec)
-                        return EnsureResult(server: await supervisor.stop())
+                        return EnsureResult(server: await supervisor.stop(reason: "requested by down"))
                     }
                 }
                 var collected: [EnsureResult] = []

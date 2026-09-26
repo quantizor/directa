@@ -90,6 +90,38 @@ import Testing
             ServerResult.self)
     }
 
+    /** An explicit restart's reason survives in the server's own log (OSLog
+        does not persist) and on the `stopped` event, not just as an exit code
+        directa itself caused. */
+    @Test func restartLogsAndEventsTheReason() async throws {
+        let env = try env(port: 45416)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        _ = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        _ = try await handle(
+            router, .serverRestart,
+            RestartParams(names: ["db"], project: env.project, timeoutSeconds: 10),
+            GroupResult.self)
+
+        let logs = try await handle(
+            router, .logsQuery,
+            LogsQueryParams(name: "db", project: env.project, streams: [.sys]),
+            LogsQueryResult.self)
+        #expect(logs.lines.contains { $0.text == "stopping: requested by restart" })
+
+        let events = try await handle(
+            router, .eventsQuery, EventsQueryParams(project: env.project), EventsQueryResult.self)
+        let stopped = try #require(events.events.last { $0.kind == .stopped })
+        #expect(stopped.detail == "requested by restart")
+
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "db", project: env.project),
+            ServerResult.self)
+    }
+
     /** The headline: a stop-then-ensure pair takes the server down and is then
         refused, leaving it down. Restart refuses before touching it. */
     @Test func restartUnderALiveLockIsRefusedAndLeavesTheServerRunning() async throws {

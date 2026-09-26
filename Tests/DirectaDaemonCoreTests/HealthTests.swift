@@ -67,7 +67,7 @@ private func pollPhase(
         /** Failures before first-healthy never mark unhealthy: still starting. */
         #expect(started.phase == .starting)
         #expect(await pollPhase(supervisor, until: .running) == .running)
-        _ = await supervisor.stop(graceSeconds: 1)
+        _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
     }
 
     @Test func unhealthyAfterThresholdAndRecovery() async throws {
@@ -84,7 +84,7 @@ private func pollPhase(
         #expect(await pollPhase(supervisor, until: .unhealthy) == .unhealthy)
         /** A healthy probe recovers the phase without a restart. */
         #expect(await pollPhase(supervisor, until: .running) == .running)
-        _ = await supervisor.stop(graceSeconds: 1)
+        _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
     }
 
     @Test func ensureFailsFastOnCrash() async throws {
@@ -112,7 +112,7 @@ private func pollPhase(
         let second = await supervisor.ensure(timeoutSeconds: 10)
         #expect(second.reason == nil)
         #expect(second.server.pid == first.server.pid)
-        _ = await supervisor.stop(graceSeconds: 1)
+        _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
     }
 
     @Test func ensureSpawnFailureReportsFailed() async throws {
@@ -132,7 +132,7 @@ private func pollPhase(
             prober: ScriptedProber(script: ProbeScript([true])))
         _ = await supervisor.start()
         async let waiter = supervisor.wait(for: .stopped, timeoutSeconds: 10)
-        _ = await supervisor.stop(graceSeconds: 1)
+        _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
         #expect(await waiter == nil)
     }
 }

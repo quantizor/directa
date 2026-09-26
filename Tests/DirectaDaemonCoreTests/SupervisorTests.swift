@@ -37,7 +37,7 @@ private func makeEnv() throws -> TestEnv {
         let spool = paths.structuredLogFile(project: env.projectPath, server: "web")
         let contents = try String(contentsOf: spool, encoding: .utf8)
         #expect(contents.contains("started"))
-        let stopped = await supervisor.stop(graceSeconds: 2)
+        let stopped = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
         #expect(stopped.phase == .stopped)
         #expect(stopped.pid == nil)
         if let pid = started.pid {
@@ -71,7 +71,7 @@ private func makeEnv() throws -> TestEnv {
         _ = await supervisor.start()
         /** Start records the intent to come back after a reboot. */
         #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
-        _ = await supervisor.stop(graceSeconds: 2, deliberate: true)
+        _ = await supervisor.stop(graceSeconds: 2, deliberate: true, reason: "requested by stop")
         /** A deliberate stop retires it: the user asked for down. */
         #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == nil)
     }
@@ -86,7 +86,8 @@ private func makeEnv() throws -> TestEnv {
             launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
             registry: registry, spec: spec)
         _ = await supervisor.start()
-        _ = await supervisor.stop(graceSeconds: 2, deliberate: false)
+        _ = await supervisor.stop(
+            graceSeconds: 2, deliberate: false, reason: "daemon shutting down")
         /** A launchd drain keeps the intent so the next boot restores the server,
             while the drained phase reads stopped. */
         let persisted = await registry.persistedState(serverID: id)
@@ -311,7 +312,7 @@ private func makeEnv() throws -> TestEnv {
         if let root {
             #expect(!ProcessTree.descendants(of: root).identities.contains { $0.pid == child })
         }
-        let stopped = await supervisor.stop(graceSeconds: 2)
+        let stopped = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
         #expect(stopped.phase == .stopped)
         var reaped = false
         for _ in 0..<100 where !reaped {
@@ -349,7 +350,7 @@ private func makeEnv() throws -> TestEnv {
             registry: registry, spec: spec)
         for _ in 0..<4 {
             await withTaskGroup(of: Void.self) { group in
-                group.addTask { _ = await supervisor.stop(graceSeconds: 1) }
+                group.addTask { _ = await supervisor.stop(graceSeconds: 1, reason: "test race") }
                 group.addTask { _ = await supervisor.start() }
                 group.addTask { _ = await supervisor.start() }
                 for await _ in group {}
@@ -357,8 +358,9 @@ private func makeEnv() throws -> TestEnv {
         }
         let phase = await supervisor.status().phase
         #expect([.stopped, .starting, .running, .crashed].contains(phase))
-        _ = await supervisor.stop(graceSeconds: 2)
-        #expect(getpid() > 0)  // the test process survived the race
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
+        /** The test process survived the race. */
+        #expect(getpid() > 0)
     }
 
     /** Reads a live process's parent from ps, for failure evidence only. */
@@ -498,7 +500,7 @@ private func makeEnv() throws -> TestEnv {
         _ = await supervisor.start()
         /** A fresh run starts with no tally; it fills only on the next failure. */
         #expect(await supervisor.status().errorSummary == nil)
-        _ = await supervisor.stop(graceSeconds: 1)
+        _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
     }
 
     @Test func errorSummaryRehydratesFromStateFile() async throws {
@@ -568,7 +570,7 @@ private func makeEnv() throws -> TestEnv {
         async let b = supervisor.start()
         let (first, second) = await (a, b)
         #expect(first.pid == second.pid)
-        _ = await supervisor.stop(graceSeconds: 1)
+        _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
     }
 
     /** `startedAt` carried into `adopt` is what the persisted state and the
@@ -593,7 +595,7 @@ private func makeEnv() throws -> TestEnv {
         let persisted = await registry.persistedState(
             serverID: serverID(project: env.projectPath, name: "web"))
         #expect(persisted?.startedAt == priorStartedAt)
-        _ = await supervisor.stop(graceSeconds: 2)
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
     }
 
     /** A `startedAt` the caller never had (pre-feature state, or a persisted
@@ -614,7 +616,7 @@ private func makeEnv() throws -> TestEnv {
             startedAt: nil)
         #expect((status.uptimeSec ?? -1) >= 0)
         #expect((status.uptimeSec ?? .max) < 5)
-        _ = await supervisor.stop(graceSeconds: 2)
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
     }
 
     /** The hole this feature closes: an adopted child that later dies must
@@ -705,7 +707,7 @@ private func makeEnv() throws -> TestEnv {
             parent-chain descendant of the root, so only the session sweep
             (seeded by `adopt`'s own `refreshDescendantSnapshot`) finds it. */
         #expect(!ProcessTree.descendants(of: root).identities.contains { $0.pid == child })
-        let stopped = await supervisor.stop(graceSeconds: 2)
+        let stopped = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
         #expect(stopped.phase == .stopped)
         #expect(kill(root, 0) != 0)
         var reaped = false

@@ -101,6 +101,34 @@ import Testing
         await stop(router, env.project)
     }
 
+    /** The reason a watch restart tore the server down must survive in the
+        server's own log (OSLog does not persist) and on the `stopped` event,
+        naming the file that changed, not just "code=0". */
+    @Test func aWatchRestartLogsAndEventsTheChangedPathAsTheReason() async throws {
+        let env = try env(port: 45427, watch: "app.config.json")
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        _ = try await start(router, env.project)
+        let now = Date()
+        _ = await router.sweepWatches(now: now.addingTimeInterval(3))
+        try Data("v2\n".utf8)
+            .write(to: URL(fileURLWithPath: env.project).appending(path: "app.config.json"))
+        #expect(await settle(router, from: now).count == 1)
+
+        let logs = try await handle(
+            router, .logsQuery,
+            LogsQueryParams(name: "web", project: env.project, streams: [.sys]),
+            LogsQueryResult.self)
+        #expect(logs.lines.contains { $0.text == "stopping: watch change in app.config.json" })
+
+        let events = try await handle(
+            router, .eventsQuery, EventsQueryParams(project: env.project), EventsQueryResult.self)
+        let stopped = try #require(events.events.last { $0.kind == .stopped })
+        #expect(stopped.detail == "watch change in app.config.json")
+        await stop(router, env.project)
+    }
+
     /** The baseline is taken after the settle window, so a write that lands
         while the server is still booting (very often the server generating its
         own config) is folded into the baseline instead of bouncing it. */

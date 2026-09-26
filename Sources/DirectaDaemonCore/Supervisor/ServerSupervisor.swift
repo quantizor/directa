@@ -86,6 +86,11 @@ public actor ServerSupervisor {
     /** Carries the stop()'s intent into recordOutcome: deliberate clears the
         resume-on-boot flag, a launchd drain keeps it. */
     private var stopWasDeliberate = true
+    /** Carries stop()'s reason into recordOutcome, which uses it as the
+        `stopped` event's detail in place of the exit code: the code says how
+        the process ended, never why directa asked it to. Always set together
+        with stopRequested, so it is current whenever recordOutcome reads it. */
+    private var stopReason = ""
     /** Durable why evidence across ensure truncate / daemon rehydrate. */
     private var terminalEvidence: [String]?
     /** Linked-worktree display identity, computed once at creation:
@@ -442,8 +447,13 @@ public actor ServerSupervisor {
         snapshotted before the first signal since orphans reparent to launchd.
         `deliberate` is true only for a user-invoked stop (directa stop/down): it
         clears the resume-on-boot intent. A launchd drain passes false so the
-        machine coming back up restores what was running. */
-    public func stop(graceSeconds: Double = 7, deliberate: Bool = true) async -> ServerStatus {
+        machine coming back up restores what was running. `reason` is a required
+        plain-English clause (for example "requested by restart", "watch change
+        in <path>") written into the server's own log before the signal and
+        carried onto the `stopped` event's detail: it is the only durable record
+        of why directa tore the process down, since OSLog does not persist and
+        the log otherwise only ever says `exited code=N`. */
+    public func stop(graceSeconds: Double = 7, deliberate: Bool = true, reason: String) async -> ServerStatus {
         switch phase {
         case .stopped, .crashed, .failed:
             return status()
@@ -459,7 +469,9 @@ public actor ServerSupervisor {
         }
         stopRequested = true
         stopWasDeliberate = deliberate
+        stopReason = reason
         phase = .stopping
+        await logStore.append(stream: .sys, text: "stopping: \(reason)")
         /** Capture the run's identity and its session before any signal and
             before any await: after the grace window the pid number may name a
             different process, recordOutcome for this same exit can run during the
@@ -1061,9 +1073,13 @@ public actor ServerSupervisor {
         let retireIntent = finalPhase == .stopped && stopWasDeliberate
         let cause = exit?.code.map { "code=\($0)" } ?? exit?.signal.map { "signal=\($0)" } ?? "unknown"
         await logStore.append(stream: .sys, text: "exited \(cause)")
+        /** A stopped server's detail says why directa asked it down (the reason
+            stop() logged before signalling); a crashed one says how it died,
+            since nothing asked for that exit. */
+        let eventDetail = finalPhase == .stopped ? stopReason : cause
         await events?.post(
             kind: finalPhase == .stopped ? .stopped : .crashed,
-            project: projectPath, server: spec.name, detail: cause)
+            project: projectPath, server: spec.name, detail: eventDetail)
         let errors = errorSummary
         let evidence = finalPhase == .stopped ? nil : terminalEvidence
         if finalPhase == .stopped { terminalEvidence = nil }

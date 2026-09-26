@@ -115,6 +115,49 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             expecting: ServerResult.self)
     }
 
+    /** A lock pause's reason survives in the server's own log (OSLog does not
+        persist) and on the `stopped` event, naming the resource, not just the
+        exit code the pause itself caused. */
+    @Test func acquirePauseLogsAndEventsTheResourceAsTheReason() async throws {
+        let env = try makeLockEnv()
+        try writeLockDevservers(project: env.projectPath)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        try await startDB(router: router, project: env.projectPath)
+
+        _ = try await handle(
+            router: router, method: .lockAcquire,
+            params: LockParams(
+                holderPid: Int(getpid()), pause: true, project: env.projectPath, resource: "data",
+                resumeTimeoutSeconds: 15),
+            expecting: LockResult.self)
+        #expect(try await phaseOf(router: router, project: env.projectPath, name: "db") == .stopped)
+
+        let logs = try await handle(
+            router: router, method: .logsQuery,
+            params: LogsQueryParams(name: "db", project: env.projectPath, streams: [.sys]),
+            expecting: LogsQueryResult.self)
+        #expect(logs.lines.contains { $0.text == "stopping: paused for lock data" })
+
+        let events = try await handle(
+            router: router, method: .eventsQuery,
+            params: EventsQueryParams(project: env.projectPath), expecting: EventsQueryResult.self)
+        let stopped = try #require(events.events.last { $0.kind == .stopped })
+        #expect(stopped.detail == "paused for lock data")
+
+        _ = try await handle(
+            router: router, method: .lockRelease,
+            params: LockParams(
+                holderPid: Int(getpid()), project: env.projectPath, resource: "data",
+                resumeTimeoutSeconds: 15),
+            expecting: LockResult.self)
+        _ = try await handle(
+            router: router, method: .serverStop,
+            params: ServerTargetParams(name: "db", project: env.projectPath),
+            expecting: ServerResult.self)
+    }
+
     /** A waiting run has to be able to name the holder, or it looks hung and
         someone kills the run that is making progress. */
     @Test func lockStatusNamesTheLiveHolderAndForgetsADeadOne() async throws {
