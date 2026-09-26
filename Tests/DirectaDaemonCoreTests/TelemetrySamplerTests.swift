@@ -14,7 +14,9 @@ private func temporaryDirectory() throws -> URL {
 private struct SnapshotRead: Decodable {
     let entry: String
     let fileDescriptors: Int?
+    let lanes: [LanePressure]
     let memory: MemorySample?
+    let reason: String
     let threads: ThreadSample?
 }
 
@@ -36,13 +38,35 @@ private let fastPolicy = TelemetryCadence.Policy(
     thresholdCooldownSeconds: 60, thresholdThreadFraction: 0.75)
 
 @Suite struct TelemetrySamplerTests {
-    @Test func samplesRealKernelNumbers() throws {
+    /** Also holds a width-1 lane with one job running and two queued, so the
+        snapshot's lane pressure is a known answer. */
+    @Test func samplesRealKernelNumbersAndLanePressure() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let log = TelemetryLog(directory: directory)
+        let lane = BlockingLane(label: "dev.quantizor.directa.test.held", width: 1, activity: DaemonActivity())
+        let gate = DispatchSemaphore(value: 0)
+        let entered = DispatchSemaphore(value: 0)
+        let done = DispatchGroup()
+        for _ in 0..<3 {
+            done.enter()
+            Task.detached {
+                await lane.run {
+                    entered.signal()
+                    gate.wait()
+                }
+                done.leave()
+            }
+        }
+        try #require(entered.wait(timeout: .now() + 5) == .success)
+        let queuedDeadline = Date().addingTimeInterval(5)
+        while lane.pressure().queued < 2, Date() < queuedDeadline {
+            usleep(5_000)
+        }
+        usleep(20_000)
         let sampler = TelemetrySampler(
             configuration: .init(
-                activity: DaemonActivity(), exitWatches: { 0 }, log: log, policy: fastPolicy,
+                activity: DaemonActivity(), exitWatches: { 0 }, lanes: [lane], log: log, policy: fastPolicy,
                 threadLimit: { nil }))
         sampler.start()
         let deadline = Date().addingTimeInterval(5)
@@ -50,7 +74,21 @@ private let fastPolicy = TelemetryCadence.Policy(
             usleep(10_000)
         }
         sampler.stop()
+        for _ in 0..<3 { gate.signal() }
+        #expect(done.wait(timeout: .now() + 5) == .success)
+        #expect(lane.pressure() == LanePressure(name: "held", oldestQueuedSeconds: 0, queued: 0, running: 0, width: 1))
         let first = try #require(snapshots(in: directory).first)
+        let pressure = try #require(first.lanes.first)
+        #expect(first.lanes.count == 1)
+        #expect(pressure.name == "held")
+        #expect(pressure.width == 1)
+        #expect(pressure.running == 1)
+        #expect(pressure.queued == 2)
+        #expect(pressure.oldestQueuedSeconds >= 0.02)
+        /** Never `interval`: a backlog forces the fast cadence. `threshold`
+            is possible when the parallel suites push this process's thread
+            count past the assumed limit's high-water mark. */
+        #expect(first.reason != "interval")
         let threads = try #require(first.threads)
         #expect(threads.total > 1)
         /** At least one: the suite's other tests run their own samplers in
@@ -83,7 +121,7 @@ private let fastPolicy = TelemetryCadence.Policy(
         let log = TelemetryLog(directory: directory)
         let sampler = TelemetrySampler(
             configuration: .init(
-                activity: DaemonActivity(), exitWatches: { 0 }, log: log, policy: fastPolicy,
+                activity: DaemonActivity(), exitWatches: { 0 }, lanes: [], log: log, policy: fastPolicy,
                 threadLimit: { nil }))
         let blockers = ProcessInfo.processInfo.activeProcessorCount * 2
         let gate = DispatchSemaphore(value: 0)
@@ -168,7 +206,8 @@ private let fastPolicy = TelemetryCadence.Policy(
         defer { activity.end(stuck) }
         let sampler = TelemetrySampler(
             configuration: .init(
-                activity: activity, exitWatches: { 0 }, log: log, policy: fastPolicy, threadLimit: { 2 }))
+                activity: activity, exitWatches: { 0 }, lanes: [], log: log, policy: fastPolicy,
+                threadLimit: { 2 }))
         sampler.start()
         let deadline = Date().addingTimeInterval(5)
         while snapshots(in: directory).count < 3, Date() < deadline {

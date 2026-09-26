@@ -19,17 +19,39 @@ public final class BlockingLane: Sendable {
     /** `launchctl`, `lsof`, `ps`, and loopback connect probes. */
     public static let system = BlockingLane(label: "dev.quantizor.directa.lane.system", width: 4)
 
-    private struct State {
-        var draining = 0
-        var pending: [@Sendable () -> Void] = []
+    /** Every shared lane, in the order telemetry reports them. */
+    public static let all = [repository, system]
+
+    private struct Pending {
+        let enqueuedAt: ContinuousClock.Instant
+        let job: @Sendable () -> Void
     }
 
+    private struct State {
+        var draining = 0
+        var pending: [Pending] = []
+        var running = 0
+    }
+
+    private let activity: DaemonActivity
+    /** The label's last component (`repository`, `system`), as telemetry
+        names the lane. */
+    public let name: String
     private let queue: DispatchQueue
+    /** A job that waited longer than this for a thread is reported to
+        `activity`, which telemetry turns into a mark. */
+    private let slowWaitSeconds: Double
     private let state = OSAllocatedUnfairLock(initialState: State())
     public let width: Int
 
-    public init(label: String, width: Int) {
+    public init(
+        label: String, width: Int, activity: DaemonActivity = .shared,
+        slowWaitSeconds: Double = TelemetryCadence.slowOperationSeconds
+    ) {
+        self.activity = activity
+        self.name = label.split(separator: ".").last.map(String.init) ?? label
         self.queue = DispatchQueue(label: label, qos: .userInitiated, attributes: .concurrent)
+        self.slowWaitSeconds = slowWaitSeconds
         self.width = max(1, width)
     }
 
@@ -42,9 +64,21 @@ public final class BlockingLane: Sendable {
         }
     }
 
+    /** How busy the lane is right now, read under the lane's own lock so it
+        answers from any thread without waiting on the lane's work. */
+    public func pressure(now: ContinuousClock.Instant = .now) -> LanePressure {
+        let (running, queued, oldest) = state.withLock { state in
+            (state.running, state.pending.count, state.pending.first?.enqueuedAt)
+        }
+        return LanePressure(
+            name: name, oldestQueuedSeconds: oldest.map { DaemonActivity.seconds($0.duration(to: now)) } ?? 0,
+            queued: queued, running: running, width: width)
+    }
+
     private func submit(_ job: @escaping @Sendable () -> Void) {
+        let entry = Pending(enqueuedAt: .now, job: job)
         let startsDrainer = state.withLock { state in
-            state.pending.append(job)
+            state.pending.append(entry)
             guard state.draining < width else { return false }
             state.draining += 1
             return true
@@ -59,17 +93,25 @@ public final class BlockingLane: Sendable {
         the queue empty, so a job submitted concurrently either lands before
         that check or starts a new drainer. */
     private func drain() {
-        while let job = nextJob() {
-            job()
+        var finishedOne = false
+        while let entry = nextJob(finishedOne: finishedOne) {
+            let waited = DaemonActivity.seconds(entry.enqueuedAt.duration(to: .now))
+            if waited > slowWaitSeconds {
+                activity.recordLaneWait(lane: name, seconds: waited)
+            }
+            entry.job()
+            finishedOne = true
         }
     }
 
-    private func nextJob() -> (@Sendable () -> Void)? {
+    private func nextJob(finishedOne: Bool) -> Pending? {
         state.withLock { state in
+            if finishedOne { state.running -= 1 }
             guard !state.pending.isEmpty else {
                 state.draining -= 1
                 return nil
             }
+            state.running += 1
             return state.pending.removeFirst()
         }
     }

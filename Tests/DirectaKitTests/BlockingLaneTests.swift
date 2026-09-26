@@ -42,6 +42,61 @@ import os
         #expect(results == Array(0..<jobs))
     }
 
+    /** Pressure counts running and queued jobs exactly, the oldest queued
+        wait grows while the lane is full, and only a job that waited past the
+        lane's slow-wait bound is reported, once, with its lane name. */
+    @Test func pressureAndSlowWaitsAreReported() async throws {
+        let activity = DaemonActivity()
+        let heard = OSAllocatedUnfairLock<[String]>(initialState: [])
+        activity.setObserver { event in
+            if case .laneWaited(let lane, let seconds) = event {
+                heard.withLock { $0.append("\(lane) \(seconds >= 0.15)") }
+            }
+        }
+        let lane = BlockingLane(
+            label: "dev.quantizor.directa.test.pressure", width: 1, activity: activity, slowWaitSeconds: 0.15)
+        #expect(lane.pressure() == LanePressure(name: "pressure", oldestQueuedSeconds: 0, queued: 0, running: 0, width: 1))
+        let entered = DispatchSemaphore(value: 0)
+        let gate = DispatchSemaphore(value: 0)
+        let calls = (0..<3).map { index in
+            Task.detached {
+                await lane.run {
+                    entered.signal()
+                    gate.wait()
+                    return index
+                }
+            }
+        }
+        let observed = await withCheckedContinuation { (continuation: CheckedContinuation<LanePressure?, Never>) in
+            let thread = Thread {
+                guard entered.wait(timeout: .now() + 5) == .success else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let deadline = Date().addingTimeInterval(5)
+                while lane.pressure().queued < 2, Date() < deadline { usleep(2_000) }
+                usleep(200_000)
+                let pressure = lane.pressure()
+                for _ in 0..<3 { gate.signal() }
+                continuation.resume(returning: pressure)
+            }
+            thread.name = "blocking-lane-test-pressure"
+            thread.start()
+        }
+        var results: [Int] = []
+        for call in calls {
+            results.append(await call.value)
+        }
+        let pressure = try #require(observed)
+        #expect(pressure.running == 1)
+        #expect(pressure.queued == 2)
+        #expect(pressure.oldestQueuedSeconds >= 0.2)
+        #expect(results.sorted() == [0, 1, 2])
+        #expect(lane.pressure() == LanePressure(name: "pressure", oldestQueuedSeconds: 0, queued: 0, running: 0, width: 1))
+        #expect(heard.withLock { $0 } == ["pressure true", "pressure true"])
+        activity.setObserver(nil)
+    }
+
     /** Git calls against a repository whose `HEAD` is a FIFO hang in `open(2)`
         until something opens the other end, the shape of a git stuck on a
         network filesystem. Twice as many callers as the cooperative pool has

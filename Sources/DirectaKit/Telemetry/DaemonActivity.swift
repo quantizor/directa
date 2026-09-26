@@ -123,10 +123,13 @@ public final class DaemonActivity: Sendable {
         public let startedAt: ContinuousClock.Instant
     }
 
-    /** What an observer hears: a begin, or an end with its duration. */
+    /** What an observer hears: a begin, an end with its duration, or a job
+        that waited past `TelemetryCadence.slowOperationSeconds` for a
+        `BlockingLane` thread. */
     public enum Event: Sendable {
         case began(Token)
         case ended(Token, outcome: String?, seconds: Double)
+        case laneWaited(lane: String, seconds: Double)
     }
 
     private struct State {
@@ -171,6 +174,11 @@ public final class DaemonActivity: Sendable {
         let token = begin(kind, label: label)
         defer { end(token) }
         return try body()
+    }
+
+    public func recordLaneWait(lane: String, seconds: Double) {
+        let observer = state.withLock { $0.observer }
+        observer?(.laneWaited(lane: lane, seconds: seconds))
     }
 
     public func clientConnected() {

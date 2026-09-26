@@ -10,17 +10,19 @@ public final class TelemetrySampler: Sendable {
     public struct Configuration: Sendable {
         public var activity: DaemonActivity
         public var exitWatches: @Sendable () -> Int
+        public var lanes: [BlockingLane]
         public var log: TelemetryLog
         public var policy: TelemetryCadence.Policy
         /** The launchd thread limit, once known; read on every sample. */
         public var threadLimit: @Sendable () -> Int?
 
         public init(
-            activity: DaemonActivity, exitWatches: @escaping @Sendable () -> Int, log: TelemetryLog,
-            policy: TelemetryCadence.Policy, threadLimit: @escaping @Sendable () -> Int?
+            activity: DaemonActivity, exitWatches: @escaping @Sendable () -> Int, lanes: [BlockingLane],
+            log: TelemetryLog, policy: TelemetryCadence.Policy, threadLimit: @escaping @Sendable () -> Int?
         ) {
             self.activity = activity
             self.exitWatches = exitWatches
+            self.lanes = lanes
             self.log = log
             self.policy = policy
             self.threadLimit = threadLimit
@@ -105,7 +107,9 @@ public final class TelemetrySampler: Sendable {
     }
 
     private struct LoopState {
-        var lastThreadsTriggerAt: ContinuousClock.Instant?
+        /** When this loop last saw threads at the burst fraction or a lane
+            with queued work: triggers only the sampler can observe. */
+        var lastSampledTriggerAt: ContinuousClock.Instant?
         var lastThresholdAt: ContinuousClock.Instant?
         let pid = getpid()
         var previousAboveThreshold = false
@@ -116,8 +120,13 @@ public final class TelemetrySampler: Sendable {
         let began = ContinuousClock.now
         let limit = configuration.threadLimit()
         var threads = sampler.threads(limit: limit, withDetail: false)
+        let lanes = configuration.lanes.map { $0.pressure(now: began) }
+        /** A queued lane job is not yet in the activity registry (its
+            blocking call has not begun), so a backlog is its own trigger. */
+        let laneBacklog = lanes.contains { $0.queued > 0 }
+        if laneBacklog { loop.lastSampledTriggerAt = began }
         let trigger = configuration.activity.triggerState()
-        let lastTrigger = [trigger.lastAt, loop.lastThreadsTriggerAt].compactMap { $0 }.max()
+        let lastTrigger = [trigger.lastAt, loop.lastSampledTriggerAt].compactMap { $0 }.max()
         let decision = TelemetryCadence.decide(
             TelemetryCadence.Input(
                 previousAboveThreshold: loop.previousAboveThreshold,
@@ -126,9 +135,9 @@ public final class TelemetrySampler: Sendable {
                     DaemonActivity.seconds($0.duration(to: began))
                 },
                 threadCount: threads?.sample.total, threadLimit: limit,
-                triggerInFlight: trigger.inFlight),
+                triggerInFlight: trigger.inFlight || laneBacklog),
             policy: configuration.policy)
-        if decision.threadsTrigger { loop.lastThreadsTriggerAt = began }
+        if decision.threadsTrigger { loop.lastSampledTriggerAt = began }
         if decision.reason == .threshold {
             loop.lastThresholdAt = began
             threads = sampler.threads(limit: limit, withDetail: true) ?? threads
@@ -136,7 +145,8 @@ public final class TelemetrySampler: Sendable {
         let activity = configuration.activity.snapshot(now: began)
         let snapshot = TelemetrySnapshot(
             activity: activity, daemonPid: loop.pid, exitWatches: configuration.exitWatches(),
-            fileDescriptors: sampler.fileDescriptors(), memory: sampler.memory(), reason: decision.reason,
+            fileDescriptors: sampler.fileDescriptors(), lanes: lanes, memory: sampler.memory(),
+            reason: decision.reason,
             sampleMicroseconds: Self.microseconds(began.duration(to: .now)),
             system: sampler.system(),
             threadDetail: decision.reason == .threshold ? threads?.detail : nil,

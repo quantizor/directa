@@ -35,7 +35,7 @@ What and where (all under the daemon's logs dir, `~/Library/Logs/directa` unless
 
 - `daemon/telemetry.log`: NDJSON through JSONCoding, one line per snapshot or mark, `time` clamped monotonic per file. Plain `write(2)` per line, no fsync (a SIGKILL keeps page-cache writes).
 - Rotation: 10 MB per file, the current file plus `telemetry.log.1` (newest) to `.4`. Disk bound 50 MB.
-- `daemon/incidents/<boot time>-pid<pid>.ndjson`: one per daemon boot, newest 50 kept. Each is at most about 1 MB (180 copied lines, at most 300 unified-log lines of at most 1000 characters, report excerpts of at most 16 KB each), so about 50 MB worst case.
+- `daemon/incidents/<boot time>-pid<pid>.ndjson`: one per daemon boot, newest 50 kept. Each holds 180 copied lines (a few KB each), at most 300 unified-log lines of at most 1000 characters, and report excerpts of at most 16 KB each, so under 1 MB; with the telemetry files, the whole record stays under about 100 MB.
 - `DIRECTA_TELEMETRY=off` in the daemon's environment disables all of it. Tests and the smoke gate get it under their temp `--logs-dir`.
 
 Snapshot line (`entry: snapshot`):
@@ -46,23 +46,24 @@ Snapshot line (`entry: snapshot`):
 - `fileDescriptors`: `PROC_PIDLISTFDS` count.
 - `system`: `kern.memorystatus_vm_pressure_level` by name, 1/5/15 minute load average.
 - `activity`: supervisors per phase, in-flight wire requests per method, in-flight work per kind (count, oldest age, oldest label), the eight longest-running items, connected clients; plus `exitWatches` (pids armed in ExitWatcher).
+- `lanes`: per BlockingLane (`repository`, `system`), its width, jobs running, jobs queued for a thread, and the oldest queued job's wait, read under the lane's own lock. A queued job is not yet in `activity`, since its blocking call has not begun, so a backlog shows only here.
 - `reason` (`interval`, `burst`, `threshold`), `sampleMicroseconds` (the sample's own cost), `uptimeSeconds`, `daemonPid`.
 - A kernel read that fails is omitted, never written as zero.
 
 In-flight work (`DaemonActivity`, one unfair lock, readable without awaiting any actor):
 
-- Kinds: `git` (CheckoutIdentity), `launchctl`, `lsof`, `ps`, `subprocess`, `log-show` (LaunchdAdmin.shell and PortGuard, kind by executable name), `stop` (ServerSupervisor.stop from the signal to its return), `stop-wait` and `spawn-wait` (a caller waiting on a phase change), `restart` (Router restart per server, stop through ensure), `request` (a wire request from the moment its line arrives, including time spent waiting for a pool thread).
+- Kinds: `git` (CheckoutIdentity), `launchctl`, `lsof`, `ps`, `subprocess`, `log-show` (LaunchdAdmin.shell and PortGuard, kind by executable name; timed inside the synchronous call a lane runs, so the age is the blocking run itself, never the lane queue), `stop` (ServerSupervisor.stop from the signal to its return), `stop-wait` and `spawn-wait` (a caller waiting on a phase change), `restart` (Router restart per server, stop through ensure), `request` (a wire request from the moment its line arrives, including time spent waiting for a pool thread).
 - Every kind but `request` and `log-show` triggers the fast cadence.
 
 Cadence (`TelemetryCadence.decide`, pure):
 
 - Baseline every 10 s.
-- Every 1 s while trigger work is in flight or threads are at 50% of the limit (16 of 32), and for 60 s after the last of either. A trigger beginning wakes the sampler at once.
+- Every 1 s while trigger work is in flight, any lane has queued work, or threads are at 50% of the limit (16 of 32), and for 60 s after the last of these. A trigger beginning wakes the sampler at once.
 - The limit is launchd's when known, else 32.
 - Threshold: the first sample at or above 75% of the limit (24 of 32) on a rising edge, at most once per 60 s, carries `threadDetail`, writes a `threads-high` mark, and logs one error-level OSLog line (persisted by macOS) naming the count and the three longest in-flight items.
 - The sampler is a dedicated thread (`dev.quantizor.directa.telemetry`, userInitiated QoS), never the cooperative pool; `TelemetrySamplerTests` blocks the whole pool and asserts samples keep arriving.
 
-Marks (`entry: mark`): `daemon-started`, `daemon-exiting` (an `atexit` hook, so every clean exit writes it and a kill never does), `stop-began`/`stop-ended` and `restart-began`/`restart-ended` (label, outcome, seconds), `slow-operation` (blocking work or a phase wait past 2 s), `threads-high`.
+Marks (`entry: mark`): `daemon-started`, `daemon-exiting` (an `atexit` hook, so every clean exit writes it and a kill never does), `stop-began`/`stop-ended` and `restart-began`/`restart-ended` (label, outcome, seconds), `slow-operation` (blocking work or a phase wait past 2 s), `slow-lane-wait` (a job that waited past 2 s for a lane thread, with the lane name), `threads-high`.
 
 Boot incident (written by a utility-QoS background thread, never delaying the socket or the restore gate):
 
@@ -72,9 +73,10 @@ Boot incident (written by a utility-QoS background thread, never delaying the so
 - `diagnostic-report` lines for JetsamEvent and `ddirecta` reports in `/Library/Logs/DiagnosticReports` and `~/Library/Logs/DiagnosticReports` modified in the window: the daemon's process entry from a JetsamEvent, else the report's first 16 KB.
 - A final `search-finished` line with the match and report counts, the window, the predicate, and the outcome (`finished`, `timed out`, `failed: ...`, `skipped: ...`), so an empty search is recorded rather than silent. A clean previous exit skips the search.
 
-Reading it: `scripts/daemon-deaths.sh [incidents-dir]` prints one summary per death (launchd fields, kernel lines, the last stop or restart and whether it ended, peak threads with their names and the workqueue in the final 60 s, memory in the final 60 s, what was in flight at the last snapshot, the last marks). What the record can and cannot tell:
+Reading it: `scripts/daemon-deaths.sh [incidents-dir]` prints one summary per death (launchd fields, kernel lines, the last stop or restart and whether it ended, peak threads with their names and the workqueue in the final 60 s, memory in the final 60 s, peak lane queue depth and longest queue wait in the final 60 s, lane state and what was in flight at the last snapshot, the last marks). What the record can and cannot tell:
 
 - Thread exhaustion reads as a thread total near the limit with blocked workqueue threads named by queue label, and in-flight blocking work with its age.
+- A lane backlog (queued jobs and a growing oldest wait while every lane thread runs a blocking call) names which kind of blocking work stalled callers, since the lanes cap their own threads.
 - Memory reads as footprint or compressed growth in the final minute, or a memory pressure level above normal.
 - The time of death is known only to within one sampling interval after the last line.
 - A kill reason appears only if the kernel or launchd logged one and `log show` still held it at the next boot.

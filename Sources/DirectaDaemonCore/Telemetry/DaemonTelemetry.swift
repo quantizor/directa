@@ -49,7 +49,8 @@ public final class DaemonTelemetry: Sendable {
         self.threadLimit = threadLimit
         self.sampler = TelemetrySampler(
             configuration: TelemetrySampler.Configuration(
-                activity: activity, exitWatches: { ExitWatcher.shared.watchedCount }, log: log, policy: policy,
+                activity: activity, exitWatches: { ExitWatcher.shared.watchedCount }, lanes: BlockingLane.all,
+                log: log, policy: policy,
                 threadLimit: { threadLimit.withLock { $0 } }))
     }
 

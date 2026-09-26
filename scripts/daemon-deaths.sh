@@ -74,13 +74,18 @@ def orNone(f): if length == 0 then "    none" else map(f) | join("\n") end;
      "    by state: \($peak.threads.byState | to_entries | map("\(.key)=\(.value)") | join(", "))",
      "  final 60s memory: footprint peak \($final | map(.memory.footprint // 0) | max | mb) MB (last \($lastSnap.memory.footprint // 0 | mb) MB, lifetime peak \($lastSnap.memory.footprintLifetimePeak // 0 | mb) MB), compressed peak \($final | map(.memory.compressed // 0) | max | mb) MB, fds peak \($final | map(.fileDescriptors // 0) | max), pressure \($lastSnap.system.memoryPressure // "?")"
    end),
+  ([$final[] | .lanes // [] | .[]] | group_by(.name)
+   | if length == 0 then "  final 60s lanes: no lane data"
+     else "  final 60s lanes: " + (map("\(.[0].name) (width \(.[0].width)) peak queued \(map(.queued) | max), peak running \(map(.running) | max), longest queue wait \(map(.oldestQueuedSeconds) | max)s") | join("; "))
+     end),
   (if $lastSnap == null then "  in flight at last snapshot: no snapshots"
    else
+     "  lanes at last snapshot: \($lastSnap.lanes // [] | if length == 0 then "none recorded" else map("\(.name) \(.running)/\(.width) running, \(.queued) queued, oldest \(.oldestQueuedSeconds)s") | join("; ") end)",
      "  in flight at last snapshot (\($lastSnap.time | clock), \($lastSnap.activity.connectedClients) clients, \($lastSnap.exitWatches) exit watches):",
      ($lastSnap.activity.longestRunning | orNone("    \(.kind) \(.seconds)s \(.label)"))
    end),
   "  last marks:",
-  ($marks | .[-8:] | orNone("    \(.time | clock) \(.event)\(if .kind then " " + .kind else "" end)\(if .seconds then " " + (.seconds | tostring) + "s" else "" end) \(.label // "")\(if .outcome then " -> " + .outcome else "" end)"))
+  ($marks | .[-10:] | orNone("    \(.time | clock) \(.event)\(if .kind then " " + .kind else "" end)\(if .seconds then " " + (.seconds | tostring) + "s" else "" end) \(.label // "")\(if .outcome then " -> " + .outcome else "" end)"))
 ]
 | join("\n")
 '

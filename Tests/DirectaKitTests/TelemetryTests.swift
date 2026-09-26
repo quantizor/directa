@@ -134,6 +134,10 @@ private func encoded<T: Encodable>(_ value: T) throws -> String {
                 requests: ["server.restart": ActivityGroup(count: 1, oldestLabel: "", oldestSeconds: 12.6)],
                 serverPhases: ["stopping": 1]),
             daemonPid: 4242, exitWatches: 3, fileDescriptors: 41,
+            lanes: [
+                LanePressure(name: "repository", oldestQueuedSeconds: 4.25, queued: 3, running: 2, width: 2),
+                LanePressure(name: "system", oldestQueuedSeconds: 0, queued: 0, running: 1, width: 4),
+            ],
             memory: MemorySample(
                 compressed: 1, compressedLifetime: 2, compressedPeak: 3, footprint: 4, footprintLifetimePeak: 5,
                 internal: 6, internalPeak: 7, resident: 8),
@@ -149,7 +153,7 @@ private func encoded<T: Encodable>(_ value: T) throws -> String {
             time: try date("2026-09-26T10:00:00.123Z"), uptimeSeconds: 99.5)
         #expect(
             try encoded(snapshot)
-                == #"{"activity":{"connectedClients":2,"longestRunning":[{"kind":"stop","label":"/p::web: requested by restart","seconds":12.5}],"operations":{"stop":{"count":1,"oldestLabel":"/p::web: requested by restart","oldestSeconds":12.5}},"requests":{"server.restart":{"count":1,"oldestLabel":"","oldestSeconds":12.6}},"serverPhases":{"stopping":1}},"daemonPid":4242,"entry":"snapshot","exitWatches":3,"fileDescriptors":41,"memory":{"compressed":1,"compressedLifetime":2,"compressedPeak":3,"footprint":4,"footprintLifetimePeak":5,"internal":6,"internalPeak":7,"resident":8},"reason":"threshold","sampleMicroseconds":180,"system":{"loadAverage":[1.5,2,3.25],"memoryPressure":"normal"},"threadDetail":[{"cpuPercent":0.5,"name":"(unnamed)","state":"waiting","systemSeconds":0.25,"userSeconds":1}],"threads":{"byName":{"(unnamed)":20,"com.apple.root.default-qos.cooperative":4},"byState":{"waiting":24},"limit":32,"total":24,"workqueue":{"blocked":18,"limitsExceeded":["constrained"],"running":2,"total":20}},"time":"2026-09-26T10:00:00.123Z","uptimeSeconds":99.5}"#
+                == #"{"activity":{"connectedClients":2,"longestRunning":[{"kind":"stop","label":"/p::web: requested by restart","seconds":12.5}],"operations":{"stop":{"count":1,"oldestLabel":"/p::web: requested by restart","oldestSeconds":12.5}},"requests":{"server.restart":{"count":1,"oldestLabel":"","oldestSeconds":12.6}},"serverPhases":{"stopping":1}},"daemonPid":4242,"entry":"snapshot","exitWatches":3,"fileDescriptors":41,"lanes":[{"name":"repository","oldestQueuedSeconds":4.25,"queued":3,"running":2,"width":2},{"name":"system","oldestQueuedSeconds":0,"queued":0,"running":1,"width":4}],"memory":{"compressed":1,"compressedLifetime":2,"compressedPeak":3,"footprint":4,"footprintLifetimePeak":5,"internal":6,"internalPeak":7,"resident":8},"reason":"threshold","sampleMicroseconds":180,"system":{"loadAverage":[1.5,2,3.25],"memoryPressure":"normal"},"threadDetail":[{"cpuPercent":0.5,"name":"(unnamed)","state":"waiting","systemSeconds":0.25,"userSeconds":1}],"threads":{"byName":{"(unnamed)":20,"com.apple.root.default-qos.cooperative":4},"byState":{"waiting":24},"limit":32,"total":24,"workqueue":{"blocked":18,"limitsExceeded":["constrained"],"running":2,"total":20}},"time":"2026-09-26T10:00:00.123Z","uptimeSeconds":99.5}"#
                 + "\n")
     }
 
@@ -157,12 +161,12 @@ private func encoded<T: Encodable>(_ value: T) throws -> String {
         let snapshot = TelemetrySnapshot(
             activity: ActivitySnapshot(
                 connectedClients: 0, longestRunning: [], operations: [:], requests: [:], serverPhases: [:]),
-            daemonPid: 1, exitWatches: 0, fileDescriptors: nil, memory: nil, reason: .interval,
+            daemonPid: 1, exitWatches: 0, fileDescriptors: nil, lanes: [], memory: nil, reason: .interval,
             sampleMicroseconds: 1, system: SystemSample(loadAverage: [], memoryPressure: "unreadable"),
             threadDetail: nil, threads: nil, time: try date("2026-09-26T10:00:00.000Z"), uptimeSeconds: 0)
         #expect(
             try encoded(snapshot)
-                == #"{"activity":{"connectedClients":0,"longestRunning":[],"operations":{},"requests":{},"serverPhases":{}},"daemonPid":1,"entry":"snapshot","exitWatches":0,"reason":"interval","sampleMicroseconds":1,"system":{"loadAverage":[],"memoryPressure":"unreadable"},"time":"2026-09-26T10:00:00.000Z","uptimeSeconds":0}"#
+                == #"{"activity":{"connectedClients":0,"longestRunning":[],"operations":{},"requests":{},"serverPhases":{}},"daemonPid":1,"entry":"snapshot","exitWatches":0,"lanes":[],"reason":"interval","sampleMicroseconds":1,"system":{"loadAverage":[],"memoryPressure":"unreadable"},"time":"2026-09-26T10:00:00.000Z","uptimeSeconds":0}"#
                 + "\n")
     }
 
@@ -281,14 +285,21 @@ private func encoded<T: Encodable>(_ value: T) throws -> String {
                 _ = activity.snapshot()
             case .ended(let token, let outcome, _):
                 heard.append("ended \(token.kind.rawValue) \(outcome ?? "-")")
+            case .laneWaited(let lane, let seconds):
+                heard.append("lane \(lane) \(seconds)")
             }
         }
         let token = activity.begin(.restart, label: "r")
         activity.end(token, outcome: "stopped")
         activity.measure(.git, label: "g") {}
+        activity.recordLaneWait(lane: "system", seconds: 3.5)
         activity.setObserver(nil)
         activity.end(activity.begin(.stop, label: "after"))
-        #expect(heard.values == ["began restart", "ended restart stopped", "began git", "ended git -"])
+        activity.recordLaneWait(lane: "system", seconds: 9)
+        #expect(
+            heard.values == [
+                "began restart", "ended restart stopped", "began git", "ended git -", "lane system 3.5",
+            ])
     }
 
     @Test func concurrentBeginAndEndLeaveNothingInFlight() async {
@@ -330,6 +341,9 @@ private func encoded<T: Encodable>(_ value: T) throws -> String {
                     daemonPid: 9, event: .slowOperation, kind: .git, label: "git x", seconds: 2.01, time: now))
         #expect(
             TelemetryMark.forActivity(.ended(request, outcome: nil, seconds: 60), daemonPid: 9, time: now) == nil)
+        #expect(
+            TelemetryMark.forActivity(.laneWaited(lane: "repository", seconds: 3.2), daemonPid: 9, time: now)
+                == TelemetryMark(daemonPid: 9, event: .slowLaneWait, label: "repository", seconds: 3.2, time: now))
     }
 }
 

@@ -96,6 +96,25 @@ public struct WorkqueueSample: Codable, Equatable, Sendable {
     }
 }
 
+/** One `BlockingLane` at an instant: jobs running on its threads, jobs
+    waiting for a thread, and how long the first waiting job has waited. */
+public struct LanePressure: Codable, Equatable, Sendable {
+    public var name: String
+    /** Zero when nothing is queued. */
+    public var oldestQueuedSeconds: Double
+    public var queued: Int
+    public var running: Int
+    public var width: Int
+
+    public init(name: String, oldestQueuedSeconds: Double, queued: Int, running: Int, width: Int) {
+        self.name = name
+        self.oldestQueuedSeconds = oldestQueuedSeconds
+        self.queued = queued
+        self.running = running
+        self.width = width
+    }
+}
+
 public struct ThreadSample: Codable, Equatable, Sendable {
     /** Thread count per name: the pthread name when set, else the dispatch
         queue the thread is serving (a cooperative-pool thread reads
@@ -178,6 +197,7 @@ public struct TelemetrySnapshot: TelemetryLine, Codable, Equatable {
     /** Exit watches armed in `ExitWatcher`. */
     public var exitWatches: Int
     public var fileDescriptors: Int?
+    public var lanes: [LanePressure]
     public var memory: MemorySample?
     public var reason: SampleReason
     /** Wall time this sample took to collect, the sampler's own cost. */
@@ -190,13 +210,15 @@ public struct TelemetrySnapshot: TelemetryLine, Codable, Equatable {
 
     public init(
         activity: ActivitySnapshot, daemonPid: Int32, exitWatches: Int, fileDescriptors: Int?,
-        memory: MemorySample?, reason: SampleReason, sampleMicroseconds: Int, system: SystemSample,
-        threadDetail: [ThreadDetail]?, threads: ThreadSample?, time: Date, uptimeSeconds: Double
+        lanes: [LanePressure], memory: MemorySample?, reason: SampleReason, sampleMicroseconds: Int,
+        system: SystemSample, threadDetail: [ThreadDetail]?, threads: ThreadSample?, time: Date,
+        uptimeSeconds: Double
     ) {
         self.activity = activity
         self.daemonPid = daemonPid
         self.exitWatches = exitWatches
         self.fileDescriptors = fileDescriptors
+        self.lanes = lanes
         self.memory = memory
         self.reason = reason
         self.sampleMicroseconds = sampleMicroseconds
@@ -214,6 +236,7 @@ public enum TelemetryMarkEvent: String, Codable, Sendable {
     case daemonStarted = "daemon-started"
     case restartBegan = "restart-began"
     case restartEnded = "restart-ended"
+    case slowLaneWait = "slow-lane-wait"
     case slowOperation = "slow-operation"
     case stopBegan = "stop-began"
     case stopEnded = "stop-ended"
@@ -247,12 +270,16 @@ public struct TelemetryMark: TelemetryLine, Codable, Equatable {
 
     /** The mark for an activity event, or nil when that event gets none:
         stops and restarts mark both ends, blocking work and phase waits mark
-        only an end past `slowOperationSeconds`. */
+        only an end past `slowOperationSeconds`, and a lane reports only the
+        queue waits already past it. */
     public static func forActivity(
         _ event: DaemonActivity.Event, daemonPid: Int32, time: Date,
         slowOperationSeconds: Double = TelemetryCadence.slowOperationSeconds
     ) -> TelemetryMark? {
         switch event {
+        case .laneWaited(let lane, let seconds):
+            return TelemetryMark(
+                daemonPid: daemonPid, event: .slowLaneWait, label: lane, seconds: seconds, time: time)
         case .began(let token):
             switch token.kind {
             case .stop:
