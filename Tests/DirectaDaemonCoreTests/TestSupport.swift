@@ -22,15 +22,16 @@ let testLaunchdJobLabelPrefix = "dev.quantizor.directa.test-job."
 /** The one raw `posix_spawn` for tests that need spawn attributes Foundation's
     `Process` cannot set (a new session, a signal mask, a Darwin SPI). The
     child inherits no descriptor but stdin, stdout, and stderr, each on
-    /dev/null (`POSIX_SPAWN_CLOEXEC_DEFAULT`, the flag `swift-subprocess`
-    passes on every spawn): a plain `posix_spawn` copies every descriptor the
+    /dev/null unless `stdoutFD` names the descriptor its stdout is duplicated
+    from (`POSIX_SPAWN_CLOEXEC_DEFAULT`, the flag `swift-subprocess` passes on
+    every spawn): a plain `posix_spawn` copies every descriptor the
     test process has open at that instant, including the write end of any
     pipe a concurrent test is draining, and that reader then waits for this
     child to exit rather than for the process it started. `flags` joins the
     close-on-exec default; `configure` sets any other attribute. The caller
     owns reaping. */
 func spawnBare(
-    _ argv: [String], flags: Int32 = 0,
+    _ argv: [String], flags: Int32 = 0, stdoutFD: Int32? = nil,
     configure: (inout posix_spawnattr_t?) throws -> Void = { _ in }
 ) throws -> pid_t {
     var attr: posix_spawnattr_t?
@@ -43,7 +44,11 @@ func spawnBare(
     posix_spawn_file_actions_init(&actions)
     defer { posix_spawn_file_actions_destroy(&actions) }
     posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
-    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
+    if let stdoutFD {
+        posix_spawn_file_actions_adddup2(&actions, stdoutFD, STDOUT_FILENO)
+    } else {
+        posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)
+    }
     posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0)
 
     var pid: pid_t = 0

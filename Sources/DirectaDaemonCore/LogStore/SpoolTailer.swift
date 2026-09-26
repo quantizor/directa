@@ -30,6 +30,53 @@ enum SpoolLineSplit {
     }
 }
 
+/** Which already-ingested spool bytes can have their disk blocks released.
+    The spool is written by a child through a descriptor directa cannot
+    reopen or reposition (the daemon's own open for a direct spawn, launchd's
+    O_APPEND open for an agent-mode job), so the file is never truncated or
+    renamed during a run: the ingested prefix is turned into a hole instead
+    (`F_PUNCHHOLE`, which APFS requires to be block aligned). The apparent
+    size keeps growing with the child's writes; the allocated size stays near
+    `retainBytes` plus whatever the tailer has not read yet. */
+enum SpoolRelease {
+    /** The block-aligned range to release, or nil when less than a step's
+        worth is eligible: everything from `releasedThrough` up to `retainBytes`
+        short of `ingestedThrough`. Releasing in steps of a quarter of the
+        retained window (at least one block) keeps the syscall off every
+        tick of a slow writer. */
+    static func range(
+        blockBytes: Int, ingestedThrough: UInt64, releasedThrough: UInt64, retainBytes: Int
+    ) -> Range<UInt64>? {
+        let block = UInt64(max(1, blockBytes))
+        let retain = UInt64(max(0, retainBytes))
+        guard ingestedThrough > retain else { return nil }
+        let end = (ingestedThrough - retain) / block * block
+        let step = max(block, retain / 4)
+        guard end > releasedThrough, end - releasedThrough >= step else { return nil }
+        return releasedThrough..<end
+    }
+
+    /** Punches `range` out of the file at `path`: 0 on success, else the
+        errno. A writable descriptor is required (a read-only one answers
+        EPERM); opening one neither truncates nor moves the child's offset. */
+    static func punchHole(path: String, range: Range<UInt64>) -> Int32 {
+        let descriptor = open(path, O_WRONLY | O_CLOEXEC)
+        guard descriptor >= 0 else { return errno }
+        defer { close(descriptor) }
+        var hole = fpunchhole_t(
+            fp_flags: 0, reserved: 0, fp_offset: off_t(range.lowerBound), fp_length: off_t(range.count))
+        return fcntl(descriptor, F_PUNCHHOLE, &hole) == 0 ? 0 : errno
+    }
+
+    /** The volume's allocation block, which `F_PUNCHHOLE` ranges must align
+        to; 4096 (the APFS block) when the volume cannot be read. */
+    static func blockBytes(path: String) -> Int {
+        var info = statfs()
+        guard statfs(path, &info) == 0, info.f_bsize > 0 else { return 4096 }
+        return Int(info.f_bsize)
+    }
+}
+
 /** Tails one raw spool file (the fd the child writes; survives daemon death)
     into the structured LogStore. Polling keeps it simple and restart-safe; an
     idle tick still opens the file and seeks to the end, not a cheap stat. */
@@ -48,6 +95,17 @@ actor SpoolTailer {
         of that `Data` copies the remainder once per line and keeps the original
         allocation alive for the whole drain. */
     private let readChunkBytes: Int
+    /** Set once the volume refuses to release blocks, so the refusal is
+        reported once rather than retried every tick. */
+    private var releaseRefused = false
+    /** Returns 0 or an errno; a seam so a test can stand in for a volume
+        that refuses hole punching. */
+    private let releaseHole: @Sendable (String, Range<UInt64>) -> Int32
+    /** Everything below this offset is already released. */
+    private var releasedThrough: UInt64 = 0
+    /** Ingested raw bytes kept readable behind the read cursor; older ones
+        are released (see `SpoolRelease`). */
+    private let retainBytes: Int
     /** True until the first drain has run: gates the end-of-file seed so it
         applies once, at attach, and never again on a later drain. */
     private var seedingAtEnd: Bool
@@ -67,11 +125,15 @@ actor SpoolTailer {
         spawn. */
     init(
         intervalMs: Int = 100, maxCatchUpBytes: Int = 1_048_576, readChunkBytes: Int = 64 * 1024,
-        startAtEnd: Bool = false, store: LogStore, stream: LogStream, url: URL
+        releaseHole: @escaping @Sendable (String, Range<UInt64>) -> Int32 = SpoolRelease.punchHole,
+        retainBytes: Int = 1_048_576, startAtEnd: Bool = false, store: LogStore, stream: LogStream,
+        url: URL
     ) {
         self.intervalMs = intervalMs
         self.maxCatchUpBytes = max(0, maxCatchUpBytes)
         self.readChunkBytes = max(1, readChunkBytes)
+        self.releaseHole = releaseHole
+        self.retainBytes = max(0, retainBytes)
         self.seedingAtEnd = startAtEnd
         self.store = store
         self.stream = stream
@@ -99,6 +161,30 @@ actor SpoolTailer {
     private func drain() async {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return }
         defer { try? handle.close() }
+        await ingestUnread(from: handle)
+        await releaseIngested()
+    }
+
+    private func releaseIngested() async {
+        guard !releaseRefused,
+            let range = SpoolRelease.range(
+                blockBytes: SpoolRelease.blockBytes(path: url.path), ingestedThrough: offset,
+                releasedThrough: releasedThrough, retainBytes: retainBytes)
+        else { return }
+        let failure = releaseHole(url.path, range)
+        guard failure != 0 else {
+            releasedThrough = range.upperBound
+            return
+        }
+        releaseRefused = true
+        let reason = String(cString: strerror(failure))
+        DirectaLog.supervisor.error("cannot release ingested bytes of \(url.path): \(reason)")
+        await store.append(
+            stream: .sys,
+            text: "\(url.lastPathComponent) cannot shrink on this volume (\(reason)), so it grows until the server restarts")
+    }
+
+    private func ingestUnread(from handle: FileHandle) async {
         let size = (try? handle.seekToEnd()) ?? 0
         if seedingAtEnd {
             offset = size
@@ -106,7 +192,11 @@ actor SpoolTailer {
             seedingAtEnd = false
         }
         /** Truncation (a fresh start reuses the path) resets the cursor. */
-        if size < offset { offset = 0; partial.removeAll() }
+        if size < offset {
+            offset = 0
+            partial.removeAll()
+            releasedThrough = 0
+        }
         guard size > offset else { return }
         var dropUntilNewline = false
         if maxCatchUpBytes > 0 {

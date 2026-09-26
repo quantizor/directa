@@ -1,6 +1,7 @@
 import DirectaKit
 import Foundation
 import Testing
+import os
 
 @testable import DirectaDaemonCore
 
@@ -97,6 +98,34 @@ private func tempDir() throws -> URL {
         #expect(String(decoding: pulled.lines[49_999], as: UTF8.self) == "l49999")
         #expect(pulled.remainder.isEmpty)
         #expect(elapsed < Duration.seconds(1))
+    }
+}
+
+@Suite struct SpoolReleaseTests {
+    private func range(ingested: UInt64, released: UInt64 = 0, retain: Int = 64 * 1024) -> Range<UInt64>? {
+        SpoolRelease.range(
+            blockBytes: 4096, ingestedThrough: ingested, releasedThrough: released, retainBytes: retain)
+    }
+
+    @Test func releasesBlockAlignedUpToTheRetainedWindow() {
+        /** 1_000_000 - 65_536 = 934_464, rounded down to a block. */
+        #expect(range(ingested: 1_000_000) == 0..<933_888)
+        #expect(range(ingested: 1_000_000, released: 409_600) == 409_600..<933_888)
+    }
+
+    @Test func holdsBackUntilAStepIsEligible() {
+        /** A quarter of the retained window is the step. */
+        #expect(range(ingested: 65_536 + 12_288) == nil)
+        #expect(range(ingested: 65_536 + 16_384) == 0..<16_384)
+        #expect(range(ingested: 65_536 + 16_384 + 12_288, released: 16_384) == nil)
+        #expect(range(ingested: 65_536) == nil)
+        #expect(range(ingested: 1_000) == nil)
+    }
+
+    @Test func aZeroWindowReleasesEveryWholeBlock() {
+        #expect(range(ingested: 4095, retain: 0) == nil)
+        #expect(range(ingested: 8191, retain: 0) == 0..<4096)
+        #expect(range(ingested: 8192, released: 8192, retain: 0) == nil)
     }
 }
 
@@ -243,6 +272,128 @@ private func tempDir() throws -> URL {
         await tailer.stop()
         texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
         #expect(texts == ["appended after attach"])
+    }
+
+    /** The two ways a child's spool descriptor is opened: the daemon's own
+        open for a direct spawn, and launchd's for an agent-mode job (read
+        and write, appending, never truncating; observed on a real job). */
+    static let spoolOpenFlags: [Int32] = [O_WRONLY | O_CREAT | O_TRUNC, O_RDWR | O_CREAT | O_APPEND]
+
+    /** A flooding child writes through a descriptor the tailer can neither
+        reopen nor reposition. Released blocks keep the spool's disk use near
+        the retained window while its apparent size grows many times past it,
+        every line still reaches the structured log, and the child's writes
+        keep landing at the end of the file. */
+    @Test(arguments: spoolOpenFlags)
+    func aFloodingChildsSpoolStaysBoundedOnDisk(openFlags: Int32) async throws {
+        let fixture = try #require(fixtureServerExecutable(), "fixture-server is not built; run swift build")
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let spool = dir.appending(path: "out.spool")
+        let descriptor = open(spool.path, openFlags | O_CLOEXEC, 0o644)
+        try #require(descriptor >= 0)
+        let child = try spawnBare([fixture, "--flood"], stdoutFD: descriptor)
+        close(descriptor)
+        defer {
+            kill(child, SIGKILL)
+            var status: Int32 = 0
+            waitpid(child, &status, 0)
+        }
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let retain = 16 * 1024
+        let tailer = SpoolTailer(
+            intervalMs: 20, maxCatchUpBytes: 256 * 1024, retainBytes: retain, store: store, stream: .out,
+            url: spool)
+        await tailer.start()
+        let floodBytes: Int64 = 1024 * 1024
+        let deadline = ContinuousClock.now + .seconds(20)
+        while try spoolSizes(spool).apparent < floodBytes, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        kill(child, SIGSTOP)
+        await tailer.stop()
+        let stopped = try spoolSizes(spool)
+        #expect(stopped.apparent >= floodBytes)
+        /** The retained window, one release step, and a block of rounding;
+            APFS adds at most a block of preallocation past that. */
+        #expect(stopped.allocated <= Int64(retain + retain / 4 + 2 * 4096), "allocated \(stopped.allocated)")
+
+        let rawTail = try spoolTailText(spool)
+        let newest = await store.query(LogQueryOptions(streams: [.out], tail: 1)).map(\.text)
+        #expect(newest == [rawTail])
+
+        kill(child, SIGCONT)
+        while try spoolSizes(spool).apparent <= stopped.apparent, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(kill(child, 0) == 0)
+        #expect(try spoolSizes(spool).apparent > stopped.apparent)
+        #expect(try spoolTailText(spool).hasPrefix("heartbeat"))
+    }
+
+    /** Attaching to a spool a prior run filled (adoption) releases that
+        backlog too, without ingesting any of it. */
+    @Test func startAtEndReleasesAPriorRunsBacklog() async throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let spool = dir.appending(path: "out.spool")
+        try Data(String(repeating: "earlier run line\n", count: 64 * 1024).utf8).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(
+            intervalMs: 20, retainBytes: 32 * 1024, startAtEnd: true, store: store, stream: .out, url: spool)
+        await tailer.start()
+        await tailer.stop()
+        let sizes = try spoolSizes(spool)
+        #expect(sizes.apparent == 64 * 1024 * 17)
+        #expect(sizes.allocated <= 32 * 1024 + 8 * 1024 + 2 * 4096, "allocated \(sizes.allocated)")
+        #expect(await store.query(LogQueryOptions()).isEmpty)
+    }
+
+    /** A volume that cannot release blocks is named once in the sys stream,
+        not retried every tick, and ingestion carries on. */
+    @Test func aVolumeThatRefusesToReleaseIsReportedOnce() async throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let spool = dir.appending(path: "out.spool")
+        try Data(String(repeating: "line\n", count: 8 * 1024).utf8).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let attempts = OSAllocatedUnfairLock<Int>(initialState: 0)
+        let tailer = SpoolTailer(
+            intervalMs: 20, maxCatchUpBytes: 0,
+            releaseHole: { _, _ in
+                attempts.withLock { $0 += 1 }
+                return ENOTSUP
+            },
+            retainBytes: 4096, store: store, stream: .out, url: spool)
+        await tailer.start()
+        let handle = try FileHandle(forWritingTo: spool)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(String(repeating: "more\n", count: 8 * 1024).utf8))
+        try handle.close()
+        try await Task.sleep(for: .milliseconds(200))
+        await tailer.stop()
+        #expect(attempts.withLock { $0 } == 1)
+        let sys = await store.query(LogQueryOptions(streams: [.sys])).map(\.text)
+        #expect(sys == ["out.spool cannot shrink on this volume (Operation not supported), so it grows until the server restarts"])
+        #expect(await store.query(LogQueryOptions(streams: [.out])).count == 16 * 1024)
+    }
+
+    private func spoolSizes(_ url: URL) throws -> (allocated: Int64, apparent: Int64) {
+        var info = stat()
+        guard stat(url.path, &info) == 0 else { throw POSIXError(.ENOENT) }
+        return (Int64(info.st_blocks) * 512, Int64(info.st_size))
+    }
+
+    /** The newest line in the raw spool (a trailing unterminated one
+        included), read from its last bytes only. */
+    private func spoolTailText(_ url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        try handle.seek(toOffset: size > 4096 ? size - 4096 : 0)
+        let bytes = try handle.readToEnd() ?? Data()
+        return String(decoding: bytes, as: UTF8.self)
+            .split(separator: "\n", omittingEmptySubsequences: true).last.map(String.init) ?? ""
     }
 
     @Test func fileHandleReadUpToCountHonorsTheLimit() throws {
