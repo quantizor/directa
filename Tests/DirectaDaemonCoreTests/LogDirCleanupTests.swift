@@ -159,6 +159,33 @@ import Testing
             ServerResult.self)
     }
 
+    /** Unregistering a server that is actually running used to just drop the
+        supervisor and remove the log directory out from under it, leaving the
+        real process alive and writing to a spool file on an unlinked
+        directory. `serverUnregister` must stop it through the normal stop
+        path first and wait for it to actually exit before dropping anything. */
+    @Test func unregisteringARunningServerStopsItFirst() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        let started = try await handle(
+            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+            ServerResult.self)
+        let pid = try #require(started.server.pid)
+        #expect(kill(pid_t(pid), 0) == 0)
+
+        _ = try await handle(
+            router, .serverUnregister, ServerTargetParams(name: "web", project: env.project),
+            WireEmpty.self)
+
+        #expect(kill(pid_t(pid), 0) != 0)
+        #expect(
+            !FileManager.default.fileExists(
+                atPath: env.paths.projectLogDir(project: env.project).path))
+    }
+
     @Test func missingProjectSweepRemovesTheProjectLogDirectory() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)

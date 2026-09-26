@@ -474,8 +474,19 @@ public actor Router {
                         hint: "run: directa status --json",
                         message: "'\(name)' is not registered as an ad hoc server for \(project)")
                 }
+                let id = serverID(project: project, name: name)
+                /** A server still running when it is unregistered must be
+                    stopped through the normal stop path first, awaiting its
+                    actual exit: dropping the supervisor while it keeps running
+                    leaves an unmanaged process alive, and the log directory
+                    removal below would then delete the directory it is still
+                    writing to. `stop()` no-ops instantly for one already
+                    terminal, so this costs nothing on the common path. */
+                if let supervisor = supervisors[id] {
+                    _ = await supervisor.stop(reason: "unregistered")
+                }
                 try await registry.unregister(project: project, name: name)
-                supervisors[serverID(project: project, name: name)] = nil
+                supervisors[id] = nil
                 await events.post(kind: .unregistered, project: project, server: name)
                 await removeLogDirIfProjectIsForgotten(project)
                 return try respond(id: head.id, result: WireEmpty())
