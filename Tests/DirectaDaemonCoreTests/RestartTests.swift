@@ -11,12 +11,14 @@ import Testing
 @Suite(.serialized) struct RestartTests {
     /** A port per test: a case that fails before its teardown would otherwise
         leave a listener behind and fail the next one for an unrelated reason. */
-    private func env(port: Int) throws -> (paths: DirectaPaths, project: String) {
+    private func env(
+        flood: Bool = false, port: Int, waitFor: String? = nil
+    ) throws -> (paths: DirectaPaths, project: String) {
         let base = FileManager.default.temporaryDirectory
             .appending(path: "directa-restart-\(UUID().uuidString)")
         let project = base.appending(path: "proj")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
-        try writeConfig(port: port, project: project.path)
+        try writeConfig(flood: flood, port: port, project: project.path, waitFor: waitFor)
         return (
             paths: DirectaPaths(
                 dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
@@ -24,16 +26,25 @@ import Testing
         )
     }
 
-    private func writeConfig(port: Int, project: String) throws {
+    private func writeConfig(
+        flood: Bool = false, port: Int, project: String, waitFor: String? = nil
+    ) throws {
         let fixture = try #require(Self.fixtureServerPath())
+        /** `--flood` composes with `--listen-tcp`: the fixture still binds and
+            answers the healthcheck, it just also writes heartbeat lines as
+            fast as possible instead of pacing them, which is what makes the
+            stop-side tailer drain slow enough to expose a stuck `.stopping`
+            wait. */
+        let floodFlag = flood ? ", \"--flood\"" : ""
+        let waitForField = waitFor.map { ",\n          \"waitFor\": \"\($0)\"" } ?? ""
         let body = """
             {
               "servers": {
                 "db": {
-                  "command": ["\(fixture)", "--listen-tcp", "\(port)"],
+                  "command": ["\(fixture)", "--listen-tcp", "\(port)"\(floodFlag)],
                   "healthcheck": { "type": "tcp", "port": \(port) },
                   "locks": ["data"],
-                  "port": \(port)
+                  "port": \(port)\(waitForField)
                 }
               },
               "version": 1
@@ -85,6 +96,80 @@ import Testing
             drops the boot intent and re-sets it; restart never drops it. */
         #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
 
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "db", project: env.project),
+            ServerResult.self)
+    }
+
+    /** Restarting a server that floods stdout: recordOutcome clears
+        `runTask` before its tailer drain (slow under a flood) and registry
+        write, so the restart's `ensure()` must wait on the phase leaving
+        `.stopping`, never on `runTask`, or it recurses on the actor without
+        suspending and grows the daemon's heap until it is killed. */
+    @Test func restartOfAFloodingServerCompletesAndStaysRunning() async throws {
+        let env = try env(flood: true, port: 45417)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let first = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        #expect(first.server.phase == .running)
+
+        try await Task.sleep(for: .seconds(1))
+
+        let restarted = try await handle(
+            router, .serverRestart,
+            RestartParams(names: ["db"], project: env.project, timeoutSeconds: 10),
+            GroupResult.self)
+        let server = try #require(restarted.results.first?.server)
+        #expect(server.phase == .running)
+        #expect(server.pid != first.server.pid)
+
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "db", project: env.project),
+            ServerResult.self)
+    }
+
+    /** `restart` is not the only path that can land on a server whose phase
+        reads `.stopping`: `up` (`.groupUp`) calls `start()` directly for a
+        spec whose `waitFor` is `started`, unconditionally once `prepareSpawn`
+        returns (which is a no-op for a `.stopping` target, not a refusal). A
+        session racing a concurrent `stop` of a flooding server must see `up`
+        wait for that stop to actually land rather than recurse against a
+        phase that has not moved, the same class of bug `ensure()` had. */
+    @Test func upDuringASlowStopOfAFloodingServerWaitsForThePhaseChange() async throws {
+        let env = try env(flood: true, port: 45418, waitFor: "started")
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let first = try await handle(
+            router, .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        #expect(first.server.phase == .running)
+
+        async let stopResult: ServerResult = handle(
+            router, .serverStop, ServerTargetParams(name: "db", project: env.project),
+            ServerResult.self)
+        /** A head start for the stop: long enough that its SIGTERM is sent and
+            the flooding tailer drain is under way, short enough that `up`
+            still lands while the phase reads `.stopping`. */
+        try await Task.sleep(for: .milliseconds(50))
+
+        let up = try await handle(
+            router, .groupUp, GroupParams(project: env.project, timeoutSeconds: 10),
+            GroupResult.self)
+        let started = try #require(up.results.first { $0.server.server == "db" }).server
+        #expect(started.pid != first.server.pid)
+
+        var running = false
+        for _ in 0..<50 where !running {
+            running = try await phase(router, env.project, "db") == .running
+            if !running { try await Task.sleep(for: .milliseconds(100)) }
+        }
+        #expect(running, "server did not become healthy after up raced a slow stop")
+
+        _ = try await stopResult
         _ = try await handle(
             router, .serverStop, ServerTargetParams(name: "db", project: env.project),
             ServerResult.self)

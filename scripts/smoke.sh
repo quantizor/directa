@@ -556,6 +556,22 @@ pass "restart under a live lock is refused and the server stays up"
 
 "$DIRECTA" down --json > /dev/null
 
+# Restarting a flooding server: the stop's final log drain runs long, and the
+# restart's ensure must wait for the phase to leave stopping rather than spin.
+# The daemon itself, not just the restarted server, has to survive this.
+FLOODPROJ="$WORK/floodproj"
+mkdir -p "$FLOODPROJ"
+cd "$FLOODPROJ"
+FLOOD_PORT=$((44000 + (RANDOM % 500)))
+"$DIRECTA" register --name flood --cmd "$BIN/fixture-server" --cmd --listen-tcp --cmd "$FLOOD_PORT" --cmd --flood --port "$FLOOD_PORT" --json > /dev/null
+"$DIRECTA" ensure flood --timeout 10 --json > /dev/null || fail "flooding fixture never became healthy"
+sleep 1
+"$DIRECTA" restart flood --timeout 15 --json > "$WORK/flood-restart.json" || fail "restart of a flooding server did not complete"
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/flood-restart.json'));s=d['results'][0]['server'];assert s['phase']=='running', d" || fail "flooding server did not come back running: $(cat "$WORK/flood-restart.json")"
+kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon (pid $DAEMON_PID) died restarting a flooding server"
+pass "restarting a flooding server completes and the daemon (pid $DAEMON_PID) stays up"
+"$DIRECTA" stop flood --json > /dev/null
+
 # watch: a config the server reads at boot changes, and the server comes back
 # having read it. The pid moving is not the point; the new value in the log is.
 WATCHP="$WORK/watchproj"

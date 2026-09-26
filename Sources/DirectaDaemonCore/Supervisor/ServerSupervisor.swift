@@ -1,6 +1,17 @@
 import DirectaKit
 import Foundation
 
+/** One registration in `ServerSupervisor.stoppingWaiters`. `deadlineTask` is
+    nil for an unbounded wait (`start()`/`ensure()` joining someone else's
+    stop); a bounded wait (`stop()`'s own waits) carries the sleeping task that
+    calls `expireStoppingWaiter(id:)` if the real transition never lands
+    first. */
+private struct StoppingWaiter {
+    let continuation: CheckedContinuation<Void, Never>
+    let deadlineTask: Task<Void, Never>?
+    let id: UUID
+}
+
 /** One actor per server: owns the child's lifecycle and serializes every mutation,
     which is what makes `ensure` single-flight (concurrent starts join the same
     in-flight attempt instead of double-spawning). */
@@ -46,7 +57,20 @@ public actor ServerSupervisor {
     private var namedPorts: [String: Int]?
     private var observedPort: Int?
     private let paths: DirectaPaths
-    private var phase: ServerPhase = .stopped
+    /** `didSet` is the one home for leaving `.stopping`: every caller that must
+        not proceed until a stop (or the drain half of a crash/exit) has fully
+        landed awaits `waitForStoppingToClear` instead of polling `runTask`,
+        which goes nil at the top of `recordOutcome`, well before the tailer
+        drains and the registry write that still have to happen. Settling here
+        rather than at each of the many phase-assignment sites means a future
+        one needs no special-casing to keep this correct. */
+    private var phase: ServerPhase = .stopped {
+        didSet {
+            if oldValue == .stopping, phase != .stopping {
+                settleStoppingWaiters()
+            }
+        }
+    }
     private var pid: pid_t?
     private var portClaim: PortClaim?
     private var portConflict: PortConflict?
@@ -68,6 +92,12 @@ public actor ServerSupervisor {
     private var spawnError: SpawnError?
     private var spawnWaiters: [CheckedContinuation<Void, Never>] = []
     private var spec: ServerSpec
+    /** Waiters for `phase` leaving `.stopping`; settled by `phase`'s `didSet`.
+        Modeled on `spawnWaiters`/`waitForSpawnSettled`/`settleSpawnWaiters`,
+        with an id so a timed-out waiter (see `waitForStoppingToClear`) can be
+        picked out of the array and resumed on its own, ahead of the real
+        transition. */
+    private var stoppingWaiters: [StoppingWaiter] = []
     /** Lifetime window a self-exit must land in to count toward the stall
         streak (see recordOutcome). Overridable so tests can use fast bounds. */
     private let stallBounds: (minSeconds: Int, maxSeconds: Int)
@@ -83,6 +113,11 @@ public actor ServerSupervisor {
     private var watchRestarts: [Date] = []
     private var watchSuspended = false
     private var stopRequested = false
+    /** Margin stop() adds past its own graceSeconds before giving up on its
+        own wait for the phase to clear (see waitForStoppingToClear).
+        Overridable so tests can reach that deadline path without a real 10s
+        wait. */
+    private let stopWaitOvertimeSeconds: Double
     /** Carries the stop()'s intent into recordOutcome: deliberate clears the
         resume-on-boot flag, a launchd drain keeps it. */
     private var stopWasDeliberate = true
@@ -107,7 +142,8 @@ public actor ServerSupervisor {
         projectPath: String,
         registry: Registry,
         spec: ServerSpec,
-        stallBounds: (minSeconds: Int, maxSeconds: Int) = (10, 300)
+        stallBounds: (minSeconds: Int, maxSeconds: Int) = (10, 300),
+        stopWaitOvertimeSeconds: Double = 10
     ) {
         self.events = events
         self.launcher = launcher
@@ -120,6 +156,7 @@ public actor ServerSupervisor {
         self.registry = registry
         self.spec = spec
         self.stallBounds = stallBounds
+        self.stopWaitOvertimeSeconds = stopWaitOvertimeSeconds
         /** Computed once at creation, not per status read (it shells out to git)
             and not per spawn: a worktree project whose servers are stopped or
             restored still reports its label. */
@@ -252,7 +289,7 @@ public actor ServerSupervisor {
             await waitForSpawnSettled()
             return status()
         case .stopping:
-            await waitForRunTaskCompletion()
+            await waitForStoppingToClear()
             return await start()
         case .crashed, .failed, .stopped:
             break
@@ -398,7 +435,10 @@ public actor ServerSupervisor {
         case .starting:
             break
         case .stopping:
-            await waitForRunTaskCompletion()
+            let bound = Duration.seconds(Self.boundedTimeoutSeconds(timeoutSeconds))
+            guard await waitForStoppingToClear(timeout: bound) else {
+                return EnsureResult(reason: .timeout, server: status())
+            }
             return await ensure(timeoutSeconds: timeoutSeconds)
         case .crashed, .failed, .stopped:
             let started = await start()
@@ -454,11 +494,20 @@ public actor ServerSupervisor {
         of why directa tore the process down, since OSLog does not persist and
         the log otherwise only ever says `exited code=N`. */
     public func stop(graceSeconds: Double = 7, deliberate: Bool = true, reason: String) async -> ServerStatus {
+        /** stopWaitOvertimeSeconds past the grace window: comfortably past the
+            SIGKILL escalation below (which fires at the grace deadline) and
+            past the crash path's own 1s escalation grace, so an ordinary
+            teardown never trips this, and only a stop that is genuinely never
+            landing (a bug elsewhere, or a child recordOutcome cannot reap)
+            does. */
+        let stopWaitTimeout = Duration.seconds(graceSeconds + stopWaitOvertimeSeconds)
         switch phase {
         case .stopped, .crashed, .failed:
             return status()
         case .stopping:
-            await waitForRunTaskCompletion()
+            if await !waitForStoppingToClear(timeout: stopWaitTimeout) {
+                await recordStuckStop(after: stopWaitTimeout)
+            }
             return status()
         case .starting, .running, .unhealthy:
             break
@@ -502,7 +551,9 @@ public actor ServerSupervisor {
         signalRun(
             target: target, rootIdentity: rootIdentity, sessionID: sessionID,
             snapshot: snapshot, signal: SIGKILL, priorSignaled: signaled)
-        await waitForRunTaskCompletion()
+        if await !waitForStoppingToClear(timeout: stopWaitTimeout) {
+            await recordStuckStop(after: stopWaitTimeout)
+        }
         return status()
     }
 
@@ -1216,6 +1267,28 @@ public actor ServerSupervisor {
         for waiter in waiters { waiter.resume() }
     }
 
+    private func settleStoppingWaiters() {
+        let waiters = stoppingWaiters
+        stoppingWaiters = []
+        for waiter in waiters {
+            waiter.deadlineTask?.cancel()
+            waiter.continuation.resume()
+        }
+    }
+
+    /** The bounded half of `waitForStoppingToClear`: picks its own waiter out
+        of the array by id and resumes it alone, leaving every other
+        registration (an unrelated caller's unbounded join, or another bounded
+        wait with a later deadline) untouched. A no-op once the real
+        transition already settled and removed this id first: the two can
+        never both resume the same continuation because both run as
+        actor-isolated methods and never interleave. */
+    private func expireStoppingWaiter(id: UUID) {
+        guard let index = stoppingWaiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = stoppingWaiters.remove(at: index)
+        waiter.continuation.resume()
+    }
+
     private static func specHash(_ spec: ServerSpec) -> String {
         guard let data = try? JSONCoding.encoder().encode(spec) else { return "" }
         return DirectaPaths.hash8(String(decoding: data, as: UTF8.self))
@@ -1234,10 +1307,6 @@ public actor ServerSupervisor {
         return records.isEmpty ? nil : records.map(\.contextLine)
     }
 
-    private func waitForRunTaskCompletion() async {
-        if let task = runTask { await task.value }
-    }
-
     /** Blocks until the in-flight start has either produced a pid or gone
         terminal; the phase itself stays `starting` until first-healthy. */
     private func waitForSpawnSettled() async {
@@ -1249,5 +1318,55 @@ public actor ServerSupervisor {
                 spawnWaiters.append(continuation)
             }
         }
+    }
+
+    /** Blocks until `phase` leaves `.stopping`, settled by its `didSet`
+        wherever a stop's own recordOutcome (or a concurrent one for the same
+        run) lands `.stopped`/`.crashed`. Replaces polling `runTask == nil`,
+        which flips well before recordOutcome finishes draining the tailers and
+        writing the registry, so a caller that resumed on that alone would
+        recurse against a phase that had not actually moved. Checks phase again
+        inside the continuation closure to guard the same lost-wakeup window
+        `waitForSpawnSettled` guards.
+
+        `timeout`, when given, bounds only the CALLER's wait: only
+        recordOutcome ever moves `phase` off `.stopping`, so a caller whose
+        deadline fires still reports an honest `.stopping`, never a phase this
+        function invents. `stop()` bounds its waits so a stop recordOutcome
+        never lands on cannot hang the wire request that asked for it;
+        `ensure()` bounds by its own timeout; `start()` has no timeout of its
+        own and joins unbounded. Returns false only when the deadline fired
+        first. */
+    @discardableResult
+    private func waitForStoppingToClear(timeout: Duration? = nil) async -> Bool {
+        guard phase == .stopping else { return true }
+        let id = UUID()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            guard phase == .stopping else {
+                continuation.resume()
+                return
+            }
+            let deadlineTask: Task<Void, Never>? = timeout.map { bound in
+                Task { [weak self] in
+                    try? await Task.sleep(for: bound)
+                    await self?.expireStoppingWaiter(id: id)
+                }
+            }
+            stoppingWaiters.append(
+                StoppingWaiter(continuation: continuation, deadlineTask: deadlineTask, id: id))
+        }
+        return phase != .stopping
+    }
+
+    /** A stop whose bounded wait expired: recorded in the server's sys stream
+        (what `logs`, `why`, and `monitor` read) and as an OSLog error, which
+        macOS persists. No event kind fits a stop still in flight. */
+    private func recordStuckStop(after bound: Duration) async {
+        let seconds = bound.components.seconds
+        await logStore.append(
+            stream: .sys,
+            text: "stop did not complete within \(seconds)s; server may still be tearing down")
+        DirectaLog.supervisor.error(
+            "\(spec.name) stop did not complete within \(seconds)s; server may still be tearing down")
     }
 }

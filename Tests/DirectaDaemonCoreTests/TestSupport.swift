@@ -1,4 +1,5 @@
 import Darwin
+import DirectaKit
 import Foundation
 
 @testable import DirectaDaemonCore
@@ -96,6 +97,30 @@ struct FakeAdoptLauncher: ProcessLauncher {
     func adopt(pid: pid_t, label: String) async -> ProcessOutcome? {
         await gate.outcome()
     }
+}
+
+/** `run` reports a real, killable pid through `onSpawn` (`signalRun`'s `kill`
+    calls need a real process to act on) and then blocks on `gate` exactly like
+    `FakeAdoptLauncher.adopt`, independent of whether that pid is still alive:
+    the deterministic stand-in for "the child exited but recordOutcome was
+    never told," which is what lets a bounded wait for that outcome be tested
+    without a real multi-second sleep or a race against how fast a flood
+    drains. */
+struct StuckRunLauncher: ProcessLauncher {
+    let gate: AdoptGate
+
+    func run(
+        argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
+        onSpawn: @escaping @Sendable (pid_t) async -> Void
+    ) async -> ProcessOutcome {
+        guard let pid = try? spawnSurvivor() else {
+            return .spawnFailed(SpawnError(message: "spawnSurvivor failed"))
+        }
+        await onSpawn(pid)
+        return await gate.outcome()
+    }
+
+    func adopt(pid: pid_t, label: String) async -> ProcessOutcome? { nil }
 }
 
 /** Ports the unit suites allocate from. Reserved as a block so the stray reaper

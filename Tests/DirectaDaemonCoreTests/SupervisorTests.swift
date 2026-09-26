@@ -95,6 +95,111 @@ private func makeEnv() throws -> TestEnv {
         #expect(persisted?.resumeOnBoot == true)
     }
 
+    /** `ensure` called while a flooding server's own `stop()` is still
+        draining the tailer must wait for the phase to actually leave
+        `.stopping`, not resume the moment `runTask` goes nil (set at the top
+        of `recordOutcome`, well before that drain and the registry write
+        after it finish). A caller resuming on `runTask` alone recurses
+        against a phase that has not moved, on the actor, without ever
+        suspending, and grows the daemon's memory without bound. */
+    @Test func ensureDuringASlowStopWaitsForThePhaseToLeaveStopping() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let fixture = try #require(fixtureServerExecutable())
+        let port = 45480
+        let spec = ServerSpec(
+            command: [fixture, "--flood", "--listen-tcp", "\(port)"],
+            healthcheck: HealthCheckSpec(port: port, type: .tcp), name: "flood", port: port)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        let started = await supervisor.start()
+        let outcome = await supervisor.wait(for: .healthy, timeoutSeconds: 5)
+        #expect(outcome == nil)
+
+        async let stopped: ServerStatus = supervisor.stop(
+            graceSeconds: 2, deliberate: false, reason: "test")
+        /** A head start so stop() has set `.stopping` and sent SIGTERM before
+            ensure() observes it. */
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await supervisor.status().phase == .stopping)
+
+        let ensured = await supervisor.ensure(timeoutSeconds: 5)
+        #expect(ensured.server.phase == .running)
+        #expect(ensured.server.pid != started.pid)
+
+        _ = await stopped
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
+    }
+
+    /** Same defect class, `start()`'s `.stopping` arm: the path `up`
+        (`.groupUp`) uses for a spec whose `waitFor` is `started`. */
+    @Test func startDuringASlowStopWaitsForThePhaseToLeaveStopping() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let fixture = try #require(fixtureServerExecutable())
+        let port = 45481
+        let spec = ServerSpec(
+            command: [fixture, "--flood", "--listen-tcp", "\(port)"],
+            healthcheck: HealthCheckSpec(port: port, type: .tcp), name: "flood", port: port)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec)
+        let started = await supervisor.start()
+        let outcome = await supervisor.wait(for: .healthy, timeoutSeconds: 5)
+        #expect(outcome == nil)
+
+        async let stopped: ServerStatus = supervisor.stop(
+            graceSeconds: 2, deliberate: false, reason: "test")
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await supervisor.status().phase == .stopping)
+
+        let restarted = await supervisor.start()
+        #expect(restarted.pid != started.pid)
+        #expect(restarted.phase == .starting || restarted.phase == .running)
+
+        _ = await stopped
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
+    }
+
+    /** `stop()`'s own wait must not hang its caller forever if the real
+        transition never lands within its bound: it logs and returns with an
+        honest `.stopping` phase rather than fabricating a terminal one.
+        `StuckRunLauncher` blocks `run()` on a gate the test controls, which is
+        what makes the deadline reachable deterministically and fast instead
+        of needing a real `graceSeconds + 10s` wait or a race against flood
+        drain speed. */
+    @Test func stopGivesUpAfterItsBoundAndLeavesPhaseHonestlyStopping() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let registry = Registry(paths: paths)
+        let spec = ServerSpec(command: ["/bin/true"], name: "stuck")
+        let gate = AdoptGate()
+        let supervisor = ServerSupervisor(
+            launcher: StuckRunLauncher(gate: gate), paths: paths, projectPath: env.projectPath,
+            registry: registry, spec: spec, stopWaitOvertimeSeconds: 0.2)
+        let started = await supervisor.start()
+        #expect(started.pid != nil)
+
+        let stopped = await supervisor.stop(graceSeconds: 0.1, reason: "test")
+        #expect(stopped.phase == .stopping)
+
+        let logs = await supervisor.logQuery(LogQueryOptions(streams: [.sys]))
+        #expect(logs.contains { $0.text.contains("stop did not complete within") })
+
+        /** Let the fake `run()` resolve now, so recordOutcome can actually
+            finish and nothing is left suspended past the test. */
+        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        var cleared = false
+        for _ in 0..<50 where !cleared {
+            cleared = await supervisor.status().phase != .stopping
+            if !cleared { try await Task.sleep(for: .milliseconds(100)) }
+        }
+        #expect(cleared, "server never left .stopping after the bounded wait gave up")
+    }
+
     /** Two self-exits in the stall window (nonzero, bounded lifetime, never
         healthy) are the crash-loop an interactive credential prompt produces:
         surfaced as blockedOn, persisted across a daemon restart, and cleared
