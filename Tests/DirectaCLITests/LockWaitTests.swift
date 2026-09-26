@@ -59,12 +59,15 @@ import Testing
 
     /** A bare-named lock (no state path) left over live declarers has no
         fingerprint fallback for the pause that no longer runs by default, so the
-        hold warns that the corruption guard is off. */
+        hold warns that the corruption guard is off, naming which server
+        declares the lock and the exact devservers.json object to add. */
     @Test func unguardedWarnsWhenNoStatePathAndDeclarersStayLive() {
         let text = LockNotice.unguarded(resource: "d1", live: ["web", "db"], statePath: nil)
         #expect(
-            text
-                == "directa lock: note: 'd1' declares no state path, so a change made while db, web stay running cannot be detected. Add a `path` to the lock declaration or use --pause.")
+            text == """
+                directa lock: note: 'd1' declares no state path, so a change made while db, web stay running cannot be detected.
+                directa lock: give db's 'd1' entry in devservers.json a path, e.g. {"name": "d1", "path": "<path to d1's state>"}, or run with --pause.
+                """)
     }
 
     @Test func unguardedIsSilentWhenAStatePathCanBeFingerprinted() {

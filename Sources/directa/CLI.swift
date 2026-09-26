@@ -2236,8 +2236,14 @@ enum LockNotice {
     static func unguarded(resource: String, live: [String], statePath: String?) -> String? {
         guard statePath == nil, !live.isEmpty else { return nil }
         let servers = live.sorted()
-        return
-            "directa lock: note: '\(resource)' declares no state path, so a change made while \(servers.joined(separator: ", ")) \(servers.count == 1 ? "stays" : "stay") running cannot be detected. Add a `path` to the lock declaration or use --pause."
+        /** Named rather than "the lock declaration": any of the live servers
+            works, since they all declare `resource`, but the fix is one JSON
+            edit and needs one name to attach it to. */
+        let example = servers[0]
+        return [
+            "directa lock: note: '\(resource)' declares no state path, so a change made while \(servers.joined(separator: ", ")) \(servers.count == 1 ? "stays" : "stay") running cannot be detected.",
+            "directa lock: give \(example)'s '\(resource)' entry in devservers.json a path, e.g. {\"name\": \"\(resource)\", \"path\": \"<path to \(resource)'s state>\"}, or run with --pause.",
+        ].joined(separator: "\n")
     }
 
     private static func pauseClause(_ holder: LockHolder) -> String {
