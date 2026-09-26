@@ -30,9 +30,9 @@ public struct DirectaPaths: Sendable {
     public var registryFile: URL { dataDir.appending(path: "registry.json") }
     public var stateFile: URL { dataDir.appending(path: "state.json") }
     public var stoppedIntentFile: URL { dataDir.appending(path: "stopped.intent") }
-    /** Written when the user turns off "Start at login" in Settings. Absence
-        is the default (resilient): `AppAgentPolicy.shouldRegisterAtLaunch`
-        registers the app's own KeepAlive agent unless this marker exists. */
+    /** Records "Start at login" as off: written by the Settings toggle, and
+        at launch when `AppAgentPolicy.launchAction` answers `recordOff`.
+        Absence alone never turns Start at login on. */
     public var appAutostartDisabledFile: URL { dataDir.appending(path: "app-autostart.disabled") }
 
     /** The unix socket path, honoring DIRECTA_SOCKET and falling back under the

@@ -101,26 +101,49 @@ enum AppAgentService {
         DirectaLog.app.info("migrated off the Start at Login item to the app agent")
     }
 
-    /** At launch: migrate off the legacy login item, then register the app
-        agent unless the user deliberately turned it off, this copy predates
-        the in-bundle plist, or this is the volume/DMG copy (registering
-        there races the relocate handoff, the same guard
-        `AgentService.ensureAtLaunchIfNeeded` applies to the daemon agent). */
+    nonisolated static var policyStatus: AppAgentPolicy.AgentStatus {
+        switch agent.status {
+        case .enabled: .enabled
+        case .notFound: .notFound
+        case .notRegistered: .notRegistered
+        case .requiresApproval: .requiresApproval
+        @unknown default: .unknown
+        }
+    }
+
+    /** At launch, act on `AppAgentPolicy.launchAction`. The legacy login
+        item's status is read before `migrateFromLoginItem()`, which
+        unregisters it: a read after would always be false and record Off for
+        someone who had Start at login on. */
     nonisolated static func ensureRegisteredAtLaunch(paths: DirectaPaths = DirectaPaths()) {
-        migrateFromLoginItem()
-        guard
-            AppAgentPolicy.shouldRegisterAtLaunch(
-                deliberatelyDisabled: FileManager.default.fileExists(
-                    atPath: paths.appAutostartDisabledFile.path),
-                runningOutsideApplications: SetupPlanner.isRunningOutsideApplications(
-                    bundlePath: Bundle.main.bundlePath),
-                bundleHasPlist: bundleHasPlist)
-        else { return }
-        do {
-            try register()
-            DirectaLog.app.info("app agent register at launch: \(statusDescription)")
-        } catch {
-            DirectaLog.app.error("app agent register at launch: \(error.localizedDescription)")
+        let legacyLoginItemEnabled = SMAppService.mainApp.status == .enabled
+        let action = AppAgentPolicy.launchAction(
+            agentStatus: policyStatus,
+            bundleHasPlist: bundleHasPlist,
+            legacyLoginItemEnabled: legacyLoginItemEnabled,
+            markerPresent: FileManager.default.fileExists(atPath: paths.appAutostartDisabledFile.path),
+            runningOutsideApplications: SetupPlanner.isRunningOutsideApplications(
+                bundlePath: Bundle.main.bundlePath))
+        switch action {
+        case .leaveAlone:
+            return
+        case .recordOff:
+            do {
+                try AtomicFile.write(Data(), to: paths.appAutostartDisabledFile)
+                DirectaLog.app.info("app agent at launch: Start at login recorded off")
+            } catch {
+                DirectaLog.app.error(
+                    "app agent at launch: could not record Start at login off at \(paths.appAutostartDisabledFile.path): \(error.localizedDescription)"
+                )
+            }
+        case .register:
+            migrateFromLoginItem()
+            do {
+                try register()
+                DirectaLog.app.info("app agent register at launch: \(statusDescription)")
+            } catch {
+                DirectaLog.app.error("app agent register at launch: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -128,7 +151,13 @@ enum AppAgentService {
         launch does not silently turn it back on. */
     nonisolated static func disableAtUserRequest(paths: DirectaPaths = DirectaPaths()) {
         unregister()
-        try? AtomicFile.write(Data(), to: paths.appAutostartDisabledFile)
+        do {
+            try AtomicFile.write(Data(), to: paths.appAutostartDisabledFile)
+        } catch {
+            DirectaLog.app.error(
+                "Start at login off: could not record the choice at \(paths.appAutostartDisabledFile.path): \(error.localizedDescription)"
+            )
+        }
     }
 
     /** Settings toggle On: clear the marker, then register. Throws exactly as

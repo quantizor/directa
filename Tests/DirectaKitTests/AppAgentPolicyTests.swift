@@ -3,53 +3,93 @@ import Testing
 @testable import DirectaKit
 
 @Suite struct AppAgentPolicyTests {
-    @Test func registersWhenNotDisabledInApplicationsWithPlist() {
-        #expect(
-            AppAgentPolicy.shouldRegisterAtLaunch(
-                deliberatelyDisabled: false, runningOutsideApplications: false, bundleHasPlist: true)
-                == true)
+    typealias Action = AppAgentPolicy.LaunchAction
+    typealias Status = AppAgentPolicy.AgentStatus
+
+    struct Case: CustomTestStringConvertible, Sendable {
+        var agentStatus: Status = .notRegistered
+        var bundleHasPlist = true
+        var expected: Action
+        var legacyLoginItemEnabled = false
+        var markerPresent = false
+        var name: String
+        var runningOutsideApplications = false
+
+        var testDescription: String { name }
+
+        var actual: Action {
+            AppAgentPolicy.launchAction(
+                agentStatus: agentStatus,
+                bundleHasPlist: bundleHasPlist,
+                legacyLoginItemEnabled: legacyLoginItemEnabled,
+                markerPresent: markerPresent,
+                runningOutsideApplications: runningOutsideApplications)
+        }
     }
 
-    @Test func skipsWhenDeliberatelyDisabled() {
-        #expect(
-            AppAgentPolicy.shouldRegisterAtLaunch(
-                deliberatelyDisabled: true, runningOutsideApplications: false, bundleHasPlist: true)
-                == false)
+    static let cases: [Case] = [
+        Case(expected: .recordOff, name: "never turned on: agent not registered"),
+        Case(agentStatus: .notFound, expected: .recordOff, name: "never turned on: agent not found"),
+        Case(expected: .register, legacyLoginItemEnabled: true, name: "legacy on migrates"),
+        Case(
+            agentStatus: .enabled, expected: .register, legacyLoginItemEnabled: true,
+            name: "legacy on beside an enabled agent still migrates"),
+        Case(
+            agentStatus: .requiresApproval, expected: .register, legacyLoginItemEnabled: true,
+            name: "legacy on wins over requires approval"),
+        Case(
+            agentStatus: .requiresApproval, expected: .leaveAlone,
+            name: "requires approval records nothing"),
+        Case(agentStatus: .enabled, expected: .leaveAlone, name: "agent already on"),
+        Case(agentStatus: .unknown, expected: .leaveAlone, name: "unknown status touches nothing"),
+        Case(
+            agentStatus: .unknown, expected: .leaveAlone, legacyLoginItemEnabled: true,
+            name: "unknown status touches nothing even with legacy on"),
+        Case(expected: .leaveAlone, markerPresent: true, name: "user turned it off"),
+        Case(
+            expected: .leaveAlone, legacyLoginItemEnabled: true, markerPresent: true,
+            name: "marker wins over legacy on"),
+        Case(
+            expected: .leaveAlone, legacyLoginItemEnabled: true, name: "volume copy with legacy on",
+            runningOutsideApplications: true),
+        Case(expected: .leaveAlone, name: "volume copy never turned on", runningOutsideApplications: true),
+        Case(
+            bundleHasPlist: false, expected: .leaveAlone, legacyLoginItemEnabled: true,
+            name: "no plist with legacy on"),
+        Case(bundleHasPlist: false, expected: .leaveAlone, name: "no plist never turned on"),
+    ]
+
+    @Test(arguments: cases) func launchAction(_ c: Case) {
+        #expect(c.actual == c.expected)
     }
 
-    /** The volume/DMG copy: registering from there races the relocate handoff
-        (SetupPerformer.quitIfTwinIsRunning, AppInstancePolicy), so this must
-        refuse regardless of the disabled marker. */
-    @Test func skipsWhenRunningOutsideApplications() {
-        #expect(
-            AppAgentPolicy.shouldRegisterAtLaunch(
-                deliberatelyDisabled: false, runningOutsideApplications: true, bundleHasPlist: true)
-                == false)
-        #expect(
-            AppAgentPolicy.shouldRegisterAtLaunch(
-                deliberatelyDisabled: false, runningOutsideApplications: true, bundleHasPlist: false)
-                == false)
-    }
+    static let allStatuses: [Status] = [.enabled, .notFound, .notRegistered, .requiresApproval, .unknown]
 
-    /** A copy that predates the in-bundle app LaunchAgent has nothing to
-        register, regardless of the other two inputs. */
-    @Test func skipsWhenBundleHasNoPlist() {
-        #expect(
-            AppAgentPolicy.shouldRegisterAtLaunch(
-                deliberatelyDisabled: false, runningOutsideApplications: false, bundleHasPlist: false)
-                == false)
-        #expect(
-            AppAgentPolicy.shouldRegisterAtLaunch(
-                deliberatelyDisabled: true, runningOutsideApplications: false, bundleHasPlist: false)
-                == false)
-    }
-
-    /** Every guard failing at once still answers false, not a trap or a
-        mismatched combination. */
-    @Test func allGuardsFailingStillRefuses() {
-        #expect(
-            AppAgentPolicy.shouldRegisterAtLaunch(
-                deliberatelyDisabled: true, runningOutsideApplications: true, bundleHasPlist: false)
-                == false)
+    /** Every input combination: registering happens only to carry forward a
+        legacy login item that was on, the off marker is never written for
+        someone whose legacy item was on, and the volume copy, a copy without
+        the plist, or an existing marker never changes anything. */
+    @Test func startAtLoginStaysOptInAcrossEveryInput() {
+        for agentStatus in Self.allStatuses {
+            for bundleHasPlist in [false, true] {
+                for legacyLoginItemEnabled in [false, true] {
+                    for markerPresent in [false, true] {
+                        for runningOutsideApplications in [false, true] {
+                            let action = AppAgentPolicy.launchAction(
+                                agentStatus: agentStatus,
+                                bundleHasPlist: bundleHasPlist,
+                                legacyLoginItemEnabled: legacyLoginItemEnabled,
+                                markerPresent: markerPresent,
+                                runningOutsideApplications: runningOutsideApplications)
+                            if action == .register { #expect(legacyLoginItemEnabled) }
+                            if action == .recordOff { #expect(!legacyLoginItemEnabled) }
+                            if !bundleHasPlist || runningOutsideApplications || markerPresent {
+                                #expect(action == .leaveAlone)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
