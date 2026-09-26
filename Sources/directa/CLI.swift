@@ -1717,7 +1717,10 @@ struct Doctor: AsyncParsableCommand {
     /** Lookback for the jetsam finding's restart-burst count. */
     private static let restartBurstWindowSeconds: TimeInterval = 24 * 60 * 60
 
-    @Flag(help: "Prune registry entries whose project directories no longer exist.")
+    @Flag(
+        help:
+            "Prune registry entries whose project directories no longer exist, then remove leftover log directories no project claims."
+    )
     var fix = false
 
     @OptionGroup var global: GlobalOptions
@@ -1757,6 +1760,26 @@ struct Doctor: AsyncParsableCommand {
             return Finding(
                 detail: "could not forget \(project): \(error.message)",
                 kind: "stale-project", severity: "error")
+        }
+    }
+
+    /** Turns one `OrphanProjectLogs.remove` outcome into the `orphan-log-dir`
+        finding `doctor --fix` reports. Pure so each wording is asserted without
+        touching disk. */
+    static func orphanLogDirFixFinding(path: URL, outcome: OrphanProjectLogs.Removal) -> Finding {
+        switch outcome {
+        case .removed:
+            return Finding(
+                detail: "removed \(path.path), which matched no registered project",
+                kind: "orphan-log-dir", severity: "fixed")
+        case .refused(let reason):
+            return Finding(
+                detail: "left \(path.path) in place: \(reason)",
+                kind: "orphan-log-dir", severity: "error")
+        case .failed(let message):
+            return Finding(
+                detail: "could not remove \(path.path): \(message)",
+                kind: "orphan-log-dir", severity: "error")
         }
     }
 
@@ -1984,8 +2007,10 @@ struct Doctor: AsyncParsableCommand {
             project mid-edit on an invalid devservers.json, or one whose file
             was deleted, still claims its log directory even though it has no
             servers to list. Skipped entirely (never guessed) when talking to a
-            daemon whose `daemon.info` predates `claimedProjects`. Report-only,
-            with the exact command to remove it. */
+            daemon whose `daemon.info` predates `claimedProjects`, for `--fix`
+            too, since an empty claimed set would call every directory a
+            leftover. Runs after the stale-project pass so the scan sees the
+            log directories `project.forget` already removed. */
         if let info, let claimedProjects = info.claimedProjects {
             let claimedSlugDirs = Set(
                 claimedProjects.map { DirectaPaths().projectLogDir(project: $0).lastPathComponent })
@@ -1993,10 +2018,16 @@ struct Doctor: AsyncParsableCommand {
             for orphan in OrphanProjectLogs.scan(
                 paths: DirectaPaths(logsDir: logsDir), claimedSlugDirs: claimedSlugDirs)
             {
-                findings.append(
-                    Finding(
-                        detail: "\(orphan.detail) (run: \(orphan.remedy))",
-                        kind: "orphan-log-dir", severity: "warning"))
+                if fix {
+                    let outcome = OrphanProjectLogs.remove(
+                        orphan.path, logsDir: logsDir, claimedSlugDirs: claimedSlugDirs)
+                    findings.append(Self.orphanLogDirFixFinding(path: orphan.path, outcome: outcome))
+                } else {
+                    findings.append(
+                        Finding(
+                            detail: "\(orphan.detail) (run: \(orphan.remedy))",
+                            kind: "orphan-log-dir", severity: "warning"))
+                }
             }
         }
         if global.json {
