@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -9,15 +10,14 @@ import Testing
     trusted project the instant its devservers.json cannot be parsed (mid-edit,
     or deleted): that project still claims its log directory, even though it
     has no servers to list right now. */
-@Suite struct ClaimedProjectsTests {
+@Suite(.temporaryTree) struct ClaimedProjectsTests {
     private struct Env {
         let paths: DirectaPaths
         let project: String
     }
 
     private func makeEnv() throws -> Env {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-claimed-projects-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "claimed-projects")
         let project = base.appending(path: "proj")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         return Env(

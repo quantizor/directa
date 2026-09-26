@@ -1,3 +1,4 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -299,9 +300,8 @@ import Testing
         }
     }
 
-    @Test func parseErrorIsActionable() throws {
-        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-cfg-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    @Test(.temporaryTree) func parseErrorIsActionable() throws {
+        let dir = try TemporaryTree.directory(named: "cfg")
         try Data(#"{"version": 1, "servers": {"web": {"port": 3000}}}"#.utf8)
             .write(to: dir.appending(path: "devservers.json"))
         do {

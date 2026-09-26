@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -32,7 +33,7 @@ private func makeSupervisor(
     prober: any HealthProber,
     port: Int? = nil
 ) throws -> (ServerSupervisor, DirectaPaths, String) {
-    let base = FileManager.default.temporaryDirectory.appending(path: "directa-health-\(UUID().uuidString)")
+    let base = try TemporaryTree.directory(named: "health")
     let project = base.appending(path: "proj")
     try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
     let paths = DirectaPaths(dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs"))
@@ -54,7 +55,7 @@ private func pollPhase(
     return latest
 }
 
-@Suite struct HealthStateMachineTests {
+@Suite(.temporaryTree) struct HealthStateMachineTests {
     private let fastTCP = HealthCheckSpec(
         healthyAfter: 1, intervalMs: 30, port: 1, timeoutMs: 100, type: .tcp, unhealthyAfter: 3)
 

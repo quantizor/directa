@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -8,7 +9,7 @@ import Testing
     start-shaped path must refuse the second binder loudly instead of letting two
     processes silently fight over the port. These share the same declared port
     numbers, so the suite is serialized. */
-@Suite(.serialized) struct PortOwnershipTests {
+@Suite(.serialized, .temporaryTree) struct PortOwnershipTests {
     private struct Env {
         let paths: DirectaPaths
         let projectA: String
@@ -16,7 +17,7 @@ import Testing
     }
 
     private func makeEnv() throws -> Env {
-        let base = FileManager.default.temporaryDirectory.appending(path: "directa-port-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "port")
         let a = base.appending(path: "checkout-a")
         let b = base.appending(path: "checkout-b")
         for dir in [a, b] {

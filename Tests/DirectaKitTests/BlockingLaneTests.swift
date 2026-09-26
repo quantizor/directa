@@ -1,11 +1,12 @@
 import Darwin
+import DirectaTestSupport
 import Foundation
 import Testing
 import os
 
 @testable import DirectaKit
 
-@Suite struct BlockingLaneTests {
+@Suite(.temporaryTree) struct BlockingLaneTests {
     /** A lane never runs more than `width` jobs at once: with every running
         job held on a gate, one more never starts, and all of them finish in
         full once the gate opens. */
@@ -106,7 +107,6 @@ import os
         the pool it is measuring. */
     @Test func hungGitCallsLeaveTheCooperativePoolFree() async throws {
         let repo = try HungRepository()
-        defer { repo.remove() }
         let callers = ProcessInfo.processInfo.activeProcessorCount * 2
         let finished = OSAllocatedUnfairLock(initialState: 0)
         let path = repo.path
@@ -141,7 +141,6 @@ import os
         spawn itself. */
     @Test func aHungGitIsTerminatedAtItsTimeout() async throws {
         let repo = try HungRepository()
-        defer { repo.remove() }
         let path = repo.path
         let answered = OSAllocatedUnfairLock(initialState: false)
         let call = Task.detached {
@@ -175,8 +174,7 @@ private struct HungRepository: Sendable {
     let path: String
 
     init() throws {
-        let root = FileManager.default.temporaryDirectory.appending(
-            path: "directa-hung-repo-\(UUID().uuidString)")
+        let root = try TemporaryTree.directory(named: "hung-repo")
         let gitDir = root.appending(path: ".git")
         try FileManager.default.createDirectory(
             at: gitDir.appending(path: "objects"), withIntermediateDirectories: true)
@@ -197,9 +195,5 @@ private struct HungRepository: Sendable {
             if fd >= 0 { close(fd) }
             usleep(2_000)
         }
-    }
-
-    func remove() {
-        try? FileManager.default.removeItem(atPath: path)
     }
 }

@@ -1,6 +1,8 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
+import os
 
 @testable import DirectaDaemonCore
 
@@ -11,7 +13,7 @@ private struct TestEnv {
 }
 
 private func makeEnv() throws -> TestEnv {
-    let base = FileManager.default.temporaryDirectory.appending(path: "directa-sup-\(UUID().uuidString)")
+    let base = try TemporaryTree.directory(named: "sup")
     let project = base.appending(path: "proj")
     try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
     return TestEnv(
@@ -19,7 +21,7 @@ private func makeEnv() throws -> TestEnv {
         projectPath: project.path)
 }
 
-@Suite struct SupervisorTests {
+@Suite(.temporaryTree) struct SupervisorTests {
     @Test func startCapturesOutputAndStopKillsGroup() async throws {
         let env = try makeEnv()
         let paths = env.paths
@@ -1410,7 +1412,7 @@ private struct AlwaysHealthyProber: HealthProber {
     func probe(_ check: EffectiveHealthcheck) async -> Bool { true }
 }
 
-@Suite struct RegistryTests {
+@Suite(.temporaryTree) struct RegistryTests {
     @Test func registerPersistsAcrossReload() async throws {
         let env = try makeEnv()
         let paths = env.paths

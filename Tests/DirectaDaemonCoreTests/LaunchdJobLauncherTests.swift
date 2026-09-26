@@ -1,5 +1,6 @@
 import Darwin
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 import os
@@ -8,7 +9,7 @@ import os
 
 /** launchctl bootstrap is a machine-wide gui-domain mutation. Serialized so two
     cases cannot share a label or race bootout. */
-@Suite(.serialized)
+@Suite(.serialized, .temporaryTree)
 struct LaunchdJobLauncherTests {
     @Test func launchdJobGetsItsOwnJetsamCoalition() async throws {
         let parent = try #require(CoalitionIDs.read(of: getpid()))
@@ -17,8 +18,6 @@ struct LaunchdJobLauncherTests {
         defer {
             close(outFD)
             close(errFD)
-            try? FileManager.default.removeItem(at: outURL)
-            try? FileManager.default.removeItem(at: errURL)
         }
         let spawned = OSAllocatedUnfairLock(initialState: pid_t(0))
         let outcome = await LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix).run(
@@ -68,8 +67,6 @@ struct LaunchdJobLauncherTests {
         defer {
             close(outFD)
             close(errFD)
-            try? FileManager.default.removeItem(at: outURL)
-            try? FileManager.default.removeItem(at: errURL)
         }
         let outcome = await LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix).run(
             argv: ["/bin/sh", "-c", "sleep 0.3; exit 3"],
@@ -114,8 +111,6 @@ struct LaunchdJobLauncherTests {
         defer {
             close(outFD)
             close(errFD)
-            try? FileManager.default.removeItem(at: outURL)
-            try? FileManager.default.removeItem(at: errURL)
         }
         let callbacks = OSAllocatedUnfairLock(initialState: [String]())
         let outcome = await LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix).run(
@@ -156,8 +151,6 @@ struct LaunchdJobLauncherTests {
         defer {
             close(outFD)
             close(errFD)
-            try? FileManager.default.removeItem(at: outURL)
-            try? FileManager.default.removeItem(at: errURL)
         }
         let missing = "/nonexistent/directa-typo-\(UUID().uuidString)"
         let exitedBeforeWatch = OSAllocatedUnfairLock(initialState: false)
@@ -286,8 +279,7 @@ struct LaunchdJobLauncherTests {
     }
 
     private func openSpool() throws -> (Int32, URL) {
-        let url = FileManager.default.temporaryDirectory.appending(
-            path: "directa-job-\(UUID().uuidString).log")
+        let url = try TemporaryTree.path(named: "job").appendingPathExtension("log")
         let fd = open(url.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
         try #require(fd >= 0)
         return (fd, url)

@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -12,10 +13,9 @@ import Testing
 
     `docs/design.md` promised this as an end-to-end test in a target that only
     ever held `#expect(Bool(true))`, so the promise outlived the coverage. */
-@Suite(.serialized) struct ConcurrentEnsureTests {
+@Suite(.serialized, .temporaryTree) struct ConcurrentEnsureTests {
     private func env(port: Int) throws -> (paths: DirectaPaths, project: String) {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-concurrent-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "concurrent")
         let project = base.appending(path: "proj")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         let fixture = try #require(fixtureServerExecutable())
@@ -106,8 +106,7 @@ import Testing
         listener is the server's own run, so the second start joins it. */
     @Test func aRunSpawnedWhileThePreCheckProbesIsTheServersOwn() async throws {
         let port = 45473
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-concurrent-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "concurrent")
         let project = base.appending(path: "proj")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         let paths = DirectaPaths(

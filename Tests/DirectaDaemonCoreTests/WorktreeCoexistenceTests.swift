@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -9,7 +10,7 @@ import Testing
     host: every `*.localhost` name resolves to loopback, so the host never
     disambiguated a bind, and a third-level subdomain breaks apps whose auth
     config pins one origin. The worktree name surfaces as a display value. */
-@Suite(.serialized) struct WorktreeCoexistenceTests {
+@Suite(.serialized, .temporaryTree) struct WorktreeCoexistenceTests {
     private struct Env {
         let fixture: String
         let main: String
@@ -18,8 +19,7 @@ import Testing
     }
 
     private func makeEnv() throws -> Env {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-wt-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "wt")
         let main = base.appending(path: "main")
         let worktree = base.appending(path: "worktrees/review")
         try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
@@ -204,8 +204,7 @@ import Testing
     }
 
     @Test func siblingWorktreePortSpanRebindsAsBlock() async throws {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-span-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "span")
         let main = base.appending(path: "main")
         try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
         /** Named so the sibling search starts one past main's base port, inside
@@ -465,8 +464,7 @@ import Testing
     }
 
     private func makeNestedEnv(port: Int) throws -> Env {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-wt-nested-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "wt-nested")
         let main = base.appending(path: "main")
         let worktree = main.appending(path: ".claude/worktrees/review")
         try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)

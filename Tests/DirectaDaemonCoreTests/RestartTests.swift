@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -8,14 +9,13 @@ import Testing
     It has two defects a single daemon-side transition removes: another session's
     ensure can land between the two commands, and a refusal (a held resource, a
     broken config) arrives only after the server is already down. */
-@Suite(.serialized) struct RestartTests {
+@Suite(.serialized, .temporaryTree) struct RestartTests {
     /** A port per test: a case that fails before its teardown would otherwise
         leave a listener behind and fail the next one for an unrelated reason. */
     private func env(
         flood: Bool = false, port: Int, waitFor: String? = nil
     ) throws -> (paths: DirectaPaths, project: String) {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-restart-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "restart")
         let project = base.appending(path: "proj")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         try writeConfig(flood: flood, port: port, project: project.path, waitFor: waitFor)

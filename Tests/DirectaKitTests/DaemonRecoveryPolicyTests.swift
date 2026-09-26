@@ -1,3 +1,4 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -7,9 +8,8 @@ import Testing
     /** launchd rejects an ExitTimeOut above 60, silently clamps it, and logs
         "ExitTimeOut is larger than the maximum allowed", so the rendered value
         has to stay inside the ceiling. */
-    @Test func exitTimeOutStaysUnderLaunchdCeiling() throws {
-        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-test-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
+    @Test(.temporaryTree) func exitTimeOutStaysUnderLaunchdCeiling() throws {
+        let dir = try TemporaryTree.path(named: "plist")
         let paths = DirectaPaths(dataDir: dir)
         let plist = LaunchdAdmin.renderPlist(daemonPath: "/tmp/ddirecta", paths: paths)
         let data = try #require(plist.data(using: .utf8))
@@ -46,10 +46,8 @@ import Testing
             !AgentRebindPolicy.shouldForceReregisterAfterHelloMiss(rebindNeeded: false))
     }
 
-    @Test func rebindMarkerRoundTrip() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-rebind-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
+    @Test(.temporaryTree) func rebindMarkerRoundTrip() throws {
+        let dir = try TemporaryTree.path(named: "rebind")
         let paths = DirectaPaths(dataDir: dir)
         #expect(!LaunchdAdmin.agentRebindNeeded(paths: paths))
         try LaunchdAdmin.markAgentRebindNeeded(paths: paths)

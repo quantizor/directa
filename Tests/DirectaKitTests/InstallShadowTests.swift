@@ -1,3 +1,4 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -59,14 +60,9 @@ import Testing
         #expect(findings.count == 2)
     }
 
-    @Test func firstOnPathResolvesInPathOrder() throws {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-shadow-\(UUID().uuidString)")
-        let dirA = base.appending(path: "a")
-        let dirB = base.appending(path: "b")
-        try FileManager.default.createDirectory(at: dirA, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: dirB, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: base) }
+    @Test(.temporaryTree) func firstOnPathResolvesInPathOrder() throws {
+        let dirA = try TemporaryTree.directory(named: "a")
+        let dirB = try TemporaryTree.directory(named: "b")
 
         /** Binary only in the second dir: PATH order picks the second. */
         FileManager.default.createFile(atPath: dirB.appending(path: "directa").path, contents: nil)

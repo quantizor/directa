@@ -1,3 +1,4 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -26,9 +27,8 @@ import Testing
 
     /** The proof that matters is about the filesystem, not the string: resolving
         the built URL must stay under the logs directory. */
-    @Test func aTraversingNameStaysUnderTheLogsDirectory() throws {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-paths-\(UUID().uuidString)")
+    @Test(.temporaryTree) func aTraversingNameStaysUnderTheLogsDirectory() throws {
+        let base = try TemporaryTree.path(named: "paths")
         let paths = DirectaPaths(
             dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs"))
         let dir = paths.serverLogDir(

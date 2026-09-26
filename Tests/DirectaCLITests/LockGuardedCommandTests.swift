@@ -1,5 +1,6 @@
 import Darwin
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -10,13 +11,9 @@ import Testing
     a relative file argument, or a tool that finds its own config by walking up
     from cwd, saw the wrong directory (a monorepo subpackage below the project
     root, or an explicit `--project` pointing elsewhere both diverge from cwd). */
-@Suite struct LockGuardedCommandTests {
+@Suite(.temporaryTree) struct LockGuardedCommandTests {
     private func inScratchDir(_ body: (URL) throws -> Void) throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-lock-cwd-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        try body(dir)
+        try body(try TemporaryTree.directory(named: "lock-cwd"))
     }
 
     /** `getcwd(3)` (what `Process.currentDirectoryURL` and the child's own

@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -10,7 +11,7 @@ import Testing
     file back from what it read, so what the read does on a file it cannot parse
     decides whether the merge is a merge or a replacement. It used to answer with
     an empty dictionary, which the write then persisted as the entire file. */
-@Suite struct HarnessSettingsTests {
+@Suite(.temporaryTree) struct HarnessSettingsTests {
     /** Stands in for a real adapter so these exercise the shared load/write pair
         rather than either harness's key layout. */
     private struct StubAdapter: HarnessAdapter {
@@ -22,10 +23,7 @@ import Testing
     }
 
     private func inScratch(_ body: (StubAdapter) throws -> Void) throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-harness-settings-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
+        let dir = try TemporaryTree.directory(named: "harness-settings")
         try body(StubAdapter(settingsURL: dir.appending(path: "settings.json")))
     }
 
@@ -108,11 +106,7 @@ import Testing
     }
 
     private func inScratchDir(_ body: (URL) throws -> Void) throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-harness-real-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        try body(dir)
+        try body(try TemporaryTree.directory(named: "harness-real"))
     }
 
     /** Install then uninstall leaves the file byte-for-byte as it started, and
@@ -985,10 +979,8 @@ import Testing
     }
 
     @Test func opencodeHookStateReportsNotInstalledWhenTheConfigDirectoryExists() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-oc-home-\(UUID().uuidString)/.config/opencode")
+        let dir = try TemporaryTree.directory(named: "oc-home").appending(path: ".config/opencode")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
         let settings = dir.appending(path: "opencode.jsonc")
         let adapter = OpenCodeAdapter(settingsURLOverride: settings)
         #expect(adapter.harnessPresent)
@@ -1004,8 +996,7 @@ import Testing
         #expect(
             OpenCodeWiring.instructionsEntry(forManagedFileAt: managed)
                 == "~/.config/opencode/" + OpenCodeWiring.managedFileName)
-        let scratch = FileManager.default.temporaryDirectory
-            .appending(path: "directa-oc-entry-\(UUID().uuidString)/directa.md")
+        let scratch = URL(fileURLWithPath: "/var/empty/directa-oc-entry/directa.md")
         #expect(OpenCodeWiring.instructionsEntry(forManagedFileAt: scratch) == scratch.path)
     }
 
@@ -1168,9 +1159,7 @@ import Testing
         jsonc over json over the legacy config.json, and opencode.jsonc is what
         OpenCode seeds on a fresh machine. */
     @Test func opencodeSettingsURLFollowsTheHarnessPreferenceOrder() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appending(path: "directa-oc-pref-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = try TemporaryTree.path(named: "oc-pref")
         let home = root.appending(path: "home")
         let dir = OpenCodeWiring.configDirectory(home: home)
 
@@ -1194,39 +1183,30 @@ import Testing
     }
 
     @Test func hookStateIsAbsentWhenTheHarnessDirectoryIsMissing() throws {
-        let missing = FileManager.default.temporaryDirectory
-            .appending(path: "directa-absent-\(UUID().uuidString)/settings.json")
+        let missing = try TemporaryTree.path(named: "absent").appending(path: "settings.json")
         let adapter = ClaudeCodeAdapter(settingsURLOverride: missing)
         #expect(adapter.hookState() == .harnessAbsent)
-        let antigravityMissing = FileManager.default.temporaryDirectory
-            .appending(path: "directa-ag-absent-\(UUID().uuidString)/config/hooks.json")
+        let antigravityMissing = try TemporaryTree.path(named: "ag-absent").appending(path: "config/hooks.json")
         let agAdapter = AntigravityAdapter(settingsURLOverride: antigravityMissing)
         #expect(agAdapter.hookState() == .harnessAbsent)
-        let grokMissing = FileManager.default.temporaryDirectory
-            .appending(path: "directa-grok-absent-\(UUID().uuidString)/hooks/directa.json")
+        let grokMissing = try TemporaryTree.path(named: "grok-absent").appending(path: "hooks/directa.json")
         let grokAdapter = GrokAdapter(settingsURLOverride: grokMissing)
         #expect(grokAdapter.hookState() == .harnessAbsent)
-        let opencodeMissing = FileManager.default.temporaryDirectory
-            .appending(path: "directa-oc-absent-\(UUID().uuidString)/.config/opencode/opencode.jsonc")
+        let opencodeMissing = try TemporaryTree.path(named: "oc-absent")
+            .appending(path: ".config/opencode/opencode.jsonc")
         let ocAdapter = OpenCodeAdapter(settingsURLOverride: opencodeMissing)
         #expect(ocAdapter.hookState() == .harnessAbsent)
     }
 
     @Test func hookStateReportsNotInstalledWhenAntigravityHomeDirectoryExists() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-ag-home-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
+        let dir = try TemporaryTree.directory(named: "ag-home")
         let settings = dir.appending(path: "config/hooks.json")
         let agAdapter = AntigravityAdapter(settingsURLOverride: settings)
         #expect(agAdapter.hookState() == .notInstalled)
     }
 
     @Test func hookStateReportsNotInstalledWhenGrokHomeDirectoryExists() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-grok-home-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
+        let dir = try TemporaryTree.directory(named: "grok-home")
         let settings = dir.appending(path: "hooks/directa.json")
         let grokAdapter = GrokAdapter(settingsURLOverride: settings)
         #expect(grokAdapter.hookState() == .notInstalled)

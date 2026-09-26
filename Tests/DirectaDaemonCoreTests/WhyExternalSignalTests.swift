@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -9,15 +10,14 @@ import Testing
     a canned closure: a real SIGTERM lands `stopped`, `ControlServer` reads
     that stop's event detail back out of a real `EventStore`, and `directa
     why`'s summary names the signal and that directa did not ask for it. */
-@Suite struct WhyExternalSignalTests {
+@Suite(.temporaryTree) struct WhyExternalSignalTests {
     private struct Env {
         let paths: DirectaPaths
         let project: String
     }
 
     private func makeEnv() throws -> Env {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-why-signal-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "why-signal")
         let project = base.appending(path: "proj")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         try Data(

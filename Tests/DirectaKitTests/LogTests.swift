@@ -1,3 +1,4 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 import os
@@ -35,10 +36,9 @@ import os
     }
 }
 
-@Suite struct LogQueryTests {
+@Suite(.temporaryTree) struct LogQueryTests {
     private func writeFamily(_ linesPerFile: [[LogRecord]]) throws -> URL {
-        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-logq-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dir = try TemporaryTree.directory(named: "logq")
         let current = dir.appending(path: "current.log")
         /** linesPerFile oldest-first: earlier arrays land in higher rotations. */
         for (index, records) in linesPerFile.enumerated() {
@@ -218,8 +218,7 @@ import os
             racing an in-flight append) must not surface as a phantom record:
             LogRecord.parse rejects it for lacking a full timestamp/stream/
             payload shape, the same as the full-parse path already does. */
-        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-logq-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dir = try TemporaryTree.directory(named: "logq")
         let current = dir.appending(path: "current.log")
         let complete = (0..<3).map { record(Double($0), .out, "line \($0)") }
         let text = complete.map { $0.formatted() }.joined(separator: "\n")
@@ -329,7 +328,7 @@ import os
     }
 
     @Test func anEmptyFamilyAnswersTheOriginCursor() throws {
-        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-logq-\(UUID().uuidString)")
+        let dir = try TemporaryTree.path(named: "logq")
         let window = LogQuery.window(current: dir.appending(path: "current.log"), options: LogQueryOptions())
         #expect(window == LogWindow(cursor: .origin, lines: []))
         /** The origin lies before every record, so the first query after it
@@ -623,9 +622,7 @@ import os
         reassembled, empty lines are skipped, and an unterminated last line
         counts. */
     @Test func aBackwardWalkMatchesAForwardSplitAtEveryChunkSize() throws {
-        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-logq-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
+        let dir = try TemporaryTree.directory(named: "logq")
         let url = dir.appending(path: "current.log")
         let bytes = Array("first é line\n\nsecond 👩‍👩‍👧‍👦 line\nü\n\n\nthird, unterminated ☃".utf8)
         try Data(bytes).write(to: url)

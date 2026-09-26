@@ -1,4 +1,5 @@
 import Darwin
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -467,7 +468,7 @@ import Testing
     }
 }
 
-@Suite struct PathTests {
+@Suite(.temporaryTree) struct PathTests {
     @Test func sunPathLimit() {
         #expect(DirectaPaths.fitsSunPath("/tmp/short.sock"))
         #expect(!DirectaPaths.fitsSunPath(String(repeating: "x", count: 104)))
@@ -533,7 +534,7 @@ import Testing
     }
 
     @Test func atomicWriteAndDefensiveLoad() throws {
-        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-test-\(UUID().uuidString)")
+        let dir = try TemporaryTree.path(named: "atomic")
         let file = dir.appending(path: "state.json")
         struct Payload: Codable, Equatable {
             var value: Int
@@ -547,7 +548,6 @@ import Testing
         let quarantined = try FileManager.default.contentsOfDirectory(atPath: dir.path)
             .filter { $0.contains(".corrupt-") }
         #expect(quarantined.count == 1)
-        try? FileManager.default.removeItem(at: dir)
     }
 
     /** Two writers inside one process must both succeed: a pid-only temp name
@@ -555,7 +555,7 @@ import Testing
         how the app lost agent.path when launch registration and the recovery
         poll wrote it at the same moment. */
     @Test func concurrentWritesToOneFileAllSucceed() async throws {
-        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-test-\(UUID().uuidString)")
+        let dir = try TemporaryTree.path(named: "concurrent-writes")
         let file = dir.appending(path: "agent.path")
         let payloads = (0..<8).map { "payload-\($0)" }
         try await withThrowingTaskGroup(of: Void.self) { group in
@@ -572,7 +572,6 @@ import Testing
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: dir.path)
             .filter { $0.hasPrefix(".agent.path.tmp-") }
         #expect(leftovers.isEmpty)
-        try? FileManager.default.removeItem(at: dir)
     }
 
     /** A rename that fails (here, a destination `chflags`'d immutable, which
@@ -581,15 +580,10 @@ import Testing
         forever, the same class of leak `sweepStaleTemps` exists to clean up
         for an earlier crash rather than a failed replace. */
     @Test func failedReplaceLeavesNoTempBehind() throws {
-        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dir = try TemporaryTree.directory(named: "immutable")
         let file = dir.appending(path: "state.json")
         try Data("{}".utf8).write(to: file)
         #expect(chflags(file.path, UInt32(UF_IMMUTABLE)) == 0)
-        defer {
-            _ = chflags(file.path, 0)
-            try? FileManager.default.removeItem(at: dir)
-        }
         #expect(throws: (any Error).self) {
             try AtomicFile.write(Data("{\"value\":1}".utf8), to: file)
         }
@@ -603,9 +597,7 @@ import Testing
         distinction that keeps the sweep from ever touching a concurrent
         `write` mid-flight under a live daemon. */
     @Test func sweepRemovesADeadPidTempAndKeepsALivePidTemp() throws {
-        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
+        let dir = try TemporaryTree.directory(named: "sweep")
 
         let deadProcess = Process()
         deadProcess.executableURL = URL(fileURLWithPath: "/usr/bin/true")

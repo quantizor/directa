@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -15,15 +16,14 @@ import Testing
     unrelated or already-absent name, or the last ad hoc entry on a project
     trusted through its committed devservers.json, must never delete logs a
     live, merely un-registered, supervisor is still writing to. */
-@Suite struct LogDirCleanupTests {
+@Suite(.temporaryTree) struct LogDirCleanupTests {
     private struct Env {
         let paths: DirectaPaths
         let project: String
     }
 
     private func makeEnv() throws -> Env {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-logdir-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "logdir")
         let project = base.appending(path: "proj")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         return Env(

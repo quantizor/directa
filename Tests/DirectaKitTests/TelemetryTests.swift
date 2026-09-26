@@ -1,3 +1,4 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 import os
@@ -111,9 +112,7 @@ private let printedAgentRunning = [
 ].joined(separator: "\n")
 
 private func temporaryDirectory() throws -> URL {
-    let url = FileManager.default.temporaryDirectory.appending(path: "directa-telemetry-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    return url
+    try TemporaryTree.directory(named: "telemetry")
 }
 
 private func date(_ iso: String) throws -> Date {
@@ -404,14 +403,13 @@ private final class LockedArray: Sendable {
     }
 }
 
-@Suite struct TelemetryLogTests {
+@Suite(.temporaryTree) struct TelemetryLogTests {
     private func mark(_ index: Int, at time: Date) -> TelemetryMark {
         TelemetryMark(daemonPid: 100, event: .slowOperation, kind: .lsof, label: "line \(index)", time: time)
     }
 
     @Test func rotationKeepsTheBoundAndEveryLineStaysWhole() throws {
         let directory = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
         let log = TelemetryLog(directory: directory, keepRotated: 2, maxBytes: 1000)
         let start = try date("2026-09-26T10:00:00.000Z")
         for index in 0..<200 {
@@ -438,7 +436,6 @@ private final class LockedArray: Sendable {
 
     @Test func timesAreClampedMonotonicAcrossAReopen() throws {
         let directory = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
         let later = try date("2026-09-26T10:00:05.000Z")
         let earlier = try date("2026-09-26T10:00:01.000Z")
         let first = TelemetryLog(directory: directory)
@@ -454,7 +451,6 @@ private final class LockedArray: Sendable {
 
     @Test func tailReadsAcrossChunksAndKeepsATornLastLine() throws {
         let directory = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appending(path: "t.log")
         let body = (0..<50).map { "line \($0) " + String(repeating: "x", count: 40) }.joined(separator: "\n")
         try Data((body + "\ntorn").utf8).write(to: url)
@@ -468,7 +464,7 @@ private final class LockedArray: Sendable {
     }
 }
 
-@Suite struct DaemonIncidentTests {
+@Suite(.temporaryTree) struct DaemonIncidentTests {
     @Test func parsesAnExitCodeFromARealPrint() {
         let record = LaunchdExitRecord.parse(printedExitCode)
         #expect(
@@ -507,7 +503,6 @@ private final class LockedArray: Sendable {
 
     @Test func previousRunIsReadFromRotatedFilesOldestFirst() throws {
         let directory = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
         /** About 60 lines per file, so the newest 180 span the current file
             and at least two rotations. */
         let log = TelemetryLog(directory: directory, keepRotated: 4, maxBytes: 8000)
@@ -534,7 +529,6 @@ private final class LockedArray: Sendable {
 
     @Test func aCleanExitMarkIsRecognized() throws {
         let directory = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
         let log = TelemetryLog(directory: directory)
         log.append(TelemetryMark(daemonPid: 1, event: .daemonExiting, label: "exit", time: Date()))
         log.close()
@@ -553,7 +547,6 @@ private final class LockedArray: Sendable {
         #expect(killed.exitedCleanly == false)
         #expect(killed.pid == 2)
         let empty = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: empty) }
         #expect(
             DaemonIncident.readPrevious(telemetryDirectory: empty)
                 == DaemonIncident.Previous(exitedCleanly: false, lastLineAt: nil, lines: [], pid: nil))
@@ -653,7 +646,6 @@ private final class LockedArray: Sendable {
 
     @Test func pruneKeepsTheNewestIncidents() throws {
         let directory = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
         for index in 0..<7 {
             try Data().write(to: directory.appending(path: "2026-09-2\(index)T00-00-00.000Z-pid1.ndjson"))
         }

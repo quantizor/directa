@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -48,7 +49,7 @@ import Testing
 /** `Doctor.orphanLogDirFindings` over a real temp logs root with a scripted
     daemon. `--fix` asks the daemon to remove each unclaimed directory by name
     and never deletes anything itself. */
-@Suite struct DoctorOrphanLogDirPassTests {
+@Suite(.temporaryTree) struct DoctorOrphanLogDirPassTests {
     private struct Dropped: Error, LocalizedError {
         var errorDescription: String? { "daemon went away" }
     }
@@ -61,7 +62,6 @@ import Testing
 
     @Test func fixAsksTheDaemonForEachUnclaimedDirectoryByNameAndReportsItsAnswer() async throws {
         let fixture = try Fixture()
-        defer { fixture.cleanUp() }
         let claimedProject = fixture.root.appending(path: "live").path
         let claimedDir = fixture.logsDir.appending(path: DirectaPaths.projectLogDirName(project: claimedProject))
         let first = fixture.logsDir.appending(path: "gone-aaaaaaaa")
@@ -95,7 +95,6 @@ import Testing
 
     @Test func aDaemonThatPredatesTheMethodGetsTheReportAndOneRestartFinding() async throws {
         let fixture = try Fixture()
-        defer { fixture.cleanUp() }
         let orphans = ["gone-aaaaaaaa", "gone-bbbbbbbb"].map { fixture.logsDir.appending(path: $0) }
         for orphan in orphans {
             try FileManager.default.createDirectory(at: orphan, withIntermediateDirectories: true)
@@ -125,7 +124,6 @@ import Testing
     /** Any other failure is that directory's own error, and the pass goes on. */
     @Test func anotherFailureIsReportedPerDirectoryAndThePassContinues() async throws {
         let fixture = try Fixture()
-        defer { fixture.cleanUp() }
         let first = fixture.logsDir.appending(path: "gone-aaaaaaaa")
         let second = fixture.logsDir.appending(path: "gone-bbbbbbbb")
         for directory in [first, second] {
@@ -153,7 +151,6 @@ import Testing
     /** Report-only never deletes, so it never asks the daemon to. */
     @Test func reportOnlyWarnsAndNeverAsksForARemoval() async throws {
         let fixture = try Fixture()
-        defer { fixture.cleanUp() }
         let orphan = fixture.logsDir.appending(path: "gone-project-abcd1234")
         try FileManager.default.createDirectory(at: orphan, withIntermediateDirectories: true)
 
@@ -173,7 +170,6 @@ import Testing
 
     @Test func fixWithNothingUnclaimedAsksForNothing() async throws {
         let fixture = try Fixture()
-        defer { fixture.cleanUp() }
         let findings = await Doctor.orphanLogDirFindings(
             fix: true, info: fixture.info(claiming: [])
         ) { name in
@@ -188,8 +184,7 @@ import Testing
         let root: URL
 
         init() throws {
-            root = FileManager.default.temporaryDirectory
-                .appending(path: "directa-doctor-orphanlogs-\(UUID().uuidString)")
+            root = try TemporaryTree.directory(named: "doctor-orphanlogs")
             logsDir = root.appending(path: "logs")
             try FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
         }
@@ -199,10 +194,6 @@ import Testing
                 claimedProjects: projects, dataDir: root.appending(path: "data").path,
                 daemonVersion: "0.0.0", logsDir: logsDir.path, pid: 1, proto: 1,
                 socketPath: root.appending(path: "daemon.sock").path)
-        }
-
-        func cleanUp() {
-            try? FileManager.default.removeItem(at: root)
         }
     }
 }

@@ -1,3 +1,4 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -159,11 +160,8 @@ import Testing
 }
 
 @Suite struct LocalOverlayTests {
-    @Test func mergesPortAndEnv() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-overlay-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
+    @Test(.temporaryTree) func mergesPortAndEnv() throws {
+        let dir = try TemporaryTree.directory(named: "overlay")
         let overlay = LocalOverlayFile(
             servers: [
                 "web": LocalOverlayServer(env: ["FOO": "bar"], port: 4100)
@@ -182,7 +180,7 @@ import Testing
     }
 }
 
-@Suite struct CheckoutIdentityTests {
+@Suite(.temporaryTree) struct CheckoutIdentityTests {
     @Test func sanitizeLabel() {
         #expect(CheckoutIdentity.sanitizeLabel("Fix Checkout Hosts") == "fix-checkout-hosts")
         #expect(CheckoutIdentity.sanitizeLabel("app_v2") == "app-v2")
@@ -195,9 +193,10 @@ import Testing
         #expect(port != 3000)
     }
 
+    /** Under `/var/empty`, which macOS keeps empty and read-only, so the path
+        can never come into existence. */
     private func nonexistentProject() -> String {
-        FileManager.default.temporaryDirectory
-            .appending(path: "directa-checkout-identity-missing-\(UUID().uuidString)").path
+        "/var/empty/directa-checkout-identity-missing-\(UUID().uuidString)"
     }
 
     /** Every fd this process has open right now, by listing `/dev/fd`. Used to
@@ -232,9 +231,8 @@ import Testing
         let worktreeSubmodule: URL
     }
 
-    private func makeGitLayout(prefix: String = "directa-gitlayout-") throws -> GitLayout {
-        let base = URL(fileURLWithPath: canonicalProjectPath(FileManager.default.temporaryDirectory.path))
-            .appending(path: "\(prefix)\(UUID().uuidString)")
+    private func makeGitLayout(prefix: String = "gitlayout") throws -> GitLayout {
+        let base = URL(fileURLWithPath: canonicalProjectPath(try TemporaryTree.directory(named: prefix).path))
         let main = base.appending(path: "main")
         let source = base.appending(path: "sub-source")
         for dir in [main, source] {
@@ -270,7 +268,6 @@ import Testing
 
     @Test func onlyALinkedWorktreesGitFileCountsAsALinkedWorktree() throws {
         let layout = try makeGitLayout()
-        defer { try? FileManager.default.removeItem(at: layout.base) }
         #expect(CheckoutIdentity.linkedWorktreeGitDir(of: layout.worktree.path) != nil)
         #expect(CheckoutIdentity.linkedWorktreeGitDir(of: layout.main.path) == nil)
         #expect(CheckoutIdentity.linkedWorktreeGitDir(of: layout.submodule.path) == nil)
@@ -280,7 +277,6 @@ import Testing
 
     @Test func isLinkedWorktreeIsFalseForASubmodule() throws {
         let layout = try makeGitLayout()
-        defer { try? FileManager.default.removeItem(at: layout.base) }
         #expect(CheckoutIdentity.isLinkedWorktree(project: layout.worktree.path))
         #expect(!CheckoutIdentity.isLinkedWorktree(project: layout.submodule.path))
         #expect(!CheckoutIdentity.isLinkedWorktree(project: layout.worktreeSubmodule.path))
@@ -289,7 +285,6 @@ import Testing
 
     @Test func mainCheckoutOfALinkedWorktreeIsTheCheckoutHoldingTheCommonGitDirectory() throws {
         let layout = try makeGitLayout()
-        defer { try? FileManager.default.removeItem(at: layout.base) }
         #expect(CheckoutIdentity.mainCheckout(ofLinkedWorktree: layout.worktree.path) == layout.main.path)
         #expect(CheckoutIdentity.mainCheckout(ofLinkedWorktree: layout.main.path) == nil)
         #expect(CheckoutIdentity.mainCheckout(ofLinkedWorktree: layout.submodule.path) == nil)
@@ -300,7 +295,6 @@ import Testing
         plain hint. */
     @Test func serverNotFoundNamesTheWorktreeFixesOnlyWhenTheMainCheckoutDeclaresTheName() throws {
         let layout = try makeGitLayout()
-        defer { try? FileManager.default.removeItem(at: layout.base) }
         let config = ProjectFileConfig(servers: ["web": ProjectFileServer(command: ["bun", "dev"])])
         try JSONCoding.fileEncoder().encode(config).write(to: layout.main.appending(path: "devservers.json"))
         let main = layout.main.path
@@ -332,8 +326,7 @@ import Testing
     /** The hint is a command a reader pastes, so a main checkout path with a
         quote and a space still arrives as one argument. */
     @Test func serverNotFoundQuotesAMainCheckoutPathHoldingAQuoteAndASpace() throws {
-        let layout = try makeGitLayout(prefix: "it's a checkout ")
-        defer { try? FileManager.default.removeItem(at: layout.base) }
+        let layout = try makeGitLayout(prefix: "it's a checkout")
         let config = ProjectFileConfig(servers: ["web": ProjectFileServer(command: ["bun", "dev"])])
         try JSONCoding.fileEncoder().encode(config).write(to: layout.main.appending(path: "devservers.json"))
         let quoted = layout.main.path.replacing("'", with: #"'\''"#)

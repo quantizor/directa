@@ -1,13 +1,13 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 
 @testable import DirectaKit
 
-@Suite("UpdateCheck")
+@Suite("UpdateCheck", .temporaryTree)
 struct UpdateCheckTests {
-    private func scratchPaths() -> (DirectaPaths, URL) {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-update-\(UUID().uuidString)")
+    private func scratchPaths() throws -> (DirectaPaths, URL) {
+        let dir = try TemporaryTree.path(named: "update")
         return (DirectaPaths(dataDir: dir, logsDir: dir.appending(path: "logs")), dir)
     }
 
@@ -25,8 +25,7 @@ struct UpdateCheckTests {
     }
 
     @Test func cachedStatusRoundTripsThroughDisk() throws {
-        let (paths, dir) = scratchPaths()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        let (paths, dir) = try scratchPaths()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let cache = UpdateCheck.Cache(checkedAt: Date(), etag: "abc", latestVersion: "2.0.0")
         try AtomicFile.write(
@@ -36,17 +35,15 @@ struct UpdateCheckTests {
         #expect(status?.updateAvailable == true)
     }
 
-    @Test func cachedStatusIsNilWithoutACache() {
-        let (paths, dir) = scratchPaths()
-        defer { try? FileManager.default.removeItem(at: dir) }
+    @Test func cachedStatusIsNilWithoutACache() throws {
+        let (paths, _) = try scratchPaths()
         #expect(UpdateCheck.cachedStatus(paths: paths) == nil)
     }
 
     /** A cache younger than maxAge is returned as-is, never triggering a fetch,
         which is what keeps doctor and the app off the network on every call. */
     @Test func refreshIfStaleReturnsFreshCacheWithoutFetching() async throws {
-        let (paths, dir) = scratchPaths()
-        defer { try? FileManager.default.removeItem(at: dir) }
+        let (paths, dir) = try scratchPaths()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let now = Date()
         let cache = UpdateCheck.Cache(checkedAt: now, etag: nil, latestVersion: "9.9.9")

@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -10,7 +11,7 @@ private struct LockEnv {
 }
 
 private func makeLockEnv() throws -> LockEnv {
-    let base = FileManager.default.temporaryDirectory.appending(path: "directa-lock-\(UUID().uuidString)")
+    let base = try TemporaryTree.directory(named: "lock")
     let project = base.appending(path: "proj")
     try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
     return LockEnv(
@@ -66,7 +67,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
     return server.phase
 }
 
-@Suite(.serialized) struct ResourceLockTests {
+@Suite(.serialized, .temporaryTree) struct ResourceLockTests {
     /** Acquire pauses the declaring server, refuses ensure, release brings it
         back. Pause is non-retiring so boot intent survives the hold. */
     @Test func acquirePausesReleaseResumesAndPreservesBootIntent() async throws {

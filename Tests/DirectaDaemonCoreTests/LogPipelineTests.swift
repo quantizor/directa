@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 import os
@@ -6,12 +7,10 @@ import os
 @testable import DirectaDaemonCore
 
 private func tempDir() throws -> URL {
-    let dir = FileManager.default.temporaryDirectory.appending(path: "directa-pipe-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir
+    try TemporaryTree.directory(named: "pipe")
 }
 
-@Suite struct LogStoreTests {
+@Suite(.temporaryTree) struct LogStoreTests {
     @Test func clampKeepsTimestampsMonotonic() async throws {
         let store = LogStore(currentURL: try tempDir().appending(path: "current.log"))
         let late = Date()
@@ -156,7 +155,7 @@ private func tempDir() throws -> URL {
     }
 }
 
-@Suite struct SpoolTailerTests {
+@Suite(.temporaryTree) struct SpoolTailerTests {
     @Test func tailsIncrementallyAndSanitizes() async throws {
         let dir = try tempDir()
         let spool = dir.appending(path: "out.spool")
@@ -315,7 +314,6 @@ private func tempDir() throws -> URL {
     func aFloodingChildsSpoolStaysBoundedOnDisk(openFlags: Int32) async throws {
         let fixture = try #require(fixtureServerExecutable(), "fixture-server is not built; run swift build")
         let dir = try tempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let spool = dir.appending(path: "out.spool")
         let descriptor = open(spool.path, openFlags | O_CLOEXEC, 0o644)
         try #require(descriptor >= 0)
@@ -368,7 +366,6 @@ private func tempDir() throws -> URL {
     @Test func aFloodThatOutrunsTheTailerIsNamedAboutOnceASecond() async throws {
         let fixture = try #require(fixtureServerExecutable(), "fixture-server is not built; run swift build")
         let dir = try tempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let spool = dir.appending(path: "out.spool")
         let descriptor = open(spool.path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0o644)
         try #require(descriptor >= 0)
@@ -405,7 +402,6 @@ private func tempDir() throws -> URL {
         backlog too, without ingesting any of it. */
     @Test func startAtEndReleasesAPriorRunsBacklog() async throws {
         let dir = try tempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let spool = dir.appending(path: "out.spool")
         try Data(String(repeating: "earlier run line\n", count: 64 * 1024).utf8).write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
@@ -423,7 +419,6 @@ private func tempDir() throws -> URL {
         not retried every tick, and ingestion carries on. */
     @Test func aVolumeThatRefusesToReleaseIsReportedOnce() async throws {
         let dir = try tempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
         let spool = dir.appending(path: "out.spool")
         try Data(String(repeating: "line\n", count: 8 * 1024).utf8).write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
@@ -477,7 +472,7 @@ private func tempDir() throws -> URL {
     }
 }
 
-@Suite struct EventStoreTests {
+@Suite(.temporaryTree) struct EventStoreTests {
     @Test func postAndQueryWithFilters() async throws {
         let store = EventStore(url: try tempDir().appending(path: "events.log"))
         await store.post(kind: .started, project: "/a", server: "web", detail: "pid 1")
@@ -546,7 +541,7 @@ private func tempDir() throws -> URL {
     }
 }
 
-@Suite struct WhyEngineTests {
+@Suite(.temporaryTree) struct WhyEngineTests {
     private func status(_ name: String, _ phase: ServerPhase, exit: Int? = nil) -> ServerStatus {
         ServerStatus(
             lastExit: exit.map { LastExit(at: Date(timeIntervalSince1970: 1_700_000_000), code: $0) },

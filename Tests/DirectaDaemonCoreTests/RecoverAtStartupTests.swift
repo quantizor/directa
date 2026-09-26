@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 import os
@@ -11,7 +12,7 @@ private struct RecoverEnv {
 }
 
 private func makeRecoverEnv() throws -> RecoverEnv {
-    let base = FileManager.default.temporaryDirectory.appending(path: "directa-recover-\(UUID().uuidString)")
+    let base = try TemporaryTree.directory(named: "recover")
     let project = base.appending(path: "proj")
     try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
     return RecoverEnv(
@@ -95,7 +96,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
 }
 
 
-@Suite struct RecoverAtStartupTests {
+@Suite(.temporaryTree) struct RecoverAtStartupTests {
     /** Config-defined servers live only in devservers.json (registry.servers is
         empty for them). Boot restore must still find the spec and bring them up. */
     @Test func restoresConfigDefinedServerWithResumeIntent() async throws {

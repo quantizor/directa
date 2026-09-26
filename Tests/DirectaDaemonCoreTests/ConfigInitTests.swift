@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -7,15 +8,14 @@ import Testing
 /** devservers.json is routinely gitignored per machine, so losing it left no way
     back. These cover writing one from what the daemon already knows, and above
     all that a file recovered from this checkout is portable to another. */
-@Suite(.serialized) struct ConfigInitTests {
+@Suite(.serialized, .temporaryTree) struct ConfigInitTests {
     private struct Env {
         let paths: DirectaPaths
         let project: String
     }
 
     private func makeEnv() throws -> Env {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-init-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "init")
         let project = base.appending(path: "shop")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         return Env(
@@ -202,8 +202,7 @@ import Testing
         neither the ephemeral host nor the rebound port, or it is wrong the moment
         someone else uses it. */
     @Test func recoveredFileFromAWorktreeCarriesNeitherEphemeralHostNorReboundPort() async throws {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-initwt-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "initwt")
         let main = base.appending(path: "main")
         let worktree = base.appending(path: "worktrees/review")
         try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)

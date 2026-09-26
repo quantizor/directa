@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -8,15 +9,14 @@ import Testing
     through `register` is validated the same as one from the file, `writeConfig`
     cannot drop a devservers.json at a path directa does not track, and an explicit
     start records the trust that boot restore later requires. */
-@Suite(.serialized) struct TrustAndInputValidationTests {
+@Suite(.serialized, .temporaryTree) struct TrustAndInputValidationTests {
     private struct Env {
         let paths: DirectaPaths
         let project: String
     }
 
     private func makeEnv() throws -> Env {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-trust-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "trust")
         let project = base.appending(path: "proj")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         return Env(
@@ -146,10 +146,7 @@ import Testing
 
     @Test func writeConfigRefusesAnUntrackedProjectPath() async throws {
         let env = try makeEnv()
-        let stranger = FileManager.default.temporaryDirectory
-            .appending(path: "directa-stranger-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: stranger, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: stranger) }
+        let stranger = try TemporaryTree.directory(named: "stranger")
         let registry = Registry(paths: env.paths)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
         let body = """

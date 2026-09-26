@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -7,12 +8,9 @@ import Testing
 /** `GlobalOptions.resolveProject` against real git layouts: the
     devservers.json ancestor search stops at a linked worktree's root and
     crosses `.git` directories and submodule `.git` files. */
-@Suite struct ProjectResolutionTests {
+@Suite(.temporaryTree) struct ProjectResolutionTests {
     private func makeBase() throws -> URL {
-        let base = URL(fileURLWithPath: canonicalProjectPath(FileManager.default.temporaryDirectory.path))
-            .appending(path: "directa-resolve-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        return base
+        URL(fileURLWithPath: canonicalProjectPath(try TemporaryTree.directory(named: "resolve").path))
     }
 
     private func directory(_ url: URL) throws -> URL {

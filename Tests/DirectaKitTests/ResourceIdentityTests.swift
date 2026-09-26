@@ -1,14 +1,12 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 
 @testable import DirectaKit
 
-@Suite struct ResourceIdentityTests {
+@Suite(.temporaryTree) struct ResourceIdentityTests {
     private func scratch() throws -> URL {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-res-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
+        try TemporaryTree.directory(named: "res")
     }
 
     @Test func hash8IsUnchangedByTheHashHexRefactor() {

@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -11,15 +12,14 @@ import Testing
     It must never act on a project whose checkout still exists (that would
     drop trust and delete logs for something still live), and must refuse a
     path directa never registered rather than silently succeeding. */
-@Suite struct ProjectForgetTests {
+@Suite(.temporaryTree) struct ProjectForgetTests {
     private struct Env {
         let paths: DirectaPaths
         let project: String
     }
 
     private func makeEnv() throws -> Env {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-project-forget-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "project-forget")
         let project = base.appending(path: "proj")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         return Env(

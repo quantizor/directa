@@ -1,3 +1,4 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -96,13 +97,11 @@ struct PortCollisionTests {
 /** Sibling worktrees share a committed port deliberately and rebind on ensure,
     so a collision between them is the design working, not a fault. Needs real
     git checkouts because the exclusion asks git for the common dir. */
-@Suite(.serialized) struct PortCollisionSiblingTests {
+@Suite(.serialized, .temporaryTree) struct PortCollisionSiblingTests {
     @Test func siblingWorktreesAreNotReported() throws {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-collide-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "collide")
         let main = base.appending(path: "main")
         try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: base) }
 
         /** Fail at the callsite that broke. A git command that quietly exits
             nonzero (no git, no worktree support, a permissions problem) otherwise

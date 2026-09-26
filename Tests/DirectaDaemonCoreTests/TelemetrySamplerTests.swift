@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 import os
@@ -6,9 +7,7 @@ import os
 @testable import DirectaDaemonCore
 
 private func temporaryDirectory() throws -> URL {
-    let url = FileManager.default.temporaryDirectory.appending(path: "directa-sampler-\(UUID().uuidString)")
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    return url
+    try TemporaryTree.directory(named: "sampler")
 }
 
 private struct SnapshotRead: Decodable {
@@ -37,12 +36,11 @@ private let fastPolicy = TelemetryCadence.Policy(
     baselineSeconds: 0.02, burstSeconds: 0.02, burstThreadFraction: 0.5, burstTailSeconds: 60,
     thresholdCooldownSeconds: 60, thresholdThreadFraction: 0.75)
 
-@Suite struct TelemetrySamplerTests {
+@Suite(.temporaryTree) struct TelemetrySamplerTests {
     /** Also holds a width-1 lane with one job running and two queued, so the
         snapshot's lane pressure is a known answer. */
     @Test func samplesRealKernelNumbersAndLanePressure() throws {
         let directory = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
         let log = TelemetryLog(directory: directory)
         let lane = BlockingLane(label: "dev.quantizor.directa.test.held", width: 1, activity: DaemonActivity())
         let gate = DispatchSemaphore(value: 0)
@@ -117,7 +115,6 @@ private let fastPolicy = TelemetryCadence.Policy(
         every suite running in parallel in this process too. */
     @Test func keepsSamplingWhileTheCooperativePoolIsBlocked() throws {
         let directory = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
         let log = TelemetryLog(directory: directory)
         let sampler = TelemetrySampler(
             configuration: .init(
@@ -147,7 +144,6 @@ private let fastPolicy = TelemetryCadence.Policy(
 
     @Test func bootWritesMarksAndAnIncidentFromThePreviousRun() throws {
         let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
         let paths = DirectaPaths(dataDir: root.appending(path: "data"), logsDir: root.appending(path: "logs"))
         let previousLog = TelemetryLog(directory: paths.daemonTelemetryDir)
         let lastAt = Date().addingTimeInterval(-30)
@@ -199,7 +195,6 @@ private let fastPolicy = TelemetryCadence.Policy(
     @Test func thresholdSampleCarriesDetailAMarkAndOnePersistedLogLine() throws {
         let recorder = try #require(DirectaLog.backend as? RecordingBackend)
         let directory = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
         let log = TelemetryLog(directory: directory)
         let activity = DaemonActivity()
         let stuck = activity.begin(.lsof, label: "lsof -nP -tiTCP:45999")
@@ -233,7 +228,6 @@ private let fastPolicy = TelemetryCadence.Policy(
 
     @Test func reportScanKeepsRelevantReportsInsideTheWindow() throws {
         let folder = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: folder) }
         let boot = Date(timeIntervalSince1970: 1_790_000_000)
         let windowStart = boot.addingTimeInterval(-120)
         let jetsam = [

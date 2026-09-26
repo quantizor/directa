@@ -10,18 +10,33 @@ SIGN_IDENTITY ?= $(shell scripts/signing-identity.sh)
 build:
 	swift build -c release
 
-# The unit suites create their fixture project trees under the user temp dir
-# (directa-sup-*, directa-wt-*, directa-cfg-*, …) and never delete them: a run
-# killed part way has no one to clean up after it. This sweeps anything older
-# than a day, so a second `make test` running concurrently is untouched and a
-# just-finished run's own dirs are not yanked from under a still-attached
-# debugger. Best-effort by design (macOS system dirs are unreadable and make
-# find exit 1), so a failed sweep never fails a test run.
+# A run killed part way leaves its scratch trees under the user temp dir
+# (directa-run.*, directa-test-*) with no one to clean up after it. This sweeps
+# anything older than a day, so a second `make test` running concurrently is
+# untouched and a just-finished run's own dirs are not yanked from under a
+# still-attached debugger. Best-effort by design (macOS system dirs are
+# unreadable and make find exit 1), so a failed sweep never fails a test run.
 sweep-test-temp:
 	@find "$$(getconf DARWIN_USER_TEMP_DIR)" -mindepth 1 -maxdepth 1 -name 'directa-*' -type d -mtime +0 -exec rm -rf {} + 2>/dev/null || true
 
+# Every test's scratch tree comes from TemporaryTree
+# (Tests/DirectaTestSupport/TemporaryTree.swift), which removes it when the
+# test ends. The run gets its own root through DIRECTA_TEST_TEMP_ROOT, and a
+# root that is not empty afterward fails the run and is kept for inspection:
+# something bypassed the helper, or a server rebuilt a tree after its test
+# returned.
 test: sweep-test-temp
-	swift test
+	@root="$$(mktemp -d "$$(getconf DARWIN_USER_TEMP_DIR)directa-run.XXXXXX")" || exit 1; \
+	DIRECTA_TEST_TEMP_ROOT="$$root" swift test; status=$$?; \
+	left="$$(find "$$root" -mindepth 1 -maxdepth 1)"; \
+	if [ -n "$$left" ]; then \
+		echo "error: the test run left temporary trees in $$root:" >&2; \
+		echo "$$left" >&2; \
+		echo "fix: each test's tree must be gone when it returns; see Tests/DirectaTestSupport/TemporaryTree.swift" >&2; \
+		exit 1; \
+	fi; \
+	rm -rf "$$root"; \
+	exit $$status
 
 app: build
 	scripts/make-app-bundle.sh "$(SIGN_IDENTITY)"

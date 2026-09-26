@@ -1,3 +1,4 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -118,7 +119,7 @@ import Testing
     }
 }
 
-@Suite struct WatchPathsTests {
+@Suite(.temporaryTree) struct WatchPathsTests {
     @Test func relativeEntriesResolveAgainstTheProjectRoot() {
         let resolved = WatchPaths.resolve(entries: ["vite.config.ts"], project: "/Users/x/proj")
         #expect(resolved.paths == ["/Users/x/proj/vite.config.ts"])
@@ -143,8 +144,7 @@ import Testing
     }
 
     @Test func aDirectoryIsDroppedWithAReason() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-watch-\(UUID().uuidString)")
+        let dir = try TemporaryTree.directory(named: "watch")
         try FileManager.default.createDirectory(
             at: dir.appending(path: "sub"), withIntermediateDirectories: true)
         let resolved = WatchPaths.resolve(entries: ["sub"], project: dir.path)

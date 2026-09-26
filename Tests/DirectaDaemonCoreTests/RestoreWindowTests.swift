@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -11,10 +12,9 @@ import Testing
     daemon that is truly gone produces, so an agent polling across an install or
     restart bounce read a busy daemon as a dead one and tried to start a second.
     The daemon now accepts during restore and says which of the two it is. */
-@Suite struct RestoreWindowTests {
+@Suite(.temporaryTree) struct RestoreWindowTests {
     private func makeRouter() throws -> (router: Router, project: String) {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-restore-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "restore")
         let project = base.appending(path: "proj")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         try Data(#"{"servers":{},"version":1}"#.utf8).write(

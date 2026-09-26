@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -11,15 +12,14 @@ import Testing
     `recordOutcome` at all, since `stop()` no-ops for one. The manual post
     belongs to the terminal case only, or a live server's stop is recorded
     twice. */
-@Suite struct MissingProjectTests {
+@Suite(.temporaryTree) struct MissingProjectTests {
     private struct Env {
         let paths: DirectaPaths
         let project: String
     }
 
     private func makeEnv() throws -> Env {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-missing-project-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "missing-project")
         let project = base.appending(path: "proj")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         return Env(

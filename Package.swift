@@ -70,13 +70,20 @@ let package = Package(
             name: "fixture-server",
             swiftSettings: strictCore
         ),
+        /** Test-only helpers shared by every test target (the scoped temporary
+            tree). Depended on by test targets alone, so no product links it. */
+        .target(
+            name: "DirectaTestSupport",
+            path: "Tests/DirectaTestSupport",
+            swiftSettings: strictCore
+        ),
         .testTarget(
             name: "DirectaKitTests",
-            dependencies: ["DirectaKit"]
+            dependencies: ["DirectaKit", "DirectaTestSupport"]
         ),
         .testTarget(
             name: "DirectaDaemonCoreTests",
-            dependencies: ["DirectaDaemonCore", "DirectaKit"]
+            dependencies: ["DirectaDaemonCore", "DirectaKit", "DirectaTestSupport"]
         ),
         /** The CLI's argument parsing is behavior with a contract (docs/cli-contract.md)
             and no other way to exercise it: a parse defect there silently changes
@@ -85,6 +92,7 @@ let package = Package(
             name: "DirectaCLITests",
             dependencies: [
                 "DirectaKit",
+                "DirectaTestSupport",
                 "directa",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]

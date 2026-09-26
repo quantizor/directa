@@ -1,5 +1,6 @@
 import Darwin
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -11,10 +12,9 @@ import Testing
     and closes the connection needs a raw socket that can write bytes with no
     trailing newline; a normal request through `DaemonClient` proves the cap
     left ordinary traffic alone. */
-@Suite struct RequestCapTests {
+@Suite(.temporaryTree) struct RequestCapTests {
     private func startServer() async throws -> (socketPath: String, cleanup: () -> Void) {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-cap-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "cap")
         let paths = DirectaPaths(
             dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs"))
         try FileManager.default.createDirectory(at: paths.dataDir, withIntermediateDirectories: true)
@@ -31,10 +31,7 @@ import Testing
         try await server.startAccepting()
         return (
             socketPath,
-            {
-                try? FileManager.default.removeItem(at: base)
-                try? FileManager.default.removeItem(atPath: socketPath)
-            }
+            { try? FileManager.default.removeItem(atPath: socketPath) }
         )
     }
 

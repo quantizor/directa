@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -10,12 +11,11 @@ import Testing
 
     Every case drives `sweepWatches(now:)` with an explicit clock rather than
     sleeping out the settle and quiet windows. */
-@Suite(.serialized) struct WatchTests {
+@Suite(.serialized, .temporaryTree) struct WatchTests {
     private func env(port: Int, watch: String?, locks: Bool = false) throws -> (
         paths: DirectaPaths, project: String
     ) {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-watch-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "watch")
         let project = base.appending(path: "proj")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         try Data("v1\n".utf8).write(to: project.appending(path: "app.config.json"))
