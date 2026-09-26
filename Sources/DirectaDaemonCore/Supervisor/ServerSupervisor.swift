@@ -471,15 +471,17 @@ public actor ServerSupervisor {
         stopWasDeliberate = deliberate
         stopReason = reason
         phase = .stopping
-        await logStore.append(stream: .sys, text: "stopping: \(reason)")
         /** Capture the run's identity and its session before any signal and
             before any await: after the grace window the pid number may name a
             different process, recordOutcome for this same exit can run during the
             awaits below and clear the live fields, and signalRun revalidates
-            against the captured identity so a recycled pid is never hit. */
+            against the captured identity so a recycled pid is never hit. The log
+            append is itself an await (actor hop to logStore), so it runs after
+            this capture too, not before it. */
         let rootIdentity = ProcessTree.identity(of: target)
         let sessionID = rootSessionID
         let snapshot = lastDescendantSnapshot
+        await logStore.append(stream: .sys, text: "stopping: \(reason)")
         let signaled = signalRun(
             target: target, rootIdentity: rootIdentity, sessionID: sessionID,
             snapshot: snapshot, signal: SIGTERM)
