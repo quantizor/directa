@@ -133,7 +133,7 @@ enum CLIRunner {
         case .usage:
             Foundation.exit(2)
         case .alreadyExists, .configInvalid, .internalError, .notTrusted, .portDrift, .portHeld,
-            .resourceLocked, .resourceMutated, .spawnFailed:
+            .requestTooLarge, .resourceLocked, .resourceMutated, .spawnFailed:
             Foundation.exit(1)
         }
     }

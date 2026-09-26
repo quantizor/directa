@@ -6,7 +6,9 @@ The JSON surface agents depend on. Every schema here is generated from the Codab
 
 Success: the command's result object on stdout. Failure with `--json`: `{"ok": false, "error": {"code", "message", "hint"}}` on stdout; `hint` is the literal remediation command when one exists.
 
-Stable `error.code` values: `already-exists`, `config-invalid`, `daemon-starting`, `daemon-unreachable`, `internal-error`, `not-found`, `not-trusted`, `port-drift`, `port-held`, `resource-locked`, `resource-mutated`, `spawn-failed`, `usage`, `version-mismatch`. (Grows append-only.)
+Stable `error.code` values: `already-exists`, `config-invalid`, `daemon-starting`, `daemon-unreachable`, `internal-error`, `not-found`, `not-trusted`, `port-drift`, `port-held`, `request-too-large`, `resource-locked`, `resource-mutated`, `spawn-failed`, `usage`, `version-mismatch`. (Grows append-only.)
+
+A request line the daemon has not yet seen a newline for is capped at a fixed size (a request is always small; the largest legitimate one, a whole devservers.json through `project.writeConfig`, is nowhere close). Exceeding it answers `request-too-large` on that connection and closes it. This never fires for the CLI or the app, which always send one small, complete, newline-terminated request at a time; it only guards a client writing directly to the socket. A daemon response carries no such cap, since `directa logs` without `--tail` can legitimately answer with tens of megabytes.
 
 Exit codes: 0 ok · 1 operation failed (crash, timeout, conflict) · 2 usage · 3 daemon unreachable · 4 named server not found. Unnamed `status` in an unconfigured project exits 0 with `{"servers": []}`. `--project` must name an existing directory; a project name is refused `usage` (exit 2) rather than answered as an empty project.
 

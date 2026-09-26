@@ -90,6 +90,10 @@ public enum WireErrorCode: String, Codable, Sendable {
     case notTrusted = "not-trusted"
     case portDrift = "port-drift"
     case portHeld = "port-held"
+    /** A request line grew past the daemon's pending-request cap with no
+        newline yet seen, so the connection was closed before any frame on it
+        could be decoded. */
+    case requestTooLarge = "request-too-large"
     case resourceLocked = "resource-locked"
     case resourceMutated = "resource-mutated"
     case spawnFailed = "spawn-failed"
@@ -684,6 +688,12 @@ public struct NDJSONBuffer: Sendable {
     private var scanned = 0
 
     public init() {}
+
+    /** Bytes buffered with no newline seen yet: the current request or response
+        line in progress. The control server caps this on its (untrusted-client)
+        side to bound memory; a client reading the daemon's own responses, which
+        can legitimately run tens of megabytes, never consults it. */
+    public var pendingByteCount: Int { buffer.count }
 
     /** Appends bytes and returns any newly completed lines (without the
         newline). Scans only the bytes appended since the previous call, and

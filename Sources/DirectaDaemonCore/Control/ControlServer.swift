@@ -1847,6 +1847,15 @@ public final class ControlServer: Sendable {
         the process exits so launchd can try a clean one. */
     static let listenerReadySeconds = 10.0
 
+    /** Ceiling on one pending (not yet newline-terminated) request line. The
+        largest legitimate request is a `project.writeConfig` carrying a whole
+        devservers.json, which is a handful of KB even for a large monorepo; 1
+        MiB is generous headroom above that while still bounding how much a
+        client streaming bytes with no newline can grow the daemon's memory.
+        The client side is never capped: a `directa logs` response with no
+        `--tail` can legitimately run tens of MB. */
+    static let maxPendingRequestBytes = 1 << 20
+
     /** Returns when the listener is actually accepting, which is later than
         `NWListener.start` returns: start is asynchronous, and the socket path is
         unlinked during init and only recreated on the way to `.ready`. Treating
@@ -1976,6 +1985,26 @@ public final class ControlServer: Sendable {
                         connection.send(content: response, completion: .contentProcessed { _ in })
                     }
                 }
+            }
+            /** A client streaming bytes with no newline would otherwise grow
+                this connection's buffer without limit; no request this daemon
+                serves comes anywhere near the cap, so reaching it means the
+                frame will never complete and the connection is refused rather
+                than left to grow forever. No request id is known yet (nothing
+                has framed), the same posture `handle(line:)` takes for an
+                unparseable frame. */
+            if advanced.pendingByteCount > maxPendingRequestBytes {
+                let refusal =
+                    (try? NDJSON.encodeLine(
+                        WireResponse<WireEmpty>(
+                            error: WireError(
+                                code: .requestTooLarge,
+                                hint: "send one request per line, under the size limit, with a single trailing newline",
+                                message: "request line exceeded \(maxPendingRequestBytes) bytes with no newline"),
+                            id: "?", ok: false))) ?? Data()
+                connection.send(
+                    content: refusal, completion: .contentProcessed { _ in connection.cancel() })
+                return
             }
             if isComplete || error != nil {
                 connection.cancel()
