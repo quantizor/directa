@@ -89,7 +89,7 @@ final class ExitWatcher: Sendable {
                     SpawnError(errno: Int(fallbackErr), message: "cannot watch pid \(pid) for exit"))
             }
             DirectaLog.supervisor.error(
-                "pid \(pid) exit status unavailable: NOTE_EXITSTATUS refused (EACCES), this daemon may not signal that process (different user); watching exit only, outcome will report as status-unknown"
+                "pid \(pid) exit status unavailable: NOTE_EXITSTATUS refused (EACCES), this daemon may not signal that process (different user); watching exit only, the exit status will come from launchd's record of the job, else report as status-unknown"
             )
             return .armed(statusKnown: false)
         }

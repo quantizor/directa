@@ -112,7 +112,10 @@ public struct LaunchdJobLauncher: ProcessLauncher {
             switch ExitWatcher.shared.arm(pid: pid) {
             case .armed:
                 await onSpawn(pid)
-                return await ExitWatcher.shared.wait(pid: pid)
+                let watched = await ExitWatcher.shared.wait(pid: pid)
+                return await Self.armedOutcome(watched) {
+                    await Self.launchdExitRecord(domain: domain, label: label)
+                }
             case .failed(let error):
                 /** Measured on a real machine: a session leader that dies in
                     the gap between confirming leadership and this arm call is
@@ -190,9 +193,24 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         here only covers a plist a crashed prior daemon left behind). */
     public func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
         let domain = LaunchdJobs.guiDomain
-        let outcome = await ExitWatcher.shared.wait(pid: pid)
+        let watched = await ExitWatcher.shared.wait(pid: pid)
+        let outcome = await Self.armedOutcome(watched) {
+            await Self.launchdExitRecord(domain: domain, label: label)
+        }
         await Self.bootOut(domain: domain, label: label)
         return outcome
+    }
+
+    /** The outcome of an armed watch, completed from launchd's own record
+        when the kernel withheld the exit status (`ExitWatcher.arm`'s
+        NOTE_EXIT-only fallback): the job is still bootstrapped until its
+        bootout, so `record` can still read its last exit code or terminating
+        signal. Any other outcome stands as watched. */
+    static func armedOutcome(
+        _ watched: ProcessOutcome, record: () async -> ProcessOutcome
+    ) async -> ProcessOutcome {
+        guard case .exitedStatusUnknown = watched else { return watched }
+        return await record()
     }
 
     /** launchd places the job in process group 1. Group teardown needs
@@ -262,9 +280,10 @@ public struct LaunchdJobLauncher: ProcessLauncher {
     static let exitRecordAttempts = 10
     static let exitRecordInterval = Duration.milliseconds(50)
 
-    /** The exit of a still-bootstrapped job whose process died before its
-        watch was armed, read from `launchctl print` once launchd shows the
-        job not running with an exit record. */
+    /** The exit of a still-bootstrapped job, read from `launchctl print` once
+        launchd shows the job not running with an exit record: for a process
+        that died before its watch was armed, and for an armed watch the
+        kernel gave no exit status. */
     private static func launchdExitRecord(domain: String, label: String) async -> ProcessOutcome {
         await exitRecord(attempts: exitRecordAttempts, interval: exitRecordInterval) {
             let printed = await LaunchdAdmin.shell("/bin/launchctl", ["print", "\(domain)/\(label)"])

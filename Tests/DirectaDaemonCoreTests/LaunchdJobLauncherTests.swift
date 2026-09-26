@@ -252,6 +252,39 @@ struct LaunchdJobLauncherTests {
         #expect(made.withLock { $0 } == readCount)
     }
 
+    /** An armed watch whose exit status the kernel withheld (the NOTE_EXIT-only
+        fallback) takes launchd's own record of the still-bootstrapped job;
+        any outcome the watch did report stands without a launchd read. */
+    @Test(arguments: [
+        ("exitedStatusUnknown", [LaunchdJobs.AgentStatus(lastExitCode: 3, runs: 1)], "exited(code: 3)", 1),
+        ("exitedStatusUnknown", [LaunchdJobs.AgentStatus(lastTerminatingSignal: 15, runs: 1)], "signaled(signal: 15)", 1),
+        ("exitedStatusUnknown", [nil], "exitedStatusUnknown", 3),
+        ("exited", [LaunchdJobs.AgentStatus(lastExitCode: 3, runs: 1)], "exited(code: 0)", 0),
+        ("signaled", [LaunchdJobs.AgentStatus(lastExitCode: 3, runs: 1)], "signaled(signal: 9)", 0),
+    ] as [(String, [LaunchdJobs.AgentStatus?], String, Int)])
+    func armedOutcomeReadsLaunchdOnlyWhenTheStatusIsUnknown(
+        watched: String, reads: [LaunchdJobs.AgentStatus?], expected: String, readCount: Int
+    ) async {
+        let outcome: ProcessOutcome =
+            switch watched {
+            case "exited": .exited(code: 0)
+            case "signaled": .signaled(signal: 9)
+            default: .exitedStatusUnknown
+            }
+        let made = OSAllocatedUnfairLock(initialState: 0)
+        let resolved = await LaunchdJobLauncher.armedOutcome(outcome) {
+            await LaunchdJobLauncher.exitRecord(attempts: 3, interval: .zero) {
+                let index = made.withLock { count in
+                    defer { count += 1 }
+                    return count
+                }
+                return reads[min(index, reads.count - 1)]
+            }
+        }
+        #expect("\(resolved)" == expected)
+        #expect(made.withLock { $0 } == readCount)
+    }
+
     private func openSpool() throws -> (Int32, URL) {
         let url = FileManager.default.temporaryDirectory.appending(
             path: "directa-job-\(UUID().uuidString).log")
