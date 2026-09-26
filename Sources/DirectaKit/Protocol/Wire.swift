@@ -90,6 +90,10 @@ public enum WireErrorCode: String, Codable, Sendable {
     case notTrusted = "not-trusted"
     case portDrift = "port-drift"
     case portHeld = "port-held"
+    /** `project.forget` refuses a project whose checkout still exists: acting
+        on it would drop trust and delete logs for a project that is still
+        live, not merely stale. */
+    case projectStillExists = "project-still-exists"
     /** A request line grew past the daemon's pending-request cap with no
         newline yet seen, so the connection was closed before any frame on it
         could be decoded. */
@@ -210,6 +214,7 @@ public enum WireMethod: String, CaseIterable, Sendable {
     case logsMark = "logs.mark"
     case logsQuery = "logs.query"
     case projectCheck = "project.check"
+    case projectForget = "project.forget"
     case projectInitConfig = "project.initConfig"
     case projectTrust = "project.trust"
     case projectWriteConfig = "project.writeConfig"
@@ -462,6 +467,17 @@ public struct ProjectOnlyParams: Codable, Equatable, Sendable {
 
     public init(project: String) {
         self.project = project
+    }
+}
+
+/** `project.forget`'s result: the ad hoc and persisted server names the daemon
+    dropped along with the project row, trust, and log directory. Empty for a
+    trusted project that carried no ad hoc or previously-run server. */
+public struct ProjectForgetResult: Codable, Equatable, Sendable {
+    public var servers: [String]
+
+    public init(servers: [String]) {
+        self.servers = servers
     }
 }
 

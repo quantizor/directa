@@ -279,6 +279,15 @@ import Testing
         )
     }
 
+    /** `project.forget`'s result names the servers it dropped along with the
+        row, trust, and log directory: `doctor --fix` reports the count in its
+        finding without a second query. */
+    @Test func projectForgetResultSchemaGolden() throws {
+        let result = ProjectForgetResult(servers: ["api", "web"])
+        let json = String(data: try JSONCoding.encoder().encode(result), encoding: .utf8)!
+        #expect(json == #"{"servers":["api","web"]}"#)
+    }
+
     /** Append-only is a wire promise: a reason the current daemon never
         produces (the worktree label host was removed) must still decode, so an
         older daemon on the socket does not break a newer CLI. */

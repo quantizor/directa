@@ -133,7 +133,7 @@ enum CLIRunner {
         case .usage:
             Foundation.exit(2)
         case .alreadyExists, .configInvalid, .internalError, .notTrusted, .portDrift, .portHeld,
-            .requestTooLarge, .resourceLocked, .resourceMutated, .spawnFailed:
+            .projectStillExists, .requestTooLarge, .resourceLocked, .resourceMutated, .spawnFailed:
             Foundation.exit(1)
         }
     }
@@ -1733,15 +1733,33 @@ struct Doctor: AsyncParsableCommand {
             }
             for project in staleProjects.sorted() {
                 if fix {
-                    let names = all.servers.filter { $0.project == project }.map(\.server)
-                    for name in names {
-                        _ = try? await client.request(
-                            .serverUnregister,
-                            params: ServerTargetParams(name: name, project: project),
-                            expecting: WireEmpty.self)
+                    /** `project.forget` runs the same daemon-side teardown the
+                        automatic missing-project sweep uses (stop supervisors,
+                        drop locks/state/registry row/trust, remove the log
+                        directory), bypassing that sweep's two-consecutive-miss
+                        debounce since the caller asked explicitly for this one
+                        project. No `try?`: a failure here (the project still
+                        exists, or the daemon refused for another reason) is a
+                        real finding, not a silent no-op. */
+                    do {
+                        let result = try await client.request(
+                            .projectForget, params: ProjectOnlyParams(project: project),
+                            expecting: ProjectForgetResult.self)
+                        findings.append(
+                            Finding(
+                                detail: "forgot \(project) (\(result.servers.count) servers)",
+                                kind: "stale-project", severity: "fixed"))
+                    } catch let error as WireError {
+                        findings.append(
+                            Finding(
+                                detail: "could not forget \(project): \(error.message)",
+                                kind: "stale-project", severity: "error"))
+                    } catch {
+                        findings.append(
+                            Finding(
+                                detail: "could not forget \(project): \(error.localizedDescription)",
+                                kind: "stale-project", severity: "error"))
                     }
-                    findings.append(
-                        Finding(detail: "pruned \(project) (\(names.count) servers)", kind: "stale-project", severity: "fixed"))
                 } else {
                     findings.append(
                         Finding(

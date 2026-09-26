@@ -179,6 +179,31 @@ public actor Router {
                 try await registry.setTrusted(
                     project: canonicalProjectPath(request.params.project))
                 return try respond(id: head.id, result: WireEmpty())
+            case .projectForget:
+                let request = try decoder.decode(WireRequest<ProjectOnlyParams>.self, from: line)
+                /** Unlike every other project-scoped arm, this one must not
+                    canonicalize the caller's path: a directory that no longer
+                    exists cannot be resolved through `canonicalProjectPath` to
+                    the same spelling recorded at registration (a
+                    `/private/var` ↔ `/var` symlink resolves only while the
+                    directory exists; see `forgetMissingProject`), so the
+                    caller is expected to pass exactly the `project` string a
+                    prior `server.status` returned. */
+                let project = request.params.project
+                guard await registry.project(project) != nil else {
+                    throw WireError(
+                        code: .notFound,
+                        hint: "run: directa status --json",
+                        message: "\(project) is not a project directa tracks")
+                }
+                guard !FileManager.default.fileExists(atPath: project) else {
+                    throw WireError(
+                        code: .projectStillExists,
+                        hint: "run: directa status --json",
+                        message: "\(project) still exists on disk; forgetting it would drop trust for a live checkout")
+                }
+                let servers = await forgetMissingProject(project)
+                return try respond(id: head.id, result: ProjectForgetResult(servers: servers))
             case .projectCheck:
                 let request = try decoder.decode(WireRequest<ProjectOnlyParams>.self, from: line)
                 let project = canonicalProjectPath(request.params.project)
@@ -776,8 +801,12 @@ public actor Router {
         is gone, so this walks supervisors + registry + state directly instead of
         groupDown / mergedSpecs. `project` must be the registry key as stored
         (already canonical at registration): re-canonicalizing a deleted path can
-        change `/private/var` ↔ `/var` spelling and miss every lookup. */
-    private func forgetMissingProject(_ project: String) async {
+        change `/private/var` ↔ `/var` spelling and miss every lookup. Returns the
+        sorted ad hoc and persisted-state server names it dropped, for a caller
+        (`project.forget`) that reports what actually happened rather than
+        assuming success. */
+    @discardableResult
+    private func forgetMissingProject(_ project: String) async -> [String] {
         let prefix = "\(project)::"
         /** Snapshot identities before teardown: a composite tree can outlive a
             no-op stop (phase already crashed/failed after the checkout vanished),
@@ -856,6 +885,7 @@ public actor Router {
             await events.post(
                 kind: .unregistered, project: project, server: name, detail: "project path gone")
         }
+        return sortedNames
     }
 
     private enum RecoverSpec {
