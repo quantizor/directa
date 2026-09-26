@@ -268,11 +268,12 @@ import Testing
 
     /** Discarding a worktree path stops its children and forgets registry/state
         without touching the main checkout. */
-    /** The timer sweep needs the path missing on two consecutive passes before
-        it tears a project down (one flaky stat must never be irreversible), and
-        on the second pass the children are stopped and the registration is
-        forgotten exactly like the machine-wide prune. */
-    @Test func missingProjectSweepPrunesAfterTwoConsecutiveMisses() async throws {
+    /** The timer sweep needs the path missing continuously for a full sweep
+        interval before it tears a project down (one flaky stat must never be
+        irreversible), and once that interval elapses the children are stopped
+        and the registration is forgotten exactly like the machine-wide prune.
+        A clock passed explicitly, never a sleep, moves time forward. */
+    @Test func missingProjectSweepPrunesAfterTheDebounceInterval() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.worktree)
@@ -287,13 +288,20 @@ import Testing
 
         try FileManager.default.removeItem(atPath: env.worktree)
 
+        let firstMiss = Date()
         /** First miss: held. Nothing is torn down on one flaky stat. */
-        #expect(await router.sweepMissingProjects() == 0)
+        #expect(await router.pruneMissingProjects(now: firstMiss) == 0)
         #expect(await registry.project(projectKey) != nil)
         #expect(kill(pid_t(pid), 0) == 0)
 
-        /** Second miss: torn down, children stopped, state forgotten. */
-        #expect(await router.sweepMissingProjects() == 1)
+        /** Still inside the sweep interval: still held. */
+        #expect(await router.pruneMissingProjects(now: firstMiss.addingTimeInterval(1)) == 0)
+        #expect(await registry.project(projectKey) != nil)
+
+        /** Missing continuously for the full sweep interval: torn down,
+            children stopped, state forgotten. */
+        let afterInterval = firstMiss.addingTimeInterval(Router.missingProjectSweepIntervalSeconds)
+        #expect(await router.pruneMissingProjects(now: afterInterval) == 1)
         #expect(await registry.project(projectKey) == nil)
         #expect(kill(pid_t(pid), 0) != 0)
         #expect(!PortGuard.isListening(port: try #require(started.server.effectivePort)))
@@ -323,6 +331,13 @@ import Testing
 
         try FileManager.default.removeItem(atPath: env.worktree)
         #expect(!FileManager.default.fileExists(atPath: env.worktree))
+
+        /** Primes the debounce with a first-miss timestamp already past the
+            sweep interval, so the next real check below (the ordinary
+            machine-wide status path, timed by the wall clock) forgets on this
+            one call instead of needing a real 30-second wait. */
+        _ = await router.pruneMissingProjects(
+            now: Date().addingTimeInterval(-Router.missingProjectSweepIntervalSeconds - 1))
 
         let after = try await handle(
             router, .serverStatus, ProjectParams(project: ""), ServerListResult.self)
@@ -361,6 +376,11 @@ import Testing
         let mainProject = canonicalProjectPath(env.main)
 
         try FileManager.default.removeItem(atPath: env.worktree)
+        /** Same priming as the machine-wide status test above: recoverAtStartup
+            calls `pruneMissingProjects()` with the real wall clock, so the
+            first-miss record is seeded already past the interval. */
+        _ = await router.pruneMissingProjects(
+            now: Date().addingTimeInterval(-Router.missingProjectSweepIntervalSeconds - 1))
         await router.recoverAtStartup()
         #expect(await registry.project(wtProject) == nil)
         #expect(kill(pid_t(wtPid), 0) != 0)

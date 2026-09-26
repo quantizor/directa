@@ -60,7 +60,12 @@ import Testing
             spelling recorded while the directory was still there. */
         let canonicalProject = canonicalProjectPath(env.project)
         try FileManager.default.removeItem(atPath: env.project)
-        await router.pruneMissingProjects()
+        let now = Date()
+        /** First miss only starts the debounce; forgetting needs a second
+            check a full sweep interval later (`MissingProjectPolicy`). */
+        await router.pruneMissingProjects(now: now)
+        await router.pruneMissingProjects(
+            now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
 
         let events = try await handle(
             router, .eventsQuery, EventsQueryParams(project: canonicalProject),
@@ -86,7 +91,10 @@ import Testing
 
         let canonicalProject = canonicalProjectPath(env.project)
         try FileManager.default.removeItem(atPath: env.project)
-        await router.pruneMissingProjects()
+        let now = Date()
+        await router.pruneMissingProjects(now: now)
+        await router.pruneMissingProjects(
+            now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
 
         let events = try await handle(
             router, .eventsQuery, EventsQueryParams(project: canonicalProject),
@@ -95,5 +103,42 @@ import Testing
         #expect(stopped.count == 1)
         #expect(stopped.first?.detail == "project path gone")
         #expect(events.events.filter { $0.kind == .unregistered }.count == 1)
+    }
+
+    /** A checkout that comes back before the sweep interval elapses (an
+        unmount that resolves, a Finder move undone) clears the miss instead of
+        being forgotten on the schedule the first miss started: a later check
+        past that original interval sees the path present and does nothing. */
+    @Test func aPathThatReappearsIsNeverForgotten() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+
+        _ = try await handle(
+            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+            ServerResult.self)
+
+        /** Captured while the checkout still exists, matching the reasoning in
+            `LogDirCleanupTests`: `canonicalProjectPath` resolves the on-disk
+            path while it exists and falls back to a lexical resolution once it
+            does not, so a lookup after the `removeItem` below must use this
+            spelling, not `env.project` directly. */
+        let canonicalProject = canonicalProjectPath(env.project)
+        let now = Date()
+        try FileManager.default.removeItem(atPath: env.project)
+        #expect(await router.pruneMissingProjects(now: now) == 0)
+        #expect(await registry.project(canonicalProject) != nil)
+
+        try FileManager.default.createDirectory(
+            atPath: env.project, withIntermediateDirectories: true)
+        #expect(
+            await router.pruneMissingProjects(
+                now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds)) == 0)
+        #expect(await registry.project(canonicalProject) != nil)
+
+        _ = try await handle(
+            router, .serverStop, ServerTargetParams(name: "web", project: env.project),
+            ServerResult.self)
     }
 }

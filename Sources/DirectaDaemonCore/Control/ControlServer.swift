@@ -504,44 +504,45 @@ public actor Router {
         }
     }
 
-    /** Forget registered projects whose checkout path is gone: stop children,
-        bounce orphan pids, drop registry/state/locks/supervisors. Immediate at
-        boot and on machine-wide status; the timer sweep (`sweepMissingProjects`)
-        is the debounced variant. */
-    public func pruneMissingProjects() async {
-        for project in await registry.allProjects() {
-            if FileManager.default.fileExists(atPath: project) { continue }
-            await forgetMissingProject(project)
-        }
-    }
+    /** How long a project's checkout path must be observed continuously
+        missing before it is forgotten: one rule for every automatic trigger
+        (boot restore, machine-wide status, the timer sweep), so a fast poller
+        (the app's machine-wide status, every 2s) cannot forget a project any
+        sooner than the timer sweep would, and a network mount blip or a slow
+        unmount never costs a project its trust and log history. */
+    public static let missingProjectSweepIntervalSeconds: Double = 30
 
-    /** Paths that failed the existence check on the previous sweep. A path must
-        be missing on two consecutive sweeps before teardown: a network mount or
-        a slow Finder move makes a path vanish for a moment, and a sweep that
-        runs unattended every 30 seconds must not tear down a live project on
-        one flaky stat. */
-    private var missingProjectStrikes: Set<String> = []
+    /** First-observed-missing timestamp per project path, cleared the moment a
+        stat succeeds again. Shared by every caller of `pruneMissingProjects`. */
+    private var missingProjectFirstMissedAt: [String: Date] = [:]
 
-    /** The timer-side sweep (ddirecta runs it every 30s after restore), so a
-        discarded worktree's servers stop within a minute of the checkout going
-        away instead of waiting for a machine-wide status or a reboot. */
+    /** Forget registered projects whose checkout path has been missing for at
+        least `missingProjectSweepIntervalSeconds`, continuously, across
+        however many callers ask: boot restore, machine-wide status, and the
+        30s timer sweep all funnel through this one debounced rule. Forgetting
+        stops children, bounces orphan pids, and drops registry/state/locks/
+        supervisors. `now` is a parameter rather than `Date()` read inline so
+        tests can move time forward without sleeping. */
     @discardableResult
-    public func sweepMissingProjects() async -> Int {
+    public func pruneMissingProjects(now: Date = Date()) async -> Int {
         var pruned = 0
         let projects = await registry.allProjects()
-        missingProjectStrikes = missingProjectStrikes.filter { projects.contains($0) }
+        missingProjectFirstMissedAt = missingProjectFirstMissedAt.filter { projects.contains($0.key) }
         for project in projects {
-            if FileManager.default.fileExists(atPath: project) {
-                missingProjectStrikes.remove(project)
-                continue
+            let exists = FileManager.default.fileExists(atPath: project)
+            switch MissingProjectPolicy.decide(
+                exists: exists, firstMissedAt: missingProjectFirstMissedAt[project], now: now,
+                sweepIntervalSeconds: Self.missingProjectSweepIntervalSeconds)
+            {
+            case .present:
+                missingProjectFirstMissedAt[project] = nil
+            case .waiting(let since):
+                missingProjectFirstMissedAt[project] = since
+            case .forget:
+                missingProjectFirstMissedAt[project] = nil
+                await forgetMissingProject(project)
+                pruned += 1
             }
-            if !missingProjectStrikes.contains(project) {
-                missingProjectStrikes.insert(project)
-                continue
-            }
-            missingProjectStrikes.remove(project)
-            await forgetMissingProject(project)
-            pruned += 1
         }
         return pruned
     }
@@ -595,6 +596,16 @@ public actor Router {
             guard let parsed = parseServerID(id) else { continue }
             let project = parsed.project
             let name = parsed.name
+            /** `pruneMissingProjects` above only forgets a path missing for a
+                full sweep interval, so a project on its first miss is still
+                here to iterate. Boot restore must never spawn (or adopt, or
+                bounce) a server for a project that is not on disk right now,
+                even mid-debounce: the automatic sweep will finish forgetting
+                it on its own schedule. */
+            guard FileManager.default.fileExists(atPath: project) else {
+                DirectaLog.daemon.info("recover skip \(name)@\(project): project path is missing")
+                continue
+            }
             let leftActive = persisted.phase == .running || persisted.phase == .starting
             let wantsRestore = persisted.resumeOnBoot ?? false
             guard persisted.pid != nil || leftActive || wantsRestore else { continue }
@@ -678,6 +689,10 @@ public actor Router {
             guard let parsed = parseServerID(id) else { continue }
             let project = parsed.project
             let name = parsed.name
+            /** Same guard as the first pass: a project mid-debounce (missing,
+                but not yet forgotten) must not have its state rows read as
+                orphaned just because its config is unreadable right now. */
+            guard FileManager.default.fileExists(atPath: project) else { continue }
             if case .missing = await resolveSpecForRecover(project: project, name: name) {
                 DirectaLog.daemon.info("recover prune \(name)@\(project): orphaned state row")
                 try? await registry.removeState(serverID: id)

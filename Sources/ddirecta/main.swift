@@ -306,7 +306,7 @@ Task {
     Task {
         DirectaLog.daemon.info("missing-project sweep started")
         while !Task.isCancelled {
-            let pruned = await router.sweepMissingProjects()
+            let pruned = await router.pruneMissingProjects()
             if pruned > 0 {
                 DirectaLog.daemon.info("missing-project sweep pruned \(pruned)")
             }

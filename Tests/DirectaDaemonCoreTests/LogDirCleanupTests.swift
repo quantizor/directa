@@ -173,7 +173,12 @@ import Testing
             (never-created) directory instead of the one `plantLogFile` wrote to. */
         let logDir = env.paths.projectLogDir(project: env.project).path
         try FileManager.default.removeItem(atPath: env.project)
-        await router.pruneMissingProjects()
+        let now = Date()
+        /** First miss only starts the debounce; forgetting needs a second
+            check a full sweep interval later (`MissingProjectPolicy`). */
+        await router.pruneMissingProjects(now: now)
+        await router.pruneMissingProjects(
+            now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
 
         #expect(!FileManager.default.fileExists(atPath: logDir))
     }

@@ -6,7 +6,7 @@ import Testing
 
 /** `project.forget` is the explicit, single-project counterpart to the
     automatic missing-project sweep (`forgetMissingProject`, driven by
-    `pruneMissingProjects`/`sweepMissingProjects`): `doctor --fix` calls it for
+    `pruneMissingProjects`): `doctor --fix` calls it for
     a project it believes is stale rather than re-implementing the teardown.
     It must never act on a project whose checkout still exists (that would
     drop trust and delete logs for something still live), and must refuse a
