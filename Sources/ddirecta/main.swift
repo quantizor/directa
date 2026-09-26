@@ -92,6 +92,18 @@ do {
     exit(1)
 }
 
+/** Checked before the lock, not after: an over-long `DIRECTA_SOCKET` reaches
+    `NWListener` as a truncated `sockaddr_un` that binds nowhere, so the daemon
+    printed its "listening on" line and held the single-instance lock forever
+    over a socket nothing could ever connect to. `DaemonClient` already refuses
+    this path with the same wording before ever calling `connect(2)`; failing
+    here first means neither end pretends the daemon is reachable. */
+guard DirectaPaths.fitsSunPath(paths.socketPath) else {
+    FileHandle.standardError.write(
+        Data("ddirecta: \(DirectaPaths.sunPathLimitMessage(paths.socketPath))\n".utf8))
+    exit(1)
+}
+
 /** Single-instancing: an exclusive flock held for the daemon's lifetime. Only the
     lock holder may unlink and rebind the socket, so stale-socket takeover cannot
     race between two starting daemons. */

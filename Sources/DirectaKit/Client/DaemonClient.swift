@@ -40,7 +40,7 @@ public actor DaemonClient {
         let pathBytes = Array(socketPath.utf8)
         guard DirectaPaths.fitsSunPath(socketPath) else {
             close(sock)
-            throw WireError(code: .daemonUnreachable, message: "socket path exceeds sun_path limit: \(socketPath)")
+            throw WireError(code: .daemonUnreachable, message: DirectaPaths.sunPathLimitMessage(socketPath))
         }
         withUnsafeMutableBytes(of: &addr.sun_path) { raw in
             raw.copyBytes(from: pathBytes)

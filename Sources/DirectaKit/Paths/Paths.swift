@@ -50,6 +50,16 @@ public struct DirectaPaths: Sendable {
         path.utf8.count < MemoryLayout.size(ofValue: sockaddr_un().sun_path)
     }
 
+    /** The one wording for a socket path `fitsSunPath` refuses. The client
+        raises this before ever calling `connect(2)`; the daemon raises the same
+        text before taking its single-instance lock, so a `DIRECTA_SOCKET`
+        override too long for `sockaddr_un` fails the same way on both ends
+        instead of the daemon printing a false "listening on" line while
+        `NWListener` binds nothing. */
+    public static func sunPathLimitMessage(_ path: String) -> String {
+        "socket path exceeds sun_path limit: \(path)"
+    }
+
     /** One path component for a server name, safe to append.
 
         A server name comes from a repo's committed devservers.json, so it is not

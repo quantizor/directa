@@ -296,6 +296,16 @@ import Testing
         #expect(!DirectaPaths.fitsSunPath(String(repeating: "x", count: 104)))
     }
 
+    /** The client and the daemon must refuse an over-long `DIRECTA_SOCKET` with
+        the exact same text, since that is the one place either side names the
+        cause: the client raises it before `connect(2)`, and the daemon raises
+        it before taking the single-instance lock. */
+    @Test func sunPathLimitMessageNamesTheOffendingPath() {
+        #expect(
+            DirectaPaths.sunPathLimitMessage("/tmp/too-long.sock")
+                == "socket path exceeds sun_path limit: /tmp/too-long.sock")
+    }
+
     @Test func serverIDShape() {
         #expect(serverID(project: "/a/b", name: "web") == "/a/b::web")
         #expect(parseServerID("/a/b::web")?.project == "/a/b")
