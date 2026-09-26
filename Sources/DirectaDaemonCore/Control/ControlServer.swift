@@ -112,7 +112,7 @@ public actor Router {
             }
             switch method {
             case .daemonInfo:
-                return try respond(id: head.id, result: daemonInfo())
+                return try respond(id: head.id, result: await daemonInfo())
             case .daemonShutdown:
                 let frame = try respond(id: head.id, result: WireEmpty())
                 Task { [weak self] in
@@ -940,8 +940,18 @@ public actor Router {
         }
     }
 
-    private func daemonInfo() -> DaemonInfo {
-        DaemonInfo(
+    private func daemonInfo() async -> DaemonInfo {
+        /** Every registry project plus every project with a resident
+            supervisor: `doctor`'s orphan-log-dir finding wants the set of
+            projects the daemon claims, not the narrower set with a currently
+            readable config (a trusted project mid-edit on an invalid
+            devservers.json still claims its log directory). */
+        var claimed = Set(await registry.allProjects())
+        for id in supervisors.keys {
+            if let parsed = parseServerID(id) { claimed.insert(parsed.project) }
+        }
+        return DaemonInfo(
+            claimedProjects: claimed.sorted(),
             dataDir: paths.dataDir.path,
             daemonVersion: DirectaVersion.version,
             logsDir: paths.logsDir.path,

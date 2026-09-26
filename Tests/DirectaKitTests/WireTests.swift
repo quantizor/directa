@@ -245,6 +245,22 @@ import Testing
         )
     }
 
+    /** `claimedProjects` is append-only like `restoring`: present only once a
+        caller sets it, so `directa doctor` can tell a daemon that never
+        claims anything (an empty array) apart from one built before the field
+        existed (absent, and the orphan-log-dir finding must skip rather than
+        guess). */
+    @Test func daemonInfoSchemaGoldenWithClaimedProjects() throws {
+        let info = DaemonInfo(
+            claimedProjects: ["/p/api", "/p/web"], dataDir: "/data", daemonVersion: "1.4.0",
+            logsDir: "/logs", pid: 42, proto: 1, socketPath: "/data/daemon.sock")
+        let json = String(data: try JSONCoding.encoder().encode(info), encoding: .utf8)!
+        #expect(
+            json
+                == #"{"claimedProjects":["/p/api","/p/web"],"daemonVersion":"1.4.0","dataDir":"/data","logsDir":"/logs","pid":42,"proto":1,"socketPath":"/data/daemon.sock"}"#
+        )
+    }
+
     /** A main checkout answers exactly as it did before the effective-host
         fields existed: they are omitted when nil, which is the compatibility
         claim, asserted rather than assumed. */

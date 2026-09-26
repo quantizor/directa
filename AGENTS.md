@@ -24,7 +24,7 @@ Codebase map
   - Launchd/: LaunchdAdmin (dual install path, SMAppService via app deep link when /Applications/directa.app exists else legacy home LaunchAgent; --legacy forces the home path), LaunchdJobs (parse/stale/reap of one-shot child labels; doctor and recover), DaemonRecoveryPolicy, AgentRebindPolicy (settles the ad-hoc CDHash window on DMG replace; see docs/macos-lifecycle.md), DaemonImagePolicy (the boot-time decision that keeps the daemon's running image off a mounted volume; ddirecta re-execs the canonical binary before taking the lock), AppAgentPolicy (whether app launch should register the app's own KeepAlive LaunchAgent; see docs/macos-lifecycle.md "Menu bar extra").
   - DeepLink/: parse/serialize + DeepLinkRunner + notification action map.
   - Update/: UpdateCheck (GitHub releases/latest, one ETag-cached poll, every failure silent, never fed into AgentContext), DirectaDistribution (the one home for the tap token, releases URL, and brew commands).
-  - Logs/: LogFormat + LogQuery (the since-query binary search that the monotonic-timestamp rule protects), OrphanProjectLogs (slug directories under the logs root no registered project claims, reported by doctor).
+  - Logs/: LogFormat + LogQuery (the since-query binary search that the monotonic-timestamp rule protects), OrphanProjectLogs (slug directories under the logs root no project the daemon claims, reported by doctor).
   - Log/DirectaLog.swift: OSLog facade with a recording backend for tests.
   - Events/DaemonRestartBurstCounter.swift: collapses clustered daemon-restart events into one burst per restart, for doctor's jetsam finding.
 - Sources/DirectaDaemonCore: daemon logic as a library.

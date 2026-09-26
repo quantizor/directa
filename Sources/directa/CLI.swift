@@ -1670,14 +1670,8 @@ struct Doctor: AsyncParsableCommand {
                         kind: "jetsam", severity: "warning"))
             }
         }
-        /** nil only when `serverStatus` itself failed; feeds the orphan-log-dir
-            finding after this block, which must run whether or not it does.
-            Distinct from an empty set, which is a real "nothing registered"
-            answer and must still let every slug directory report as orphaned. */
-        var registeredProjects: Set<String>?
         if let all = try? await client.request(
             .serverStatus, params: ProjectParams(project: ""), expecting: ServerListResult.self) {
-            registeredProjects = Set(all.servers.map(\.project))
             var signatureHolders: [String: String] = [:]
             var staleProjects: Set<String> = []
             /** Host-keyed signatures miss a real collision: two projects on one
@@ -1849,13 +1843,21 @@ struct Doctor: AsyncParsableCommand {
             one when it forgets the project (unregister down to zero servers,
             the missing-project sweep), but a directory predating that fix, or
             orphaned some other way, sits under the logs root forever until
-            `directa uninstall --purge`. Report-only, with the exact command to
-            remove it; skipped entirely when `serverStatus` itself failed, since
-            every slug directory would otherwise misreport as orphaned. */
-        if let registeredProjects {
+            `directa uninstall --purge`. The claimed set comes from the daemon's
+            own `daemon.info` (every registry project plus every project with a
+            resident supervisor), not machine-wide server status: a trusted
+            project mid-edit on an invalid devservers.json, or one whose file
+            was deleted, still claims its log directory even though it has no
+            servers to list. Skipped entirely (never guessed) when talking to a
+            daemon whose `daemon.info` predates `claimedProjects`. Report-only,
+            with the exact command to remove it. */
+        if let info, let claimedProjects = info.claimedProjects {
             let claimedSlugDirs = Set(
-                registeredProjects.map { DirectaPaths().projectLogDir(project: $0).lastPathComponent })
-            for orphan in OrphanProjectLogs.scan(paths: DirectaPaths(), claimedSlugDirs: claimedSlugDirs) {
+                claimedProjects.map { DirectaPaths().projectLogDir(project: $0).lastPathComponent })
+            let logsDir = URL(fileURLWithPath: info.logsDir)
+            for orphan in OrphanProjectLogs.scan(
+                paths: DirectaPaths(logsDir: logsDir), claimedSlugDirs: claimedSlugDirs)
+            {
                 findings.append(
                     Finding(
                         detail: "\(orphan.detail) (run: \(orphan.remedy))",

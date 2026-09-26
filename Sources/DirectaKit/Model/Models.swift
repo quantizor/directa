@@ -555,6 +555,13 @@ public struct WhyResult: Codable, Equatable, Sendable {
 
 /** Basic daemon identity returned by `daemon.info`. */
 public struct DaemonInfo: Codable, Equatable, Sendable {
+    /** Every project the daemon currently claims: every registry project plus
+        every project with a resident supervisor, sorted. Optional and
+        append-only like `restoring`, so an older daemon that never set it is
+        read as "unknown" rather than "claims nothing"; `directa doctor`'s
+        orphan-log-dir finding skips entirely rather than guessing when this
+        is nil. */
+    public var claimedProjects: [String]?
     public var dataDir: String
     public var daemonVersion: String
     public var logsDir: String
@@ -569,6 +576,7 @@ public struct DaemonInfo: Codable, Equatable, Sendable {
     public var socketPath: String
 
     public init(
+        claimedProjects: [String]? = nil,
         dataDir: String,
         daemonVersion: String,
         logsDir: String,
@@ -578,6 +586,7 @@ public struct DaemonInfo: Codable, Equatable, Sendable {
         searchPath: String? = nil,
         socketPath: String
     ) {
+        self.claimedProjects = claimedProjects
         self.dataDir = dataDir
         self.daemonVersion = daemonVersion
         self.logsDir = logsDir
