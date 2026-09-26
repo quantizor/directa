@@ -69,11 +69,6 @@ struct LaunchdJobLauncherTests {
             try? FileManager.default.removeItem(at: errURL)
         }
         let outcome = await LaunchdJobLauncher().run(
-            /** A brief sleep before exiting: `run` confirms the job's pid is
-                published and has become a session leader before arming the
-                exit watch, and a command that exits before that confirmation
-                finishes races `run` into reporting `spawnFailed` instead of
-                the real exit code, independent of this test's assertion. */
             argv: ["/bin/sh", "-c", "sleep 0.3; exit 3"],
             capture: SpawnCapture(
                 stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),
@@ -86,6 +81,50 @@ struct LaunchdJobLauncherTests {
             #expect(code == 3)
         case .exitedStatusUnknown, .signaled, .spawnFailed:
             Issue.record("expected .exited(code: 3), got \(outcome)")
+        }
+    }
+
+    /** A command that exits before `run` can confirm the job's pid has
+        become a session leader used to lose its real exit to a manufactured
+        `spawnFailed` ("never became a session leader"), since the session-
+        leader poll kept retrying `getpgid` for its full budget instead of
+        noticing the pid was already gone. It now notices within one poll
+        (`kill(pid, 0)` answering ESRCH) and arms the exit watch at that point
+        instead, so `spawnFailed` never happens here. `exit 7` is fast enough
+        that this daemon's own two `/bin/launchctl` round trips (bootstrap,
+        then the poll that confirms the pid) measure single-digit
+        milliseconds each and consistently lose the race to launchd reaping
+        the job: the kernel has already discarded the exit status by the time
+        this daemon can register interest, so `NOTE_EXITSTATUS` (or the
+        registration itself) is refused and `.exitedStatusUnknown` is the
+        honest, measured result for this exact command, not the real code 7.
+        A slower failure (a command doing real work before a nonzero exit,
+        `sleep 0.3; exit 3` above) still recovers the real code, since the
+        process is still alive when this daemon gets to register interest. */
+    @Test func launchdJobReportsAnInstantExitAsExitedOrStatusUnknownNeverSpawnFailed() async throws {
+        let (outFD, outURL) = try openSpool()
+        let (errFD, errURL) = try openSpool()
+        defer {
+            close(outFD)
+            close(errFD)
+            try? FileManager.default.removeItem(at: outURL)
+            try? FileManager.default.removeItem(at: errURL)
+        }
+        let outcome = await LaunchdJobLauncher().run(
+            argv: ["/bin/sh", "-c", "exit 7"],
+            capture: SpawnCapture(
+                stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),
+            cwd: nil,
+            environment: [:],
+            onSpawn: { _ in }
+        )
+        switch outcome {
+        case .exited(let code):
+            #expect(code == 7)
+        case .exitedStatusUnknown:
+            break
+        case .signaled, .spawnFailed:
+            Issue.record("expected .exited(code: 7) or .exitedStatusUnknown, got \(outcome)")
         }
     }
 

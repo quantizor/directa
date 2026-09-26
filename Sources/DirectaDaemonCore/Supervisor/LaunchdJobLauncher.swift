@@ -63,20 +63,62 @@ public struct LaunchdJobLauncher: ProcessLauncher {
             return .spawnFailed(
                 SpawnError(errno: nil, message: "launchd job \(label) never published a pid"))
         }
-        guard await Self.waitUntilSessionLeader(pid) else {
+        switch await Self.waitUntilSessionLeader(pid) {
+        case .leader:
+            /** The proven-reliable order: arm only once session leadership
+                (setsid, inside the perl wrapper) is confirmed. Arming any
+                earlier, before that transition, measurably makes the kernel
+                refuse NOTE_EXITSTATUS even for a process that is very much
+                still alive, trading a rare lost exit code for a common one. */
+            switch ExitWatcher.shared.arm(pid: pid) {
+            case .armed: break
+            case .failed(let error): return .spawnFailed(error)
+            }
+            await onSpawn(pid)
+            return await ExitWatcher.shared.wait(pid: pid)
+        case .died:
+            /** The process exited before it could confirm session leadership,
+                the shape of a command that does nothing but exit
+                (`/bin/sh -c "exit N"`) racing this daemon's own two
+                `/bin/launchctl` round trips (bootstrap, then the poll that
+                confirms the pid). Arming now, after the fact, still reports
+                the real exit if the kernel has not yet reaped the pid, or
+                `.exitedStatusUnknown` if it has (NOTE_EXITSTATUS is refused
+                for a pid the kernel has already reaped): either beats a
+                manufactured spawnFailed that would otherwise hide the exit
+                entirely. onSpawn is skipped, matching every other early-return
+                branch in this method. */
+            switch ExitWatcher.shared.arm(pid: pid) {
+            case .armed: break
+            case .failed(let error):
+                /** By the time this daemon gets to register interest, launchd
+                    can have already fully reaped the pid (not merely made
+                    NOTE_EXITSTATUS unavailable): the kernel then refuses the
+                    registration outright with ESRCH, since it has no record of
+                    the process left at all to watch. The exit is not in
+                    question, only its code, which is exactly what
+                    `.exitedStatusUnknown` means; every other registration
+                    failure is a genuine spawnFailed. */
+                if error.errno == Int(ESRCH) { return .exitedStatusUnknown }
+                return .spawnFailed(error)
+            }
+            return await ExitWatcher.shared.wait(pid: pid)
+        case .timedOut:
             return .spawnFailed(
                 SpawnError(
                     errno: nil,
                     message: "launchd job \(label) pid \(pid) never became a session leader"))
         }
-        /** Arm the exit watch before advertising the pid so a failure to watch
-            is `spawnFailed` rather than a fake `_exit(0)` after `onSpawn`. */
-        switch ExitWatcher.shared.arm(pid: pid) {
-        case .armed: break
-        case .failed(let error): return .spawnFailed(error)
-        }
-        await onSpawn(pid)
-        return await ExitWatcher.shared.wait(pid: pid)
+    }
+
+    /** Outcome of polling for session leadership: `died` is detected as soon
+        as `kill(pid, 0)` fails, rather than only after the full poll budget
+        elapses, which is what lets `run` treat an instant exit as an exit to
+        report instead of a slow, manufactured `spawnFailed`. */
+    private enum SessionLeaderCheck {
+        case died
+        case leader
+        case timedOut
     }
 
     /** Re-watches a launchd child job this process did not spawn: the surviving
@@ -151,12 +193,20 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         return nil
     }
 
-    private static func waitUntilSessionLeader(_ pid: pid_t) async -> Bool {
+    private static func waitUntilSessionLeader(_ pid: pid_t) async -> SessionLeaderCheck {
         for _ in 0..<40 {
-            if getpgid(pid) == pid { return true }
+            if getpgid(pid) == pid { return .leader }
+            /** `errno == ESRCH` specifically, not merely a nonzero return: a
+                launchd child freshly spawned by this same user can transiently
+                answer `kill(pid, 0)` with EPERM ("operation not permitted")
+                while very much alive, before its own credential setup has
+                settled, mirroring the exact quirk that already gates
+                NOTE_EXITSTATUS (see ExitWatcher.arm). Only ESRCH means the
+                kernel has no such process left to check. */
+            if kill(pid, 0) != 0, errno == ESRCH { return .died }
             try? await Task.sleep(for: .milliseconds(25))
         }
-        return false
+        return .timedOut
     }
 
     private static func publishedPid(domain: String, label: String) -> pid_t? {
