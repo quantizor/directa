@@ -84,8 +84,11 @@ public actor ServerSupervisor {
             if oldValue == .stopping, phase != .stopping {
                 settleStoppingWaiters()
             }
+            DaemonActivity.shared.recordPhase(phase.rawValue, key: writerID.uuidString)
         }
     }
+    /** The server id telemetry labels this supervisor's stops and waits with. */
+    private nonisolated let activityID: String
     private var pid: pid_t?
     private var portClaim: PortClaim?
     private var portConflict: PortConflict?
@@ -197,6 +200,7 @@ public actor ServerSupervisor {
         self.stoppingWaitBound = .seconds(stopTiming.graceSeconds + stopTiming.overtimeSeconds)
         self.worktreeLabel = worktree?.label
         self.mainProjectSlug = worktree?.mainProject
+        self.activityID = serverID(project: project, name: spec.name)
         let id = serverID(project: project, name: spec.name)
         if let persisted = AtomicFile.loadDefensively(StateFile.self, from: paths.stateFile)?
             .servers[id] {
@@ -209,6 +213,12 @@ public actor ServerSupervisor {
                 self.phase = persisted.phase
             }
         }
+        /** `didSet` does not run for assignments inside init. */
+        DaemonActivity.shared.recordPhase(phase.rawValue, key: writerID.uuidString)
+    }
+
+    deinit {
+        DaemonActivity.shared.forgetPhase(key: writerID.uuidString)
     }
 
     public func updateSpec(_ newSpec: ServerSpec) {
@@ -610,6 +620,8 @@ public actor ServerSupervisor {
         stopReason = reason
         stoppingWaitBound = stopWaitTimeout
         phase = .stopping
+        let activity = DaemonActivity.shared.begin(.stop, label: "\(activityID): \(reason)")
+        defer { DaemonActivity.shared.end(activity, outcome: phase.rawValue) }
         /** Capture the run's identity and its session before any signal and
             before any await: after the grace window the pid number may name a
             different process, recordOutcome for this same exit can run during the
@@ -1508,6 +1520,8 @@ public actor ServerSupervisor {
     private func waitForSpawnSettled(timeout: Duration? = nil) async -> Bool {
         guard phase == .starting, pid == nil else { return true }
         let id = UUID()
+        let activity = DaemonActivity.shared.begin(.spawnWait, label: activityID)
+        defer { DaemonActivity.shared.end(activity, outcome: phase.rawValue) }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             guard phase == .starting, pid == nil else {
                 continuation.resume()
@@ -1544,6 +1558,8 @@ public actor ServerSupervisor {
     private func waitForStoppingToClear(timeout: Duration) async -> Bool {
         guard phase == .stopping else { return true }
         let id = UUID()
+        let activity = DaemonActivity.shared.begin(.stopWait, label: activityID)
+        defer { DaemonActivity.shared.end(activity, outcome: phase.rawValue) }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             guard phase == .stopping else {
                 continuation.resume()

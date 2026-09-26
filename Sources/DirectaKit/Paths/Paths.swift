@@ -146,6 +146,14 @@ public struct DirectaPaths: Sendable {
 
     public var eventsFile: URL { dataDir.appending(path: "events.log") }
 
+    /** The daemon's own diagnostics: telemetry.log and its rotations. The
+        name has no hash suffix, so `isProjectLogDirName` never mistakes it
+        for a project's log directory. */
+    public var daemonTelemetryDir: URL { logsDir.appending(path: "daemon") }
+
+    /** One file per daemon boot describing how the previous run ended. */
+    public var daemonIncidentsDir: URL { daemonTelemetryDir.appending(path: "incidents") }
+
     /** Caches, preferences, and saved state outside the data/logs trees.
         `--purge` removes these along with `dataDir` and `logsDir`. */
     public static func userLibraryResidue(

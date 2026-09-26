@@ -166,6 +166,17 @@ do {
     exit(1)
 }
 
+/** Telemetry starts after the single-instance lock, so a second daemon that is
+    about to exit never touches the file, and before the socket, so the first
+    requests are already counted. Its slow work (the boot incident's
+    launchctl and `log show`) runs on its own background thread. */
+if DaemonTelemetry.isEnabled(environment: ProcessInfo.processInfo.environment) {
+    DaemonTelemetry.start(paths: paths, runningAsAgent: LaunchdJobLauncher.runningAsAgent)
+    atexit {
+        DaemonTelemetry.current?.recordExit(reason: "exit")
+    }
+}
+
 let registry = Registry(paths: paths)
 let launcher: any ProcessLauncher =
     LaunchdJobLauncher.runningAsAgent ? LaunchdJobLauncher() : SubprocessLauncher()

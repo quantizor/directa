@@ -143,6 +143,12 @@ public enum CheckoutIdentity {
     static func git(
         project: String, args: [String], timeoutSeconds: Double = gitTimeoutSeconds
     ) -> String? {
+        DaemonActivity.shared.measure(.git, label: "git \(args.joined(separator: " ")) in \(project)") {
+            gitUnmeasured(project: project, args: args, timeoutSeconds: timeoutSeconds)
+        }
+    }
+
+    private static func gitUnmeasured(project: String, args: [String], timeoutSeconds: Double) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = args

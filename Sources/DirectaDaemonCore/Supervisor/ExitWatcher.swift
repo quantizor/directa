@@ -60,6 +60,11 @@ final class ExitWatcher: Sendable {
         state.withLock { $0.kq }
     }
 
+    /** Pids armed and not yet consumed by `wait(pid:)`, for telemetry. */
+    var watchedCount: Int {
+        state.withLock { $0.slots.count }
+    }
+
     /** Registers interest in `pid`'s exit. Requests `NOTE_EXIT |
         NOTE_EXITSTATUS` first; the kqueue man page calls `NOTE_EXITSTATUS`
         "valid only on child processes", but the gate actually measured is

@@ -1890,8 +1890,13 @@ public actor Router {
                 reads it, and clearing it here made that a no-op for every
                 refusal raised after this point. */
             if rearm { await entry.supervisor.rearmWatch() }
+            let activity = DaemonActivity.shared.begin(
+                .restart, label: "\(serverID(project: params.project, name: entry.spec.name)): \(reason)")
             _ = await entry.supervisor.stop(deliberate: false, reason: reason)
-            results.append(await entry.supervisor.ensure(timeoutSeconds: params.timeoutSeconds))
+            let restarted = await entry.supervisor.ensure(timeoutSeconds: params.timeoutSeconds)
+            DaemonActivity.shared.end(
+                activity, outcome: restarted.reason?.rawValue ?? restarted.server.phase.rawValue)
+            results.append(restarted)
             DirectaLog.daemon.info("restart \(entry.spec.name)@\(params.project)")
         }
         return GroupResult(results: results.sorted { $0.server.server < $1.server.server })
@@ -2234,11 +2239,12 @@ public final class ControlServer: Sendable {
                 }
                 connection.cancel()
             case .cancelled:
-                break
+                DaemonActivity.shared.clientDisconnected()
             default:
                 break
             }
         }
+        DaemonActivity.shared.clientConnected()
         connection.start(queue: queue)
         let hello = try? NDJSON.encodeLine(
             WireEvent(
@@ -2257,9 +2263,14 @@ public final class ControlServer: Sendable {
             var advanced = buffer
             if let data, !data.isEmpty {
                 for line in advanced.feed(data) {
+                    /** Begun here, on the connection queue, so a request still
+                        waiting for a pool thread is counted with its age. */
+                    let method = (try? JSONCoding.decoder().decode(WireRequestHead.self, from: line))?.method
+                    let activity = DaemonActivity.shared.begin(.request, label: method ?? "unparseable")
                     Task {
                         let response = await router.handle(line: line)
                         connection.send(content: response, completion: .contentProcessed { _ in })
+                        DaemonActivity.shared.end(activity)
                     }
                 }
             }

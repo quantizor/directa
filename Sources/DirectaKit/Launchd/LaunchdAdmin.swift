@@ -580,6 +580,15 @@ public enum LaunchdAdmin {
         _ path: String, _ arguments: [String], environment: [String: String]? = nil,
         timeoutSeconds: Double? = nil
     ) -> (status: Int32, output: String) {
+        let label = ([(path as NSString).lastPathComponent] + arguments).joined(separator: " ")
+        return DaemonActivity.shared.measure(ActivityKind.forExecutable(path), label: label) {
+            shellUnmeasured(path, arguments, environment: environment, timeoutSeconds: timeoutSeconds)
+        }
+    }
+
+    private static func shellUnmeasured(
+        _ path: String, _ arguments: [String], environment: [String: String]?, timeoutSeconds: Double?
+    ) -> (status: Int32, output: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
