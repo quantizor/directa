@@ -635,12 +635,18 @@ private enum MonitorRunOutcome: Sendable {
     `EV_EOF` the instant the reader closes, with no write required to notice
     it. A regular file or a TTY has no such edge, so that case instead
     watches `CLAUDE_PID` (`EVFILT_PROC`/`NOTE_EXIT`) when the harness set it,
-    or falls back to polling `getppid()` for a change. */
+    else the parent's own `NOTE_EXIT`, and polls `getppid()` for a change
+    only when the kernel refuses every registration. */
 final class MonitorLifetime: Sendable {
     /** The signal that ends the run; a kqueue signal carries its descriptor,
         already registered. */
     enum Watch: Equatable {
-        case parentChange
+        /** Polls until `getppid()` stops returning `from`. */
+        case parentChange(from: pid_t)
+        /** `NOTE_EXIT` registered on `parent`. A parent that exited between
+            reading its pid and registering never delivers the note, so
+            `arm` confirms `parent` is still the parent afterward. */
+        case parentExit(kqueue: Int32, parent: pid_t)
         case processExit(kqueue: Int32)
         case stdoutEOF(kqueue: Int32)
     }
@@ -666,11 +672,18 @@ final class MonitorLifetime: Sendable {
             fstat(1, &st) == 0 && [S_IFIFO, S_IFSOCK].contains(mode_t(st.st_mode) & S_IFMT)
         let claudePID = ProcessInfo.processInfo.environment["CLAUDE_PID"].flatMap { pid_t($0) }
         let watch = Self.choose(
-            claudePID: claudePID, registerProcessExit: Self.registerProcessExit,
+            claudePID: claudePID, parentPID: getppid(), registerProcessExit: Self.registerProcessExit,
             registerStdoutEOF: Self.registerStdoutEOF, stdoutIsStream: stdoutIsStream)
         switch watch {
-        case .parentChange:
-            watchParentChange()
+        case .parentChange(let parent):
+            watchParentChange(from: parent)
+        case .parentExit(let kq, let parent):
+            guard getppid() == parent else {
+                close(kq)
+                fire()
+                return
+            }
+            runWatcher(kqueue: kq, name: "parent") { _ in true }
         case .processExit(let kq):
             runWatcher(kqueue: kq, name: "claude") { _ in true }
         case .stdoutEOF(let kq):
@@ -681,15 +694,20 @@ final class MonitorLifetime: Sendable {
     /** The first signal whose registration succeeds, most direct first. A
         `CLAUDE_PID` naming a process that already exited (the kernel
         refuses the registration with ESRCH), or a kqueue the kernel will
-        not create, falls through to the parent-change poll instead of
-        leaving the run with no lifetime watch at all. */
+        not create, falls through to the next signal, and the parent-change
+        poll is the last resort, never no lifetime watch at all. A parent of
+        pid 1 means the process is already orphaned to launchd, which never
+        exits, so that case goes straight to the poll. */
     static func choose(
-        claudePID: pid_t?, registerProcessExit: (pid_t) -> Int32?, registerStdoutEOF: () -> Int32?,
-        stdoutIsStream: Bool
+        claudePID: pid_t?, parentPID: pid_t, registerProcessExit: (pid_t) -> Int32?,
+        registerStdoutEOF: () -> Int32?, stdoutIsStream: Bool
     ) -> Watch {
         if stdoutIsStream, let kq = registerStdoutEOF() { return .stdoutEOF(kqueue: kq) }
         if let claudePID, let kq = registerProcessExit(claudePID) { return .processExit(kqueue: kq) }
-        return .parentChange
+        if parentPID > 1, let kq = registerProcessExit(parentPID) {
+            return .parentExit(kqueue: kq, parent: parentPID)
+        }
+        return .parentChange(from: parentPID)
     }
 
     /** A kqueue with `pid`'s `NOTE_EXIT` registered, or nil (nothing left
@@ -742,8 +760,7 @@ final class MonitorLifetime: Sendable {
         thread.start()
     }
 
-    private func watchParentChange() {
-        let parent = getppid()
+    private func watchParentChange(from parent: pid_t) {
         let thread = Thread { [self] in
             while getppid() == parent {
                 usleep(500_000)

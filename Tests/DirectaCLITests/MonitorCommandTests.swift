@@ -719,33 +719,60 @@ private actor FakeMonitorClock: MonitorClock {
     @Test func aStreamStdoutIsWatchedForItsReaderLeaving() {
         #expect(
             MonitorLifetime.choose(
-                claudePID: 4242, registerProcessExit: { _ in 7 }, registerStdoutEOF: { 9 }, stdoutIsStream: true)
+                claudePID: 4242, parentPID: 500, registerProcessExit: { _ in 7 }, registerStdoutEOF: { 9 },
+                stdoutIsStream: true)
                 == .stdoutEOF(kqueue: 9))
     }
 
     @Test func aFileOrTerminalStdoutWatchesClaudePID() {
         #expect(
             MonitorLifetime.choose(
-                claudePID: 4242, registerProcessExit: { _ in 7 }, registerStdoutEOF: { 9 }, stdoutIsStream: false)
+                claudePID: 4242, parentPID: 500, registerProcessExit: { $0 == 4242 ? 7 : 8 },
+                registerStdoutEOF: { 9 }, stdoutIsStream: false)
                 == .processExit(kqueue: 7))
     }
 
-    /** A `CLAUDE_PID` whose exit watch the kernel refuses (the process is
-        already gone) falls back to the parent-change poll, never to no
-        watch at all; so does a stdout watch that will not register. */
-    @Test func aWatchThatCannotRegisterFallsBackToTheParentPoll() {
+    /** With no `CLAUDE_PID`, or one the kernel refuses (the process is
+        already gone), the parent's own exit is the signal, and a stdout
+        watch that will not register falls through the same way. */
+    @Test func withoutAUsableClaudePIDTheParentsExitIsWatched() {
+        let parentOnly: (pid_t) -> Int32? = { $0 == 500 ? 11 : nil }
         #expect(
             MonitorLifetime.choose(
-                claudePID: 4242, registerProcessExit: { _ in nil }, registerStdoutEOF: { 9 }, stdoutIsStream: false)
-                == .parentChange)
+                claudePID: nil, parentPID: 500, registerProcessExit: parentOnly, registerStdoutEOF: { 9 },
+                stdoutIsStream: false)
+                == .parentExit(kqueue: 11, parent: 500))
         #expect(
             MonitorLifetime.choose(
-                claudePID: nil, registerProcessExit: { _ in 7 }, registerStdoutEOF: { nil }, stdoutIsStream: true)
-                == .parentChange)
+                claudePID: 4242, parentPID: 500, registerProcessExit: parentOnly, registerStdoutEOF: { 9 },
+                stdoutIsStream: false)
+                == .parentExit(kqueue: 11, parent: 500))
         #expect(
             MonitorLifetime.choose(
-                claudePID: 4242, registerProcessExit: { _ in 7 }, registerStdoutEOF: { nil }, stdoutIsStream: true)
+                claudePID: nil, parentPID: 500, registerProcessExit: parentOnly, registerStdoutEOF: { nil },
+                stdoutIsStream: true)
+                == .parentExit(kqueue: 11, parent: 500))
+        #expect(
+            MonitorLifetime.choose(
+                claudePID: 4242, parentPID: 500, registerProcessExit: { _ in 7 }, registerStdoutEOF: { nil },
+                stdoutIsStream: true)
                 == .processExit(kqueue: 7))
+    }
+
+    /** The poll is the last resort: every registration refused, or a
+        parent that is launchd itself (already orphaned), whose exit would
+        never come. */
+    @Test func thePollIsTheLastResort() {
+        #expect(
+            MonitorLifetime.choose(
+                claudePID: 4242, parentPID: 500, registerProcessExit: { _ in nil }, registerStdoutEOF: { nil },
+                stdoutIsStream: true)
+                == .parentChange(from: 500))
+        #expect(
+            MonitorLifetime.choose(
+                claudePID: nil, parentPID: 1, registerProcessExit: { _ in 11 }, registerStdoutEOF: { 9 },
+                stdoutIsStream: false)
+                == .parentChange(from: 1))
     }
 
     @Test func registeringAnExitedProcessFailsAndALiveOneSucceeds() throws {
@@ -757,5 +784,8 @@ private actor FakeMonitorClock: MonitorClock {
 
         let live = try #require(MonitorLifetime.registerProcessExit(getpid()))
         close(live)
+
+        let parent = try #require(MonitorLifetime.registerProcessExit(getppid()))
+        close(parent)
     }
 }
