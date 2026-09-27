@@ -76,7 +76,7 @@ struct Monitor: AsyncParsableCommand {
             while !Task.isCancelled {
                 let outcome = await session.step()
                 if debugPolls {
-                    FileHandle.standardError.write(Data("directa monitor: poll at \(Date())\n".utf8))
+                    CLIRunner.note("directa monitor: poll at \(Date())")
                 }
                 switch outcome {
                 case .exit(let error):
