@@ -1,5 +1,7 @@
+import DirectaTestSupport
 import Foundation
 import Testing
+import os
 
 @testable import DirectaKit
 
@@ -30,17 +32,15 @@ import Testing
     }
 }
 
-/** An explicit response deadline bounds the whole request, the hello read
-    included, so a daemon that accepts and never answers releases the caller
-    at that deadline rather than the default one. */
-@Suite struct DaemonClientResponseDeadlineTests {
-    @Test func anExplicitDeadlineEndsAWaitOnASilentDaemon() async throws {
-        let path = "/tmp/directa-dc-\(UUID().uuidString.prefix(8)).sock"
-        let listener = socket(AF_UNIX, SOCK_STREAM, 0)
-        defer {
-            close(listener)
-            unlink(path)
-        }
+/** A daemon socket that nothing accepts on: the kernel completes each
+    connect from the backlog, so no hello is ever sent. */
+private final class SilentDaemonSocket: Sendable {
+    let path: String
+    private let listener: Int32
+
+    init(backlog: Int32) throws {
+        path = "/tmp/directa-dc-\(UUID().uuidString.prefix(8)).sock"
+        listener = socket(AF_UNIX, SOCK_STREAM, 0)
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let bytes = Array(path.utf8)
@@ -50,10 +50,24 @@ import Testing
                 Darwin.bind(listener, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        try #require(listener >= 0 && bound == 0 && listen(listener, 4) == 0)
-        /** The kernel completes the connect from the backlog; nothing ever
-            accepts, so no hello is ever sent. */
-        let client = DaemonClient(socketPath: path)
+        guard listener >= 0, bound == 0, listen(listener, backlog) == 0 else {
+            throw WireError(code: .internalError, message: "test listener failed: \(String(cString: strerror(errno)))")
+        }
+    }
+
+    deinit {
+        close(listener)
+        unlink(path)
+    }
+}
+
+/** An explicit response deadline bounds the whole request, the hello read
+    included, so a daemon that accepts and never answers releases the caller
+    at that deadline rather than the default one. */
+@Suite struct DaemonClientResponseDeadlineTests {
+    @Test func anExplicitDeadlineEndsAWaitOnASilentDaemon() async throws {
+        let daemon = try SilentDaemonSocket(backlog: 4)
+        let client = DaemonClient(socketPath: daemon.path)
         let started = ContinuousClock.now
         let failure = try await #require(throws: WireError.self) {
             _ = try await client.request(
@@ -62,6 +76,46 @@ import Testing
         #expect(failure.code == .daemonUnreachable)
         #expect(failure.message == "the daemon did not answer in time; it may be wedged")
         #expect(started.duration(to: .now) < .seconds(10))
+    }
+
+    /** Clients waiting on a daemon that never answers wait off the
+        cooperative pool: with twice as many of them as the pool has threads,
+        a trivial task submitted after all of them still runs while they
+        wait. Nothing answers, so they can only finish at their deadline: the
+        task counts how many had finished when it ran, and any nonzero count
+        means it waited for them to give pool threads back. Measured from a
+        thread of its own, since the test body runs on the pool it measures. */
+    @Test func clientsWaitingOnASilentDaemonLeaveTheCooperativePoolFree() async throws {
+        let callers = ProcessInfo.processInfo.activeProcessorCount * 2
+        let daemon = try SilentDaemonSocket(backlog: Int32(callers * 2))
+        let deadline = 3.0
+        let finished = OSAllocatedUnfairLock(initialState: 0)
+        let finishedWhenTaskRan = OSAllocatedUnfairLock<Int?>(initialState: nil)
+        let path = daemon.path
+        let calls = (0..<callers).map { _ in
+            Task.detached {
+                let client = DaemonClient(socketPath: path)
+                let answer = try? await client.request(
+                    .daemonInfo, params: WireEmpty(), expecting: WireEmpty.self, responseTimeoutSeconds: deadline)
+                finished.withLock { $0 += 1 }
+                return answer
+            }
+        }
+        await offPool {
+            let ran = DispatchSemaphore(value: 0)
+            Task.detached {
+                finishedWhenTaskRan.withLock { $0 = finished.withLock { $0 } }
+                ran.signal()
+            }
+            _ = ran.wait(timeout: .now() + deadline * 4)
+        }
+        for call in calls {
+            #expect(await call.value == nil)
+        }
+        let seen = finishedWhenTaskRan.withLock { $0 }
+        #expect(
+            seen == 0,
+            "a trivial task ran only after \(seen.map(String.init) ?? "none") of \(callers) waiting clients had given up")
     }
 }
 

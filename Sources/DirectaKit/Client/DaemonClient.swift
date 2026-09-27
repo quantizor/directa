@@ -2,8 +2,17 @@ import Foundation
 
 /** Thin blocking-POSIX unix-socket client wrapped in an actor. Used unchanged by
     the CLI and the menu bar app. Request/response is correlated by id; the daemon
-    may interleave push frames, which this client ignores beyond the hello handshake. */
+    may interleave push frames, which this client ignores beyond the hello handshake.
+
+    The actor runs on a serial Dispatch queue of its own, never the cooperative
+    pool: its connect, read, and write block the thread for as long as the
+    daemon takes to answer (up to the response deadline), and a caller holding
+    several clients at once would otherwise hold that many pool threads. */
 public actor DaemonClient {
+    private let queue = DispatchSerialQueue(label: "dev.quantizor.directa.client", qos: .userInitiated)
+
+    public nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
+
     private var buffer = NDJSONBuffer()
     private var fd: Int32 = -1
     private var nextID = 0
