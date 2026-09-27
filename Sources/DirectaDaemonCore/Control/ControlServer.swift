@@ -630,13 +630,14 @@ public actor Router {
             shell-out, and every server's adoption check and the leftover-job
             reap at the end need the same snapshot. Empty outside agent mode
             (`agentJobs == nil`), which is what makes every match below fail
-            closed to the pre-existing bounce+respawn path. */
-        var listed: [LaunchdJobs.ChildJob] = []
+            closed to the pre-existing bounce+respawn path; nil in agent mode
+            when launchd gave no answer, which defers instead. */
+        var listed: [LaunchdJobs.ChildJob]? = []
         var adoptableChildJobs: [pid_t: LaunchdJobs.ChildJob] = [:]
         if let agentJobs {
-            listed = await agentJobs.listChildJobs()
+            listed = await Self.childJobsForRecovery(agentJobs)
             adoptableChildJobs = Dictionary(
-                listed.compactMap { job in job.pid.map { ($0, job) } },
+                (listed ?? []).compactMap { job in job.pid.map { ($0, job) } },
                 uniquingKeysWith: { first, _ in first })
         }
         var toStart: [(project: String, spec: ServerSpec)] = []
@@ -694,6 +695,15 @@ public actor Router {
                 if let identity = ProcessTree.provenIdentity(
                     pid: persisted.pid, startedAt: persisted.startedAt)
                 {
+                    /** Without a job listing, whether this run is an adoptable
+                        child job is unknown, and bouncing it would stop a
+                        server recovery may well have kept. The row stays as
+                        it is for the next boot to decide. */
+                    if restores, listed == nil {
+                        DirectaLog.daemon.error(
+                            "recover defer \(name)@\(project): launchd's job list is unavailable; leaving live pid \(identity.pid) alone")
+                        continue
+                    }
                     /** A row with no restore intent (a removal whose stop gave
                         up retired it) keeps its pid only so its leftover run
                         can be bounced here: it is never adopted or restarted. */
@@ -768,8 +778,9 @@ public actor Router {
             through, so they never touch a real launchd domain, the user's
             included. The listing is the one taken before restore, so a job a
             restore started just now is never in it; `keepingPids` protects
-            every listed job a supervisor adopted. */
-        if let agentJobs {
+            every listed job a supervisor adopted. With no listing there is
+            nothing to judge stale. */
+        if let agentJobs, let listed {
             var keepingPids: Set<pid_t> = []
             for supervisor in supervisors.values {
                 if let pid = await supervisor.status().pid.flatMap(ProcessTree.narrowed) {
@@ -784,6 +795,23 @@ public actor Router {
                 DirectaLog.daemon.info("reaped \(staleJobs.count) leftover child launchd job(s)")
             }
         }
+    }
+
+    /** The child jobs recovery judges adoption and the leftover reap on, or
+        nil when `launchctl list` gave no answer twice: one retry covers a
+        launchd that was briefly slow at boot, and a second failure defers
+        every decision that needs the listing rather than reading it as "no
+        jobs", which would bounce every survivor recovery could have kept. */
+    private static func childJobsForRecovery(_ agentJobs: AgentJobs) async -> [LaunchdJobs.ChildJob]? {
+        for attempt in 1...2 {
+            switch await agentJobs.listChildJobs() {
+            case .listed(let jobs):
+                return jobs
+            case .unavailable(let reason):
+                DirectaLog.daemon.error("recover: launchd job list attempt \(attempt) of 2 failed: \(reason)")
+            }
+        }
+        return nil
     }
 
     /** Attaches a fresh supervisor to a launchd child job (`job`) that survived

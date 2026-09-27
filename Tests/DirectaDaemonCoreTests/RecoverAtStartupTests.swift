@@ -81,11 +81,19 @@ private final class RecordingAgentJobs: Sendable {
     var listingCount: Int { listings.withLock { $0 } }
 
     func agentJobs(listing jobs: [LaunchdJobs.ChildJob]) -> AgentJobs {
+        agentJobs(answering: [.listed(jobs)])
+    }
+
+    /** Answers the reads in `answers` in order, repeating the last. */
+    func agentJobs(answering answers: [LaunchdJobs.ChildJobListing]) -> AgentJobs {
         AgentJobs(
             bootOut: { [bootedOutLabels] job in bootedOutLabels.withLock { $0.append(job.label) } },
             listChildJobs: { [listings] in
-                listings.withLock { $0 += 1 }
-                return jobs
+                let read = listings.withLock { count in
+                    count += 1
+                    return count
+                }
+                return answers[min(read, answers.count) - 1]
             })
     }
 }
@@ -484,6 +492,98 @@ private func logTexts(router: Router, project: String, name: String) async throw
         }
         #expect(texts.contains("post-adopt line"))
         #expect(!texts.contains("preexisting line"))
+    }
+
+    /** A `launchctl list` that does not answer (it timed out, twice) says
+        nothing about which survivors are directa's child jobs, so recovery
+        leaves a live survivor with restore intent alone rather than bouncing
+        a server it could have adopted: no signal, no replacement spawn, the
+        row intact for the next boot to decide, and no leftover-job reap from
+        a listing it never got. */
+    @Test func anUnreadableJobListDefersInsteadOfBouncingASurvivor() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath,
+            serversJSON: """
+            {
+              "web": {
+                "command": ["/bin/sh", "-c", "sleep 30"]
+              }
+            }
+            """)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let startedAt = Date()
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        let id = serverID(project: env.projectPath, name: "web")
+        try await registry.updateState(serverID: id, writer: .router) { entry in
+            entry.phase = .running
+            entry.pid = Int(survivor)
+            entry.resumeOnBoot = true
+            entry.startedAt = startedAt
+        }
+        let recorder = RecordingAgentJobs()
+        let gate = AdoptGate()
+        let router = Router(
+            agentJobs: recorder.agentJobs(answering: [.unavailable(reason: "launchctl list timed out")]),
+            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+
+        #expect(recorder.listingCount == 2)
+        #expect(recorder.labels.isEmpty)
+        #expect(await gate.callCount == 0)
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(kill(survivor, 0) == 0, "survivor \(survivor) was signaled while launchd could not be read")
+        let row = await registry.persistedState(serverID: id)
+        #expect(row?.pid == Int(survivor))
+        #expect(row?.phase == .running)
+        #expect(row?.resumeOnBoot == true)
+        let events = try await eventsList(router: router, project: env.projectPath)
+        #expect(events.filter { $0.kind == .crashed || $0.kind == .started }.isEmpty)
+    }
+
+    /** One unanswered `launchctl list` is retried, and a retry that answers
+        is used exactly as a first answer would be: the survivor it lists is
+        adopted, pid unchanged. */
+    @Test func aJobListThatAnswersOnRetryStillAdopts() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath,
+            serversJSON: """
+            {
+              "web": {
+                "command": ["/bin/sh", "-c", "sleep 30"]
+              }
+            }
+            """)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let startedAt = Date()
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        let id = serverID(project: env.projectPath, name: "web")
+        try await registry.updateState(serverID: id, writer: .router) { entry in
+            entry.phase = .running
+            entry.pid = Int(survivor)
+            entry.resumeOnBoot = true
+            entry.startedAt = startedAt
+        }
+        let recorder = RecordingAgentJobs()
+        let gate = AdoptGate()
+        let router = Router(
+            agentJobs: recorder.agentJobs(answering: [
+                .unavailable(reason: "launchctl list timed out"),
+                .listed([LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-retry", pid: survivor)]),
+            ]),
+            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+
+        #expect(recorder.listingCount == 2)
+        #expect(await gate.callCount == 1)
+        #expect(recorder.labels.isEmpty)
+        let web = try await statusList(router: router, project: env.projectPath).first { $0.server == "web" }
+        #expect(web?.pid == Int(survivor))
     }
 
     /** A survivor whose ports no longer resolve (here the checkout's

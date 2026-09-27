@@ -14,12 +14,13 @@ import Foundation
 public struct AgentJobs: Sendable {
     /** `launchctl bootout` for one child-job label. */
     public var bootOut: @Sendable (LaunchdJobs.ChildJob) async -> Void
-    /** `launchctl list`, filtered to directa's child-job labels. */
-    public var listChildJobs: @Sendable () async -> [LaunchdJobs.ChildJob]
+    /** `launchctl list`, filtered to directa's child-job labels, or why it
+        gave no answer. */
+    public var listChildJobs: @Sendable () async -> LaunchdJobs.ChildJobListing
 
     public init(
         bootOut: @escaping @Sendable (LaunchdJobs.ChildJob) async -> Void,
-        listChildJobs: @escaping @Sendable () async -> [LaunchdJobs.ChildJob]
+        listChildJobs: @escaping @Sendable () async -> LaunchdJobs.ChildJobListing
     ) {
         self.bootOut = bootOut
         self.listChildJobs = listChildJobs
@@ -32,5 +33,5 @@ public struct AgentJobs: Sendable {
         launchd state unless it opts in explicitly. */
     public static let live = AgentJobs(
         bootOut: { job in await LaunchdJobs.bootOut(label: job.label) },
-        listChildJobs: { await BlockingLane.system.run(LaunchdJobs.loadChildJobs) })
+        listChildJobs: { await BlockingLane.system.run(LaunchdJobs.listChildJobs) })
 }

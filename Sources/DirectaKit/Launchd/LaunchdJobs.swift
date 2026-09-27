@@ -140,10 +140,35 @@ public enum LaunchdJobs {
         printed.status == 0 ? parseJobPrint(printed.output) : nil
     }
 
+    /** What one `launchctl list` read found. */
+    public enum ChildJobListing: Equatable, Sendable {
+        case listed([ChildJob])
+        /** launchctl gave no usable answer (it timed out, could not start,
+            or exited nonzero): nothing is known about which jobs exist,
+            which is not the same as knowing there are none. */
+        case unavailable(reason: String)
+    }
+
+    /** `launchctl list` filtered to directa's child jobs, under launchctl's
+        default deadline. */
+    public static func listChildJobs() -> ChildJobListing {
+        switch LaunchdAdmin.shellOutcome("/bin/launchctl", ["list"]) {
+        case .exited(status: 0, let output):
+            .listed(parseChildJobs(fromList: output))
+        case .exited(let status, let output):
+            .unavailable(reason: "launchctl list exited \(status): \(output.prefix(200))")
+        case .failedToRun(let reason):
+            .unavailable(reason: "launchctl list did not start: \(reason.prefix(200))")
+        case .timedOut:
+            .unavailable(reason: "launchctl list timed out")
+        }
+    }
+
+    /** `listChildJobs` for a report that reads an unavailable listing as no
+        jobs (doctor's leftover-job finding). */
     public static func loadChildJobs() -> [ChildJob] {
-        let listed = LaunchdAdmin.shell("/bin/launchctl", ["list"])
-        guard listed.status == 0 else { return [] }
-        return parseChildJobs(fromList: listed.output)
+        guard case .listed(let jobs) = listChildJobs() else { return [] }
+        return jobs
     }
 
     /** Boot out one child job. Never called for the agent label itself: the
