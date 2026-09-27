@@ -793,21 +793,29 @@ public actor Router {
         effective port, then `PortMaterializer`) but never claims or binds the
         port: the live child already holds it. `boundPort`/`startedAt` come from
         the persisted state so the adopted run keeps its rebind and its uptime.
-        Returns false when the exit watch could not be armed, which records no
-        phase, pid, or state and sends the caller down the same bounce+respawn
-        path as a pid with no matching job. */
+        Returns false when the spec's port claim no longer resolves (the error
+        `prepareSpawn` would refuse a spawn with) or the exit watch could not
+        be armed, which records no phase, pid, or state and sends the caller
+        down the same bounce+respawn path as a pid with no matching job. */
     private func adoptSurvivor(
         boundPort: Int?, job: LaunchdJobs.ChildJob, name: String, pid: pid_t, project: String,
         spec: ServerSpec, startedAt: Date?
     ) async -> Bool {
-        let supervisor = await self.supervisor(project: project, spec: spec)
         let overlaid = Self.overlaid(spec, project: project)
         let declaredPort = overlaid.spec.port
         let effective = overlaid.overlayPort ?? boundPort ?? declaredPort
+        let claim: PortClaim
+        do {
+            claim = try Self.claim(spec: overlaid.spec, effectivePort: effective)
+        } catch {
+            DirectaLog.daemon.error(
+                "recover adopt \(name)@\(project): \(error.message); bouncing pid \(pid) instead")
+            return false
+        }
+        let supervisor = await self.supervisor(project: project, spec: spec)
         await materializeSpawnSpec(
-            overlaid.spec,
-            claim: PortClaim.resolve(spec: overlaid.spec, effectivePort: effective).claim,
-            declaredPort: declaredPort, effectivePort: effective, on: supervisor)
+            overlaid.spec, claim: claim, declaredPort: declaredPort, effectivePort: effective,
+            on: supervisor)
         guard await supervisor.adopt(
             pid: pid, label: job.label, boundPort: boundPort, startedAt: startedAt)
         else {
@@ -1393,7 +1401,7 @@ public actor Router {
 
     /** The ports a spawn at `effectivePort` claims, or config-invalid when the
         spec's port declarations contradict each other there. */
-    private static func claim(spec: ServerSpec, effectivePort: Int?) throws -> PortClaim {
+    private static func claim(spec: ServerSpec, effectivePort: Int?) throws(WireError) -> PortClaim {
         let resolved = PortClaim.resolve(spec: spec, effectivePort: effectivePort)
         guard let claim = resolved.claim, resolved.error == nil else {
             throw WireError(
@@ -1408,7 +1416,7 @@ public actor Router {
         bookkeeping status reports. The one tail of `prepareSpawn` and
         `adoptSurvivor`. */
     private func materializeSpawnSpec(
-        _ spec: ServerSpec, claim: PortClaim?, declaredPort: Int?, effectivePort: Int?,
+        _ spec: ServerSpec, claim: PortClaim, declaredPort: Int?, effectivePort: Int?,
         portConflict: PortConflict? = nil, on supervisor: ServerSupervisor
     ) async {
         await supervisor.updateSpec(PortMaterializer.materialize(spec: spec, effectivePort: effectivePort))

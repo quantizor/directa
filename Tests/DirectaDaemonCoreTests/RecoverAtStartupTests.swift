@@ -424,6 +424,62 @@ private func logTexts(router: Router, project: String, name: String) async throw
         #expect(!texts.contains("preexisting line"))
     }
 
+    /** A survivor whose ports no longer resolve (here the checkout's
+        `directa.local.json` now declares a named port inside the span) is
+        refused adoption the way `prepareSpawn` refuses the spawn: it is
+        bounced, and the start that follows reports the config error instead
+        of running, rather than being adopted with no port claim at all. */
+    @Test func refusesToAdoptASurvivorWhosePortClaimNoLongerResolves() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath,
+            serversJSON: """
+            {
+              "web": {
+                "command": ["/bin/sh", "-c", "sleep 30"],
+                "port": 45480,
+                "portSpan": 4
+              }
+            }
+            """)
+        try Data(#"{"servers":{"web":{"ports":{"cms":{"offset":1}}}}}"#.utf8)
+            .write(to: LocalOverlay.overlayURL(project: env.projectPath))
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let startedAt = Date()
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        let id = serverID(project: env.projectPath, name: "web")
+        try await registry.updateState(serverID: id, writer: .router) { entry in
+            entry.phase = .running
+            entry.pid = Int(survivor)
+            entry.resumeOnBoot = true
+            entry.startedAt = startedAt
+        }
+        let gate = AdoptGate()
+        let router = Router(
+            agentJobs: RecordingAgentJobs().agentJobs(listing: [
+                LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-bad-claim", pid: survivor)
+            ]),
+            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+
+        #expect(await gate.callCount == 0)
+        let web = try await statusList(router: router, project: env.projectPath)
+            .first { $0.server == "web" }
+        #expect(web?.pid == nil)
+        let events = try await eventsList(router: router, project: env.projectPath)
+        #expect(
+            events.filter { $0.kind == .crashed }.map(\.detail)
+                == [DaemonRestartDetail.orphanBounced(pid: survivor)])
+        var gone = kill(survivor, 0) != 0
+        for _ in 0..<50 where !gone {
+            try await Task.sleep(for: .milliseconds(50))
+            gone = kill(survivor, 0) != 0
+        }
+        #expect(gone, "survivor \(survivor) with an unresolvable claim was left running")
+    }
+
     /** A matching child job whose exit watch cannot be armed (the arm is
         refused, or the pid died after the job listing) is bounced and started
         fresh, exactly like a pid with no matching job: never left `.failed`
