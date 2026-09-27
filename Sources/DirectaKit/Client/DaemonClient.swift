@@ -30,6 +30,12 @@ public actor DaemonClient {
 
     /** Connects and consumes the hello frame, enforcing protocol compatibility. */
     public func connect() throws {
+        try connect(responseTimeoutSeconds: Self.defaultResponseTimeout)
+    }
+
+    /** `responseTimeoutSeconds` bounds the hello read, so a daemon that
+        accepts and never greets cannot hold a caller past its own deadline. */
+    private func connect(responseTimeoutSeconds: Double) throws {
         guard fd < 0 else { return }
         let sock = socket(AF_UNIX, SOCK_STREAM, 0)
         guard sock >= 0 else {
@@ -67,7 +73,7 @@ public actor DaemonClient {
             never ignored the signal. */
         var noSigPipe: Int32 = 1
         _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
-        setResponseTimeout(Self.defaultResponseTimeout)
+        setResponseTimeout(responseTimeoutSeconds)
         /** The socket is open but unproven from here, and `fd >= 0` is what the
             guard above reads as "already connected". So every failing exit has
             to put the client back to disconnected: leaving a live fd behind with
@@ -115,10 +121,13 @@ public actor DaemonClient {
         value, and this deadline ultimately derives from a caller-supplied
         `--timeout`, so `--timeout inf` must degrade to the default rather than
         crash the process. One day is far above any real deadline and well inside
-        Int range. */
+        Int range. The floor is one millisecond, not zero, because a zero
+        `SO_RCVTIMEO` means no deadline at all. */
     static func clampedResponseTimeout(_ seconds: Double) -> Double {
-        seconds.isFinite ? min(max(seconds, 0), 86_400) : defaultResponseTimeout
+        seconds.isFinite ? min(max(seconds, minimumResponseTimeout), 86_400) : defaultResponseTimeout
     }
+
+    static let minimumResponseTimeout: Double = 0.001
 
     /** Sets the socket receive timeout (`SO_RCVTIMEO`); a blocking `read` then
         fails with `EAGAIN` once no data arrives within the window. */
@@ -135,17 +144,24 @@ public actor DaemonClient {
     /** `operationTimeoutSeconds` is the command's own health/wait budget, when it
         has one. The response deadline is set well above it so a legitimately long
         `ensure`/`wait`/group rollout (including a few dependency waves) is never
-        cut off, while a wedged daemon still fails in bounded time. */
+        cut off, while a wedged daemon still fails in bounded time.
+        `responseTimeoutSeconds`, when given, is the whole deadline instead,
+        connect and hello included, for a caller that must give up within a
+        budget of its own (a poll waiting for a daemon to come back). */
     public func request<P: Codable & Sendable, R: Codable & Sendable>(
         _ method: WireMethod,
         params: P,
         expecting: R.Type,
-        operationTimeoutSeconds: Double? = nil
+        operationTimeoutSeconds: Double? = nil,
+        responseTimeoutSeconds: Double? = nil
     ) throws -> R {
-        try connect()
-        if let operationTimeoutSeconds {
-            setResponseTimeout(max(Self.defaultResponseTimeout, operationTimeoutSeconds * 2 + 60))
-        }
+        /** A long operation widens only the wait for its answer; the hello
+            that precedes it is always a prompt reply. */
+        try connect(responseTimeoutSeconds: responseTimeoutSeconds ?? Self.defaultResponseTimeout)
+        setResponseTimeout(
+            responseTimeoutSeconds
+                ?? operationTimeoutSeconds.map { max(Self.defaultResponseTimeout, $0 * 2 + 60) }
+                ?? Self.defaultResponseTimeout)
         defer { setResponseTimeout(Self.defaultResponseTimeout) }
         nextID += 1
         let id = "c\(nextID)"

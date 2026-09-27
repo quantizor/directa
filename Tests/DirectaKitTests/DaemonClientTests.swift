@@ -16,15 +16,52 @@ import Testing
 
     @Test func finiteValuesPassThroughWithinRange() {
         #expect(DaemonClient.clampedResponseTimeout(30) == 30)
-        #expect(DaemonClient.clampedResponseTimeout(0) == 0)
+        #expect(DaemonClient.clampedResponseTimeout(0.25) == 0.25)
     }
 
     @Test func outOfRangeValuesClampToTheEdges() {
-        /** A negative deadline is meaningless; floor it at zero. A value past a
-            day is far beyond any real deadline and would risk the Int conversion,
-            so it caps rather than overflows. */
-        #expect(DaemonClient.clampedResponseTimeout(-5) == 0)
+        /** Zero or a negative deadline floors at one millisecond, since a zero
+            `SO_RCVTIMEO` means no deadline at all. A value past a day is far
+            beyond any real deadline and would risk the Int conversion, so it
+            caps rather than overflows. */
+        #expect(DaemonClient.clampedResponseTimeout(0) == 0.001)
+        #expect(DaemonClient.clampedResponseTimeout(-5) == 0.001)
         #expect(DaemonClient.clampedResponseTimeout(1_000_000_000) == 86_400)
+    }
+}
+
+/** An explicit response deadline bounds the whole request, the hello read
+    included, so a daemon that accepts and never answers releases the caller
+    at that deadline rather than the default one. */
+@Suite struct DaemonClientResponseDeadlineTests {
+    @Test func anExplicitDeadlineEndsAWaitOnASilentDaemon() async throws {
+        let path = "/tmp/directa-dc-\(UUID().uuidString.prefix(8)).sock"
+        let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+        defer {
+            close(listener)
+            unlink(path)
+        }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(path.utf8)
+        withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: bytes) }
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(listener, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        try #require(listener >= 0 && bound == 0 && listen(listener, 4) == 0)
+        /** The kernel completes the connect from the backlog; nothing ever
+            accepts, so no hello is ever sent. */
+        let client = DaemonClient(socketPath: path)
+        let started = ContinuousClock.now
+        let failure = try await #require(throws: WireError.self) {
+            _ = try await client.request(
+                .daemonInfo, params: WireEmpty(), expecting: WireEmpty.self, responseTimeoutSeconds: 0.3)
+        }
+        #expect(failure.code == .daemonUnreachable)
+        #expect(failure.message == "the daemon did not answer in time; it may be wedged")
+        #expect(started.duration(to: .now) < .seconds(10))
     }
 }
 

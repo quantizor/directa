@@ -23,6 +23,14 @@ import os
 
     private static let closed = WireError(code: .daemonUnreachable, message: "daemon closed the connection")
     private static let starting = WireError(code: .daemonStarting, message: "restoring")
+    /** Scripted as a status answer, stands for a daemon that accepts and
+        never answers: the call takes its whole response deadline, then fails
+        the way the client does. */
+    private static let wedged = WireError(
+        code: .daemonUnreachable, hint: "run: directa daemon restart",
+        message: "the daemon did not answer in time; it may be wedged")
+    /** `DaemonClient`'s response deadline for a request that names none. */
+    private static let clientDefaultDeadline = Duration.seconds(120)
 
     /** Each method answers from its own queue, in order; an empty queue is a
         test bug and fails loudly. Every call is logged. */
@@ -32,17 +40,21 @@ import os
         var restarts: [Result<GroupResult, WireError>] = []
         var statuses: [Result<ServerListResult, WireError>] = []
         var waits: [Result<EnsureResult, WireError>] = []
+        /** Advanced by a `wedged` status answer. */
+        let wedgeClock: VirtualClock?
 
         init(
             ensures: [Result<EnsureResult, WireError>] = [],
             restarts: [Result<GroupResult, WireError>] = [],
             statuses: [Result<ServerListResult, WireError>] = [],
-            waits: [Result<EnsureResult, WireError>] = []
+            waits: [Result<EnsureResult, WireError>] = [],
+            wedgeClock: VirtualClock? = nil
         ) {
             self.ensures = ensures
             self.restarts = restarts
             self.statuses = statuses
             self.waits = waits
+            self.wedgeClock = wedgeClock
         }
 
         func ensure(_ params: EnsureParams) async throws -> EnsureResult {
@@ -55,8 +67,14 @@ import os
             return try Self.next(&restarts, "restart")
         }
 
-        func status(_ params: ProjectParams) async throws -> ServerListResult {
+        func status(_ params: ProjectParams, responseTimeoutSeconds: Double?) async throws -> ServerListResult {
             calls.append("status \(params.name ?? "--all")")
+            if case .failure(RestartSessionTests.wedged)? = statuses.first, let wedgeClock {
+                await wedgeClock.advance(
+                    by: min(
+                        RestartSessionTests.clientDefaultDeadline,
+                        responseTimeoutSeconds.map { .seconds($0) } ?? RestartSessionTests.clientDefaultDeadline))
+            }
             return try Self.next(&statuses, "status")
         }
 
@@ -86,6 +104,13 @@ import os
             sleeps.append(duration)
             elapsed += duration
         }
+
+        /** Time a blocked request spends, which is not a session sleep. */
+        func advance(by duration: Duration) {
+            elapsed += duration
+        }
+
+        var totalElapsed: Duration { elapsed }
     }
 
     private final class Notices: Sendable {
@@ -235,6 +260,31 @@ import os
         let slept = await harness.clock.sleeps.reduce(Duration.zero, +)
         #expect(slept >= .seconds(30))
         #expect(slept <= .seconds(32))
+    }
+
+    /** A daemon that accepts and never answers holds each status poll for
+        its whole response deadline. The session bounds each poll by what is
+        left of its budget, so giving up takes the stated budget, not a
+        response deadline past it. */
+    @Test func aWedgedDaemonGivesUpWithinTheBudget() async throws {
+        let clock = VirtualClock()
+        let daemon = FakeDaemon(
+            restarts: [.failure(Self.closed)],
+            statuses: Array(repeating: .failure(Self.wedged), count: 40),
+            wedgeClock: clock)
+        let session = RestartSession(
+            clock: clock, notice: { _ in },
+            params: RestartParams(names: ["web"], project: Self.project, timeoutSeconds: 5),
+            requester: daemon)
+
+        let error = await #expect(throws: WireError.self) {
+            _ = try await session.run(before: Self.list(Self.status("web", phase: .running, pid: 10)))
+        }
+
+        #expect(error?.code == .daemonUnreachable)
+        #expect(await daemon.calls.filter { $0.hasPrefix("restart") } == ["restart web"])
+        let elapsed = await clock.totalElapsed
+        #expect(elapsed <= .seconds(32), "gave up after \(elapsed) against a 30-second budget")
     }
 
     /** `--all`: each server gets its own decision, only the unreached one is

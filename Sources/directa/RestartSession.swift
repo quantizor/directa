@@ -6,7 +6,8 @@ import Foundation
 protocol RestartRequesting: Sendable {
     func ensure(_ params: EnsureParams) async throws -> EnsureResult
     func restart(_ params: RestartParams) async throws -> GroupResult
-    func status(_ params: ProjectParams) async throws -> ServerListResult
+    /** `responseTimeoutSeconds` nil keeps the client's default deadline. */
+    func status(_ params: ProjectParams, responseTimeoutSeconds: Double?) async throws -> ServerListResult
     func wait(_ params: WaitParams) async throws -> EnsureResult
 }
 
@@ -40,8 +41,10 @@ struct DaemonClientRestartRequester: RestartRequesting {
             operationTimeoutSeconds: params.timeoutSeconds)
     }
 
-    func status(_ params: ProjectParams) async throws -> ServerListResult {
-        try await client.request(.serverStatus, params: params, expecting: ServerListResult.self)
+    func status(_ params: ProjectParams, responseTimeoutSeconds: Double?) async throws -> ServerListResult {
+        try await client.request(
+            .serverStatus, params: params, expecting: ServerListResult.self,
+            responseTimeoutSeconds: responseTimeoutSeconds)
     }
 
     func wait(_ params: WaitParams) async throws -> EnsureResult {
@@ -123,7 +126,7 @@ struct RestartSession: Sendable {
         daemon: nothing has been restarted yet at that point, so a retry is
         safe there and nowhere after. */
     func readBefore() async throws -> ServerListResult {
-        try await requester.status(scope)
+        try await requester.status(scope, responseTimeoutSeconds: nil)
     }
 
     func run(before: ServerListResult) async throws -> GroupResult {
@@ -190,15 +193,22 @@ struct RestartSession: Sendable {
 
     /** Polls status until the daemon answers, backing off, until `deadline`.
         An unreachable or still-restoring daemon is waited out; any other
-        refusal is a real answer and ends the session. */
+        refusal is a real answer and ends the session. Each poll's response
+        deadline is what is left of the budget, since a daemon that accepts
+        and never answers would otherwise hold one poll for the client's full
+        default deadline. */
     private func statusWhenReachable(scope: ProjectParams, deadline: ContinuousClock.Instant) async throws
         -> ServerListResult
     {
         var delay = Self.backoffFloor
+        var lastLoss: WireError?
         while true {
+            let remaining = await clock.now().duration(to: deadline)
+            guard remaining > .zero else { throw Self.gaveUp(lastLoss) }
             do {
-                return try await requester.status(scope)
+                return try await requester.status(scope, responseTimeoutSeconds: remaining / .seconds(1))
             } catch let error as WireError where Self.isConnectionLoss(error) {
+                lastLoss = error
                 guard await clock.now() < deadline else { throw Self.gaveUp(error) }
                 await clock.sleep(for: delay)
                 delay = min(delay * 2, Self.backoffCeiling)
