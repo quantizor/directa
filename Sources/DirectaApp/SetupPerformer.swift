@@ -181,7 +181,7 @@ enum SetupPerformer: Sendable {
                 if migration {
                     try await AgentService.reregister()
                 } else {
-                    try AgentService.register()
+                    try await AgentService.register()
                 }
                 try await LaunchdAdmin.pollHello(paths: paths, timeoutSeconds: 8)
                 notes.append("Daemon registered via Login Items.")

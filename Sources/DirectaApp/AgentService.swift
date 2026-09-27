@@ -39,6 +39,15 @@ enum AgentService {
         return status
     }
 
+    /** The form async code calls: `register` makes synchronous Service
+        Management and launchctl round trips, so it runs on
+        `BlockingLane.system`. Swift picks this over the synchronous form in
+        any async context. */
+    @discardableResult
+    nonisolated static func register() async throws -> AppAgentPolicy.RegistrationStatus {
+        try await onLane { try register() }
+    }
+
     /** Unregister then register: required after the helper binary or plist
         changes inside the bundle (SDK guidance), and the only way to reload a
         job that is registered but not running.
@@ -48,19 +57,33 @@ enum AgentService {
         `SIGKILL (Code Signature Invalid)` / Launch Constraint Violation. So
         unregister always waits for launchd + a BTM settle before register. */
     nonisolated static func reregister() async throws {
-        try LaunchdAdmin.writeAgentPath()
-        migrateLegacyHomeAgent()
-        let service = agent.service
-        if service.status == .enabled || service.status == .requiresApproval {
-            try? await service.unregister()
+        let registered = try await onLane {
+            try LaunchdAdmin.writeAgentPath()
+            migrateLegacyHomeAgent()
+            let status = agent.service.status
+            return status == .enabled || status == .requiresApproval
+        }
+        if registered {
+            /** Register below is what reports a real problem; a failed
+                unregister is logged so a Launch Constraint Violation that
+                follows has its cause on record. */
+            do {
+                try await agent.service.unregister()
+            } catch {
+                DirectaLog.app.error("agent unregister before re-register: \(error.localizedDescription)")
+            }
             let unloaded = await LaunchdAdmin.waitUntilAgentUnloaded()
             if !unloaded {
                 DirectaLog.app.error(
                     "agent still loaded after unregister; register may hit a Launch Constraint Violation")
             }
         }
-        try service.register()
-        if service.status == .requiresApproval {
+        let status = try await onLane {
+            let service = agent.service
+            try service.register()
+            return service.status
+        }
+        if status == .requiresApproval {
             SMAppService.openSystemSettingsLoginItems()
             throw Failure.needsApproval
         }
@@ -70,11 +93,13 @@ enum AgentService {
         first: without the marker the recovery poll sees an unreachable daemon a
         moment later and registers the agent right back. */
     nonisolated static func unregister(paths: DirectaPaths = DirectaPaths()) async throws {
-        try AtomicFile.write(Data(), to: paths.stoppedIntentFile)
-        migrateLegacyHomeAgent()
-        let service = agent.service
-        guard service.status != .notRegistered else { return }
-        try await service.unregister()
+        let registered = try await onLane {
+            try AtomicFile.write(Data(), to: paths.stoppedIntentFile)
+            migrateLegacyHomeAgent()
+            return agent.service.status != .notRegistered
+        }
+        guard registered else { return }
+        try await agent.service.unregister()
         DirectaLog.app.info("agent unregistered on request")
     }
 
@@ -86,7 +111,7 @@ enum AgentService {
         it. */
     nonisolated static func unregisterLaunchItemsButAppAgent(paths: DirectaPaths = DirectaPaths()) async throws {
         try await unregister(paths: paths)
-        AppAgentService.retireLegacyLoginItem(because: "uninstall")
+        await BlockingLane.system.run { AppAgentService.retireLegacyLoginItem(because: "uninstall") }
     }
 
     /** Deep-link / recovery entry: register, then wait until the socket answers.
@@ -98,8 +123,17 @@ enum AgentService {
         present but still spawning after a bad first attempt. */
     nonisolated static func ensureRunning(paths: DirectaPaths = DirectaPaths()) async throws {
         try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
-        try register()
+        try await register()
         try await waitForHelloOrEscalate(paths: paths, escalate: true)
+    }
+
+    /** Runs a synchronous Service Management or launchctl call on
+        `BlockingLane.system`, so its XPC round trip parks a lane thread rather
+        than a cooperative-pool thread. */
+    nonisolated private static func onLane<T: Sendable>(
+        _ work: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        try await BlockingLane.system.run { Result { try work() } }.get()
     }
 
     /** At launch: keep the agent registered when this bundle can host it,
@@ -137,7 +171,7 @@ enum AgentService {
             if rebind {
                 try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
             }
-            let status = try register()
+            let status = try await register()
             DirectaLog.app.info("agent register at launch: \(status)")
             if AgentRebindPolicy.shouldForceReregisterAfterHelloMiss(rebindNeeded: rebind) {
                 if (try? await LaunchdAdmin.pollHello(
@@ -183,7 +217,8 @@ enum AgentService {
         if (try? await LaunchdAdmin.pollHello(paths: paths, timeoutSeconds: 2)) != nil {
             return
         }
-        guard agent.service.status == .enabled else {
+        let enabled = await BlockingLane.system.run { agent.service.status == .enabled }
+        guard enabled else {
             throw WireError(code: .daemonUnreachable, message: "the daemon never answered")
         }
         guard !LaunchdAdmin.deliberatelyStopped(paths: paths) else { return }
@@ -200,10 +235,13 @@ enum AgentService {
         /** KeepAlive's in-place LWCR repair after a Launch Constraint Violation
             fails for ad-hoc helpers (`Unable to update LWCR with smd: 22`) and
             only burns another ThrottleInterval. Prefer a fresh register. */
-        if LaunchdAdmin.agentRebindNeeded(paths: paths)
-            || LaunchdAdmin.agentSpawnScheduled()
-        {
-            if LaunchdAdmin.agentRebindNeeded(paths: paths) {
+        let rebindNeeded = LaunchdAdmin.agentRebindNeeded(paths: paths)
+        var slowToSpawn = rebindNeeded
+        if !slowToSpawn {
+            slowToSpawn = await BlockingLane.system.run { LaunchdAdmin.agentSpawnScheduled() }
+        }
+        if slowToSpawn {
+            if rebindNeeded {
                 DirectaLog.app.info(
                     "post-replace agent still silent; re-registering instead of waiting on LWCR repair")
                 guard escalate else { return }
