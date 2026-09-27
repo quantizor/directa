@@ -1156,7 +1156,7 @@ import os
     }
 
     /** Stands in for a harness whose detection state and install outcome are
-        both controllable, for `HookInstall.resolveTargets`/`installAll`. */
+        both controllable, for `HookInstall.resolveTargets` and `HarnessBatch`. */
     private struct DetectableStub: HarnessAdapter {
         var installError: WireError?
         var installSummary: String = ""
