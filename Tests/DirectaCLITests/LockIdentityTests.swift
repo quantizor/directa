@@ -29,7 +29,7 @@ import Testing
             error.message
                 == "resource 'd1' state at /p/state changed (it was replaced) while db stayed running. That server holds the old state open and can write cached pages back over the change, so what is on disk is not what the command wrote."
         )
-        #expect(error.hint == "directa lock d1 --pause -- <command>")
+        #expect(error.hint == "run: directa lock d1 --pause -- <command>")
     }
 
     @Test func theFaultNamesEveryLiveServerSortedAndHintsPause() throws {
@@ -41,7 +41,7 @@ import Testing
             Issue.record("expected a fault")
             return
         }
-        #expect(error.hint == "directa lock d1 --pause -- <command>")
+        #expect(error.hint == "run: directa lock d1 --pause -- <command>")
         /** Plural subject when more than one server stayed up, listed sorted. */
         #expect(error.message.contains("while db, web stayed running"))
         #expect(error.message.contains("Those servers hold the old state open"))

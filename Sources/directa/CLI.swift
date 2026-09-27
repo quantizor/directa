@@ -626,7 +626,7 @@ struct Stop: AsyncParsableCommand {
             a bounce. `--json` carries `locks` instead, so stdout keeps its schema. */
         if !global.json, let resource = result.server.locks?.sorted().first {
             CLIRunner.note(
-                "hint: \(name) holds '\(resource)'; directa lock \(resource) -- <command> gets exclusive access without stopping it"
+                "hint: \(name) holds '\(resource)'; directa lock \(ShellWord.argument(resource)) -- <command> gets exclusive access without stopping it"
             )
         }
     }
@@ -2638,7 +2638,7 @@ struct Switch: AsyncParsableCommand {
                 CLIRunner.fail(
                     WireError(
                         code: .internalError,
-                        hint: "fix the failure, then: directa up",
+                        hint: "fix the failure, then run: directa up",
                         message: "lifecycle command failed (\(process.terminationStatus)): \(argv.joined(separator: " "))"),
                     json: global.json)
             }
@@ -2803,7 +2803,7 @@ enum LockIdentityVerdict: Equatable {
         return .fault(
             WireError(
                 code: .resourceMutated,
-                hint: "directa lock \(resource) --pause -- <command>",
+                hint: "run: directa lock \(ShellWord.argument(resource)) --pause -- <command>",
                 message:
                     "resource '\(resource)' state at \(statePath) changed (\(described)) while \(servers.joined(separator: ", ")) stayed running. \(servers.count == 1 ? "That server holds" : "Those servers hold") the old state open and can write cached pages back over the change, so what is on disk is not what the command wrote."
             ))
@@ -2890,7 +2890,7 @@ struct Lock: AsyncParsableCommand {
         guard command.isEmpty else { return nil }
         return WireError(
             code: .usage,
-            hint: "directa lock \(resource) -- <command>",
+            hint: "run: directa lock \(ShellWord.argument(resource)) -- <command>",
             message: "directa lock needs a command after `--`; its own options go before it (directa lock \(resource) [--pause] [--acquire-timeout <seconds>] [--timeout <seconds>] -- <command…>)")
     }
 

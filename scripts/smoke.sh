@@ -571,7 +571,7 @@ set +e
 MUTATED_EXIT=$?
 set -e
 [[ "$MUTATED_EXIT" -ne 0 ]] || fail "default hold accepted a command that replaced the locked state"
-/usr/bin/python3 -c "import json;d=json.load(open('$WORK/mutated.json'));assert d['error']['code']=='resource-mutated', d; assert d['error']['hint']=='directa lock data --pause -- <command>', d" || fail "resource-mutated envelope wrong: $(cat "$WORK/mutated.json")"
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/mutated.json'));assert d['error']['code']=='resource-mutated', d; assert d['error']['hint']=='run: directa lock data --pause -- <command>', d" || fail "resource-mutated envelope wrong: $(cat "$WORK/mutated.json")"
 pass "a default-hold command over changed state fails loudly with resource-mutated"
 
 # And an untouched resource stays quiet, so the check cannot fire on everything.

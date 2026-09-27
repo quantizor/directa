@@ -71,8 +71,15 @@ import Testing
         #expect(lock.command.isEmpty)
         let error = try #require(Lock.usageError(command: lock.command, resource: lock.resource))
         #expect(error.code == .usage)
-        #expect(error.hint == "directa lock d1 -- <command>")
+        #expect(error.hint == "run: directa lock d1 -- <command>")
         #expect(error.message.contains("needs a command after `--`"))
+    }
+
+    /** The hint is pasted into a shell, so a resource name that is not plain
+        arrives as one quoted argument. */
+    @Test func theUsageHintQuotesAResourceNameThatIsNotPlain() throws {
+        let error = try #require(Lock.usageError(command: [], resource: "my db"))
+        #expect(error.hint == "run: directa lock 'my db' -- <command>")
     }
 
     @Test func aPresentCommandProducesNoUsageError() {
