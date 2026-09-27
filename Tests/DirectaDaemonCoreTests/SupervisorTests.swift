@@ -750,6 +750,66 @@ private func makeEnv() throws -> TestEnv {
         #expect(written == "done\n", "the worker was killed before its graceful shutdown finished")
     }
 
+    /** A worker that daemonized away from the root (its parent exited, so
+        launchd adopted it) is still this server's own process when the
+        startup snapshot recorded it, and its listener must read as the
+        server's port rather than as a foreign holder. The healthcheck targets
+        a second port the test opens only after it has killed the listener's
+        parent, so the first healthy scan runs once the listener has left the
+        root's parent chain, and the startup snapshot has had the whole
+        starting window to record it. */
+    @Test func aListenerThatLeftTheRootsParentChainIsStillTheServersPort() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeEnv()
+        let port = 45_490
+        let healthPort = 45_491
+        let spec = ServerSpec(
+            command: [
+                "/bin/sh", "-c",
+                "\(ShellWord.singleQuoted(fixture)) --setsid-listener \(port) & exec /bin/sleep 30",
+            ],
+            healthcheck: HealthCheckSpec(intervalMs: 200, port: healthPort, type: .tcp),
+            name: "daemonizer", port: port)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectPath,
+            registry: Registry(paths: env.paths), spec: spec)
+        let root = try #require(await supervisor.start().pid.flatMap { pid_t(exactly: $0) })
+        let spool = env.paths.spoolOutFile(project: env.projectPath, server: "daemonizer")
+        var listener: pid_t?
+        for _ in 0..<100 where listener == nil {
+            let text = (try? String(contentsOf: spool, encoding: .utf8)) ?? ""
+            if let match = text.range(of: #"setsid listener pid (\d+)"#, options: .regularExpression) {
+                listener = String(text[match]).split(separator: " ").last.flatMap { pid_t($0) }
+            }
+            if listener == nil { try await Task.sleep(for: .milliseconds(20)) }
+        }
+        let worker = try #require(listener, "the fixture never reported its setsid listener")
+        defer { kill(worker, SIGKILL) }
+        /** Several descendant refreshes while the listener's parent still
+            parents it, then that parent goes. */
+        try await Task.sleep(for: .seconds(1))
+        let parent = try #require(ProcessTree.descendants(of: root).pids.first { $0 != worker })
+        kill(parent, SIGKILL)
+        for _ in 0..<100 where ProcessTree.descendants(of: root).pids.contains(worker) {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        /** The premise: the listener is no longer in the root's parent chain. */
+        #expect(!ProcessTree.descendants(of: root).pids.contains(worker))
+        #expect(await supervisor.status().phase == .starting)
+
+        let health = try spawnReapedSessionLeader([fixture, "--listen-tcp", "\(healthPort)"])
+        defer { kill(health, SIGKILL) }
+        #expect(try await waitForPhase(supervisor, .running, tries: 50).phase == .running)
+        var status = await supervisor.status()
+        for _ in 0..<50 where status.observedPort == nil && status.portConflict == nil {
+            try await Task.sleep(for: .milliseconds(50))
+            status = await supervisor.status()
+        }
+        #expect(status.observedPort == port)
+        #expect(status.portConflict == nil)
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
+    }
+
     /** Reads a live process's parent from ps, for failure evidence only. */
     private func parentPid(of pid: pid_t) -> String {
         shell(["/bin/ps", "-o", "ppid=", "-p", String(pid)])

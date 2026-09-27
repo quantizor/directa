@@ -906,13 +906,16 @@ public actor ServerSupervisor {
 
     /** Post-healthy listen scan: dev servers auto-increment ports on conflict
         (Vite, Next), so the port actually listening is surfaced separately from
-        the declared one. */
+        the declared one. The run's own processes are the root plus the
+        refreshed descendant snapshot, which keeps a worker that setsid'd and
+        reparented away from the root's parent chain. */
     private func scanObservedPort() {
         guard let rootPid = pid else { return }
+        refreshDescendantSnapshot()
+        let pids = [rootPid] + lastDescendantSnapshot.map(\.pid)
         let expected = effectivePort ?? spec.port
         let generation = runGeneration
         Task { [weak self] in
-            let pids = [rootPid] + ProcessTree.descendants(of: rootPid).pids
             let ports = await PortGuard.listeningPorts(pids: pids)
             await self?.applyListenScan(
                 expected: expected, generation: generation, ours: pids.map(Int.init),
