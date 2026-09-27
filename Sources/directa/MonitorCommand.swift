@@ -144,9 +144,9 @@ struct Monitor: AsyncParsableCommand {
     }
 }
 
-/** Screens every monitor budget flag at the parser boundary, the same
-    boundary `TimeoutOption` screens `--timeout` at: a value outside
-    `MonitorLimits`' range is refused with a message naming the range,
+/** Screens every monitor budget flag at the parser boundary: a value outside
+    `MonitorLimits`' range is refused by the argument parser (exit 64) with a
+    message naming the range,
     rather than reaching `MonitorStream` and silently behaving as an
     unlimited or a zero budget. ArgumentParser prefixes each message with the
     flag it came from. */

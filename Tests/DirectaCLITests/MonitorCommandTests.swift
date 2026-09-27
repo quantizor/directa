@@ -583,14 +583,11 @@ private actor FakeMonitorClock: MonitorClock {
     }
 }
 
-/** Every `directa monitor` budget flag validated at the parser boundary,
-    the same boundary `TimeoutOption` screens `--timeout` at
-    (`TimeoutOptionTests`). */
+/** Every `directa monitor` budget flag validated at the parser boundary. */
 @Suite struct MonitorFlagOptionTests {
-    /** Direct calls to the transform functions, mirroring how
-        `TimeoutOptionTests` tests `TimeoutOption.parse` itself: a value
-        `Monitor.parse` hands one of these throws the raw `ValidationError`,
-        with a message naming the offending value and the accepted range. */
+    /** Direct calls to the transform functions: a value `Monitor.parse`
+        hands one of these throws the raw `ValidationError`, with a message
+        naming the offending value and the accepted range. */
     private static let lineRanges = [
         MonitorLimits.errorsPerArmRange, MonitorLimits.errorsPerMinuteRange, MonitorLimits.linesPerArmRange,
         MonitorLimits.linesPerMinuteRange,
@@ -631,9 +628,8 @@ private actor FakeMonitorClock: MonitorClock {
     /** Every flag actually routes through its validator at the CLI's own
         parser boundary (not just when called directly): a bad value fails
         `Monitor.parse` itself. `ArgumentParser` wraps the transform's thrown
-        `ValidationError` in its own `CommandError`, the same reason
-        `TimeoutOptionTests.everyTimeoutOptionRejectsANonFiniteValueAtTheParserBoundary`
-        asserts `(any Error).self` rather than `ValidationError.self` here. */
+        `ValidationError` in its own `CommandError`, so this asserts
+        `(any Error).self` rather than `ValidationError.self`. */
     @Test func everyFlagIsWiredThroughItsValidatorAtTheParserBoundary() {
         #expect(throws: (any Error).self) { try Monitor.parse(["web", "--lines-per-minute", "0"]) }
         #expect(throws: (any Error).self) { try Monitor.parse(["web", "--lines-per-arm", "0"]) }
