@@ -559,10 +559,12 @@ public enum LaunchdAdmin {
     @discardableResult
     public static func shell(
         _ path: String, _ arguments: [String], environment: [String: String]? = nil,
-        timeoutSeconds: Double? = nil
+        includeStderr: Bool = true, timeoutSeconds: Double? = nil
     ) async -> (status: Int32, output: String) {
         await BlockingLane.system.run {
-            shell(path, arguments, environment: environment, timeoutSeconds: timeoutSeconds)
+            shell(
+                path, arguments, environment: environment, includeStderr: includeStderr,
+                timeoutSeconds: timeoutSeconds)
         }
     }
 
@@ -572,9 +574,12 @@ public enum LaunchdAdmin {
     @discardableResult
     public static func shell(
         _ path: String, _ arguments: [String], environment: [String: String]? = nil,
-        timeoutSeconds: Double? = nil
+        includeStderr: Bool = true, timeoutSeconds: Double? = nil
     ) -> (status: Int32, output: String) {
-        switch shellOutcome(path, arguments, environment: environment, timeoutSeconds: timeoutSeconds) {
+        switch shellOutcome(
+            path, arguments, environment: environment, includeStderr: includeStderr,
+            timeoutSeconds: timeoutSeconds)
+        {
         case .exited(let status, let output):
             (status: status, output: output)
         case .failedToRun(let reason):
@@ -587,17 +592,22 @@ public enum LaunchdAdmin {
     /** The async form of `shellOutcome`, on `BlockingLane.system`. */
     public static func shellOutcome(
         _ path: String, _ arguments: [String], environment: [String: String]? = nil,
-        timeoutSeconds: Double? = nil
+        includeStderr: Bool = true, timeoutSeconds: Double? = nil
     ) async -> ShellOutcome {
         await BlockingLane.system.run {
-            shellOutcome(path, arguments, environment: environment, timeoutSeconds: timeoutSeconds)
+            shellOutcome(
+                path, arguments, environment: environment, includeStderr: includeStderr,
+                timeoutSeconds: timeoutSeconds)
         }
     }
 
-    /** Runs a command to the end with stdout and stderr merged, on this
-        thread alone. `environment` nil inherits this process's, which is what
-        most callers want. Pass one to make the child's answer independent of
-        who asked.
+    /** Runs a command to the end on this thread alone. `environment` nil
+        inherits this process's, which is what most callers want. Pass one to
+        make the child's answer independent of who asked.
+
+        `includeStderr` merges the child's stderr into the output, which is
+        what a caller reporting a failure wants; pass false where the output
+        is parsed as a value (a version string), and stderr is discarded.
 
         `timeoutSeconds` nil waits forever, which is right for a command directa
         controls end to end. Pass one for anything that runs a file the user
@@ -606,24 +616,22 @@ public enum LaunchdAdmin {
         app hangs at launch with nothing on screen explaining why. */
     public static func shellOutcome(
         _ path: String, _ arguments: [String], environment: [String: String]? = nil,
-        timeoutSeconds: Double? = nil
+        includeStderr: Bool = true, timeoutSeconds: Double? = nil
     ) -> ShellOutcome {
         let label = ([(path as NSString).lastPathComponent] + arguments).joined(separator: " ")
         return DaemonActivity.shared.measure(ActivityKind.forExecutable(path), label: label) {
-            shellUnmeasured(path, arguments, environment: environment, timeoutSeconds: timeoutSeconds)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = arguments
+            process.environment = environment
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = includeStderr ? pipe : FileHandle.nullDevice
+            return run(process, capturing: pipe, timeoutSeconds: timeoutSeconds)
         }
     }
 
-    private static func shellUnmeasured(
-        _ path: String, _ arguments: [String], environment: [String: String]?, timeoutSeconds: Double?
-    ) -> ShellOutcome {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = arguments
-        process.environment = environment
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
+    private static func run(_ process: Process, capturing pipe: Pipe, timeoutSeconds: Double?) -> ShellOutcome {
         guard let timeoutSeconds else {
             /** Read to end of file on this thread before the wait, so a child
                 that fills the pipe buffer always has a reader and the call

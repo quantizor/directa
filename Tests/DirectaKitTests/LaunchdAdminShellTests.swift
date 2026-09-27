@@ -80,6 +80,24 @@ import Testing
         #expect(started.duration(to: .now) < .seconds(3))
     }
 
+    /** Output parsed as a value (a `--version` string) excludes stderr, so a
+        warning on stderr cannot corrupt it; the default keeps both. */
+    @Test func stdoutAloneWhenStderrIsExcluded() {
+        let script = ["-c", "echo warning >&2; echo 1.2.3"]
+        for timeout in [nil, 10.0] {
+            #expect(
+                LaunchdAdmin.shell("/bin/sh", script, includeStderr: false, timeoutSeconds: timeout).output
+                    == "1.2.3\n")
+            #expect(
+                LaunchdAdmin.shell("/bin/sh", script, timeoutSeconds: timeout).output == "warning\n1.2.3\n")
+        }
+    }
+
+    @Test func theAsyncFormExcludesStderrToo() async {
+        let script = ["-c", "echo warning >&2; echo 1.2.3"]
+        #expect(await LaunchdAdmin.shell("/bin/sh", script, includeStderr: false).output == "1.2.3\n")
+    }
+
     /** The form async code calls answers exactly like the synchronous one. */
     @Test func theAsyncFormReturnsStatusAndFullOutput() async {
         let target = 200_000

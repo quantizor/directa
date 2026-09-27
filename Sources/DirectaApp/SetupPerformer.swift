@@ -426,7 +426,7 @@ enum SetupPerformer: Sendable {
 
     nonisolated private static func readCLIVersion(at url: URL) -> String? {
         guard FileManager.default.isExecutableFile(atPath: url.path) else { return nil }
-        let result = LaunchdAdmin.shell(url.path, ["--version"])
+        let result = LaunchdAdmin.shell(url.path, ["--version"], includeStderr: false)
         guard result.status == 0 else { return nil }
         let text = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? nil : text
