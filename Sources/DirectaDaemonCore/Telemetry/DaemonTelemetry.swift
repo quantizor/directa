@@ -19,6 +19,7 @@ public final class DaemonTelemetry: Sendable {
     public static let launchctlTimeoutSeconds = 10.0
 
     public let activity: DaemonActivity
+    private let exitRecorded = OSAllocatedUnfairLock(initialState: false)
     private let incidentDone = DispatchSemaphore(value: 0)
     public let log: TelemetryLog
     public let paths: DirectaPaths
@@ -99,18 +100,33 @@ public final class DaemonTelemetry: Sendable {
         return telemetry
     }
 
-    /** The clean-exit mark; its absence as a run's last line is how the next
-        boot tells a kill from an exit. The sampler and the activity marks are
-        stopped first, so no line can land after it. */
-    public func recordExit(reason: String) {
+    /** The exit mark: its absence is how the next boot tells a kill from an
+        exit, and a nonzero `code` makes the exit a death too. Only the first
+        call writes, so an exit helper that names the code wins over the
+        process-exit hook that runs after it and knows none. The sampler and
+        the activity marks are stopped first, so no line can land after it. */
+    public func recordExit(code: Int32?, reason: String) {
+        let first = exitRecorded.withLock { recorded -> Bool in
+            defer { recorded = true }
+            return !recorded
+        }
+        guard first else { return }
         activity.setObserver(nil)
         sampler.stop()
-        log.append(TelemetryMark(daemonPid: pid, event: .daemonExiting, label: reason, time: Date()))
+        log.append(TelemetryMark(daemonPid: pid, event: .daemonExiting, exitCode: code, label: reason, time: Date()))
     }
 
     /** Blocks until the boot incident is fully written, for tests. */
     public func waitForIncident(timeoutSeconds: Double) -> Bool {
         incidentDone.wait(timeout: .now() + timeoutSeconds) == .success
+    }
+
+    /** Records the exit with its code, then exits. An `exit` that skips this
+        reaches only the process-exit hook, whose mark names no code and so
+        reads as clean. */
+    public static func exit(code: Int32, reason: String) -> Never {
+        current?.recordExit(code: code, reason: reason)
+        Darwin.exit(code)
     }
 
     /** Stops the sampler and detaches the observer, for tests; safe after

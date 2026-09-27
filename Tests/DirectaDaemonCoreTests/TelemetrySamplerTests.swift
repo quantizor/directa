@@ -166,7 +166,9 @@ private let fastPolicy = TelemetryCadence.Policy(
         let stop = activity.begin(.stop, label: "/p::web: requested by stop")
         activity.end(stop, outcome: "stopped")
         #expect(telemetry.waitForIncident(timeoutSeconds: 10))
-        telemetry.recordExit(reason: "test")
+        telemetry.recordExit(code: 3, reason: "test")
+        /** The process-exit hook after an exit that named its code writes nothing. */
+        telemetry.recordExit(code: nil, reason: "exit")
         telemetry.shutdown()
 
         let incidents = try FileManager.default.contentsOfDirectory(atPath: paths.daemonIncidentsDir.path)
@@ -182,7 +184,7 @@ private let fastPolicy = TelemetryCadence.Policy(
                 == IncidentHeader(
                     daemonPid: getpid(), gapSeconds: header.gapSeconds,
                     launchd: .unavailable(note: "not running as the launchd agent (started with --foreground or by hand)"),
-                    previousExitedCleanly: false, previousLastLineAt: lastAt, previousLineCount: 5, previousPid: 4321,
+                    previousExitCode: nil, previousExitedCleanly: false, previousLastLineAt: lastAt, previousLineCount: 5, previousPid: 4321,
                     time: header.time))
         #expect(try #require(header.gapSeconds) >= 30)
         #expect(try decoded(Array(lines[1...5]), entry: .mark, as: TelemetryMark.self) == previousMarks)
@@ -198,6 +200,9 @@ private let fastPolicy = TelemetryCadence.Policy(
         let marks = try decoded(current, entry: .mark, as: TelemetryMark.self)
             .filter { $0.daemonPid == getpid() && $0.event != .threadsHigh }
         #expect(marks.map(\.event) == [.daemonStarted, .stopBegan, .stopEnded, .daemonExiting])
+        let exiting = try #require(marks.last)
+        #expect(
+            exiting == TelemetryMark(daemonPid: getpid(), event: .daemonExiting, exitCode: 3, label: "test", time: exiting.time))
         let ended = try #require(marks.first { $0.event == .stopEnded })
         #expect(
             ended

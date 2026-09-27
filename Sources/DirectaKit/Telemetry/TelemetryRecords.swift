@@ -256,6 +256,9 @@ public struct TelemetryMark: TelemetryLine, Codable, Equatable {
     public var daemonPid: Int32
     public var entry = TelemetryEntryKind.mark
     public var event: TelemetryMarkEvent
+    /** On `daemon-exiting`, the code the daemon passed to `exit`; nil when
+        the exit went through a path that did not name one. */
+    public var exitCode: Int32?
     public var kind: ActivityKind?
     public var label: String?
     public var outcome: String?
@@ -263,11 +266,12 @@ public struct TelemetryMark: TelemetryLine, Codable, Equatable {
     public var time: Date
 
     public init(
-        daemonPid: Int32, event: TelemetryMarkEvent, kind: ActivityKind? = nil, label: String? = nil,
-        outcome: String? = nil, seconds: Double? = nil, time: Date
+        daemonPid: Int32, event: TelemetryMarkEvent, exitCode: Int32? = nil, kind: ActivityKind? = nil,
+        label: String? = nil, outcome: String? = nil, seconds: Double? = nil, time: Date
     ) {
         self.daemonPid = daemonPid
         self.event = event
+        self.exitCode = exitCode
         self.kind = kind
         self.label = label
         self.outcome = outcome

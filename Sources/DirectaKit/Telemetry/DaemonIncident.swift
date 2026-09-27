@@ -75,7 +75,11 @@ public struct IncidentHeader: Codable, Equatable, Sendable {
     /** Seconds from the previous run's last telemetry line to this boot. */
     public var gapSeconds: Double?
     public var launchd: LaunchdLookup
-    /** True when the previous run wrote its clean-exit mark. */
+    /** The code on the previous run's own exit mark, when it wrote one
+        that named a code. */
+    public var previousExitCode: Int32?
+    /** True when the previous run wrote its exit mark with no code or code
+        zero. */
     public var previousExitedCleanly: Bool
     public var previousLastLineAt: Date?
     public var previousLineCount: Int
@@ -84,12 +88,14 @@ public struct IncidentHeader: Codable, Equatable, Sendable {
     public var time: Date
 
     public init(
-        daemonPid: Int32, gapSeconds: Double?, launchd: LaunchdLookup, previousExitedCleanly: Bool,
-        previousLastLineAt: Date?, previousLineCount: Int, previousPid: Int32?, time: Date
+        daemonPid: Int32, gapSeconds: Double?, launchd: LaunchdLookup, previousExitCode: Int32?,
+        previousExitedCleanly: Bool, previousLastLineAt: Date?, previousLineCount: Int, previousPid: Int32?,
+        time: Date
     ) {
         self.daemonPid = daemonPid
         self.gapSeconds = gapSeconds
         self.launchd = launchd
+        self.previousExitCode = previousExitCode
         self.previousExitedCleanly = previousExitedCleanly
         self.previousLastLineAt = previousLastLineAt
         self.previousLineCount = previousLineCount
@@ -98,8 +104,8 @@ public struct IncidentHeader: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case daemonPid, entry, gapSeconds, launchd, launchdNote, previousExitedCleanly, previousLastLineAt
-        case previousLineCount, previousPid, time
+        case daemonPid, entry, gapSeconds, launchd, launchdNote, previousExitCode, previousExitedCleanly
+        case previousLastLineAt, previousLineCount, previousPid, time
     }
 
     public init(from decoder: any Decoder) throws {
@@ -113,6 +119,7 @@ public struct IncidentHeader: Codable, Equatable, Sendable {
             } else {
                 .unavailable(note: try container.decode(String.self, forKey: .launchdNote))
             }
+        previousExitCode = try container.decodeIfPresent(Int32.self, forKey: .previousExitCode)
         previousExitedCleanly = try container.decode(Bool.self, forKey: .previousExitedCleanly)
         previousLastLineAt = try container.decodeIfPresent(Date.self, forKey: .previousLastLineAt)
         previousLineCount = try container.decode(Int.self, forKey: .previousLineCount)
@@ -129,6 +136,7 @@ public struct IncidentHeader: Codable, Equatable, Sendable {
         case .found(let record): try container.encode(record, forKey: .launchd)
         case .unavailable(let note): try container.encode(note, forKey: .launchdNote)
         }
+        try container.encodeIfPresent(previousExitCode, forKey: .previousExitCode)
         try container.encode(previousExitedCleanly, forKey: .previousExitedCleanly)
         try container.encodeIfPresent(previousLastLineAt, forKey: .previousLastLineAt)
         try container.encode(previousLineCount, forKey: .previousLineCount)
@@ -222,12 +230,15 @@ public enum DaemonIncident {
 
     /** What a boot knows about the previous run from its telemetry. */
     public struct Previous: Equatable, Sendable {
+        /** The code on the run's own exit mark, when the mark named one. */
+        public var exitCode: Int32?
         public var exitedCleanly: Bool
         public var lastLineAt: Date?
         public var lines: [String]
         public var pid: Int32?
 
-        public init(exitedCleanly: Bool, lastLineAt: Date?, lines: [String], pid: Int32?) {
+        public init(exitCode: Int32? = nil, exitedCleanly: Bool, lastLineAt: Date?, lines: [String], pid: Int32?) {
+            self.exitCode = exitCode
             self.exitedCleanly = exitedCleanly
             self.lastLineAt = lastLineAt
             self.lines = lines
@@ -236,14 +247,15 @@ public enum DaemonIncident {
     }
 
     /** How many of the previous run's last lines are searched for its
-        clean-exit mark: a line already in flight on another thread when the
-        exit began can land after the mark. */
+        exit mark: a line already in flight on another thread when the exit
+        began can land after the mark. */
     public static let exitMarkSearchLines = 8
 
     /** Reads the previous run's last lines from the telemetry directory.
         Called before this run writes its first line. The run exited cleanly
         when its own `daemon-exiting` mark is among the last
-        `exitMarkSearchLines`. */
+        `exitMarkSearchLines` and names no code or code zero; a nonzero code
+        (a startup failure) is a death like a kill. */
     public static func readPrevious(
         telemetryDirectory: URL, keepRotated: Int = TelemetryLog.defaultKeepRotated
     ) -> Previous {
@@ -253,12 +265,13 @@ public enum DaemonIncident {
         let last = lines.last.flatMap { TelemetryLog.LineHead(line: $0, decoder: decoder) }
         let pid = last?.daemonPid
         let exitingEvent = TelemetryMarkEvent.daemonExiting.rawValue
-        let exited = lines.suffix(exitMarkSearchLines).contains { line in
-            guard line.contains(exitingEvent), let head = TelemetryLog.LineHead(line: line, decoder: decoder)
-            else { return false }
-            return head.event == exitingEvent && head.daemonPid == pid
-        }
-        return Previous(exitedCleanly: exited, lastLineAt: last?.time, lines: lines, pid: pid)
+        let exitMark = lines.suffix(exitMarkSearchLines).lazy
+            .filter { $0.contains(exitingEvent) }
+            .compactMap { TelemetryLog.LineHead(line: $0, decoder: decoder) }
+            .first { $0.event == exitingEvent && $0.daemonPid == pid }
+        return Previous(
+            exitCode: exitMark?.exitCode, exitedCleanly: exitMark.map { ($0.exitCode ?? 0) == 0 } ?? false,
+            lastLineAt: last?.time, lines: lines, pid: pid)
     }
 
     /** `<boot time>-pid<pid>.ndjson`, colons swapped for dashes so the name
@@ -275,7 +288,7 @@ public enum DaemonIncident {
         let header = IncidentHeader(
             daemonPid: daemonPid,
             gapSeconds: previous.lastLineAt.map { Duration.seconds(bootTime.timeIntervalSince($0)).roundedSeconds },
-            launchd: launchd, previousExitedCleanly: previous.exitedCleanly,
+            launchd: launchd, previousExitCode: previous.exitCode, previousExitedCleanly: previous.exitedCleanly,
             previousLastLineAt: previous.lastLineAt, previousLineCount: previous.lines.count,
             previousPid: previous.pid, time: bootTime)
         var data = try NDJSON.encodeLine(header)

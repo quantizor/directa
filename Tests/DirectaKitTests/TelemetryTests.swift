@@ -603,6 +603,24 @@ private final class LockedArray: Sendable {
                 == DaemonIncident.Previous(exitedCleanly: false, lastLineAt: nil, lines: [], pid: nil))
     }
 
+    /** An exit mark with a nonzero code (a startup failure) is a death for
+        the next boot; code zero, or a mark with no code, is clean. */
+    @Test func aNonzeroExitCodeIsNotACleanExit() throws {
+        let cases: [(mark: String, clean: Bool, code: Int32?)] = [
+            (#"{"daemonPid":7,"entry":"mark","event":"daemon-exiting","exitCode":1,"label":"x","time":"2026-09-26T10:00:00.000Z"}"#, false, 1),
+            (#"{"daemonPid":7,"entry":"mark","event":"daemon-exiting","exitCode":0,"label":"x","time":"2026-09-26T10:00:00.000Z"}"#, true, 0),
+            (#"{"daemonPid":7,"entry":"mark","event":"daemon-exiting","label":"x","time":"2026-09-26T10:00:00.000Z"}"#, true, nil),
+        ]
+        for (mark, clean, code) in cases {
+            let directory = try temporaryDirectory()
+            let started = #"{"daemonPid":7,"entry":"mark","event":"daemon-started","label":"1","time":"2026-09-26T09:59:00.000Z"}"#
+            try Data((started + "\n" + mark + "\n").utf8).write(to: directory.appending(path: TelemetryLog.fileName))
+            let previous = DaemonIncident.readPrevious(telemetryDirectory: directory)
+            #expect(previous.exitedCleanly == clean, "\(mark)")
+            #expect(previous.exitCode == code, "\(mark)")
+        }
+    }
+
     @Test func headerAndLinesAssembleTheIncident() throws {
         let boot = try date("2026-09-26T10:05:00.000Z")
         let data = try DaemonIncident.headerAndLines(
@@ -626,12 +644,12 @@ private final class LockedArray: Sendable {
     @Test func aHeaderWithNoLaunchdRecordCarriesOnlyTheNote() throws {
         let header = IncidentHeader(
             daemonPid: 20, gapSeconds: nil, launchd: .unavailable(note: "not running as the launchd agent"),
-            previousExitedCleanly: false, previousLastLineAt: nil, previousLineCount: 0, previousPid: nil,
+            previousExitCode: 1, previousExitedCleanly: false, previousLastLineAt: nil, previousLineCount: 0, previousPid: nil,
             time: try date("2026-09-26T10:05:00.000Z"))
         let line = try encoded(header)
         #expect(
             line
-                == #"{"daemonPid":20,"entry":"incident","launchdNote":"not running as the launchd agent","previousExitedCleanly":false,"previousLineCount":0,"time":"2026-09-26T10:05:00.000Z"}"#
+                == #"{"daemonPid":20,"entry":"incident","launchdNote":"not running as the launchd agent","previousExitCode":1,"previousExitedCleanly":false,"previousLineCount":0,"time":"2026-09-26T10:05:00.000Z"}"#
                 + "\n")
         #expect(try decoded([line], as: IncidentHeader.self) == [header])
     }

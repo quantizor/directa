@@ -159,6 +159,7 @@ public final class TelemetryLog: Sendable {
     public struct LineHead: Decodable, Equatable, Sendable {
         public var daemonPid: Int32?
         public var event: String?
+        public var exitCode: Int32?
         public var time: Date?
 
         public init?(line: String, decoder: JSONDecoder) {

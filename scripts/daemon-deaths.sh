@@ -7,8 +7,8 @@
 #   ~/Library/Logs/directa/daemon/incidents.
 #
 # A death is an incident whose previous run left telemetry and did not end
-# with its clean-exit mark. Clean exits and first boots are counted, not
-# summarized. Fails loudly on a missing or empty directory, a missing jq, or
+# with its exit mark, or whose exit mark names a nonzero code. Clean exits
+# and first boots are counted, not summarized. Fails loudly on a missing or empty directory, a missing jq, or
 # a file with no incident header; prints nothing but the summaries otherwise.
 # Lines that are not JSON are skipped, since the copied telemetry can end in a
 # line the kill tore in half. Each file is read by one jq pass.
@@ -59,6 +59,7 @@ def summary($h):
   | [
     "== death before boot \($h.time) (previous pid \($h.previousPid // "?"), new pid \($h.daemonPid))",
     "  last telemetry line: \($lastAt // "none") (\($h.gapSeconds // "?")s before boot)",
+    (if ($h.previousExitCode // 0) != 0 then "  exited on its own with code \($h.previousExitCode), not killed" else empty end),
     (if $h.launchd then
        ($h.launchd | [.exitCode, .terminatingSignal, .exitReason, .immediateReason, .runs] | all(. == null)) as $unparsed
        | "  launchd: exit code \($h.launchd.exitCode // "-"), signal \($h.launchd.terminatingSignal // "-"), exit reason \($h.launchd.exitReason // "-"), immediate reason \($h.launchd.immediateReason // "-"), runs \($h.launchd.runs // "-")",
@@ -93,14 +94,14 @@ def summary($h):
        ($lastSnap.activity.longestRunning | orNone("    \(.kind) \(.seconds)s \(.label)"))
      end),
     "  last marks:",
-    ($marks | .[-10:] | orNone("    \(.time | clock) \(.event)\(if .kind then " " + .kind else "" end)\(if .seconds then " " + (.seconds | tostring) + "s" else "" end) \(.label // "")\(if .outcome then " -> " + .outcome else "" end)"))
+    ($marks | .[-10:] | orNone("    \(.time | clock) \(.event)\(if .exitCode != null then " code " + (.exitCode | tostring) else "" end)\(if .kind then " " + .kind else "" end)\(if .seconds then " " + (.seconds | tostring) + "s" else "" end) \(.label // "")\(if .outcome then " -> " + .outcome else "" end)"))
   ]
   | join("\n");
 
 [inputs | fromjson?]
 | (map(select(.entry == "incident")) | first) as $h
 | if $h == null then "invalid"
-  elif $h.previousExitedCleanly then "clean"
+  elif $h.previousExitedCleanly and ($h.previousExitCode // 0) == 0 then "clean"
   elif ($h.previousLineCount // 0) == 0 then "first"
   else "death\n" + summary($h) end
 '

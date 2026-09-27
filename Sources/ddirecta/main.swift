@@ -172,8 +172,10 @@ do {
     launchctl and `log show`) runs on its own background thread. */
 if DaemonTelemetry.isEnabled(environment: ProcessInfo.processInfo.environment) {
     DaemonTelemetry.start(paths: paths, runningAsAgent: LaunchdJobLauncher.runningAsAgent)
+    /** For an `exit` that does not go through `DaemonTelemetry.exit`; after
+        one that does, this records nothing. */
     atexit {
-        DaemonTelemetry.current?.recordExit(reason: "exit")
+        DaemonTelemetry.current?.recordExit(code: nil, reason: "exit")
     }
 }
 
@@ -255,7 +257,7 @@ terminationSource.setEventHandler {
             IONotificationPortDestroy(port)
             powerPort = nil
         }
-        exit(0)
+        DaemonTelemetry.exit(code: 0, reason: "SIGTERM")
     }
 }
 terminationSource.resume()
@@ -278,7 +280,7 @@ Task {
     } catch {
         FileHandle.standardError.write(
             Data("ddirecta: control listener never accepted on \(socketPath): \(error)\n".utf8))
-        exit(1)
+        DaemonTelemetry.exit(code: 1, reason: "control listener never accepted")
     }
     await router.recoverAtStartup()
     await router.setRestoring(false)
