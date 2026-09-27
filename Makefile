@@ -16,13 +16,15 @@ build:
 	swift build -c release --product DirectaApp
 
 # A run killed part way leaves its scratch trees under the user temp dir
-# (directa-run.*, directa-test-*) with no one to clean up after it. This sweeps
-# anything older than a day, so a second `make test` running concurrently is
+# (directa-run.* from `make test`, directa-test-* from TemporaryTree when no
+# run root is set) with no one to clean up after it. This sweeps exactly those
+# two shapes, never another directa-* entry there (the grok hook's turn state
+# lives in directa-grok-hook), and only when older than a day, so a second `make test` running concurrently is
 # untouched and a just-finished run's own dirs are not yanked from under a
 # still-attached debugger. Best-effort by design (macOS system dirs are
 # unreadable and make find exit 1), so a failed sweep never fails a test run.
 sweep-test-temp:
-	@find "$$(getconf DARWIN_USER_TEMP_DIR)" -mindepth 1 -maxdepth 1 -name 'directa-*' -type d -mtime +0 -exec rm -rf {} + 2>/dev/null || true
+	@find "$$(getconf DARWIN_USER_TEMP_DIR)" -mindepth 1 -maxdepth 1 \( -name 'directa-run.*' -o -name 'directa-test-*' \) -type d -mtime +0 -exec rm -rf {} + 2>/dev/null || true
 
 # Every test's scratch tree comes from TemporaryTree
 # (Tests/DirectaTestSupport/TemporaryTree.swift), which removes it when the
