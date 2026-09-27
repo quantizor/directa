@@ -67,7 +67,9 @@ enum AppAgentService {
     }
 
     /** Everything that starts the app at login: the older login item, then
-        the app agent. */
+        the app agent. Unregistering the agent terminates the job's running
+        process, which is this one when launchd started it, so a caller
+        with work left does that work first. */
     nonisolated static func removeAll(because reason: String) {
         retireLegacyLoginItem(because: reason)
         unregister()
@@ -119,13 +121,11 @@ enum AppAgentService {
         }
     }
 
-    /** Settings toggle Off: unregister the agent and any legacy item a
-        registration kept (either one alone would still start the app at
-        login), then record the marker so a later launch does not silently
-        turn it back on. */
+    /** Settings toggle Off: record the marker first so a later launch does
+        not silently turn Start at login back on, then `removeAll`, since
+        either the agent or a legacy item a registration kept would still
+        start the app at login. */
     nonisolated static func disableAtUserRequest(paths: DirectaPaths = DirectaPaths()) {
-        unregister()
-        retireLegacyLoginItem(because: "Start at login turned off in Settings")
         do {
             try AtomicFile.write(Data(), to: paths.appAutostartDisabledFile)
         } catch {
@@ -133,6 +133,7 @@ enum AppAgentService {
                 "Start at login off: could not record the choice at \(paths.appAutostartDisabledFile.path): \(error.localizedDescription)"
             )
         }
+        removeAll(because: "Start at login turned off in Settings")
     }
 
     /** Settings toggle On: clear the marker, then register. A registration
