@@ -70,6 +70,12 @@ enum HarnessHookState: Equatable, Sendable {
     case installed(path: String, pathExists: Bool)
     /** The harness is present but carries no directa hook. */
     case notInstalled
+
+    /** A directa hook is installed and its recorded path still exists. */
+    var isLive: Bool {
+        if case .installed(_, pathExists: true) = self { return true }
+        return false
+    }
 }
 
 /** A harness adapter owns one agent harness's settings format and injection
@@ -146,7 +152,7 @@ extension HarnessAdapter {
     private func refusal(because reason: String) -> WireError {
         WireError(
             code: .configInvalid,
-            hint: "directa hook install",
+            hint: "run: directa hook install",
             message:
                 "\(settingsURL.path) exists but could not be read (\(reason)), so directa left it "
                 + "alone. Installing the hook rewrites the whole file from what it reads back, so "
@@ -160,38 +166,82 @@ let harnessAdapters: [any HarnessAdapter] = [
     OpenCodeAdapter(),
 ]
 
+/** A harness's hook or statusline stdin JSON, decoded once and shared by
+    every decision the invocation makes. Lenient by design: every field is
+    optional and a field of the wrong type reads as absent rather than failing
+    the whole decode, since the payload belongs to a harness directa does not
+    control. `parse` answers nil for anything that is not a JSON object. */
+struct HookPayload: Decodable, Equatable {
+    /** Claude Code's and Grok's session directory. */
+    var cwd: String?
+    /** Whether the payload names `cursor_version` at all, with any value:
+        every Cursor hook payload carries it and no Claude Code payload does. */
+    var hasCursorVersion: Bool
+    /** Antigravity's 0-indexed model call number, as a number (never a
+        boolean or a string). */
+    var invocationNumber: Double?
+    /** The statusline's `workspace.current_dir`. */
+    var workspaceCurrentDir: String?
+    /** Antigravity's workspace list. */
+    var workspacePaths: [String]?
+    /** Grok's workspace root. */
+    var workspaceRoot: String?
+    /** Cursor's workspace list. */
+    var workspaceRoots: [String]?
+
+    private enum CodingKeys: String, CodingKey {
+        case cursorVersion = "cursor_version"
+        case cwd
+        case invocationNumber = "invocationNum"
+        case workspace
+        case workspacePaths
+        case workspaceRoot
+        case workspaceRoots = "workspace_roots"
+    }
+
+    private enum WorkspaceKeys: String, CodingKey {
+        case currentDir = "current_dir"
+    }
+
+    static func parse(_ stdin: Data) -> HookPayload? {
+        try? JSONCoding.decoder().decode(HookPayload.self, from: stdin)
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        cwd = try? container.decodeIfPresent(String.self, forKey: .cwd)
+        hasCursorVersion = container.contains(.cursorVersion)
+        invocationNumber = try? container.decodeIfPresent(Double.self, forKey: .invocationNumber)
+        workspaceCurrentDir =
+            (try? container.nestedContainer(keyedBy: WorkspaceKeys.self, forKey: .workspace))
+            .flatMap { try? $0.decodeIfPresent(String.self, forKey: .currentDir) }
+        workspacePaths = try? container.decodeIfPresent([String].self, forKey: .workspacePaths)
+        workspaceRoot = try? container.decodeIfPresent(String.self, forKey: .workspaceRoot)
+        workspaceRoots = try? container.decodeIfPresent([String].self, forKey: .workspaceRoots)
+    }
+}
+
 /** Resolve the project directory a session-start hook should introspect. Antigravity
     carries workspacePaths; Cursor carries workspace_roots (and CURSOR_PROJECT_DIR);
     Claude Code carries cwd; Grok carries cwd, workspaceRoot, and GROK_WORKSPACE_ROOT.
     Fall back to the process cwd when the payload is empty or malformed. */
 enum HookSessionCwd {
-    static func resolve(stdin: Data) -> String {
-        if let payload = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] {
-            if let roots = payload["workspace_roots"] as? [String], let first = roots.first,
-                !first.isEmpty
-            {
-                return first
-            }
-            if let paths = payload["workspacePaths"] as? [String], let first = paths.first,
-                !first.isEmpty
-            {
-                return first
-            }
-            if let cwd = payload["cwd"] as? String, !cwd.isEmpty { return cwd }
-            if let root = payload["workspaceRoot"] as? String, !root.isEmpty { return root }
-        }
-        if let env = ProcessInfo.processInfo.environment["CURSOR_PROJECT_DIR"], !env.isEmpty {
-            return env
-        }
-        if let env = ProcessInfo.processInfo.environment["GROK_WORKSPACE_ROOT"], !env.isEmpty {
-            return env
+    static func resolve(
+        _ payload: HookPayload?, environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String {
+        let candidates = [
+            payload?.workspaceRoots?.first, payload?.workspacePaths?.first, payload?.cwd,
+            payload?.workspaceRoot, environment["CURSOR_PROJECT_DIR"], environment["GROK_WORKSPACE_ROOT"],
+        ]
+        for case let candidate? in candidates where !candidate.isEmpty {
+            return candidate
         }
         return FileManager.default.currentDirectoryPath
     }
 }
 
 /** Whether a session hook speaks for this invocation, decided from the stdin
-    payload alone. Anything unparseable or unexpected answers true: a missing
+    payload. Anything unparseable or unexpected answers true: a missing
     context block costs the agent more than a duplicate one. */
 enum HookPayloadGate {
     /** Cursor runs the hooks in `~/.claude/settings.json` as well as its own
@@ -203,25 +253,62 @@ enum HookPayloadGate {
         session started from Cursor's integrated terminal can inherit Cursor's
         environment, and would then lose its only context block. The hook
         stands down only while directa's own Cursor hook is installed, so a
-        machine with just the claude hook still gets the block in Cursor. */
-    static func claudeHookShouldEmit(stdin: Data, cursorHookInstalled: Bool) -> Bool {
-        guard cursorHookInstalled, let payload = object(stdin) else { return true }
-        return payload["cursor_version"] == nil
+        machine with just the claude hook still gets the block in Cursor.
+        `cursorHookInstalled` reads Cursor's settings file, so it is asked
+        only for a payload that came from Cursor. */
+    static func claudeHookShouldEmit(_ payload: HookPayload?, cursorHookInstalled: () -> Bool) -> Bool {
+        guard payload?.hasCursorVersion == true else { return true }
+        return !cursorHookInstalled()
     }
 
     /** Antigravity has no session-start event, so its hook is registered on
         PreInvocation, which fires before every model call; `invocationNum` is
         the 0-indexed number of that call. Only the first call carries the
-        block. */
-    static func antigravityHookShouldEmit(stdin: Data) -> Bool {
-        guard let number = object(stdin)?["invocationNum"] as? NSNumber,
-            CFGetTypeID(number) != CFBooleanGetTypeID()
-        else { return true }
-        return number.intValue == 0
+        block; a fractional number counts by its whole part. */
+    static func antigravityHookShouldEmit(_ payload: HookPayload?) -> Bool {
+        guard let number = payload?.invocationNumber else { return true }
+        return number.magnitude < 1
+    }
+}
+
+/** A session hook's stdout: one JSON object in the shape its harness reads,
+    through `JSONCoding`. */
+enum HookOutput {
+    /** Antigravity's PreInvocation answer; an empty `injectSteps` says nothing. */
+    struct Antigravity: Encodable {
+        struct Step: Encodable {
+            var ephemeralMessage: String
+        }
+
+        var injectSteps: [Step]
     }
 
-    private static func object(_ stdin: Data) -> [String: Any]? {
-        (try? JSONSerialization.jsonObject(with: stdin)) as? [String: Any]
+    /** Claude Code's and Grok's `hookSpecificOutput`. */
+    struct AdditionalContext: Encodable {
+        struct Body: Encodable {
+            var additionalContext: String
+            var hookEventName: String
+        }
+
+        var hookSpecificOutput: Body
+    }
+
+    /** Cursor's snake_case sessionStart answer. */
+    struct Cursor: Encodable {
+        private enum CodingKeys: String, CodingKey {
+            case additionalContext = "additional_context"
+        }
+
+        var additionalContext: String
+    }
+
+    static func encoded(_ value: some Encodable) -> Data? {
+        try? JSONCoding.encoder().encode(value)
+    }
+
+    static func write(_ value: some Encodable) {
+        guard let data = encoded(value) else { return }
+        FileHandle.standardOutput.write(data)
     }
 }
 
@@ -640,13 +727,6 @@ enum GrokTurnGate {
         return URL(fileURLWithPath: tmp).appending(path: stateDirName)
     }
 
-    static func sessionId(in stdin: Data) -> String? {
-        guard let payload = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] else {
-            return nil
-        }
-        return (payload["sessionId"] as? String) ?? (payload["session_id"] as? String)
-    }
-
     static let fallbackKey = "nosession"
     static let maxKeyLength = 128
 
@@ -953,7 +1033,7 @@ struct OpenCodeAdapter: HarnessAdapter {
         let entry = OpenCodeWiring.instructionsEntry(forManagedFileAt: managed)
         return WireError(
             code: .configInvalid,
-            hint: "directa hook install",
+            hint: "run: directa hook install",
             message:
                 "OpenCode's config directory is overridden by OPENCODE_CONFIG_DIR "
                 + "(\(overridden)), which changes how OpenCode merges its global config, so "
@@ -978,7 +1058,7 @@ struct OpenCodeAdapter: HarnessAdapter {
         } else {
             throw WireError(
                 code: .configInvalid,
-                hint: "directa hook install",
+                hint: "run: directa hook install",
                 message:
                     "directa left \(settingsURL.path) alone: its instructions value is not an "
                     + "array of paths. Fix or remove the instructions key, then rerun")
@@ -1061,7 +1141,7 @@ struct OpenCodeAdapter: HarnessAdapter {
         } catch is WireError {
             throw WireError(
                 code: .configInvalid,
-                hint: "directa hook install",
+                hint: "run: directa hook install",
                 message:
                     "directa could not read \(settingsURL.path) as JSON, so it left the file "
                     + "alone. For OpenCode this most often means JSONC comments or trailing "

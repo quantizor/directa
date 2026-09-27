@@ -55,10 +55,6 @@ public enum LaunchdAdmin {
     }
 
     /** True when launchd currently has our agent in the gui domain. */
-    public static func isAgentLoaded() -> Bool {
-        shell("/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(label)"]).status == 0
-    }
-
     public static func isAgentLoaded() async -> Bool {
         await shell("/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(label)"]).status == 0
     }
@@ -72,26 +68,27 @@ public enum LaunchdAdmin {
         timeoutSeconds: Double = 10,
         settleSeconds: Double = AgentRebindPolicy.settleSeconds
     ) async -> Bool {
-        var loaded = await isAgentLoaded()
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while loaded, Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(50))
-            loaded = await isAgentLoaded()
-        }
+        var loaded = await pollWhileLoaded(until: Date().addingTimeInterval(timeoutSeconds))
         if loaded {
             _ = await shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
-            loaded = await isAgentLoaded()
-            let bootoutDeadline = Date().addingTimeInterval(3)
-            while loaded, Date() < bootoutDeadline {
-                try? await Task.sleep(for: .milliseconds(50))
-                loaded = await isAgentLoaded()
-            }
+            loaded = await pollWhileLoaded(until: Date().addingTimeInterval(3))
         }
         guard !loaded else { return false }
         if settleSeconds > 0 {
             try? await Task.sleep(for: .seconds(settleSeconds))
         }
         return await !isAgentLoaded()
+    }
+
+    /** Checks every 50ms while the agent stays loaded, until `deadline`;
+        answers whether it is still loaded. */
+    private static func pollWhileLoaded(until deadline: Date) async -> Bool {
+        var loaded = await isAgentLoaded()
+        while loaded, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+            loaded = await isAgentLoaded()
+        }
+        return loaded
     }
 
     /** Marker for the Applications copy: settle, then register, after a DMG
@@ -158,21 +155,20 @@ public enum LaunchdAdmin {
         return nil
     }
 
-    /** Auto-bootstrap: only against the default socket (never a test override),
-        never past a deliberate-stop marker. Prefers the Applications app's
-        SMAppService path when present; otherwise kickstarts/installs the
-        legacy home LaunchAgent. */
+    /** Auto-bootstrap: only against the default layout (never under
+        `DirectaPaths.hasEnvironmentOverride`, since the agent does not run that
+        layout's daemon), never past a deliberate-stop marker. Prefers the
+        Applications app's SMAppService path when present; otherwise
+        kickstarts/installs the legacy home LaunchAgent. */
     @discardableResult
     public static func attemptBootstrap(
         paths: DirectaPaths = DirectaPaths(),
         extraDaemonCandidates: [URL] = [],
         forceLegacy: Bool = false
     ) async -> Bool {
-        let environment = ProcessInfo.processInfo.environment
-        let overrides = [
-            "DIRECTA_SOCKET", DirectaPaths.dataDirEnvironmentKey, DirectaPaths.logsDirEnvironmentKey,
-        ]
-        guard overrides.allSatisfy({ environment[$0] == nil }) else { return false }
+        guard !DirectaPaths.hasEnvironmentOverride(ProcessInfo.processInfo.environment) else {
+            return false
+        }
         guard !deliberatelyStopped(paths: paths) else { return false }
         /** With the app installed it owns registration, so a silent socket is
             answered by waiting, never by installing a second job. Falling through
@@ -554,17 +550,9 @@ public enum LaunchdAdmin {
         _ path: String, _ arguments: [String], environment: [String: String]? = nil,
         timeoutSeconds: Double? = nil
     ) async -> (status: Int32, output: String) {
-        let result = await BlockingLane.system.run {
-            let (status, output) = shell(
-                path, arguments, environment: environment, timeoutSeconds: timeoutSeconds)
-            return ShellResult(output: output, status: status)
+        await BlockingLane.system.run {
+            shell(path, arguments, environment: environment, timeoutSeconds: timeoutSeconds)
         }
-        return (status: result.status, output: result.output)
-    }
-
-    private struct ShellResult: Sendable {
-        var output: String
-        var status: Int32
     }
 
     @discardableResult

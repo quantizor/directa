@@ -6,11 +6,23 @@ import Foundation
 public struct DirectaPaths: Sendable {
     public let dataDir: URL
     public let logsDir: URL
+    /** A socket path that replaces the data-dir default, fixed when this
+        layout is built so `socketPath` answers from the same inputs as the
+        directories. */
+    private let socketOverride: String?
 
+    /** `DIRECTA_SOCKET` in this process's environment is read here, once. */
     public init(dataDir: URL? = nil, logsDir: URL? = nil) {
+        self.init(
+            dataDir: dataDir, logsDir: logsDir,
+            socketOverride: Self.value(ProcessInfo.processInfo.environment, Self.socketEnvironmentKey))
+    }
+
+    private init(dataDir: URL?, logsDir: URL?, socketOverride: String?) {
         let home = FileManager.default.homeDirectoryForCurrentUser
         self.dataDir = dataDir ?? home.appending(path: "Library/Application Support/directa")
         self.logsDir = logsDir ?? home.appending(path: "Library/Logs/directa")
+        self.socketOverride = socketOverride
     }
 
     /** The CLI's local layout: `DIRECTA_DATA_DIR` and `DIRECTA_LOGS_DIR` stand
@@ -23,15 +35,31 @@ public struct DirectaPaths: Sendable {
         _ environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> DirectaPaths {
         func directory(_ key: String) -> URL? {
-            guard let value = environment[key], !value.isEmpty else { return nil }
-            return URL(fileURLWithPath: value).standardizedFileURL
+            value(environment, key).map { URL(fileURLWithPath: $0).standardizedFileURL }
         }
         return DirectaPaths(
-            dataDir: directory(dataDirEnvironmentKey), logsDir: directory(logsDirEnvironmentKey))
+            dataDir: directory(dataDirEnvironmentKey), logsDir: directory(logsDirEnvironmentKey),
+            socketOverride: value(environment, socketEnvironmentKey))
     }
 
     public static let dataDirEnvironmentKey = "DIRECTA_DATA_DIR"
     public static let logsDirEnvironmentKey = "DIRECTA_LOGS_DIR"
+    public static let socketEnvironmentKey = "DIRECTA_SOCKET"
+
+    /** True when `environment` moves any part of the layout off this
+        machine's defaults: a non-empty `DIRECTA_SOCKET`, `DIRECTA_DATA_DIR`,
+        or `DIRECTA_LOGS_DIR`. Such a layout belongs to a daemon the background
+        agent does not run. */
+    public static func hasEnvironmentOverride(_ environment: [String: String]) -> Bool {
+        [dataDirEnvironmentKey, logsDirEnvironmentKey, socketEnvironmentKey].contains {
+            value(environment, $0) != nil
+        }
+    }
+
+    private static func value(_ environment: [String: String], _ key: String) -> String? {
+        guard let value = environment[key], !value.isEmpty else { return nil }
+        return value
+    }
 
     /** The layout of the daemon that answered `daemon.info`: its own data and
         logs directories, which a daemon started with `--data-dir`/`--logs-dir`
@@ -66,9 +94,7 @@ public struct DirectaPaths: Sendable {
     /** The unix socket path, honoring DIRECTA_SOCKET and falling back under the
         sun_path 104-byte limit (long usernames, relocated homes). */
     public var socketPath: String {
-        if let override = ProcessInfo.processInfo.environment["DIRECTA_SOCKET"], !override.isEmpty {
-            return override
-        }
+        if let socketOverride { return socketOverride }
         let preferred = dataDir.appending(path: "daemon.sock").path
         return Self.fitsSunPath(preferred) ? preferred : "/tmp/directa-\(getuid())/daemon.sock"
     }
@@ -128,6 +154,12 @@ public struct DirectaPaths: Sendable {
     public static func projectLogDirName(project: String) -> String {
         let project = canonicalProjectPath(project)
         return "\(projectSlug(project))-\(hash8(project))"
+    }
+
+    /** The log directory names a set of projects claims, the form the orphan
+        check compares directory listings against. */
+    public static func projectLogDirNames(projects: some Sequence<String>) -> Set<String> {
+        Set(projects.map { projectLogDirName(project: $0) })
     }
 
     /** True when `name` has the shape `projectLogDir` gives a directory: the
@@ -266,60 +298,55 @@ public struct AtomicFileError: CustomStringConvertible, Error, Sendable {
     failure quarantines the file to `.corrupt-<timestamp>` and returns nil rather
     than crashing (a startup parse crash under launchd KeepAlive loops forever). */
 public enum AtomicFile {
-    /** Temp + fsync + rename. The temp name carries a per-call unique suffix, not
-        just the pid: two writers inside one process (the app registers the agent
-        at launch while its recovery poll writes the same file) would otherwise
-        share a temp path and rename it out from under each other. */
+    /** Temp + fsync + rename, the temp named by `tempName(for:)`. */
     public static func write(_ data: Data, to url: URL) throws {
         let dir = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let tmp = dir.appending(
-            path: ".\(url.lastPathComponent).tmp-\(getpid())-\(UUID().uuidString)")
+        let tmp = dir.appending(path: tempName(for: url))
+        /** The temp file is only ever meaningful mid-write: once any step
+            before the rename fails, nothing will ever pick it up, so it is
+            removed here rather than left for `sweepStaleTemps`. */
+        var renamed = false
+        defer {
+            if !renamed { try? FileManager.default.removeItem(at: tmp) }
+        }
         try data.write(to: tmp)
-        let fd = open(tmp.path, O_WRONLY)
-        if fd < 0 {
-            let openErrno = errno
-            try? FileManager.default.removeItem(at: tmp)
-            throw AtomicFileError(
-                message: "cannot open \(tmp.path) to fsync it: \(String(cString: strerror(openErrno)))")
-        }
-        let syncStatus = fsync(fd)
-        let syncErrno = errno
-        close(fd)
-        if syncStatus != 0 {
-            try? FileManager.default.removeItem(at: tmp)
-            throw AtomicFileError(
-                message: "fsync(\(tmp.path)) failed: \(String(cString: strerror(syncErrno)))")
-        }
-        do {
-            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
-        } catch {
-            /** The temp file is only ever meaningful mid-write: once the rename
-                fails, nothing will ever pick it up, so a daemon killed right
-                here would otherwise leave it on disk forever (that leftover
-                class is exactly what `sweepStaleTemps` cleans up for an
-                earlier crash; this path prevents adding to the pile). */
-            try? FileManager.default.removeItem(at: tmp)
-            throw error
-        }
+        try fsyncPath(tmp, flags: O_WRONLY, purpose: "to fsync it")
+        _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+        renamed = true
         /** Durability covers the rename, not only the bytes: fsyncing `tmp`
             guarantees its content survives a crash, but a crash before the
             directory entry itself is flushed can still lose the rename and
             leave the old file in place. fsyncing the parent directory after
             the replace closes that window. */
-        let dirFD = open(dir.path, O_RDONLY)
-        if dirFD < 0 {
+        try fsyncPath(dir, flags: O_RDONLY, purpose: "to fsync the rename")
+    }
+
+    /** Opens `url` with `flags`, fsyncs it, and closes it, throwing an error
+        that names the failed call, the path, and `purpose` (why it was opened). */
+    private static func fsyncPath(_ url: URL, flags: Int32, purpose: String) throws {
+        let fd = open(url.path, flags)
+        if fd < 0 {
             let openErrno = errno
             throw AtomicFileError(
-                message: "cannot open \(dir.path) to fsync the rename: \(String(cString: strerror(openErrno)))")
+                message: "cannot open \(url.path) \(purpose): \(String(cString: strerror(openErrno)))")
         }
-        let dirSyncStatus = fsync(dirFD)
-        let dirSyncErrno = errno
-        close(dirFD)
-        if dirSyncStatus != 0 {
+        let syncStatus = fsync(fd)
+        let syncErrno = errno
+        close(fd)
+        if syncStatus != 0 {
             throw AtomicFileError(
-                message: "fsync(\(dir.path)) failed: \(String(cString: strerror(dirSyncErrno)))")
+                message: "fsync(\(url.path)) failed: \(String(cString: strerror(syncErrno)))")
         }
+    }
+
+    /** `write`'s temp name, `.<name>.tmp-<pid>-<uuid>`: unique per call, not
+        just per pid, since two writers inside one process would otherwise
+        share a temp path and rename it out from under each other. The pid is
+        what `sweepStaleTemps` reads back through `tempFilePid`, whose pattern
+        must keep matching this shape. */
+    static func tempName(for url: URL) -> String {
+        ".\(url.lastPathComponent).tmp-\(getpid())-\(UUID().uuidString)"
     }
 
     /** Deletes a `write`-generated temp (`.<name>.tmp-<pid>-<uuid>`) whose pid is
@@ -340,8 +367,8 @@ public enum AtomicFile {
         }
     }
 
-    /** The pid embedded in a `write`-generated temp name, anchored to the exact
-        suffix `write` appends, or nil for anything else in the directory (a real
+    /** The pid embedded in a `tempName(for:)` name, anchored to the exact
+        suffix it appends, or nil for anything else in the directory (a real
         store, an unrelated dotfile, a `.corrupt-<timestamp>` quarantine). */
     static func tempFilePid(_ filename: String) -> Int? {
         guard let match = filename.firstMatch(of: /\.tmp-(\d+)-[0-9A-Fa-f-]+$/) else { return nil }

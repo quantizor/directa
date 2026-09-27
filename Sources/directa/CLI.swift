@@ -68,8 +68,12 @@ struct GlobalOptions: ParsableArguments {
         return Self.resolveProject(from: FileManager.default.currentDirectoryPath)
     }
 
+    /** One walk up from `cwd`: it answers the first directory holding a
+        devservers.json or rooting a linked worktree, and remembers the nearest
+        `.git` on the way for when neither turns up. */
     static func resolveProject(from cwd: String) -> String {
         let fm = FileManager.default
+        var nearestGitRoot: URL?
         var probe = URL(fileURLWithPath: cwd)
         while true {
             if fm.fileExists(atPath: probe.appending(path: "devservers.json").path)
@@ -77,20 +81,14 @@ struct GlobalOptions: ParsableArguments {
             {
                 return canonicalProjectPath(probe.path)
             }
+            if nearestGitRoot == nil, fm.fileExists(atPath: probe.appending(path: ".git").path) {
+                nearestGitRoot = probe
+            }
             let parent = probe.deletingLastPathComponent()
             if parent.path == probe.path { break }
             probe = parent
         }
-        var gitProbe = URL(fileURLWithPath: cwd)
-        while true {
-            if fm.fileExists(atPath: gitProbe.appending(path: ".git").path) {
-                return canonicalProjectPath(gitProbe.path)
-            }
-            let parent = gitProbe.deletingLastPathComponent()
-            if parent.path == gitProbe.path { break }
-            gitProbe = parent
-        }
-        return canonicalProjectPath(cwd)
+        return canonicalProjectPath(nearestGitRoot?.path ?? cwd)
     }
 }
 
@@ -126,11 +124,31 @@ enum CLIRunner {
                 .flatMap { String(data: $0, encoding: .utf8) }
             print(payload ?? #"{"ok":false}"#)
         } else {
-            var text = "directa: \(error.message)"
+            var text = noticeLine(error.message)
             if let hint = error.hint { text += "\n  \(hint)" }
-            FileHandle.standardError.write(Data((text + "\n").utf8))
+            note(text)
         }
     }
+
+    /** Writes `text` as one line on stderr, the channel for everything that
+        is not the command's result: stdout belongs to the result (`--json`)
+        or, under `lock`, to the guarded command. */
+    static func note(_ text: String) {
+        FileHandle.standardError.write(Data((text + "\n").utf8))
+    }
+
+    /** Writes a `CLINotice` body on stderr under directa's own prefix. */
+    static func notice(_ body: String) {
+        note(noticeLine(body))
+    }
+
+    static func noticeLine(_ body: String) -> String {
+        "directa: \(body)"
+    }
+
+    /** The response budget for a request that stops servers, which drains
+        each one through its own stop grace. */
+    static let stopOperationTimeoutSeconds: Double = 120
 
     static func fail(_ error: WireError, json: Bool) -> Never {
         emitFailure(error, json: json)
@@ -211,7 +229,7 @@ enum CLIRunner {
                 guard ContinuousClock.now < deadline else { throw error }
                 if !announced {
                     announced = true
-                    FileHandle.standardError.write(Data((CLINotice.daemonRestoring + "\n").utf8))
+                    notice(CLINotice.daemonRestoring)
                 }
                 /** A cancelled sleep just re-checks the deadline on the next
                     pass, so the loop still terminates and nothing is lost. */
@@ -248,22 +266,32 @@ enum CLIRunner {
     }
 }
 
-/** User-facing strings CLIRunner itself prints or fails with (never a message
-    the daemon composed), named so the exact wording is pinned by a test.
-    `CLIRunner.emitFailure` prepends "directa: " to every message on stderr, so
-    a message that led with "ddirecta" (the daemon binary's own name) used to
-    read as "directa: ddirecta …", a stutter easy to mistake for a typo; both
-    strings here name the daemon in plain English instead. */
+/** User-facing strings the CLI itself prints or fails with (never a message
+    the daemon composed), named so the exact wording is pinned by a test. Each
+    is a body without a prefix: `CLIRunner.notice` and `CLIRunner.emitFailure`
+    print it after "directa: ", so a body names the daemon in plain English
+    rather than as "ddirecta", which would read "directa: ddirecta …". */
 enum CLINotice {
     /** What `directa daemon start` points at when auto-bootstrap declines to
         restart a daemon a person stopped on purpose. */
     static let daemonDeliberatelyStopped = "the daemon was deliberately stopped"
-    /** Printed once per invocation when a request is retried against a daemon
-        still finishing boot restore, so a silent wait does not read as a hang. */
-    static let daemonRestoring = "directa: the daemon is restoring supervised servers; waiting…"
     /** A command that needs a result field only a newer daemon sends (the
         logs cursor) refuses rather than falling back to an unbounded read. */
     static let daemonOlderThanCLI = "the daemon is older than this CLI and cannot answer this command"
+    /** Printed once per invocation when a request is retried against a daemon
+        still finishing boot restore, so a silent wait does not read as a hang. */
+    static let daemonRestoring = "the daemon is restoring supervised servers; waiting…"
+    /** Printed by `daemon uninstall`, on stderr so `--json` stdout stays clean. */
+    static let daemonUninstallDeprecated =
+        "`directa daemon uninstall` is deprecated; use `directa uninstall` (or `directa uninstall --agent-only` to remove just the agent)"
+    /** Printed once by `logs --follow` inside a Claude Code session whose
+        stdout is not a terminal (`Logs.monitorHint`). */
+    static let followUseMonitor =
+        "to stream a server's output into this session, run directa monitor <name> with the Monitor tool"
+    /** Printed once when `restart` loses the daemon mid-restart and starts
+        recovering (`RestartSession`). */
+    static let restartConnectionLost =
+        "the daemon connection closed during the restart; waiting for it to come back and checking the server instead of restarting it again"
 }
 
 /** Screens every `--timeout`/`--acquire-timeout` option at the argument-parser
@@ -520,14 +548,13 @@ struct Restart: AsyncParsableCommand {
         let params = RestartParams(
             names: name.map { [$0] }, port: port, project: global.resolvedProject(),
             timeoutSeconds: timeout)
-        let client = CLIRunner.client()
         let session = RestartSession(
             clock: SystemRestartClock(),
-            notice: { FileHandle.standardError.write(Data(($0 + "\n").utf8)) },
+            notice: { CLIRunner.notice($0) },
             params: params,
-            requester: DaemonClientRestartRequester(client: client, timeoutSeconds: timeout))
+            requester: DaemonClientRestartRequester(client: CLIRunner.client()))
         let before = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { _ in
-            try await session.requester.status(session.scope)
+            try await session.readBefore()
         }
         /** Not through `CLIRunner.run`: once the restart is sent, its retry
             would send it again and bounce a server whose restart landed. */
@@ -566,10 +593,9 @@ struct Stop: AsyncParsableCommand {
             something it holds is the heavy way there, and `lock` does it without
             a bounce. `--json` carries `locks` instead, so stdout keeps its schema. */
         if !global.json, let resource = result.server.locks?.sorted().first {
-            FileHandle.standardError.write(
-                Data(
-                    "hint: \(name) holds '\(resource)'; directa lock \(resource) -- <command> gets exclusive access without stopping it\n"
-                        .utf8))
+            CLIRunner.note(
+                "hint: \(name) holds '\(resource)'; directa lock \(resource) -- <command> gets exclusive access without stopping it"
+            )
         }
     }
 }
@@ -600,10 +626,8 @@ struct Logs: AsyncParsableCommand {
         whole history a long-running server has accumulated. */
     static let defaultTailLines = 200
 
-    /** `--follow`'s own initial-backlog default, unchanged by
-        `defaultTailLines`: follow is about watching new lines arrive, not
-        backfilling history, and it was already bounded before the unbounded
-        no-flags default became a problem. */
+    /** `--follow`'s own initial backlog, smaller than `defaultTailLines`:
+        follow is about watching new lines arrive, not backfilling history. */
     static let followDefaultTailLines = 50
 
     @Flag(help: "Full history instead of the last \(defaultTailLines) lines.")
@@ -656,13 +680,13 @@ struct Logs: AsyncParsableCommand {
         return nil
     }
 
-    /** Printed once on stderr by `--follow` inside a Claude Code session whose
-        stdout is not a terminal: a polling command there is usually a
-        harness waiting on it, and the monitor command is the streaming shape
-        built for that. Nil everywhere else. */
+    /** The notice `--follow` prints once on stderr inside a Claude Code
+        session whose stdout is not a terminal: a polling command there is
+        usually a harness waiting on it, and the monitor command is the
+        streaming shape built for that. Nil everywhere else. */
     static func monitorHint(environment: [String: String], stdoutIsTerminal: Bool) -> String? {
         guard environment["CLAUDECODE"] == "1", !stdoutIsTerminal else { return nil }
-        return "directa: to stream a server's output into this session, run directa monitor <name> with the Monitor tool"
+        return CLINotice.followUseMonitor
     }
 
     /** `--head` and `--follow` need the result's cursor; a daemon older than
@@ -684,14 +708,14 @@ struct Logs: AsyncParsableCommand {
         return params
     }
 
-    /** The tail bound actually sent to the daemon. `--all` always wins (full
-        history, even under `--follow`). An explicit `--tail` always wins next.
-        Otherwise `--follow` keeps its own smaller backlog default, and a bare
-        `--since`/`--since-mark` is left unbounded (already scoped by time,
-        not the bug this default fixes) while truly no bound at all falls back
-        to `defaultTailLines`. */
+    /** The tail bound actually sent to the daemon. `--all` and `--head` send
+        none (full history, even under `--follow`; `--head` bounds from the
+        start instead). An explicit `--tail` wins next. Otherwise `--follow`
+        keeps its own smaller backlog default, a bare `--since`/`--since-mark`
+        is left unbounded (already scoped by time), and no bound at all falls
+        back to `defaultTailLines`. */
     static func effectiveTail(
-        all: Bool, follow: Bool, head: Int? = nil, since: Date?, sinceMark: String?, tail: Int?
+        all: Bool, follow: Bool, head: Int?, since: Date?, sinceMark: String?, tail: Int?
     ) -> Int? {
         if all || head != nil { return nil }
         if let tail { return tail }
@@ -724,18 +748,21 @@ struct Logs: AsyncParsableCommand {
             tail: Self.effectiveTail(
                 all: all, follow: follow, head: head, since: sinceDate, sinceMark: sinceMark, tail: tail))
         let result = await query(first)
-        if head != nil || follow, result.cursor == nil { failOlderDaemon() }
-        emit(result.lines)
-        guard follow else { return }
-        if let hint = Self.monitorHint(
-            environment: ProcessInfo.processInfo.environment, stdoutIsTerminal: isatty(STDOUT_FILENO) == 1)
-        {
-            FileHandle.standardError.write(Data((hint + "\n").utf8))
+        var followCursor: LogCursor?
+        if follow || head != nil {
+            guard let cursor = result.cursor else { failOlderDaemon() }
+            followCursor = cursor
         }
+        emit(result.lines)
         /** Incremental polling past the daemon's cursor: restart-safe, no
             push machinery, and seeded by the first answer even when it
             matched nothing, so an empty start never re-reads history. */
-        guard var cursor = result.cursor else { failOlderDaemon() }
+        guard follow, var cursor = followCursor else { return }
+        if let hint = Self.monitorHint(
+            environment: ProcessInfo.processInfo.environment, stdoutIsTerminal: isatty(STDOUT_FILENO) == 1)
+        {
+            CLIRunner.notice(hint)
+        }
         while true {
             try await Task.sleep(for: .milliseconds(300))
             let more = await query(Self.followParams(first, after: cursor))
@@ -965,32 +992,34 @@ struct HookInstall: AsyncParsableCommand {
     @Flag(help: "Also print the statusline wiring suggestion.")
     var statusline = false
 
-    /** Which adapters `hook install` acts on, and which it silently leaves alone.
-        An explicit `--harness` is unconditional, the same single adapter every
-        prior version installed regardless of detection. Omitted, it installs
-        every harness whose `hookState()` reads as present (installed or
-        `notInstalled`, never `harnessAbsent`), so a harness this machine has
-        never run stays untouched rather than gaining a settings file for a tool
-        that was never there. Pure so the exact decision is asserted with stub
-        adapters, without touching a harness's real settings file. */
-    static func resolveTargets(harness: String?, adapters: [any HarnessAdapter]) -> Result<
-        (install: [any HarnessAdapter], skipped: [any HarnessAdapter]), WireError
-    > {
+    /** The adapters `hook install` acts on, and the ones it leaves alone. */
+    struct Targets {
+        var install: [any HarnessAdapter]
+        var skipped: [any HarnessAdapter]
+    }
+
+    /** Which adapters `hook install` acts on. An explicit `--harness` is
+        unconditional: it installs that one adapter regardless of detection.
+        Omitted, it installs every harness whose `hookState()` reads as present
+        (installed or `notInstalled`, never `harnessAbsent`), so a harness this
+        machine has never run stays untouched rather than gaining a settings
+        file for a tool that was never there. Pure so the exact decision is
+        asserted with stub adapters, without touching a harness's real
+        settings file. */
+    static func resolveTargets(harness: String?, adapters: [any HarnessAdapter]) -> Result<Targets, WireError> {
         if let harness {
-            guard let adapter = adapters.first(where: { $0.name == harness }) else {
-                return .failure(
-                    WireError(
-                        code: .usage,
-                        hint: "run: directa hook install --harness <name>",
-                        message:
-                            "unknown harness '\(harness)' (supported: \(adapters.map(\.name).joined(separator: ", ")); adding one: CONTRIBUTING.md)"
-                    ))
-            }
-            return .success((install: [adapter], skipped: []))
+            return HarnessBatch.adapter(named: harness, in: adapters, verb: .install)
+                .map { Targets(install: [$0], skipped: []) }
         }
-        let detected = adapters.filter { $0.hookState() != .harnessAbsent }
-        let skipped = adapters.filter { $0.hookState() == .harnessAbsent }
-        guard !detected.isEmpty else {
+        var targets = Targets(install: [], skipped: [])
+        for adapter in adapters {
+            if adapter.hookState() == .harnessAbsent {
+                targets.skipped.append(adapter)
+            } else {
+                targets.install.append(adapter)
+            }
+        }
+        guard !targets.install.isEmpty else {
             return .failure(
                 WireError(
                     code: .usage,
@@ -999,31 +1028,11 @@ struct HookInstall: AsyncParsableCommand {
                         "no supported harness detected on this machine (checked: \(adapters.map(\.name).joined(separator: ", ")))"
                 ))
         }
-        return .success((install: detected, skipped: skipped))
-    }
-
-    /** One install pass over the adapters, collecting rather than aborting: the
-        same shape as `HookUninstall.uninstallAll`, since a refusal from one
-        harness has already left every earlier adapter's file rewritten. */
-    static func installAll(_ adapters: [any HarnessAdapter], cliPath: String) -> (
-        summaries: [String], failures: [(name: String, message: String)]
-    ) {
-        var summaries: [String] = []
-        var failures: [(name: String, message: String)] = []
-        for adapter in adapters {
-            do {
-                summaries.append(try adapter.install(cliPath: cliPath))
-            } catch let error as WireError {
-                failures.append((adapter.name, error.message))
-            } catch {
-                failures.append((adapter.name, String(describing: error)))
-            }
-        }
-        return (summaries, failures)
+        return .success(targets)
     }
 
     func run() async throws {
-        let targets: (install: [any HarnessAdapter], skipped: [any HarnessAdapter])
+        let targets: Targets
         switch Self.resolveTargets(harness: harness, adapters: harnessAdapters) {
         case .failure(let error):
             CLIRunner.fail(error, json: global.json)
@@ -1039,22 +1048,9 @@ struct HookInstall: AsyncParsableCommand {
                 json: global.json)
         }
         let cliPath = cliPath ?? CLISelf.path
-        let result = Self.installAll(targets.install, cliPath: cliPath)
-        if !result.failures.isEmpty {
-            var message = "hook install finished with errors"
-            let succeeded = targets.install.map(\.name).filter { name in
-                !result.failures.contains { $0.name == name }
-            }
-            if !succeeded.isEmpty {
-                message += "; installed \(succeeded.joined(separator: ", "))"
-            }
-            message +=
-                ". Failed: "
-                + result.failures.map { "\($0.name) (\($0.message))" }.joined(separator: "; ")
-            message += " Fix each cause and rerun directa hook install."
-            CLIRunner.fail(
-                WireError(code: .internalError, hint: "directa hook install", message: message),
-                json: global.json)
+        let result = HarnessBatch.run(targets.install) { try $0.install(cliPath: cliPath) }
+        if let failure = result.failure(verb: .install) {
+            CLIRunner.fail(failure, json: global.json)
         }
         var lines = result.summaries
         lines.append(
@@ -1092,61 +1088,100 @@ struct HookUninstall: AsyncParsableCommand {
     func run() async throws {
         let adapters: [any HarnessAdapter]
         if let harness {
-            guard let adapter = harnessAdapters.first(where: { $0.name == harness }) else {
-                CLIRunner.fail(
-                    WireError(
-                        code: .usage,
-                        hint: "run: directa hook uninstall --harness <name>",
-                        message:
-                            "unknown harness '\(harness)' (supported: \(harnessAdapters.map(\.name).joined(separator: ", ")))"
-                    ),
-                    json: global.json)
+            switch HarnessBatch.adapter(named: harness, in: harnessAdapters, verb: .uninstall) {
+            case .failure(let error):
+                CLIRunner.fail(error, json: global.json)
+            case .success(let adapter):
+                adapters = [adapter]
             }
-            adapters = [adapter]
         } else {
             adapters = harnessAdapters
         }
-        let result = Self.uninstallAll(adapters)
-        if !result.failures.isEmpty {
-            /** Every adapter before the first failure has already rewritten its
-                file, so the report names what succeeded rather than discarding
-                that work. */
-            let succeeded = adapters.map(\.name).filter { name in
-                !result.failures.contains { $0.name == name }
-            }
-            var message = "hook uninstall finished with errors"
-            if !succeeded.isEmpty {
-                message += "; removed from \(succeeded.joined(separator: ", "))"
-            }
-            message +=
-                ". Failed: "
-                + result.failures.map { "\($0.name) (\($0.message))" }.joined(separator: "; ")
-            message += " Fix each cause and rerun directa hook uninstall."
-            CLIRunner.fail(
-                WireError(code: .internalError, hint: "directa hook uninstall", message: message),
-                json: global.json)
+        let result = HarnessBatch.run(adapters) { try $0.uninstall() }
+        if let failure = result.failure(verb: .uninstall) {
+            CLIRunner.fail(failure, json: global.json)
         }
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in result.summaries.joined(separator: "\n") }
     }
+}
 
-    /** One uninstall pass over the adapters, collecting rather than aborting: a
-        refusal from one harness must not discard the others' summaries, because
-        their files are already rewritten by the time the throw lands. */
-    static func uninstallAll(_ adapters: [any HarnessAdapter]) -> (
-        summaries: [String], failures: [(name: String, message: String)]
-    ) {
-        var summaries: [String] = []
-        var failures: [(name: String, message: String)] = []
-        for adapter in adapters {
-            do {
-                summaries.append(try adapter.uninstall())
-            } catch let error as WireError {
-                failures.append((adapter.name, error.message))
-            } catch {
-                failures.append((adapter.name, String(describing: error)))
+/** What one `hook install` or `hook uninstall` pass over several harnesses
+    did. The pass collects rather than aborts: a refusal from one harness must
+    not discard the others' work, since their files are already rewritten by
+    the time it lands, so every adapter runs and the report names both what
+    succeeded and what failed. */
+struct HarnessBatchResult {
+    struct Failure: Equatable {
+        var message: String
+        var name: String
+    }
+
+    var failures: [Failure] = []
+    /** Names of the adapters whose action returned, in order. */
+    var succeeded: [String] = []
+    var summaries: [String] = []
+
+    /** The failure the command exits with when any adapter failed, or nil. */
+    func failure(verb: HarnessBatch.Verb) -> WireError? {
+        guard !failures.isEmpty else { return nil }
+        var message = "hook \(verb.rawValue) finished with errors"
+        if !succeeded.isEmpty {
+            message += "; \(verb.pastTense) \(succeeded.joined(separator: ", "))"
+        }
+        message +=
+            ". Failed: " + failures.map { "\($0.name) (\($0.message))" }.joined(separator: "; ")
+        message += " Fix each cause and rerun directa hook \(verb.rawValue)."
+        return WireError(code: .internalError, hint: "run: directa hook \(verb.rawValue)", message: message)
+    }
+}
+
+/** The pieces `hook install` and `hook uninstall` share. */
+enum HarnessBatch {
+    enum Verb: String {
+        case install
+        case uninstall
+
+        /** How the failure report names what succeeded ("installed claude"). */
+        var pastTense: String {
+            switch self {
+            case .install: "installed"
+            case .uninstall: "removed from"
             }
         }
-        return (summaries, failures)
+    }
+
+    /** The adapter an explicit `--harness` names, or the usage error listing
+        the supported names. */
+    static func adapter(
+        named name: String, in adapters: [any HarnessAdapter], verb: Verb
+    ) -> Result<any HarnessAdapter, WireError> {
+        if let adapter = adapters.first(where: { $0.name == name }) { return .success(adapter) }
+        let supported = adapters.map(\.name).joined(separator: ", ")
+        let guide = verb == .install ? "; adding one: CONTRIBUTING.md" : ""
+        return .failure(
+            WireError(
+                code: .usage,
+                hint: "run: directa hook \(verb.rawValue) --harness <name>",
+                message: "unknown harness '\(name)' (supported: \(supported)\(guide))"))
+    }
+
+    /** Runs `action` on every adapter, collecting each summary or failure. */
+    static func run(
+        _ adapters: [any HarnessAdapter], _ action: (any HarnessAdapter) throws -> String
+    ) -> HarnessBatchResult {
+        var result = HarnessBatchResult()
+        for adapter in adapters {
+            do {
+                result.summaries.append(try action(adapter))
+                result.succeeded.append(adapter.name)
+            } catch let error as WireError {
+                result.failures.append(HarnessBatchResult.Failure(message: error.message, name: adapter.name))
+            } catch {
+                result.failures.append(
+                    HarnessBatchResult.Failure(message: String(describing: error), name: adapter.name))
+            }
+        }
+        return result
     }
 }
 
@@ -1158,28 +1193,18 @@ struct HookAntigravitySessionStart: AsyncParsableCommand {
         commandName: "antigravity-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let stdin = CLIRunner.stdinData()
-        let cwd = HookSessionCwd.resolve(stdin: stdin)
-        FileManager.default.changeCurrentDirectoryPath(cwd)
-        let project = GlobalOptions.resolveProject(from: cwd)
-        let text: String? =
-            HookPayloadGate.antigravityHookShouldEmit(stdin: stdin)
-            ? await HookContext.render(project: project, harness: .antigravity) : nil
-        guard let text else {
-            let empty: [String: Any] = ["injectSteps": []]
-            if let data = try? JSONSerialization.data(withJSONObject: empty) {
-                FileHandle.standardOutput.write(data)
-            }
+        let payload = HookPayload.parse(CLIRunner.stdinData())
+        /** Decided before any project lookup: every model call after the
+            first answers empty, so it costs one stdin parse and nothing more. */
+        guard HookPayloadGate.antigravityHookShouldEmit(payload),
+            let text = await HookContext.render(
+                project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
+                harness: .antigravity)
+        else {
+            HookOutput.write(HookOutput.Antigravity(injectSteps: []))
             return
         }
-        let output: [String: Any] = [
-            "injectSteps": [
-                ["ephemeralMessage": text]
-            ]
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: output) {
-            FileHandle.standardOutput.write(data)
-        }
+        HookOutput.write(HookOutput.Antigravity(injectSteps: [.init(ephemeralMessage: text)]))
     }
 }
 
@@ -1193,32 +1218,17 @@ struct HookClaudeSessionStart: AsyncParsableCommand {
         commandName: "claude-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let stdin = CLIRunner.stdinData()
-        let cursorHookInstalled: Bool
-        if case .installed(_, pathExists: true) = CursorAdapter().hookState() {
-            cursorHookInstalled = true
-        } else {
-            cursorHookInstalled = false
-        }
+        let payload = HookPayload.parse(CLIRunner.stdinData())
         guard
             HookPayloadGate.claudeHookShouldEmit(
-                stdin: stdin, cursorHookInstalled: cursorHookInstalled)
+                payload, cursorHookInstalled: { CursorAdapter().hookState().isLive }),
+            let text = await HookContext.render(
+                project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
+                harness: .claude)
         else { return }
-        let cwd = HookSessionCwd.resolve(stdin: stdin)
-        /** Project resolution without --project: reuse the CLI's walk from the
-            hook cwd by chdir-ing there first. */
-        FileManager.default.changeCurrentDirectoryPath(cwd)
-        let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await HookContext.render(project: project, harness: .claude) else { return }
-        let output: [String: Any] = [
-            "hookSpecificOutput": [
-                "additionalContext": text,
-                "hookEventName": "SessionStart",
-            ]
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: output) {
-            FileHandle.standardOutput.write(data)
-        }
+        HookOutput.write(
+            HookOutput.AdditionalContext(
+                hookSpecificOutput: .init(additionalContext: text, hookEventName: "SessionStart")))
     }
 }
 
@@ -1229,15 +1239,13 @@ struct HookCursorSessionStart: AsyncParsableCommand {
         commandName: "cursor-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let stdin = CLIRunner.stdinData()
-        let cwd = HookSessionCwd.resolve(stdin: stdin)
-        FileManager.default.changeCurrentDirectoryPath(cwd)
-        let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await HookContext.render(project: project, harness: .cursor) else { return }
-        let output: [String: Any] = ["additional_context": text]
-        if let data = try? JSONSerialization.data(withJSONObject: output) {
-            FileHandle.standardOutput.write(data)
-        }
+        let payload = HookPayload.parse(CLIRunner.stdinData())
+        guard
+            let text = await HookContext.render(
+                project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
+                harness: .cursor)
+        else { return }
+        HookOutput.write(HookOutput.Cursor(additionalContext: text))
     }
 }
 
@@ -1285,19 +1293,15 @@ struct HookGrokSessionStart: AsyncParsableCommand {
 
     /** Returns false when there is nothing to say, so the caller can skip the mark. */
     private func emit(stdin: Data) async -> Bool {
-        let cwd = HookSessionCwd.resolve(stdin: stdin)
-        FileManager.default.changeCurrentDirectoryPath(cwd)
-        let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await HookContext.render(project: project, harness: .grok) else { return false }
-        let output: [String: Any] = [
-            "hookSpecificOutput": [
-                "additionalContext": text,
-                "hookEventName": "PreToolUse",
-            ]
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: output) {
-            FileHandle.standardOutput.write(data)
-        }
+        guard
+            let text = await HookContext.render(
+                project: GlobalOptions.resolveProject(
+                    from: HookSessionCwd.resolve(HookPayload.parse(stdin))),
+                harness: .grok)
+        else { return false }
+        HookOutput.write(
+            HookOutput.AdditionalContext(
+                hookSpecificOutput: .init(additionalContext: text, hookEventName: "PreToolUse")))
         return true
     }
 }
@@ -1309,16 +1313,8 @@ struct Statusline: AsyncParsableCommand {
         abstract: "Compact server presence for a statusline; reads harness stdin JSON.")
 
     func run() async throws {
-        let stdin = CLIRunner.stdinData()
-        var cwd = FileManager.default.currentDirectoryPath
-        if let payload = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] {
-            if let workspace = payload["workspace"] as? [String: Any],
-                let dir = workspace["current_dir"] as? String {
-                cwd = dir
-            } else if let dir = payload["cwd"] as? String {
-                cwd = dir
-            }
-        }
+        let payload = HookPayload.parse(CLIRunner.stdinData())
+        let cwd = payload?.workspaceCurrentDir ?? payload?.cwd ?? FileManager.default.currentDirectoryPath
         let project = GlobalOptions.resolveProject(from: cwd)
         let client = CLIRunner.client()
         guard
@@ -1427,7 +1423,7 @@ struct Down: AsyncParsableCommand {
             case .server(let target):
                 let stopped = try await client.request(
                     .serverStop, params: target, expecting: ServerResult.self,
-                    operationTimeoutSeconds: 120)
+                    operationTimeoutSeconds: CLIRunner.stopOperationTimeoutSeconds)
                 return GroupResult(results: [EnsureResult(server: stopped.server)])
             case .group(let params):
                 /** A deep dependency chain drains one wave at a time, each with
@@ -1435,7 +1431,7 @@ struct Down: AsyncParsableCommand {
                     stop. */
                 return try await client.request(
                     .groupDown, params: params, expecting: GroupResult.self,
-                    operationTimeoutSeconds: 120)
+                    operationTimeoutSeconds: CLIRunner.stopOperationTimeoutSeconds)
             }
         }
         CLIRunner.emit(result, json: global.json) { r in
@@ -1598,7 +1594,7 @@ struct CLIDeepLinkEffects: DeepLinkEffects {
     }
 
     func notify(title: String, body: String) async {
-        FileHandle.standardError.write(Data("directa: \(title): \(body)\n".utf8))
+        CLIRunner.notice("\(title): \(body)")
     }
 
     func openBrowser(_ url: URL) async {
@@ -1754,41 +1750,71 @@ struct Doctor: AsyncParsableCommand {
 
     @OptionGroup var global: GlobalOptions
 
-    struct Finding: Codable {
+    /** One line of the report. `kind` and `severity` encode as their raw
+        values, which are the `--json` contract. */
+    struct Finding: Codable, Equatable {
+        enum Kind: String, Codable {
+            case daemon
+            case harnessHook = "harness-hook"
+            case installShadow = "install-shadow"
+            case jetsam
+            case jetsamCoalition = "jetsam-coalition"
+            case launchd
+            case leftoverJob = "leftover-job"
+            case orphanLogDir = "orphan-log-dir"
+            case pathStaleness = "path-staleness"
+            case portCollision = "port-collision"
+            case portSquatter = "port-squatter"
+            case signature
+            case signatureConflict = "signature-conflict"
+            case staleProject = "stale-project"
+            case update
+        }
+
+        enum Severity: String, Codable {
+            case error
+            case fixed
+            case info
+            case ok
+            case warning
+        }
+
         var detail: String
-        var kind: String
-        var severity: String
+        var kind: Kind
+        var severity: Severity
+    }
+
+    /** A failure's text for a finding: a daemon error's own message, anything
+        else as the system describes it. */
+    static func describe(_ error: any Error) -> String {
+        (error as? WireError)?.message ?? error.localizedDescription
     }
 
     /** Turns one `project.forget` outcome into the `stale-project` finding
         `doctor --fix` reports. Pure so the plural grammar and the old-daemon
         rewrite are asserted without a live socket. A daemon built before
-        `project.forget` existed refuses it with the exact `usage` message
-        `Router.handle` writes for any unrecognized method; that specific
-        refusal is rewritten into a restart hint instead of the raw wire
-        error, since "unknown method" means nothing to whoever reads the
-        report. */
+        `project.forget` existed refuses it as an unknown method
+        (`WireError.isUnknownMethod`); that refusal is rewritten into a restart
+        hint instead of the raw wire error, since "unknown method" means
+        nothing to whoever reads the report. */
     static func staleProjectFixFinding(
-        project: String, outcome: Result<ProjectForgetResult, WireError>
+        project: String, outcome: Result<ProjectForgetResult, any Error>
     ) -> Finding {
         switch outcome {
         case .success(let result):
             let count = result.servers.count
             return Finding(
                 detail: "forgot \(project) (\(count) server\(count == 1 ? "" : "s"))",
-                kind: "stale-project", severity: "fixed")
-        case .failure(let error):
-            if error.code == .usage,
-                error.message == WireError.unknownMethodMessage(WireMethod.projectForget.rawValue)
-            {
-                return Finding(
-                    detail:
-                        "could not forget \(project): the running daemon predates project.forget; run: directa daemon restart",
-                    kind: "stale-project", severity: "error")
-            }
+                kind: .staleProject, severity: .fixed)
+        case .failure(let error as WireError) where error.isUnknownMethod(.projectForget):
             return Finding(
-                detail: "could not forget \(project): \(error.message)",
-                kind: "stale-project", severity: "error")
+                detail:
+                    "could not forget \(project): the running daemon predates project.forget; run: directa daemon restart",
+                kind: .staleProject, severity: .error)
+        case .failure(let error):
+            return Finding(
+                detail: "could not forget \(project): \(describe(error))",
+                kind: .staleProject, severity: .error)
         }
     }
 
@@ -1800,17 +1826,18 @@ struct Doctor: AsyncParsableCommand {
         case .removed:
             return Finding(
                 detail: "removed \(result.path), which matched no registered project",
-                kind: "orphan-log-dir", severity: "fixed")
-        case .refused:
-            let remedy = result.remedy.map { "; \($0)" } ?? ""
+                kind: .orphanLogDir, severity: .fixed)
+        case .refused(let reason, let remedy):
             return Finding(
-                detail: "left \(result.path) in place: \(result.reason ?? "the daemon refused")\(remedy)",
-                kind: "orphan-log-dir", severity: "error")
-        case .failed:
-            return Finding(
-                detail: "could not remove \(result.path): \(result.reason ?? "the removal failed")",
-                kind: "orphan-log-dir", severity: "error")
+                detail: "left \(result.path) in place: \(reason)\(remedy.map { "; \($0)" } ?? "")",
+                kind: .orphanLogDir, severity: .error)
+        case .failed(let reason):
+            return orphanLogDirFailureFinding(path: result.path, reason: reason)
         }
+    }
+
+    private static func orphanLogDirFailureFinding(path: String, reason: String) -> Finding {
+        Finding(detail: "could not remove \(path): \(reason)", kind: .orphanLogDir, severity: .error)
     }
 
     /** The `orphan-log-dir` findings for one doctor run, against `info`, the
@@ -1826,12 +1853,12 @@ struct Doctor: AsyncParsableCommand {
         removeOrphan: (String) async throws -> LogsRemoveOrphanResult
     ) async -> [Finding] {
         let paths = DirectaPaths(daemon: info)
-        let claimedSlugDirs = claimedLogDirNames(info.claimedProjects ?? [])
+        let claimedSlugDirs = DirectaPaths.projectLogDirNames(projects: info.claimedProjects ?? [])
         func reportOnly() -> [Finding] {
             OrphanProjectLogs.scan(paths: paths, claimedSlugDirs: claimedSlugDirs).map { orphan in
                 Finding(
-                    detail: "\(orphan.detail) (run: \(orphan.remedy))",
-                    kind: "orphan-log-dir", severity: "warning")
+                    detail: "\(orphan.detail) (run: \(OrphanProjectLogs.remedy))",
+                    kind: .orphanLogDir, severity: .warning)
             }
         }
         guard fix else { return reportOnly() }
@@ -1841,26 +1868,15 @@ struct Doctor: AsyncParsableCommand {
         {
             do {
                 findings.append(orphanLogDirFixFinding(try await removeOrphan(directory.lastPathComponent)))
-            } catch let error as WireError
-                where error.code == .usage
-                && error.message == WireError.unknownMethodMessage(WireMethod.logsRemoveOrphan.rawValue)
-            {
+            } catch let error as WireError where error.isUnknownMethod(.logsRemoveOrphan) {
                 return findings + reportOnly() + [
                     Finding(
                         detail:
                             "removed no leftover log directories: the running daemon is too old to remove them safely; run: directa daemon restart, then directa doctor --fix",
-                        kind: "orphan-log-dir", severity: "error")
+                        kind: .orphanLogDir, severity: .error)
                 ]
-            } catch let error as WireError {
-                findings.append(
-                    Finding(
-                        detail: "could not remove \(directory.path): \(error.message)",
-                        kind: "orphan-log-dir", severity: "error"))
             } catch {
-                findings.append(
-                    Finding(
-                        detail: "could not remove \(directory.path): \(error.localizedDescription)",
-                        kind: "orphan-log-dir", severity: "error"))
+                findings.append(orphanLogDirFailureFinding(path: directory.path, reason: describe(error)))
             }
         }
         return findings
@@ -1888,12 +1904,8 @@ struct Doctor: AsyncParsableCommand {
             guard managedOwner == nil, isListening(port) else { return nil }
             return Finding(
                 detail: "port \(port) has an unmanaged listener while \(server.server) is down",
-                kind: "port-squatter", severity: "warning")
+                kind: .portSquatter, severity: .warning)
         }
-    }
-
-    private static func claimedLogDirNames(_ projects: [String]) -> Set<String> {
-        Set(projects.map { DirectaPaths.projectLogDirName(project: $0) })
     }
 
     func run() async throws {
@@ -1903,31 +1915,29 @@ struct Doctor: AsyncParsableCommand {
         let paths = info.map(DirectaPaths.init(daemon:)) ?? DirectaPaths.fromEnvironment()
         if let info {
             findings.append(
-                Finding(detail: "v\(info.daemonVersion) pid \(info.pid) on \(info.socketPath)", kind: "daemon", severity: "ok"))
+                Finding(detail: "v\(info.daemonVersion) pid \(info.pid) on \(info.socketPath)", kind: .daemon, severity: .ok))
             let livePath = LaunchdAdmin.capturedPath()
             let storedPath = LaunchdAdmin.readAgentPath(paths: paths)
             if let daemonPath = info.searchPath, daemonPath != livePath {
                 findings.append(
                     Finding(
                         detail: "daemon PATH differs from the current login shell (captured at install; run: directa daemon install)",
-                        kind: "path-staleness", severity: "warning"))
+                        kind: .pathStaleness, severity: .warning))
             }
             if let storedPath, storedPath != livePath {
                 findings.append(
                     Finding(
                         detail: "agent.path differs from the current login shell (run: directa daemon install)",
-                        kind: "path-staleness", severity: "warning"))
+                        kind: .pathStaleness, severity: .warning))
             }
         } else {
             findings.append(
-                Finding(detail: "daemon not responding (run: directa daemon status)", kind: "daemon", severity: "error"))
+                Finding(detail: "daemon not responding (run: directa daemon status)", kind: .daemon, severity: .error))
         }
         let printed = await LaunchdAdmin.shell(
             "/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)"])
         findings.append(
-            Finding(
-                detail: LaunchdAdmin.launchdState(from: printed), kind: "launchd",
-                severity: "info"))
+            Finding(detail: LaunchdAdmin.launchdState(from: printed), kind: .launchd, severity: .info))
         if printed.status == 0 {
             let agent = LaunchdJobs.parseJobPrint(printed.output)
             if agent.jetsammed {
@@ -1939,22 +1949,21 @@ struct Doctor: AsyncParsableCommand {
                     Finding(
                         detail:
                             "the daemon last exited \(agent.lastExitReason ?? "OS_REASON_JETSAM")\(runs)\(burstDetail); memory pressure killed it, not a crash dump. Check: launchctl print \(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)",
-                        kind: "jetsam", severity: "warning"))
+                        kind: .jetsam, severity: .warning))
             }
         }
         if let all = try? await client.request(
             .serverStatus, params: ProjectParams(project: ""), expecting: ServerListResult.self) {
             var signatureHolders: [String: String] = [:]
-            var staleProjects: Set<String> = []
+            let staleProjects = Set(all.servers.map(\.project)).filter {
+                !FileManager.default.fileExists(atPath: $0)
+            }
             /** Host-keyed signatures miss a real collision: two projects on one
                 port under different *.localhost names are different signatures
                 and the same bind. Reported from declared ports, so it lands
                 before anyone tries to start either one. */
-            for collision in PortCollision.detect(
-                all.servers.filter { FileManager.default.fileExists(atPath: $0.project) })
-            {
-                findings.append(
-                    Finding(detail: collision.detail, kind: "port-collision", severity: "warning"))
+            for collision in PortCollision.detect(all.servers.filter { !staleProjects.contains($0.project) }) {
+                findings.append(Finding(detail: collision.detail, kind: .portCollision, severity: .warning))
             }
             let livePids = Set(
                 all.servers.compactMap { server -> pid_t? in
@@ -1971,7 +1980,7 @@ struct Doctor: AsyncParsableCommand {
                     Finding(
                         detail:
                             "\(leftover.count) leftover directa child job\(leftover.count == 1 ? "" : "s") with no live server (a jetsammed daemon never boots them out). Daemon recovery reaps them; to clear one now: launchctl bootout \(LaunchdJobs.guiDomain)/\(example)",
-                        kind: "leftover-job", severity: "warning"))
+                        kind: .leftoverJob, severity: .warning))
             }
             if let daemonPid = info.flatMap({ pid_t(exactly: $0.pid) }),
                 let daemonJetsam = CoalitionIDs.read(of: daemonPid)?.jetsam
@@ -1985,14 +1994,10 @@ struct Doctor: AsyncParsableCommand {
                         Finding(
                             detail:
                                 "\(server.server) in \(server.project) shares the daemon's jetsam coalition (pid \(childPid)); under memory pressure macOS may kill the daemon instead of this server",
-                            kind: "jetsam-coalition", severity: "warning"))
+                            kind: .jetsamCoalition, severity: .warning))
                 }
             }
-            for server in all.servers {
-                if !FileManager.default.fileExists(atPath: server.project) {
-                    staleProjects.insert(server.project)
-                    continue
-                }
+            for server in all.servers where !staleProjects.contains(server.project) {
                 if let port = server.declaredPort {
                     let host = server.url.flatMap { URL(string: $0)?.host } ?? "localhost"
                     let signature = "\(host):\(port)"
@@ -2001,13 +2006,13 @@ struct Doctor: AsyncParsableCommand {
                         findings.append(
                             Finding(
                                 detail: "signature \(signature) claimed by both \(existing) and \(holder)",
-                                kind: "signature-conflict", severity: "warning"))
+                                kind: .signatureConflict, severity: .warning))
                     } else {
                         signatureHolders[signature] = holder
                         findings.append(
                             Finding(
                                 detail: "\(signature) -> \(holder) [\(server.phase.rawValue)]",
-                                kind: "signature", severity: "info"))
+                                kind: .signature, severity: .info))
                     }
                 }
             }
@@ -2024,25 +2029,22 @@ struct Doctor: AsyncParsableCommand {
                         project. No `try?`: a failure here (the project still
                         exists, or the daemon refused for another reason) is a
                         real finding, not a silent no-op. */
+                    let outcome: Result<ProjectForgetResult, any Error>
                     do {
-                        let result = try await client.request(
-                            .projectForget, params: ProjectOnlyParams(project: project),
-                            expecting: ProjectForgetResult.self)
-                        findings.append(Self.staleProjectFixFinding(project: project, outcome: .success(result)))
-                    } catch let error as WireError {
-                        findings.append(Self.staleProjectFixFinding(project: project, outcome: .failure(error)))
+                        outcome = .success(
+                            try await client.request(
+                                .projectForget, params: ProjectOnlyParams(project: project),
+                                expecting: ProjectForgetResult.self))
                     } catch {
-                        findings.append(
-                            Finding(
-                                detail: "could not forget \(project): \(error.localizedDescription)",
-                                kind: "stale-project", severity: "error"))
+                        outcome = .failure(error)
                     }
+                    findings.append(Self.staleProjectFixFinding(project: project, outcome: outcome))
                 } else {
                     findings.append(
                         Finding(
                             detail:
                                 "\(project) no longer exists on disk (daemon auto-prunes missing projects; doctor --fix forces leftovers)",
-                            kind: "stale-project", severity: "warning"))
+                            kind: .staleProject, severity: .warning))
                 }
             }
         }
@@ -2054,7 +2056,7 @@ struct Doctor: AsyncParsableCommand {
                 Finding(
                     detail:
                         "directa \(update.latestVersion) is available (you have \(update.currentVersion)); upgrade with `brew upgrade --cask \(DirectaDistribution.homebrewCaskToken)` or download from \(DirectaDistribution.releasesLatestURL)",
-                    kind: "update", severity: "info"))
+                    kind: .update, severity: .info))
         }
 
         /** Harness hooks: report only, never repair. directa does not edit a file
@@ -2064,25 +2066,23 @@ struct Doctor: AsyncParsableCommand {
             switch adapter.hookState() {
             case .harnessAbsent:
                 break
-            case .installed(let path, let pathExists):
-                if pathExists {
-                    findings.append(
-                        Finding(
-                            detail: "\(adapter.name) session hook installed (\(path))",
-                            kind: "harness-hook", severity: "ok"))
-                } else {
-                    findings.append(
-                        Finding(
-                            detail:
-                                "\(adapter.name) session hook points at \(path), which no longer exists (run: directa hook install --harness \(adapter.name), or directa hook uninstall --harness \(adapter.name))",
-                            kind: "harness-hook", severity: "warning"))
-                }
+            case .installed(let path, pathExists: true):
+                findings.append(
+                    Finding(
+                        detail: "\(adapter.name) session hook installed (\(path))",
+                        kind: .harnessHook, severity: .ok))
+            case .installed(let path, pathExists: false):
+                findings.append(
+                    Finding(
+                        detail:
+                            "\(adapter.name) session hook points at \(path), which no longer exists (run: directa hook install --harness \(adapter.name), or directa hook uninstall --harness \(adapter.name))",
+                        kind: .harnessHook, severity: .warning))
             case .notInstalled:
                 findings.append(
                     Finding(
                         detail:
                             "\(adapter.name) detected without a directa session hook (run: directa hook install --harness \(adapter.name))",
-                        kind: "harness-hook", severity: "info"))
+                        kind: .harnessHook, severity: .info))
             }
         }
         /** Shadowed install: a second directa copy (a `make install` in
@@ -2094,13 +2094,13 @@ struct Doctor: AsyncParsableCommand {
             findings.append(
                 Finding(
                     detail: "\(shadow.detail) (run: \(shadow.remedy))",
-                    kind: "install-shadow", severity: "warning"))
+                    kind: .installShadow, severity: .warning))
         }
         /** Log directories a project no longer claims: `ControlServer` removes
             one when it forgets the project (unregister down to zero servers,
-            the missing-project sweep), but a directory predating that fix, or
-            orphaned some other way, sits under the logs root forever until
-            `directa uninstall --purge`. The claimed set comes from the daemon's
+            the missing-project sweep), and a directory orphaned any other way
+            sits under the logs root until `--fix` or `directa uninstall
+            --purge` removes it. The claimed set comes from the daemon's
             own `daemon.info` (every registry project plus every project with a
             resident supervisor), not machine-wide server status: a trusted
             project mid-edit on an invalid devservers.json, or one whose file
@@ -2124,10 +2124,10 @@ struct Doctor: AsyncParsableCommand {
             CLIRunner.emit(Report(findings: findings), json: true) { _ in "" }
         } else {
             for finding in findings {
-                print("[\(finding.severity)] \(finding.kind): \(finding.detail)")
+                print("[\(finding.severity.rawValue)] \(finding.kind.rawValue): \(finding.detail)")
             }
         }
-        if findings.contains(where: { $0.severity == "error" }) {
+        if findings.contains(where: { $0.severity == .error }) {
             Foundation.exit(1)
         }
     }
@@ -2295,10 +2295,7 @@ struct DaemonUninstall: AsyncParsableCommand {
     var purge = false
 
     func run() async throws {
-        FileHandle.standardError.write(
-            Data(
-                "directa: `directa daemon uninstall` is deprecated; use `directa uninstall` (or `directa uninstall --agent-only` to remove just the agent)\n"
-                    .utf8))
+        CLIRunner.notice(CLINotice.daemonUninstallDeprecated)
         await LaunchdAdmin.uninstall(paths: DirectaPaths(), purge: purge)
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
             purge ? "the daemon is uninstalled; data and logs removed" : "the daemon is uninstalled"
@@ -2467,7 +2464,7 @@ struct Switch: AsyncParsableCommand {
         print("stopping servers…")
         _ = try? await CLIRunner.client().request(
             .groupDown, params: GroupParams(project: project), expecting: GroupResult.self,
-            operationTimeoutSeconds: 120)
+            operationTimeoutSeconds: CLIRunner.stopOperationTimeoutSeconds)
         var switched = Self.git(["switch", branch], in: project)
         if switched.status != 0 {
             /** A remote-only branch needs a tracking checkout. */
@@ -2865,7 +2862,7 @@ struct Lock: AsyncParsableCommand {
                         expecting: LockStatusResult.self
                     ).holder
                     if let holder {
-                        Self.note(
+                        CLIRunner.note(
                             first
                                 ? LockNotice.contended(
                                     budgetSeconds: acquireTimeout, holder: holder, now: Date(),
@@ -2889,12 +2886,12 @@ struct Lock: AsyncParsableCommand {
         /** Progress chatter is stderr: stdout belongs to the guarded command, and
             --json governs stdout schemas. */
         for name in acquired.paused {
-            Self.note("directa lock: paused \(name) (holds \(resource))")
+            CLIRunner.note("directa lock: paused \(name) (holds \(resource))")
         }
         if let warning = LockNotice.unguarded(
             resource: resource, live: acquired.live ?? [], statePath: acquired.statePath)
         {
-            Self.note(warning)
+            CLIRunner.note(warning)
         }
         /** Identity is taken before the command and again before release, so a
             resumed server's first writes are never blamed on the command. */
@@ -2914,7 +2911,7 @@ struct Lock: AsyncParsableCommand {
                 resumeTimeoutSeconds: timeout),
             expecting: LockResult.self)) ?? LockResult()
         for name in released.paused {
-            Self.note("directa lock: resuming \(name)…")
+            CLIRunner.note("directa lock: resuming \(name)…")
         }
         switch verdict {
         case .fault(let error):
@@ -2923,15 +2920,11 @@ struct Lock: AsyncParsableCommand {
             CLIRunner.emitFailure(error, json: global.json)
             Foundation.exit(commandStatus == 0 ? 1 : commandStatus)
         case .note(let text):
-            Self.note(text)
+            CLIRunner.note(text)
         case .silent:
             break
         }
         Foundation.exit(commandStatus)
-    }
-
-    static func note(_ text: String) {
-        FileHandle.standardError.write(Data((text + "\n").utf8))
     }
 
     /** Spawns the guarded command with inherited stdio in `cwd`, so a test can
@@ -2945,7 +2938,7 @@ struct Lock: AsyncParsableCommand {
         do {
             try process.run()
         } catch {
-            FileHandle.standardError.write(Data("directa lock: cannot run command: \(error)\n".utf8))
+            CLIRunner.note("directa lock: cannot run command: \(error)")
             return 1
         }
         process.waitUntilExit()

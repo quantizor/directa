@@ -27,18 +27,17 @@ struct SystemRestartClock: RestartClock {
 
 struct DaemonClientRestartRequester: RestartRequesting {
     let client: DaemonClient
-    let timeoutSeconds: Double
 
     func ensure(_ params: EnsureParams) async throws -> EnsureResult {
         try await client.request(
             .serverEnsure, params: params, expecting: EnsureResult.self,
-            operationTimeoutSeconds: timeoutSeconds)
+            operationTimeoutSeconds: params.timeoutSeconds)
     }
 
     func restart(_ params: RestartParams) async throws -> GroupResult {
         try await client.request(
             .serverRestart, params: params, expecting: GroupResult.self,
-            operationTimeoutSeconds: timeoutSeconds)
+            operationTimeoutSeconds: params.timeoutSeconds)
     }
 
     func status(_ params: ProjectParams) async throws -> ServerListResult {
@@ -48,7 +47,7 @@ struct DaemonClientRestartRequester: RestartRequesting {
     func wait(_ params: WaitParams) async throws -> EnsureResult {
         try await client.request(
             .serverWait, params: params, expecting: EnsureResult.self,
-            operationTimeoutSeconds: timeoutSeconds)
+            operationTimeoutSeconds: params.timeoutSeconds)
     }
 }
 
@@ -77,7 +76,8 @@ struct DaemonClientRestartRequester: RestartRequesting {
     fields every daemon version reports. */
 struct RestartSession: Sendable {
     let clock: any RestartClock
-    /** Written to stderr once, when the session starts recovering. */
+    /** Receives `CLINotice.restartConnectionLost` once, when the session
+        starts recovering. */
     let notice: @Sendable (String) -> Void
     let params: RestartParams
     let requester: any RestartRequesting
@@ -86,8 +86,6 @@ struct RestartSession: Sendable {
     static let backoffFloor = Duration.milliseconds(250)
     /** Rounds of reconnect-then-act after the first drop. */
     static let maxRecoveryRounds = 3
-    static let recoveringNotice =
-        "directa: the daemon connection closed during the restart; waiting for it to come back and checking the server instead of restarting it again"
 
     /** How long the session waits for a daemon to answer again after a drop:
         the restart's own timeout, with a floor that covers a launchd relaunch
@@ -114,12 +112,18 @@ struct RestartSession: Sendable {
         return .wait
     }
 
+    /** The status scope every read uses: the one named server, or the whole
+        project for `--all`. */
+    var scope: ProjectParams {
+        ProjectParams(name: params.names?.count == 1 ? params.names?.first : nil, project: params.project)
+    }
+
     /** The status read the decision compares against. The caller sends it
         before `run` through the retrying runner, which may bootstrap a
         daemon: nothing has been restarted yet at that point, so a retry is
         safe there and nowhere after. */
-    var scope: ProjectParams {
-        ProjectParams(name: params.names?.count == 1 ? params.names?.first : nil, project: params.project)
+    func readBefore() async throws -> ServerListResult {
+        try await requester.status(scope)
     }
 
     func run(before: ServerListResult) async throws -> GroupResult {
@@ -128,7 +132,7 @@ struct RestartSession: Sendable {
         do {
             return try await requester.restart(params)
         } catch let error as WireError where Self.isConnectionLoss(error) {
-            notice(Self.recoveringNotice)
+            notice(CLINotice.restartConnectionLost)
         }
         return try await recover(livePids: livePids, scope: scope, targets: targets)
     }

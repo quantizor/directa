@@ -32,6 +32,11 @@ import Testing
             project: project.path)
     }
 
+    private static func isRefused(_ result: LogsRemoveOrphanResult) -> Bool {
+        if case .refused = result.outcome { return true }
+        return false
+    }
+
     private func handle<P: Codable & Sendable, R: Codable & Sendable>(
         _ router: Router, _ method: WireMethod, _ params: P, _ expecting: R.Type
     ) async throws -> R {
@@ -566,8 +571,7 @@ import Testing
             router, .logsRemoveOrphan, LogsRemoveOrphanParams(directory: name),
             LogsRemoveOrphanResult.self)
 
-        #expect(result.outcome == .refused)
-        #expect(result.reason == OrphanProjectLogs.Refusal.claimed.reason)
+        #expect(result.outcome == .refused(reason: OrphanProjectLogs.Refusal.claimed.reason, remedy: nil))
         #expect(
             FileManager.default.fileExists(
                 atPath: env.paths.structuredLogFile(project: env.project, server: "web").path))
@@ -590,7 +594,7 @@ import Testing
             router, .logsRemoveOrphan, LogsRemoveOrphanParams(directory: name),
             LogsRemoveOrphanResult.self)
 
-        #expect(result.outcome == .refused)
+        #expect(Self.isRefused(result))
         #expect(FileManager.default.fileExists(atPath: kept.path))
         #expect(FileManager.default.fileExists(atPath: env.paths.logsDir.path))
     }
@@ -614,7 +618,7 @@ import Testing
             LogsRemoveOrphanParams(directory: DirectaPaths.projectLogDirName(project: env.project)),
             LogsRemoveOrphanResult.self)
 
-        #expect(result.outcome == .refused)
+        #expect(Self.isRefused(result))
         #expect(
             FileManager.default.fileExists(
                 atPath: env.paths.spoolOutFile(project: env.project, server: "web").path))
@@ -645,7 +649,9 @@ import Testing
             async let started = registerThenStart(router, project: project, spec: spec)
             let (removed, run) = try await (removal, started)
 
-            #expect(removed.outcome != .failed)
+            if case .failed(let reason) = removed.outcome {
+                Issue.record("removal failed: \(reason)")
+            }
             #expect(run.server.pid != nil)
             #expect(
                 FileManager.default.fileExists(

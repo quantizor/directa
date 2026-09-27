@@ -6,26 +6,26 @@ import Testing
 @testable import directa
 
 /** `directa logs <name>` with none of `--tail`/`--since`/`--since-mark`/
-    `--follow` used to answer with the server's whole log history: every line
-    since it was first supervised. `effectiveTail` is the one place that
-    decides the bound actually sent to the daemon, so it is asserted directly
-    rather than through a live request. */
+    `--follow` answers a bounded tail rather than the server's whole log
+    history. `effectiveTail` is the one place that decides the bound actually
+    sent to the daemon, so it is asserted directly rather than through a live
+    request. */
 @Suite struct LogsCommandParsingTests {
     @Test func noBoundFlagsDefaultToTheBoundedTail() {
         #expect(
-            Logs.effectiveTail(all: false, follow: false, since: nil, sinceMark: nil, tail: nil)
+            Logs.effectiveTail(all: false, follow: false, head: nil, since: nil, sinceMark: nil, tail: nil)
                 == Logs.defaultTailLines)
     }
 
     @Test func allProducesNoTail() {
-        #expect(Logs.effectiveTail(all: true, follow: false, since: nil, sinceMark: nil, tail: nil) == nil)
+        #expect(Logs.effectiveTail(all: true, follow: false, head: nil, since: nil, sinceMark: nil, tail: nil) == nil)
     }
 
     /** `--all` still means the whole history even under `--follow`: the two
         default rules (`--follow`'s smaller backlog, `--all`'s "everything")
         would otherwise silently pick a winner with no flag telling you which. */
     @Test func allWinsOverFollowsOwnDefault() {
-        #expect(Logs.effectiveTail(all: true, follow: true, since: nil, sinceMark: nil, tail: nil) == nil)
+        #expect(Logs.effectiveTail(all: true, follow: true, head: nil, since: nil, sinceMark: nil, tail: nil) == nil)
     }
 
     @Test func allWithTailIsAUsageError() throws {
@@ -42,18 +42,17 @@ import Testing
         #expect(Logs.usageError(all: true, tail: nil) == nil)
     }
 
-    /** `--since` already scopes the answer to a time window, which is not the
-        unbounded-by-default bug this tail bound fixes, so a bare `--since`
-        keeps its historical no-tail behavior rather than gaining an implicit
-        200-line cap on top of the time window. */
+    /** `--since` already scopes the answer to a time window, so a bare
+        `--since` sends no tail rather than an implicit cap on top of the
+        window. */
     @Test func sinceAloneStillHasNoImplicitTail() {
         #expect(
-            Logs.effectiveTail(all: false, follow: false, since: Date(), sinceMark: nil, tail: nil) == nil)
+            Logs.effectiveTail(all: false, follow: false, head: nil, since: Date(), sinceMark: nil, tail: nil) == nil)
     }
 
     @Test func sinceMarkAloneStillHasNoImplicitTail() {
         #expect(
-            Logs.effectiveTail(all: false, follow: false, since: nil, sinceMark: "m1", tail: nil) == nil)
+            Logs.effectiveTail(all: false, follow: false, head: nil, since: nil, sinceMark: "m1", tail: nil) == nil)
     }
 
     /** `--all` combined with `--since`/`--since-mark` is a no-op on the tail
@@ -61,24 +60,23 @@ import Testing
         usage error the way `--all --tail` is. */
     @Test func allWithSinceIsNotAUsageError() {
         #expect(
-            Logs.effectiveTail(all: true, follow: false, since: Date(), sinceMark: nil, tail: nil) == nil)
+            Logs.effectiveTail(all: true, follow: false, head: nil, since: Date(), sinceMark: nil, tail: nil) == nil)
     }
 
     @Test func explicitTailIsUnchanged() {
-        #expect(Logs.effectiveTail(all: false, follow: false, since: nil, sinceMark: nil, tail: 5) == 5)
+        #expect(Logs.effectiveTail(all: false, follow: false, head: nil, since: nil, sinceMark: nil, tail: 5) == 5)
     }
 
-    /** `--follow` with no other bound keeps its own smaller pre-existing
-        default rather than switching to `defaultTailLines`: it was already
-        bounded before this change, so it is not the bug being fixed. */
+    /** `--follow` with no other bound keeps its own smaller backlog rather
+        than `defaultTailLines`. */
     @Test func followAloneKeepsItsOwnSmallerDefault() {
         #expect(
-            Logs.effectiveTail(all: false, follow: true, since: nil, sinceMark: nil, tail: nil)
+            Logs.effectiveTail(all: false, follow: true, head: nil, since: nil, sinceMark: nil, tail: nil)
                 == Logs.followDefaultTailLines)
     }
 
     @Test func followWithExplicitTailKeepsTheExplicitValue() {
-        #expect(Logs.effectiveTail(all: false, follow: true, since: nil, sinceMark: nil, tail: 5) == 5)
+        #expect(Logs.effectiveTail(all: false, follow: true, head: nil, since: nil, sinceMark: nil, tail: 5) == 5)
     }
 
     @Test func allFlagParsesFromArguments() throws {
@@ -133,9 +131,9 @@ import Testing
     }
 
     @Test func theMonitorHintAppearsOnlyInClaudeCodeWithAPipedStdout() {
-        let hint =
-            "directa: to stream a server's output into this session, run directa monitor <name> with the Monitor tool"
-        #expect(Logs.monitorHint(environment: ["CLAUDECODE": "1"], stdoutIsTerminal: false) == hint)
+        #expect(
+            Logs.monitorHint(environment: ["CLAUDECODE": "1"], stdoutIsTerminal: false)
+                == CLINotice.followUseMonitor)
         #expect(Logs.monitorHint(environment: ["CLAUDECODE": "1"], stdoutIsTerminal: true) == nil)
         #expect(Logs.monitorHint(environment: [:], stdoutIsTerminal: false) == nil)
         #expect(Logs.monitorHint(environment: ["CLAUDECODE": "0"], stdoutIsTerminal: false) == nil)

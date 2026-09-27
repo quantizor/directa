@@ -6,49 +6,30 @@ import Testing
 
 @Suite(.temporaryTree) struct OrphanProjectLogsTests {
     @Test func aClaimedSlugDirIsNotAnOrphan() {
-        let findings = OrphanProjectLogs.detect(
-            entries: [(apparentBytes: 100, path: URL(fileURLWithPath: "/logs/myproj-abcd1234"))],
-            claimedSlugDirs: ["myproj-abcd1234"])
-        #expect(findings.isEmpty)
+        #expect(!OrphanProjectLogs.isUnclaimedName("myproj-abcd1234", claimedSlugDirs: ["myproj-abcd1234"]))
+        #expect(OrphanProjectLogs.isUnclaimedName("myproj-abcd1234", claimedSlugDirs: ["other-abcd1234"]))
     }
 
-    @Test func anUnclaimedSlugDirIsAnOrphanNamingSizeAndTheDoctorFixCommand() {
-        let path = URL(fileURLWithPath: "/logs/myproj-abcd1234")
+    @Test func anUnclaimedSlugDirIsAnOrphanNamingItsSize() {
         let findings = OrphanProjectLogs.detect(
-            entries: [(apparentBytes: 100, path: path)], claimedSlugDirs: [])
+            entries: [(apparentBytes: 100, path: URL(fileURLWithPath: "/logs/myproj-abcd1234"))])
         #expect(findings == [
-            OrphanProjectLogs.Finding(
-                detail: "/logs/myproj-abcd1234 (100 bytes) matches no registered project",
-                path: path,
-                remedy: "directa doctor --fix"),
+            OrphanProjectLogs.Finding(detail: "/logs/myproj-abcd1234 (100 bytes) matches no registered project")
         ])
-    }
-
-    @Test func multipleOrphansSortByPath() {
-        let findings = OrphanProjectLogs.detect(
-            entries: [
-                (apparentBytes: 0, path: URL(fileURLWithPath: "/logs/zproj-11111111")),
-                (apparentBytes: 0, path: URL(fileURLWithPath: "/logs/aproj-22222222")),
-            ],
-            claimedSlugDirs: [])
-        #expect(findings.map(\.detail) == [
-            "/logs/aproj-22222222 (Zero KB) matches no registered project",
-            "/logs/zproj-11111111 (Zero KB) matches no registered project",
-        ])
+        #expect(OrphanProjectLogs.remedy == "directa doctor --fix")
     }
 
     /** A logs root shared with other apps (`ddirecta --logs-dir
         ~/Library/Logs`) holds folders directa never made; only the
         `<slug>-<hash8>` shape `projectLogDir` produces is ever reported. */
-    @Test func detectReportsOnlyNamesWithTheProjectLogDirShape() {
+    @Test func onlyNamesWithTheProjectLogDirShapeAreCandidates() {
         let names = [
             "DiagnosticReports", "com.apple.xpc.launchd", "myproj-abcd123", "myproj-ABCD1234",
             "myproj-abcd12345", "My App-abcd1234", "-abcd1234", "web-app-0123abcd",
         ]
-        let findings = OrphanProjectLogs.detect(
-            entries: names.map { (apparentBytes: 0, path: URL(fileURLWithPath: "/logs/\($0)")) },
-            claimedSlugDirs: [])
-        #expect(findings.map(\.path.lastPathComponent) == ["-abcd1234", "web-app-0123abcd"])
+        #expect(
+            names.filter { OrphanProjectLogs.isUnclaimedName($0, claimedSlugDirs: []) }
+                == ["-abcd1234", "web-app-0123abcd"])
     }
 
     @Test func aProjectLogDirNameMatchesTheShapeItDeclares() {
@@ -70,11 +51,7 @@ import Testing
 
         let findings = OrphanProjectLogs.scan(paths: fixture.paths, claimedSlugDirs: [Fixture.claimedName])
 
-        #expect(findings.count == 1)
-        #expect(findings[0].detail.hasPrefix(fixture.orphaned.path))
-        #expect(findings[0].detail.contains("100 bytes"))
-        #expect(findings[0].path == fixture.orphaned)
-        #expect(findings[0].remedy == "directa doctor --fix")
+        #expect(findings.map(\.detail) == ["\(fixture.orphaned.path) (100 bytes) matches no registered project"])
     }
 
     @Test func scanSkipsAnotherAppsFolderUnderASharedLogsRoot() throws {
@@ -84,7 +61,7 @@ import Testing
 
         let findings = OrphanProjectLogs.scan(paths: fixture.paths, claimedSlugDirs: [Fixture.claimedName])
 
-        #expect(findings.map(\.path) == [fixture.orphaned])
+        #expect(findings.map(\.detail) == [fixture.orphanedDetail])
     }
 
     /** A link is not a log directory directa created, and `--fix` refuses to
@@ -96,7 +73,7 @@ import Testing
 
         let findings = OrphanProjectLogs.scan(paths: fixture.paths, claimedSlugDirs: [Fixture.claimedName])
 
-        #expect(findings.map(\.path) == [fixture.orphaned])
+        #expect(findings.map(\.detail) == [fixture.orphanedDetail])
     }
 
     /** `unclaimedDirectories`, the listing `doctor --fix` removes from
@@ -118,7 +95,10 @@ import Testing
         let scanned = OrphanProjectLogs.scan(paths: fixture.paths, claimedSlugDirs: [Fixture.claimedName])
 
         #expect(unclaimed == [second, fixture.orphaned])
-        #expect(scanned.map(\.path) == unclaimed)
+        #expect(scanned.map(\.detail) == [
+            "\(second.path) (Zero KB) matches no registered project",
+            "\(fixture.orphaned.path) (100 bytes) matches no registered project",
+        ])
     }
 
     @Test func scanAnswersEmptyForAMissingLogsDirectory() throws {
@@ -289,6 +269,11 @@ import Testing
         let orphaned: URL
         let paths: DirectaPaths
         let root: URL
+
+        /** What `scan` reports for the empty `orphaned` directory. */
+        var orphanedDetail: String {
+            "\(orphaned.path) (Zero KB) matches no registered project"
+        }
 
         init() throws {
             root = try TemporaryTree.directory(named: "orphanlogs")

@@ -29,7 +29,7 @@ import Testing
         Doctor.portSquatterFindings(
             servers: servers, isListening: { listening.contains($0) },
             projectExists: { !missingProjects.contains($0) }
-        ).map { "[\($0.severity)] \($0.kind): \($0.detail)" }
+        ).map { "[\($0.severity.rawValue)] \($0.kind.rawValue): \($0.detail)" }
     }
 
     @Test func aStoppedServerWithAForeignListenerIsReported() {
@@ -119,6 +119,14 @@ import Testing
             status(phase: .running, pid: 7, port: 3000, project: "/gone", server: "old"),
         ]
         #expect(lines(servers, listening: [3000], missingProjects: ["/gone"]).isEmpty)
+    }
+
+    /** The JSON a finding encodes to is the `--json` contract. */
+    @Test func aFindingEncodesItsKindAndSeverityAsTheContractStrings() throws {
+        let finding = Doctor.Finding(detail: "d", kind: .portSquatter, severity: .warning)
+        #expect(
+            String(decoding: try JSONCoding.encoder().encode(finding), as: UTF8.self)
+                == #"{"detail":"d","kind":"port-squatter","severity":"warning"}"#)
     }
 
     @Test func noServersNoFindings() {

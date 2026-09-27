@@ -127,6 +127,12 @@ public struct WireError: Codable, Equatable, Error, Sendable {
     public static func unknownMethodMessage(_ rawMethod: String) -> String {
         "unknown method \(rawMethod)"
     }
+
+    /** True when this is a daemon's refusal of `method` as a method it does
+        not know: a daemon older than this client, which a restart updates. */
+    public func isUnknownMethod(_ method: WireMethod) -> Bool {
+        code == .usage && message == Self.unknownMethodMessage(method.rawValue)
+    }
 }
 
 /** Without this, `localizedDescription` renders a WireError as "The operation
@@ -504,11 +510,27 @@ public struct LogsRemoveOrphanParams: Codable, Equatable, Sendable {
     }
 }
 
-/** `logs.removeOrphan`'s result. `reason` is present when the directory was
-    left in place (`refused`) or the removal failed (`failed`); `remedy` only
-    for a refusal a person can act on, and never a deletion command. */
+/** `logs.removeOrphan`'s result. On the wire, `{outcome, path, reason?,
+    remedy?}`: `reason` is present when the directory was left in place
+    (`refused`) or the removal failed (`failed`), `remedy` only for a refusal a
+    person can act on, and never a deletion command. In memory each outcome
+    carries exactly the fields it has, so a refusal or failure always has a
+    reason; one decoded without a reason gets a generic one at this seam. */
 public struct LogsRemoveOrphanResult: Codable, Equatable, Sendable {
-    public enum Outcome: String, Codable, Sendable {
+    public enum Outcome: Equatable, Sendable {
+        case failed(reason: String)
+        case refused(reason: String, remedy: String?)
+        case removed
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case outcome
+        case path
+        case reason
+        case remedy
+    }
+
+    private enum OutcomeName: String, Codable {
         case failed
         case refused
         case removed
@@ -517,14 +539,10 @@ public struct LogsRemoveOrphanResult: Codable, Equatable, Sendable {
     public var outcome: Outcome
     /** The full path the daemon checked, inside its own logs dir. */
     public var path: String
-    public var reason: String?
-    public var remedy: String?
 
-    public init(outcome: Outcome, path: String, reason: String? = nil, remedy: String? = nil) {
+    public init(outcome: Outcome, path: String) {
         self.outcome = outcome
         self.path = path
-        self.reason = reason
-        self.remedy = remedy
     }
 
     public init(path: URL, removal: OrphanProjectLogs.Removal) {
@@ -532,9 +550,41 @@ public struct LogsRemoveOrphanResult: Codable, Equatable, Sendable {
         case .removed:
             self.init(outcome: .removed, path: path.path)
         case .refused(let refusal):
-            self.init(outcome: .refused, path: path.path, reason: refusal.reason, remedy: refusal.remedy)
+            self.init(outcome: .refused(reason: refusal.reason, remedy: refusal.remedy), path: path.path)
         case .failed(let message):
-            self.init(outcome: .failed, path: path.path, reason: message)
+            self.init(outcome: .failed(reason: message), path: path.path)
+        }
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        path = try container.decode(String.self, forKey: .path)
+        let reason = try container.decodeIfPresent(String.self, forKey: .reason)
+        switch try container.decode(OutcomeName.self, forKey: .outcome) {
+        case .failed:
+            outcome = .failed(reason: reason ?? "the removal failed")
+        case .refused:
+            outcome = .refused(
+                reason: reason ?? "the daemon refused",
+                remedy: try container.decodeIfPresent(String.self, forKey: .remedy))
+        case .removed:
+            outcome = .removed
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(path, forKey: .path)
+        switch outcome {
+        case .failed(let reason):
+            try container.encode(OutcomeName.failed, forKey: .outcome)
+            try container.encode(reason, forKey: .reason)
+        case .refused(let reason, let remedy):
+            try container.encode(OutcomeName.refused, forKey: .outcome)
+            try container.encode(reason, forKey: .reason)
+            try container.encodeIfPresent(remedy, forKey: .remedy)
+        case .removed:
+            try container.encode(OutcomeName.removed, forKey: .outcome)
         }
     }
 }

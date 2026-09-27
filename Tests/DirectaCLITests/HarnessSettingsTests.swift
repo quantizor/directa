@@ -2,6 +2,7 @@ import DirectaKit
 import DirectaTestSupport
 import Foundation
 import Testing
+import os
 
 @testable import directa
 
@@ -9,8 +10,7 @@ import Testing
     owns and directa does not: `~/.claude/settings.json` holds every other hook,
     permission and preference the harness reads. The install writes the whole
     file back from what it read, so what the read does on a file it cannot parse
-    decides whether the merge is a merge or a replacement. It used to answer with
-    an empty dictionary, which the write then persisted as the entire file. */
+    decides whether the merge is a merge or a replacement. */
 @Suite(.temporaryTree) struct HarnessSettingsTests {
     /** Stands in for a real adapter so these exercise the shared load/write pair
         rather than either harness's key layout. */
@@ -93,7 +93,7 @@ import Testing
             let error = #expect(throws: WireError.self) { try adapter.loadSettings() }
             #expect(error?.code == .configInvalid)
             #expect(error?.message.contains(adapter.settingsURL.path) == true)
-            #expect(error?.hint == "directa hook install")
+            #expect(error?.hint == "run: directa hook install")
         }
     }
 
@@ -544,13 +544,32 @@ import Testing
         ("[1,2]", true),
     ])
     func claudeHookStandsDownOnlyUnderCursor(payload: String, emits: Bool) {
-        #expect(
-            HookPayloadGate.claudeHookShouldEmit(stdin: Data(payload.utf8), cursorHookInstalled: true)
-                == emits)
+        let parsed = HookPayload.parse(Data(payload.utf8))
+        #expect(HookPayloadGate.claudeHookShouldEmit(parsed, cursorHookInstalled: { true }) == emits)
         /** Without directa's own Cursor hook, the claude hook is the only
             source of the block in a Cursor session, so it always speaks. */
+        #expect(HookPayloadGate.claudeHookShouldEmit(parsed, cursorHookInstalled: { false }))
+    }
+
+    /** A `cursor_version` of any type, `null` included, is still Cursor. */
+    @Test(arguments: [#"{"cursor_version":null}"#, #"{"cursor_version":3}"#, #"{"cursor_version":{}}"#])
+    func anyCursorVersionValueCounts(payload: String) {
         #expect(
-            HookPayloadGate.claudeHookShouldEmit(stdin: Data(payload.utf8), cursorHookInstalled: false))
+            !HookPayloadGate.claudeHookShouldEmit(
+                HookPayload.parse(Data(payload.utf8)), cursorHookInstalled: { true }))
+    }
+
+    /** Cursor's settings file is read only for a payload that came from
+        Cursor, so a Claude Code session start never pays for it. */
+    @Test func theCursorSettingsAreReadOnlyForACursorPayload() {
+        let claude = HookPayload.parse(Data(#"{"cwd":"/p","hook_event_name":"SessionStart"}"#.utf8))
+        #expect(
+            HookPayloadGate.claudeHookShouldEmit(
+                claude,
+                cursorHookInstalled: {
+                    Issue.record("read Cursor's settings for a Claude Code payload")
+                    return true
+                }))
     }
 
     /** PreInvocation input copied from antigravity.google/docs/hooks (the
@@ -567,14 +586,48 @@ import Testing
             "artifactDirectoryPath": "~/.gemini/antigravity/brain/ec33ebf9-0cba-4100-8142-c61503f6c587", \
             "modelName": "gemini-3.6-flash-medium"}
             """
-        #expect(HookPayloadGate.antigravityHookShouldEmit(stdin: Data(payload.utf8)) == emits)
+        #expect(HookPayloadGate.antigravityHookShouldEmit(HookPayload.parse(Data(payload.utf8))) == emits)
     }
 
     @Test(arguments: [
         #"{"workspacePaths":["/p"]}"#, #"{"invocationNum":"2"}"#, #"{"invocationNum":null}"#, "", "garbage",
+        #"{"invocationNum":true}"#, #"{"invocationNum":false}"#, "[0]", #"{"invocationNum":0.5}"#,
     ])
     func antigravityHookEmitsWhenTheInvocationNumberIsMissingOrUnreadable(payload: String) {
-        #expect(HookPayloadGate.antigravityHookShouldEmit(stdin: Data(payload.utf8)))
+        #expect(HookPayloadGate.antigravityHookShouldEmit(HookPayload.parse(Data(payload.utf8))))
+    }
+
+    @Test(arguments: [#"{"invocationNum":1.5}"#, #"{"invocationNum":-1}"#, #"{"invocationNum":1e3}"#])
+    func antigravityHookIsSilentForAnyNumberPastTheFirstCall(payload: String) {
+        #expect(!HookPayloadGate.antigravityHookShouldEmit(HookPayload.parse(Data(payload.utf8))))
+    }
+
+    /** One wrong-typed field reads as absent without costing the others. */
+    @Test func aWrongTypedFieldDoesNotFailTheWholePayload() {
+        let payload = HookPayload.parse(
+            Data(#"{"cwd":7,"invocationNum":"x","workspace":"flat","workspace_roots":[1],"workspaceRoot":"/r"}"#.utf8))
+        #expect(
+            payload
+                == HookPayload.parse(Data(#"{"workspaceRoot":"/r"}"#.utf8)))
+        #expect(payload?.workspaceRoot == "/r")
+        #expect(payload?.cwd == nil)
+    }
+
+    /** Each hook's stdout, byte for byte: sorted keys, slashes unescaped. */
+    @Test func hookOutputsEncodeTheHarnessShapes() throws {
+        func text(_ value: some Encodable) throws -> String {
+            String(decoding: try #require(HookOutput.encoded(value)), as: UTF8.self)
+        }
+        #expect(try text(HookOutput.Antigravity(injectSteps: [])) == #"{"injectSteps":[]}"#)
+        #expect(
+            try text(HookOutput.Antigravity(injectSteps: [.init(ephemeralMessage: "a/b")]))
+                == #"{"injectSteps":[{"ephemeralMessage":"a/b"}]}"#)
+        #expect(
+            try text(
+                HookOutput.AdditionalContext(
+                    hookSpecificOutput: .init(additionalContext: "a/b", hookEventName: "SessionStart")))
+                == #"{"hookSpecificOutput":{"additionalContext":"a/b","hookEventName":"SessionStart"}}"#)
+        #expect(try text(HookOutput.Cursor(additionalContext: "a/b")) == #"{"additional_context":"a/b"}"#)
     }
 
     @Test func grokSessionHookActionMatrix() {
@@ -614,12 +667,6 @@ import Testing
         #expect(!GrokTurnGate.sessionKey("../../etc/passwd").contains("/"))
         let long = String(repeating: "a", count: 200)
         #expect(GrokTurnGate.sessionKey(long).count == GrokTurnGate.maxKeyLength)
-    }
-
-    @Test func grokTurnGateReadsSessionIdFromStdin() {
-        #expect(GrokTurnGate.sessionId(in: Data(#"{"sessionId":"abc"}"#.utf8)) == "abc")
-        #expect(GrokTurnGate.sessionId(in: Data(#"{"session_id":"def"}"#.utf8)) == "def")
-        #expect(GrokTurnGate.sessionId(in: Data("{}".utf8)) == nil)
     }
 
     @Test func grokTurnGateRoundTripsState() throws {
@@ -1054,17 +1101,58 @@ import Testing
     }
 
     /** A refusal from one harness must not discard the others: their files are
-        already rewritten when the throw lands, so uninstallAll collects. */
-    @Test func uninstallAllCollectsFailuresInsteadOfAborting() throws {
+        already rewritten when the throw lands, so the batch collects. */
+    @Test func anUninstallBatchCollectsFailuresInsteadOfAborting() throws {
         try inScratchDir { dir in
             let good = StubAdapter(settingsURL: dir.appending(path: "a.json"))
             let bad = FailingAdapter(settingsURL: dir.appending(path: "b.json"))
-            let result = HookUninstall.uninstallAll([good, bad, good])
+            let result = HarnessBatch.run([good, bad, good]) { try $0.uninstall() }
             #expect(result.summaries.count == 2)
-            #expect(result.failures.count == 1)
-            #expect(result.failures.first?.name == "failing")
-            #expect(result.failures.first?.message == "nope")
+            #expect(result.failures == [HarnessBatchResult.Failure(message: "nope", name: "failing")])
+            #expect(result.succeeded == [good.name, good.name])
         }
+    }
+
+    /** The one report both commands fail with: what succeeded, each failure
+        with its cause, and the rerun command as a literal hint. */
+    @Test func aBatchWithFailuresReportsBothHalvesPerVerb() {
+        var result = HarnessBatchResult()
+        #expect(result.failure(verb: .install) == nil)
+        result.succeeded = ["claude", "grok"]
+        result.failures = [HarnessBatchResult.Failure(message: "unreadable", name: "cursor")]
+        #expect(
+            result.failure(verb: .install)
+                == WireError(
+                    code: .internalError, hint: "run: directa hook install",
+                    message:
+                        "hook install finished with errors; installed claude, grok. Failed: cursor (unreadable) Fix each cause and rerun directa hook install."
+                ))
+        result.succeeded = []
+        #expect(
+            result.failure(verb: .uninstall)
+                == WireError(
+                    code: .internalError, hint: "run: directa hook uninstall",
+                    message:
+                        "hook uninstall finished with errors. Failed: cursor (unreadable) Fix each cause and rerun directa hook uninstall."
+                ))
+    }
+
+    @Test func anUnknownHarnessNamesTheSupportedOnesPerVerb() {
+        let stub = DetectableStub(name: "claude", settingsURL: URL(fileURLWithPath: "/a"), state: .notInstalled)
+        guard case .failure(let uninstall) = HarnessBatch.adapter(named: "x", in: [stub], verb: .uninstall) else {
+            Issue.record("expected an unknown harness to fail")
+            return
+        }
+        #expect(
+            uninstall
+                == WireError(
+                    code: .usage, hint: "run: directa hook uninstall --harness <name>",
+                    message: "unknown harness 'x' (supported: claude)"))
+        guard case .success(let found) = HarnessBatch.adapter(named: "claude", in: [stub], verb: .install) else {
+            Issue.record("expected a known harness to resolve")
+            return
+        }
+        #expect(found.name == "claude")
     }
 
     /** Stands in for a harness whose detection state and install outcome are
@@ -1083,9 +1171,9 @@ import Testing
         func hookState() -> HarnessHookState { state }
     }
 
-    /** `hook install` with no `--harness` used to default to `claude` alone;
-        it now installs every harness `hookState()` reads as present, skipping
-        (never touching) one that reads `.harnessAbsent`. */
+    /** `hook install` with no `--harness` installs every harness `hookState()`
+        reads as present, skipping (never touching) one that reads
+        `.harnessAbsent`. */
     @Test func resolveTargetsWithNoHarnessInstallsOnlyDetectedOnes() {
         let claude = DetectableStub(name: "claude", settingsURL: URL(fileURLWithPath: "/a"), state: .notInstalled)
         let cursor = DetectableStub(name: "cursor", settingsURL: URL(fileURLWithPath: "/b"), state: .harnessAbsent)
@@ -1140,19 +1228,35 @@ import Testing
                 == "unknown harness 'bogus' (supported: ; adding one: CONTRIBUTING.md)")
     }
 
-    /** The same collect-rather-than-abort shape as `HookUninstall.uninstallAll`. */
-    @Test func installAllCollectsFailuresInsteadOfAborting() {
+    @Test func anInstallBatchCollectsFailuresInsteadOfAborting() {
         let good = DetectableStub(
             installSummary: "installed good", name: "good", settingsURL: URL(fileURLWithPath: "/g"),
             state: .notInstalled)
         let bad = DetectableStub(
             installError: WireError(code: .configInvalid, message: "nope"), name: "bad",
             settingsURL: URL(fileURLWithPath: "/b"), state: .notInstalled)
-        let result = HookInstall.installAll([good, bad, good], cliPath: "/bin/directa")
+        let result = HarnessBatch.run([good, bad, good]) { try $0.install(cliPath: "/bin/directa") }
         #expect(result.summaries == ["installed good", "installed good"])
-        #expect(result.failures.count == 1)
-        #expect(result.failures.first?.name == "bad")
-        #expect(result.failures.first?.message == "nope")
+        #expect(result.failures == [HarnessBatchResult.Failure(message: "nope", name: "bad")])
+    }
+
+    /** `hookState()` reads a settings file, so the detection pass asks each
+        adapter once. */
+    @Test func resolveTargetsAsksEachAdapterForItsStateOnce() {
+        struct Counting: HarnessAdapter {
+            let calls: OSAllocatedUnfairLock<Int>
+            let name = "counted"
+            let settingsURL = URL(fileURLWithPath: "/c")
+            func install(cliPath: String) throws -> String { "" }
+            func uninstall() throws -> String { "" }
+            func hookState() -> HarnessHookState {
+                calls.withLock { $0 += 1 }
+                return .notInstalled
+            }
+        }
+        let calls = OSAllocatedUnfairLock(initialState: 0)
+        _ = HookInstall.resolveTargets(harness: nil, adapters: [Counting(calls: calls)])
+        #expect(calls.withLock { $0 } == 1)
     }
 
     /** OpenCode's own preference order decides which global config file wins:
@@ -1212,33 +1316,38 @@ import Testing
         #expect(grokAdapter.hookState() == .notInstalled)
     }
 
+    private func sessionCwd(_ json: String, environment: [String: String] = [:]) -> String {
+        HookSessionCwd.resolve(HookPayload.parse(Data(json.utf8)), environment: environment)
+    }
+
     @Test func sessionCwdResolvesAntigravityWorkspacePaths() {
-        let json = #"{"workspacePaths":["/my/workspace/path"]}"#
-        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
-        #expect(resolved == "/my/workspace/path")
+        #expect(sessionCwd(#"{"workspacePaths":["/my/workspace/path"]}"#) == "/my/workspace/path")
     }
 
     @Test func sessionCwdResolvesClaudeCwd() {
-        let json = #"{"cwd":"/my/claude/cwd"}"#
-        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
-        #expect(resolved == "/my/claude/cwd")
+        #expect(sessionCwd(#"{"cwd":"/my/claude/cwd"}"#) == "/my/claude/cwd")
     }
 
     @Test func sessionCwdResolvesCursorWorkspaceRoots() {
-        let json = #"{"workspace_roots":["/my/cursor/root"]}"#
-        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
-        #expect(resolved == "/my/cursor/root")
+        #expect(sessionCwd(#"{"workspace_roots":["/my/cursor/root"]}"#) == "/my/cursor/root")
     }
 
     @Test func sessionCwdResolvesGrokWorkspaceRoot() {
-        let json = #"{"workspaceRoot":"/my/grok/root"}"#
-        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
-        #expect(resolved == "/my/grok/root")
+        #expect(sessionCwd(#"{"workspaceRoot":"/my/grok/root"}"#) == "/my/grok/root")
     }
 
     @Test func sessionCwdPrefersGrokCwdOverWorkspaceRoot() {
-        let json = #"{"cwd":"/my/grok/cwd","workspaceRoot":"/my/grok/root"}"#
-        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
-        #expect(resolved == "/my/grok/cwd")
+        #expect(sessionCwd(#"{"cwd":"/my/grok/cwd","workspaceRoot":"/my/grok/root"}"#) == "/my/grok/cwd")
+    }
+
+    /** An empty first entry falls through to the next source, then to the
+        environment, then to the process directory. */
+    @Test func sessionCwdSkipsEmptyValuesInOrder() {
+        #expect(sessionCwd(#"{"workspace_roots":[""],"cwd":"/c"}"#) == "/c")
+        #expect(
+            sessionCwd(#"{"cwd":""}"#, environment: ["CURSOR_PROJECT_DIR": "", "GROK_WORKSPACE_ROOT": "/g"])
+                == "/g")
+        #expect(sessionCwd("garbage", environment: ["CURSOR_PROJECT_DIR": "/cp"]) == "/cp")
+        #expect(sessionCwd("garbage") == FileManager.default.currentDirectoryPath)
     }
 }

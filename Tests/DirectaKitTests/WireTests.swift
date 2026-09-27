@@ -328,6 +328,32 @@ import Testing
         #expect(
             String(data: try JSONCoding.encoder().encode(failed), encoding: .utf8)
                 == #"{"outcome":"failed","path":"/logs/app-deadbeef","reason":"busy"}"#)
+        for result in [refused, removed, failed] {
+            let decoded = try JSONCoding.decoder().decode(
+                LogsRemoveOrphanResult.self, from: JSONCoding.encoder().encode(result))
+            #expect(decoded == result)
+        }
+    }
+
+    /** The contract makes `reason` optional on the wire, so a refusal or a
+        failure that arrives without one still decodes, with a generic reason. */
+    @Test func logsRemoveOrphanResultWithoutAReasonStillDecodes() throws {
+        let refused = try JSONCoding.decoder().decode(
+            LogsRemoveOrphanResult.self, from: Data(#"{"outcome":"refused","path":"/l/a-deadbeef"}"#.utf8))
+        #expect(refused.outcome == .refused(reason: "the daemon refused", remedy: nil))
+        let failed = try JSONCoding.decoder().decode(
+            LogsRemoveOrphanResult.self, from: Data(#"{"outcome":"failed","path":"/l/a-deadbeef"}"#.utf8))
+        #expect(failed.outcome == .failed(reason: "the removal failed"))
+    }
+
+    @Test func isUnknownMethodMatchesOnlyTheExactRefusalForThatMethod() {
+        let refusal = WireError(
+            code: .usage, message: WireError.unknownMethodMessage(WireMethod.projectForget.rawValue))
+        #expect(refusal.isUnknownMethod(.projectForget))
+        #expect(!refusal.isUnknownMethod(.logsRemoveOrphan))
+        #expect(
+            !WireError(code: .internalError, message: refusal.message).isUnknownMethod(.projectForget))
+        #expect(!WireError(code: .usage, message: "bad params").isUnknownMethod(.projectForget))
     }
 
     /** Append-only is a wire promise: a reason the current daemon never
@@ -642,6 +668,9 @@ import Testing
         quarantine file or an unrelated dotfile must never parse as one. */
     @Test func tempFilePidParsesOnlyTheWriteGeneratedShape() {
         #expect(AtomicFile.tempFilePid(".registry.json.tmp-4242-\(UUID().uuidString)") == 4242)
+        #expect(
+            AtomicFile.tempFilePid(AtomicFile.tempName(for: URL(fileURLWithPath: "/d/registry.json")))
+                == Int(getpid()))
         #expect(AtomicFile.tempFilePid("registry.json") == nil)
         #expect(AtomicFile.tempFilePid("registry.json.corrupt-2025-07-18T19-46-40.000Z") == nil)
         #expect(AtomicFile.tempFilePid(".registry.json.tmp-not-a-pid-abc") == nil)

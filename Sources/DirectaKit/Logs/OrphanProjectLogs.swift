@@ -1,30 +1,24 @@
 import Foundation
 
 /** Slug directories under the logs root (`~/Library/Logs/directa/<slug>-<hash8>`)
-    that match no project the daemon currently reports. `ControlServer` removes
-    a project's log directory when it forgets the project (an explicit
-    unregister down to zero servers, the missing-project sweep), but a directory
-    predating that fix, or one orphaned some other way, is never cleaned up
-    automatically; `directa doctor --fix` removes one at a time through
-    `remove`, and `directa uninstall --purge` removes the whole logs tree.
+    that match no project the daemon claims. `ControlServer` removes a
+    project's log directory when it forgets the project (an explicit unregister
+    down to zero servers, the missing-project sweep); a directory orphaned any
+    other way stays until `directa doctor --fix`, whose `logs.removeOrphan`
+    request has the daemon run `remove` on each one while it holds its claim
+    set, or `directa uninstall --purge`, which removes the whole logs tree.
 
-    `detect` is pure over injected disk facts so it is unit-testable; `scan`
-    gathers those facts from disk for `directa doctor`. */
+    `isUnclaimedName` and `detect` are pure so they are unit-testable;
+    `unclaimedDirectories` and `scan` read the disk for `directa doctor`. */
 public enum OrphanProjectLogs {
     /** A slug directory with no project left to claim it. */
     public struct Finding: Equatable, Sendable {
         /** What is wrong, in plain terms a non-engineer can read, including the
-            directory's apparent size. */
+            directory's apparent size. `OrphanProjectLogs.remedy` removes it. */
         public let detail: String
-        /** The directory as listed under the logs root, the URL `remove` gets. */
-        public let path: URL
-        /** The literal command that removes it. */
-        public let remedy: String
 
-        public init(detail: String, path: URL, remedy: String) {
+        public init(detail: String) {
             self.detail = detail
-            self.path = path
-            self.remedy = remedy
         }
     }
 
@@ -72,33 +66,29 @@ public enum OrphanProjectLogs {
         }
     }
 
+    /** The literal command that removes every reported directory. */
     public static let remedy = "directa doctor --fix"
 
-    /** `entries` is every slug directory found directly under the logs root,
-        each paired with its apparent size in bytes (never a block-allocation
-        size: a cloud-synced or lazily-materialized tree can report zero
-        allocated blocks for a fully intact file, which would misreport a real
-        orphan as empty). `claimedSlugDirs` is
-        `DirectaPaths.projectLogDir(project:).lastPathComponent` for every
-        project the daemon currently reports; a directory not in that set has
-        no project left to speak for it. A name without the
-        `DirectaPaths.isProjectLogDirName` shape is never reported: directa did
-        not create it, and `remove` refuses it. */
-    public static func detect(
-        entries: [(apparentBytes: Int64, path: URL)], claimedSlugDirs: Set<String>
-    ) -> [Finding] {
-        entries
-            .filter { entry in
-                let name = entry.path.lastPathComponent
-                return DirectaPaths.isProjectLogDirName(name) && !claimedSlugDirs.contains(name)
-            }
-            .sorted { $0.path.path < $1.path.path }
-            .map { entry in
-                Finding(
-                    detail: "\(entry.path.path) (\(formatBytes(entry.apparentBytes))) matches no registered project",
-                    path: entry.path,
-                    remedy: remedy)
-            }
+    /** Whether a name listed directly under the logs root is an unclaimed
+        project log directory. `claimedSlugDirs` is
+        `DirectaPaths.projectLogDirNames(projects:)` over every project the
+        daemon claims; a name not in that set has no project left to speak for
+        it. A name without the `DirectaPaths.isProjectLogDirName` shape is
+        never one: directa did not create it, and `remove` refuses it. */
+    public static func isUnclaimedName(_ name: String, claimedSlugDirs: Set<String>) -> Bool {
+        DirectaPaths.isProjectLogDirName(name) && !claimedSlugDirs.contains(name)
+    }
+
+    /** One finding per unclaimed directory, in the order given, each naming
+        its apparent size in bytes (never a block-allocation size: a
+        cloud-synced or lazily-materialized tree can report zero allocated
+        blocks for a fully intact file, which would misreport a real orphan as
+        empty). */
+    public static func detect(entries: [(apparentBytes: Int64, path: URL)]) -> [Finding] {
+        entries.map { entry in
+            Finding(
+                detail: "\(entry.path.path) (\(formatBytes(entry.apparentBytes))) matches no registered project")
+        }
     }
 
     /** The unclaimed directories directly under the logs root, sorted by
@@ -107,9 +97,8 @@ public enum OrphanProjectLogs {
         between its claimed-set re-read and the removal. A symbolic link is
         skipped even when it points at a directory: directa never creates one
         here, `remove` refuses it, and sizing it would count whatever the link
-        points at. A name without the `DirectaPaths.isProjectLogDirName` shape
-        is skipped, so a logs root shared with other apps never has their
-        trees walked. */
+        points at. A name `isUnclaimedName` rejects is skipped, so a logs root
+        shared with other apps never has their trees walked. */
     public static func unclaimedDirectories(
         paths: DirectaPaths, claimedSlugDirs: Set<String>, fileManager: FileManager = .default
     ) -> [URL] {
@@ -117,22 +106,20 @@ public enum OrphanProjectLogs {
             return []
         }
         return names
-            .filter { DirectaPaths.isProjectLogDirName($0) && !claimedSlugDirs.contains($0) }
+            .filter { isUnclaimedName($0, claimedSlugDirs: claimedSlugDirs) }
             .map { paths.logsDir.appending(path: $0) }
             .filter { fileType(at: $0) == S_IFDIR }
             .sorted { $0.path < $1.path }
     }
 
-    /** `unclaimedDirectories` with each one sized, run through `detect`.
-        Impure (directory listing, file sizes); the decision it feeds is the
-        pure `detect` above. */
+    /** `unclaimedDirectories` with each one sized, as findings. */
     public static func scan(
         paths: DirectaPaths, claimedSlugDirs: Set<String>, fileManager: FileManager = .default
     ) -> [Finding] {
-        let entries = unclaimedDirectories(
-            paths: paths, claimedSlugDirs: claimedSlugDirs, fileManager: fileManager
-        ).map { (apparentBytes: apparentSize(of: $0, fileManager: fileManager), path: $0) }
-        return detect(entries: entries, claimedSlugDirs: claimedSlugDirs)
+        detect(
+            entries: unclaimedDirectories(
+                paths: paths, claimedSlugDirs: claimedSlugDirs, fileManager: fileManager
+            ).map { (apparentBytes: apparentSize(of: $0, fileManager: fileManager), path: $0) })
     }
 
     /** Nil when `directory` is safe to delete as a leftover log directory,

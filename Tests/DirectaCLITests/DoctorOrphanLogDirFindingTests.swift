@@ -14,17 +14,21 @@ import Testing
 
     @Test func aRemovedDirectoryIsFixed() {
         let finding = Doctor.orphanLogDirFixFinding(LogsRemoveOrphanResult(path: path, removal: .removed))
-        #expect(finding.detail == "removed /logs/myproj-abcd1234, which matched no registered project")
-        #expect(finding.kind == "orphan-log-dir")
-        #expect(finding.severity == "fixed")
+        #expect(
+            finding
+                == Doctor.Finding(
+                    detail: "removed /logs/myproj-abcd1234, which matched no registered project",
+                    kind: .orphanLogDir, severity: .fixed))
     }
 
     @Test func aRefusedDirectoryWithNothingLeftToDoNamesOnlyTheReason() {
         let finding = Doctor.orphanLogDirFixFinding(
             LogsRemoveOrphanResult(path: path, removal: .refused(.claimed)))
-        #expect(finding.detail == "left /logs/myproj-abcd1234 in place: a registered project claims it")
-        #expect(finding.kind == "orphan-log-dir")
-        #expect(finding.severity == "error")
+        #expect(
+            finding
+                == Doctor.Finding(
+                    detail: "left /logs/myproj-abcd1234 in place: a registered project claims it",
+                    kind: .orphanLogDir, severity: .error))
     }
 
     @Test func aRefusedLinkNamesTheReasonAndTheNextStep() {
@@ -34,15 +38,17 @@ import Testing
             finding.detail
                 == "left /logs/myproj-abcd1234 in place: it is a link to another location, not a log directory directa created; remove the link yourself if nothing needs it"
         )
-        #expect(finding.severity == "error")
+        #expect(finding.severity == .error)
     }
 
     @Test func aFailedDeleteKeepsTheSystemMessage() {
         let finding = Doctor.orphanLogDirFixFinding(
             LogsRemoveOrphanResult(path: path, removal: .failed("permission denied")))
-        #expect(finding.detail == "could not remove /logs/myproj-abcd1234: permission denied")
-        #expect(finding.kind == "orphan-log-dir")
-        #expect(finding.severity == "error")
+        #expect(
+            finding
+                == Doctor.Finding(
+                    detail: "could not remove /logs/myproj-abcd1234: permission denied",
+                    kind: .orphanLogDir, severity: .error))
     }
 }
 
@@ -85,7 +91,7 @@ import Testing
             "removed \(first.path), which matched no registered project",
             "left \(second.path) in place: a registered project claims it",
         ])
-        #expect(findings.map(\.severity) == ["fixed", "error"])
+        #expect(findings.map(\.severity) == [.fixed, .error])
         /** The scripted daemon deleted nothing, so every directory is still
             there: the client never removes one on its own. */
         for directory in [claimedDir, first, second] {
@@ -115,7 +121,7 @@ import Testing
             "\(orphans[1].path) (Zero KB) matches no registered project (run: directa doctor --fix)",
             "removed no leftover log directories: the running daemon is too old to remove them safely; run: directa daemon restart, then directa doctor --fix",
         ])
-        #expect(findings.map(\.severity) == ["warning", "warning", "error"])
+        #expect(findings.map(\.severity) == [.warning, .warning, .error])
         for orphan in orphans {
             #expect(FileManager.default.fileExists(atPath: orphan.path))
         }
@@ -145,7 +151,7 @@ import Testing
             "could not remove \(first.path): daemon closed the connection",
             "could not remove \(second.path): daemon went away",
         ])
-        #expect(findings.map(\.severity) == ["error", "error"])
+        #expect(findings.map(\.severity) == [.error, .error])
     }
 
     /** Report-only never deletes, so it never asks the daemon to. */
@@ -164,7 +170,7 @@ import Testing
         #expect(findings.map(\.detail) == [
             "\(orphan.path) (Zero KB) matches no registered project (run: directa doctor --fix)"
         ])
-        #expect(findings.map(\.severity) == ["warning"])
+        #expect(findings.map(\.severity) == [.warning])
         #expect(FileManager.default.fileExists(atPath: orphan.path))
     }
 

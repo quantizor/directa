@@ -14,9 +14,7 @@ import Testing
     @Test func oneServerIsSingular() {
         let finding = Doctor.staleProjectFixFinding(
             project: "/p", outcome: .success(ProjectForgetResult(servers: ["web"])))
-        #expect(finding.detail == "forgot /p (1 server)")
-        #expect(finding.kind == "stale-project")
-        #expect(finding.severity == "fixed")
+        #expect(finding == Doctor.Finding(detail: "forgot /p (1 server)", kind: .staleProject, severity: .fixed))
     }
 
     @Test func multipleServersArePlural() {
@@ -40,7 +38,7 @@ import Testing
             code: .usage,
             message: WireError.unknownMethodMessage(WireMethod.projectForget.rawValue))
         let finding = Doctor.staleProjectFixFinding(project: "/p", outcome: .failure(error))
-        #expect(finding.severity == "error")
+        #expect(finding.severity == .error)
         #expect(finding.detail == "could not forget /p: the running daemon predates project.forget; run: directa daemon restart")
     }
 
@@ -51,6 +49,19 @@ import Testing
         let error = WireError(code: .projectStillExists, message: "/p still exists on disk")
         let finding = Doctor.staleProjectFixFinding(project: "/p", outcome: .failure(error))
         #expect(finding.detail == "could not forget /p: /p still exists on disk")
-        #expect(finding.severity == "error")
+        #expect(finding.severity == .error)
+    }
+
+    /** A failure that is not a daemon error (a dropped connection surfacing
+        as a system error) reads as the system describes it. */
+    @Test func aNonDaemonFailureUsesTheSystemDescription() {
+        struct Dropped: LocalizedError {
+            var errorDescription: String? { "the connection dropped" }
+        }
+        let finding = Doctor.staleProjectFixFinding(project: "/p", outcome: .failure(Dropped()))
+        #expect(
+            finding
+                == Doctor.Finding(
+                    detail: "could not forget /p: the connection dropped", kind: .staleProject, severity: .error))
     }
 }

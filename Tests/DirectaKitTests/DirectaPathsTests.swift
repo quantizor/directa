@@ -41,6 +41,31 @@ import Testing
         #expect(paths.logsDir == defaults.logsDir)
     }
 
+    /** The socket comes from the environment the layout was built from, never
+        from this process's own, so an injected environment decides it. */
+    @Test func theSocketFollowsTheInjectedEnvironment() {
+        #expect(
+            DirectaPaths.fromEnvironment(["DIRECTA_SOCKET": "/tmp/s/d.sock"]).socketPath == "/tmp/s/d.sock")
+        #expect(
+            DirectaPaths.fromEnvironment(["DIRECTA_DATA_DIR": "/tmp/s/data"]).socketPath
+                == "/tmp/s/data/daemon.sock")
+        #expect(
+            DirectaPaths.fromEnvironment(["DIRECTA_DATA_DIR": "/tmp/s/data", "DIRECTA_SOCKET": ""]).socketPath
+                == "/tmp/s/data/daemon.sock")
+    }
+
+    @Test func anyNonEmptyLayoutVariableIsAnOverride() {
+        #expect(!DirectaPaths.hasEnvironmentOverride([:]))
+        #expect(!DirectaPaths.hasEnvironmentOverride(["HOME": "/Users/x"]))
+        #expect(
+            !DirectaPaths.hasEnvironmentOverride([
+                "DIRECTA_DATA_DIR": "", "DIRECTA_LOGS_DIR": "", "DIRECTA_SOCKET": "",
+            ]))
+        for key in ["DIRECTA_DATA_DIR", "DIRECTA_LOGS_DIR", "DIRECTA_SOCKET"] {
+            #expect(DirectaPaths.hasEnvironmentOverride([key: "/tmp/x"]), "\(key)")
+        }
+    }
+
     @Test func dotSegmentsAreResolved() {
         let paths = DirectaPaths.fromEnvironment(["DIRECTA_DATA_DIR": "/tmp/a/../b/./data"])
         #expect(paths.dataDir.path == "/tmp/b/data")

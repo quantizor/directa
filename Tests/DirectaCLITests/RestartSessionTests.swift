@@ -1,6 +1,7 @@
 import DirectaKit
 import Foundation
 import Testing
+import os
 
 @testable import directa
 
@@ -87,11 +88,10 @@ import Testing
         }
     }
 
-    private final class Notices: @unchecked Sendable {
-        private let lock = NSLock()
-        private var lines: [String] = []
-        func append(_ line: String) { lock.withLock { lines.append(line) } }
-        var all: [String] { lock.withLock { lines } }
+    private final class Notices: Sendable {
+        private let lines = OSAllocatedUnfairLock<[String]>(initialState: [])
+        func append(_ line: String) { lines.withLock { $0.append(line) } }
+        var all: [String] { lines.withLock { $0 } }
     }
 
     private struct Harness {
@@ -157,7 +157,7 @@ import Testing
 
         #expect(result == GroupResult(results: [healthy]))
         #expect(await harness.daemon.calls == ["restart web", "status web", "wait web healthy"])
-        #expect(harness.notices.all == [RestartSession.recoveringNotice])
+        #expect(harness.notices.all == [CLINotice.restartConnectionLost])
     }
 
     @Test func aDropBeforeTheRestartReachedTheServerRestartsItOnce() async throws {
@@ -345,5 +345,16 @@ import Testing
         #expect(named.session.scope == ProjectParams(name: "web", project: Self.project))
         let all = Harness(daemon: FakeDaemon(), names: nil)
         #expect(all.session.scope == ProjectParams(project: Self.project))
+    }
+
+    /** The pre-restart read goes through the same scope every later read uses. */
+    @Test func readBeforeReadsStatusInTheSessionsScope() async throws {
+        let before = Self.list(Self.status("web", phase: .running, pid: 10))
+        let named = Harness(daemon: FakeDaemon(statuses: [.success(before)]))
+        #expect(try await named.session.readBefore() == before)
+        #expect(await named.daemon.calls == ["status web"])
+        let all = Harness(daemon: FakeDaemon(statuses: [.success(before)]), names: nil)
+        _ = try await all.session.readBefore()
+        #expect(await all.daemon.calls == ["status --all"])
     }
 }
