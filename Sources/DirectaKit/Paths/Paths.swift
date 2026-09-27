@@ -62,11 +62,13 @@ public struct DirectaPaths: Sendable {
     }
 
     /** The layout of the daemon that answered `daemon.info`: its own data and
-        logs directories, which a daemon started with `--data-dir`/`--logs-dir`
-        moves away from this machine's defaults. */
+        logs directories and the socket it listens on, which a daemon started
+        with `--data-dir`/`--logs-dir`/`--socket` moves away from this
+        machine's defaults. */
     public init(daemon info: DaemonInfo) {
         self.init(
-            dataDir: URL(fileURLWithPath: info.dataDir), logsDir: URL(fileURLWithPath: info.logsDir))
+            dataDir: URL(fileURLWithPath: info.dataDir), logsDir: URL(fileURLWithPath: info.logsDir),
+            socketOverride: info.socketPath)
     }
 
     public var daemonBinaryDir: URL { dataDir.appending(path: "bin") }

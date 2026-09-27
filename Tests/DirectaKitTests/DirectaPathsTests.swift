@@ -80,5 +80,6 @@ import Testing
         #expect(paths.logsDir.path == "/tmp/w/logs")
         #expect(
             paths.projectLogDir(project: "/code/app").deletingLastPathComponent().path == "/tmp/w/logs")
+        #expect(paths.socketPath == "/tmp/w/d.sock")
     }
 }
