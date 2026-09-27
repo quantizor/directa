@@ -1,6 +1,17 @@
 import Foundation
 import os
 
+/** How one `LaunchdAdmin.shellOutcome` run ended. */
+public enum ShellOutcome: Equatable, Sendable {
+    /** The child ran to the end; `output` is everything it wrote. */
+    case exited(status: Int32, output: String)
+    /** The child could not be started; the payload says why. */
+    case failedToRun(String)
+    /** The child, or a process holding its output open, outlived the
+        timeout; `partialOutput` is what arrived before it. */
+    case timedOut(partialOutput: String)
+}
+
 /** launchd administration: install renders the LaunchAgent and bootstraps it;
     upgrades stage-and-rename the binary (overwriting a running signed Mach-O
     gets it SIGKILLed); restart drains, kickstarts, and re-ensures what ran.
@@ -555,19 +566,48 @@ public enum LaunchdAdmin {
         }
     }
 
+    /** `shellOutcome` in the `(status, output)` shape most callers read: a
+        child that could not start is status -1 with the reason as output, and
+        one killed at its timeout is status -1 with no output. */
     @discardableResult
-    /** `environment` nil inherits this process's, which is what most callers
-        want. Pass one to make the child's answer independent of who asked.
+    public static func shell(
+        _ path: String, _ arguments: [String], environment: [String: String]? = nil,
+        timeoutSeconds: Double? = nil
+    ) -> (status: Int32, output: String) {
+        switch shellOutcome(path, arguments, environment: environment, timeoutSeconds: timeoutSeconds) {
+        case .exited(let status, let output):
+            (status: status, output: output)
+        case .failedToRun(let reason):
+            (status: -1, output: reason)
+        case .timedOut:
+            (status: -1, output: "")
+        }
+    }
+
+    /** The async form of `shellOutcome`, on `BlockingLane.system`. */
+    public static func shellOutcome(
+        _ path: String, _ arguments: [String], environment: [String: String]? = nil,
+        timeoutSeconds: Double? = nil
+    ) async -> ShellOutcome {
+        await BlockingLane.system.run {
+            shellOutcome(path, arguments, environment: environment, timeoutSeconds: timeoutSeconds)
+        }
+    }
+
+    /** Runs a command to the end with stdout and stderr merged, on this
+        thread alone. `environment` nil inherits this process's, which is what
+        most callers want. Pass one to make the child's answer independent of
+        who asked.
 
         `timeoutSeconds` nil waits forever, which is right for a command directa
         controls end to end. Pass one for anything that runs a file the user
         wrote: a shell profile can prompt, wait on the network, or expect a
         terminal that is not there, and waiting forever for it is how a menu bar
         app hangs at launch with nothing on screen explaining why. */
-    public static func shell(
+    public static func shellOutcome(
         _ path: String, _ arguments: [String], environment: [String: String]? = nil,
         timeoutSeconds: Double? = nil
-    ) -> (status: Int32, output: String) {
+    ) -> ShellOutcome {
         let label = ([(path as NSString).lastPathComponent] + arguments).joined(separator: " ")
         return DaemonActivity.shared.measure(ActivityKind.forExecutable(path), label: label) {
             shellUnmeasured(path, arguments, environment: environment, timeoutSeconds: timeoutSeconds)
@@ -576,7 +616,7 @@ public enum LaunchdAdmin {
 
     private static func shellUnmeasured(
         _ path: String, _ arguments: [String], environment: [String: String]?, timeoutSeconds: Double?
-    ) -> (status: Int32, output: String) {
+    ) -> ShellOutcome {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
@@ -591,49 +631,75 @@ public enum LaunchdAdmin {
             do {
                 try process.run()
             } catch {
-                return (status: -1, output: String(describing: error))
+                return .failedToRun(String(describing: error))
             }
             let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
             process.waitUntilExit()
-            return (status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
+            return .exited(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
         }
         /** Installed before `run()`, not after: a child that exits in the window
             between `run()` returning and a later assignment is already terminated
             when the handler is set, and Foundation does not fire terminationHandler
-            for an already-dead process. The timeout below would then wait out
-            its full ceiling and SIGKILL a pid the kernel may have recycled, and the
-            PATH capture that rides this would silently fall back to `pathFloor`. */
+            for an already-dead process. The wait below would then run out its
+            full ceiling and treat a finished child as timed out. */
         let exited = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in exited.signal() }
         do {
             try process.run()
         } catch {
-            return (status: -1, output: String(describing: error))
+            return .failedToRun(String(describing: error))
         }
-        /** Drained on another thread because this path waits on termination
-            first, and a read to end of file on this thread would block until the
-            child closed the pipe, which is the thing being timed out. Started
-            only once a child exists: before that, this process holds the only
-            write end, and the reader would never see end of file. */
-        let collected = OSAllocatedUnfairLock(initialState: Data())
-        let drained = DispatchSemaphore(value: 0)
-        DispatchQueue.global(qos: .userInitiated).async {
-            let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
-            collected.withLock { $0 = data }
-            drained.signal()
+        /** Bounded before it becomes a Duration, which traps on a non-finite
+            value. */
+        let boundedSeconds = timeoutSeconds.isFinite ? min(max(timeoutSeconds, 0), 86_400) : 86_400
+        let deadline = ContinuousClock.now.advanced(by: .seconds(boundedSeconds))
+        let reader = pipe.fileHandleForReading.fileDescriptor
+        var output = Data()
+        if drain(reader, into: &output, until: deadline),
+            exited.wait(timeout: .now() + max(ContinuousClock.now.duration(to: deadline) / .seconds(1), 0))
+                == .success
+        {
+            return .exited(status: process.terminationStatus, output: String(decoding: output, as: UTF8.self))
         }
-        if exited.wait(timeout: .now() + timeoutSeconds) == .timedOut {
-            /** SIGKILL rather than SIGTERM: this is already the path where the
-                child ignored its chance to finish, and a profile blocked on a
-                read will not act on a term either. */
+        /** SIGKILL rather than SIGTERM: this is already the path where the
+            child ignored its chance to finish, and a profile blocked on a read
+            will not act on a term either. Only while it still runs, so an
+            exited child's pid, which the kernel may have reused, is never
+            signaled. */
+        if process.isRunning {
             kill(process.processIdentifier, SIGKILL)
             _ = exited.wait(timeout: .now() + 2)
-            return (status: -1, output: "")
         }
-        drained.wait()
-        return (
-            status: process.terminationStatus,
-            output: String(decoding: collected.withLock { $0 }, as: UTF8.self)
-        )
+        /** What the child wrote before it died is still in the pipe. */
+        _ = drain(reader, into: &output, until: ContinuousClock.now.advanced(by: .milliseconds(200)))
+        return .timedOut(partialOutput: String(decoding: output, as: UTF8.self))
+    }
+
+    /** Reads `fd` into `output` until end of file (true) or `deadline`
+        (false), polling so the wait needs no second thread. */
+    private static func drain(_ fd: Int32, into output: inout Data, until deadline: ContinuousClock.Instant) -> Bool {
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let remaining = ContinuousClock.now.duration(to: deadline)
+            var request = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let milliseconds = max(remaining / .milliseconds(1), 0).rounded(.up)
+            let ready = poll(&request, 1, Int32(clamping: Int(min(milliseconds, Double(Int32.max)))))
+            if ready < 0 {
+                if errno == EINTR { continue }
+                return false
+            }
+            if ready == 0 {
+                if remaining <= .zero { return false }
+                continue
+            }
+            let count = read(fd, &buffer, buffer.count)
+            if count > 0 {
+                output.append(contentsOf: buffer[0..<count])
+            } else if count == 0 {
+                return true
+            } else if errno != EINTR, errno != EAGAIN {
+                return false
+            }
+        }
     }
 }

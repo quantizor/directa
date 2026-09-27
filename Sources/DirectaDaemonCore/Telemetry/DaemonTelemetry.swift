@@ -192,7 +192,7 @@ public final class DaemonTelemetry: Sendable {
         let predicate = DaemonIncident.logPredicate(
             previousPid: previous.pid, label: LaunchdAdmin.label, processName: SetupPlanner.daemonBinaryName)
         let began = ContinuousClock.now
-        let shown = LaunchdAdmin.shell(
+        let shown = LaunchdAdmin.shellOutcome(
             "/usr/bin/log",
             [
                 "show", "--start", DaemonIncident.logShowTime(window.start), "--end",
@@ -202,13 +202,18 @@ public final class DaemonTelemetry: Sendable {
         let seconds = began.duration(to: .now).roundedSeconds
         let outcome: String
         var parsed = DaemonIncident.ParsedLogShow(lines: [], matches: 0)
-        if shown.status == 0 {
-            parsed = DaemonIncident.parseLogShow(shown.output)
+        switch shown {
+        case .exited(status: 0, let output):
+            parsed = DaemonIncident.parseLogShow(output)
             outcome = "finished"
-        } else if seconds >= Self.logShowTimeoutSeconds {
+        case .exited(let status, let output):
+            outcome = "failed: log show exited \(status): \(output.prefix(200))"
+        case .failedToRun(let reason):
+            outcome = "failed: log show did not start: \(reason.prefix(200))"
+        case .timedOut(let partialOutput):
+            /** The lines found before the deadline are still evidence. */
+            parsed = DaemonIncident.parseLogShow(partialOutput)
             outcome = "timed out"
-        } else {
-            outcome = "failed: log show exited \(shown.status): \(shown.output.prefix(200))"
         }
         incident.append(parsed.lines)
         let reports = Self.diagnosticReports(
