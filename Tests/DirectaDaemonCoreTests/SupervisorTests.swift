@@ -203,13 +203,6 @@ private func makeEnv() throws -> TestEnv {
         #expect(cleared, "server never left .stopping after the bounded wait gave up")
     }
 
-    private func awaitPhase(_ phase: ServerPhase, of supervisor: ServerSupervisor) async throws {
-        for _ in 0..<50 where await supervisor.status().phase != phase {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        #expect(await supervisor.status().phase == phase)
-    }
-
     /** A `start()` that joins a stop which never lands gives up with the
         stop's own bound (grace plus overtime, 0.15 s here) and reports the
         honest `.stopping`, rather than holding its caller until the run
@@ -217,8 +210,10 @@ private func makeEnv() throws -> TestEnv {
         `start()` returns, so a bounded join returns while it is still stuck
         and an unbounded one can only return once the safety valve releases
         it, however loaded the machine is. The valve exists so a regression
-        fails instead of hanging. */
-    @Test func startJoiningAStuckStopGivesUpWithTheStopsOwnBound() async throws {
+        fails instead of hanging. Releasing the run lets the stop's own
+        recordOutcome finish, and the test waits for it to land `.stopped`,
+        since that is the run's last write into the test's tree. */
+    @Test func startWaitingOnAHungStopGivesUpWhenTheStopDoes() async throws {
         let env = try makeEnv()
         let gate = AdoptGate()
         let supervisor = ServerSupervisor(
@@ -228,7 +223,7 @@ private func makeEnv() throws -> TestEnv {
         #expect(await supervisor.start().pid != nil)
 
         async let stopped = supervisor.stop(graceSeconds: 0.05, reason: "test")
-        try await awaitPhase(.stopping, of: supervisor)
+        #expect(try await waitForPhase(supervisor, .stopping).phase == .stopping)
         let valveOpened = OSAllocatedUnfairLock(initialState: false)
         let safetyValve = Task {
             try? await Task.sleep(for: .seconds(10))
@@ -241,45 +236,70 @@ private func makeEnv() throws -> TestEnv {
         #expect(joined.phase == .stopping)
         #expect(returnedWhileStuck, "start held its caller until the stuck run was released")
 
+        /** Cancelling the valve ends its sleep early, and it then releases
+            the run. */
         safetyValve.cancel()
         await safetyValve.value
         _ = await stopped
+        #expect(try await waitForPhase(supervisor, .stopped).phase == .stopped)
     }
 
     /** An `ensure()` that first waits out a stop spends only what is left of
-        its timeout afterwards: the stop clears at 0.6 s, the fresh run (no
-        healthcheck, so a 2 s stabilization window) cannot turn healthy, and
-        the whole call times out near its 1 s budget rather than 0.6 s plus
-        a second full second. */
+        its timeout on the fresh run, so the whole call lasts its timeout, not
+        the stop wait plus a second full timeout. The fresh run can never turn
+        healthy, so the call always ends by timing out. Both bounds hold
+        however slowly the machine schedules the test: a whole call is never
+        shorter than its timeout (what is left is measured from when the
+        call began), and one that spent a full timeout after the stop cleared
+        lasts at least the time until the run was released plus that timeout,
+        which a remaining-time ensure stays under by the release delay, less
+        the fresh start and one 100 ms health poll. */
     @Test func ensureAfterAStopClearsSpendsOnlyTheRemainingTimeout() async throws {
         let env = try makeEnv()
         let gate = AdoptGate()
+        let port = 45483
         let supervisor = ServerSupervisor(
-            launcher: StuckRunLauncher(gate: gate), paths: env.paths, projectPath: env.projectPath,
-            registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "stuck"),
+            launcher: StuckRunLauncher(gate: gate), paths: env.paths, prober: NeverHealthyProber(),
+            projectPath: env.projectPath, registry: Registry(paths: env.paths),
+            spec: ServerSpec(
+                command: ["/bin/true"], healthcheck: HealthCheckSpec(port: port, type: .tcp),
+                name: "stuck", port: port),
             stopTiming: StopTiming(graceSeconds: StopTiming.standard.graceSeconds, overtimeSeconds: 0.1))
-        #expect(await supervisor.start().pid != nil)
+        let first = await supervisor.start()
+        #expect(first.pid != nil)
 
         async let stopped = supervisor.stop(graceSeconds: 0.05, reason: "test")
-        try await awaitPhase(.stopping, of: supervisor)
+        #expect(try await waitForPhase(supervisor, .stopping).phase == .stopping)
+        let timeout = Duration.seconds(3)
+        let releasedAt = OSAllocatedUnfairLock<ContinuousClock.Instant?>(initialState: nil)
         let release = Task {
-            try? await Task.sleep(for: .milliseconds(600))
+            try? await Task.sleep(for: .milliseconds(1_500))
+            releasedAt.withLock { $0 = .now }
             await gate.signal(.signaled(signal: Int(SIGKILL)))
         }
 
         let ensureStart = ContinuousClock.now
-        let result = await supervisor.ensure(timeoutSeconds: 1)
+        let result = await supervisor.ensure(timeoutSeconds: timeout / .seconds(1))
         let waited = ensureStart.duration(to: .now)
-        #expect(result.reason == .timeout)
-        #expect(waited < .milliseconds(1_350), "ensure took \(waited) against a 1 s timeout")
-
         await release.value
+        let releasedAfter = ensureStart.duration(to: try #require(releasedAt.withLock { $0 }))
+        #expect(result.reason == .timeout)
+        /** The stop cleared inside the call and a fresh run began. */
+        #expect(result.server.phase == .starting)
+        #expect(result.server.pid != nil && result.server.pid != first.pid)
+        #expect(waited >= timeout, "ensure returned after \(waited), before its \(timeout) timeout")
+        #expect(
+            waited < releasedAfter + timeout,
+            "ensure took \(waited), a full \(timeout) past the stop clearing at \(releasedAfter)")
+
         _ = await stopped
         /** The fresh run's survivor dies to this stop's SIGKILL; the gate's
-            second signal lets its fake `run()` return. */
+            second signal lets its fake `run()` return, and the wait for
+            `.stopped` keeps the run's last write inside the test. */
         async let cleanup = supervisor.stop(graceSeconds: 0.05, reason: "test cleanup")
         await gate.signal(.signaled(signal: Int(SIGKILL)))
         _ = await cleanup
+        #expect(try await waitForPhase(supervisor, .stopped).phase == .stopped)
     }
 
     /** Two self-exits in the stall window (nonzero, bounded lifetime, never
@@ -1211,7 +1231,10 @@ private func makeEnv() throws -> TestEnv {
 
     /** A `startedAt` the caller never had (pre-feature state, or a persisted
         row with no timestamp) still produces a usable run: adoption falls back
-        to now rather than leaving the clock unset. */
+        to now rather than leaving the clock unset. "Now" is bracketed by the
+        wall clock read just before the adopt call and just after the status
+        read, so the check holds however long a loaded machine takes between
+        them. */
     @Test func adoptFallsBackToNowWhenStartedAtIsMissing() async throws {
         let env = try makeEnv()
         let paths = env.paths
@@ -1223,13 +1246,18 @@ private func makeEnv() throws -> TestEnv {
             registry: registry, spec: spec)
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
+        let beforeAdopt = Date()
         #expect(
             await supervisor.adopt(
                 pid: survivor, label: "dev.quantizor.directa.job.uptime-fallback", boundPort: nil,
                 startedAt: nil))
         let status = await supervisor.status()
-        #expect((status.uptimeSec ?? -1) >= 0)
-        #expect((status.uptimeSec ?? .max) < 5)
+        let afterStatus = Date()
+        let startedAt = try #require(
+            await registry.persistedState(serverID: serverID(project: env.projectPath, name: "web"))?.startedAt)
+        #expect((beforeAdopt...afterStatus).contains(startedAt))
+        let uptime = try #require(status.uptimeSec)
+        #expect((0...Int(afterStatus.timeIntervalSince(beforeAdopt))).contains(uptime))
         _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
     }
 
@@ -1856,6 +1884,10 @@ private struct ExitsAtOnceAdoptLauncher: ProcessLauncher {
 
 private struct AlwaysHealthyProber: HealthProber {
     func probe(_ check: EffectiveHealthcheck) async -> Bool { true }
+}
+
+private struct NeverHealthyProber: HealthProber {
+    func probe(_ check: EffectiveHealthcheck) async -> Bool { false }
 }
 
 @Suite(.temporaryTree) struct RegistryTests {
