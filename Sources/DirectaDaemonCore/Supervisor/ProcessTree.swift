@@ -409,14 +409,30 @@ public enum ProcessTree {
         return kill(narrow, 0) == 0
     }
 
-    /** Live identity for `pid`, or nil if gone / not readable. */
+    /** Live identity for `pid`, or nil if gone / not readable. A zombie still
+        answers, so a root that exited but is not yet reaped keeps its identity. */
     public static func identity(of pid: pid_t) -> ProcessIdentity? {
+        guard let info = processInfo(of: pid) else { return nil }
+        return ProcessIdentity(info, uniqueID: ProcessUniqueIDs.read(of: pid)?.process)
+    }
+
+    /** Whether `identity` still names a process that has not exited: its pid
+        answers with the same identity and is not a zombie waiting to be
+        reaped. */
+    public static func isRunning(_ identity: ProcessIdentity) -> Bool {
+        guard let info = processInfo(of: identity.pid), Int32(info.kp_proc.p_stat) != SZOMB else {
+            return false
+        }
+        return ProcessIdentity(info, uniqueID: ProcessUniqueIDs.read(of: identity.pid)?.process)
+            == identity
+    }
+
+    private static func processInfo(of pid: pid_t) -> kinfo_proc? {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
         var length = MemoryLayout<kinfo_proc>.stride
         var info = kinfo_proc()
         guard sysctl(&mib, 4, &info, &length, nil, 0) == 0, length >= MemoryLayout<kinfo_proc>.stride
         else { return nil }
-        guard info.kp_proc.p_pid == pid else { return nil }
-        return ProcessIdentity(info, uniqueID: ProcessUniqueIDs.read(of: pid)?.process)
+        return info.kp_proc.p_pid == pid ? info : nil
     }
 }

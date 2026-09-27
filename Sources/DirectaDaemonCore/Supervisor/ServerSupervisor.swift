@@ -634,10 +634,16 @@ public actor ServerSupervisor {
         let keys = teardownKeys
         await logStore.append(stream: .sys, text: "stopping: \(reason)")
         let signaled = signalRun(target: target, keys: keys, signalGroup: true, signal: SIGTERM)
+        /** The grace ends early only once the root and every SIGTERM candidate
+            have exited: a descendant still shutting down after the root is
+            gone keeps the rest of its grace rather than meeting SIGKILL the
+            moment the root exits. */
         let deadline = ContinuousClock.now.advanced(by: .seconds(graceSeconds))
         while ContinuousClock.now < deadline {
-            if runTask == nil { break }
-            if kill(target, 0) != 0 { break }
+            let rootRunning =
+                runTask != nil
+                && (keys.rootIdentity.map(ProcessTree.isRunning) ?? (kill(target, 0) == 0))
+            if !rootRunning, !signaled.contains(where: ProcessTree.isRunning) { break }
             try? await Task.sleep(for: .milliseconds(100))
         }
         /** Escalate over a freshly re-derived union (new children may have

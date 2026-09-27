@@ -722,6 +722,34 @@ private func makeEnv() throws -> TestEnv {
         #expect(try await waitForPhase(supervisor, .stopped).phase == .stopped)
     }
 
+    /** The grace window belongs to every process the SIGTERM reached, not only
+        the root: a worker that needs a second to shut down after its root has
+        already exited must get that second, not a SIGKILL the moment the root
+        is gone. The root exits at once on SIGTERM; its background subshell
+        takes about a second, then writes a marker the SIGKILL would have
+        prevented. */
+    @Test func stopGivesADescendantItsGraceAfterTheRootExits() async throws {
+        let env = try makeEnv()
+        let marker = URL(fileURLWithPath: env.projectPath).appending(path: "cleaned")
+        let spec = ServerSpec(
+            command: [
+                "/bin/sh", "-c",
+                #"trap "exit 0" TERM; (trap "sleep 1; echo done > cleaned; exit 0" TERM; while :; do sleep 0.1; done) & while :; do sleep 0.1; done"#,
+            ],
+            name: "slow-worker")
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectPath,
+            registry: Registry(paths: env.paths), spec: spec)
+        #expect(await supervisor.start().pid != nil)
+        /** Lets the subshell start and install its trap before the stop. */
+        try await Task.sleep(for: .milliseconds(300))
+
+        let stopped = await supervisor.stop(graceSeconds: 4, reason: "test")
+        #expect(stopped.phase == .stopped)
+        let written = try? String(contentsOf: marker, encoding: .utf8)
+        #expect(written == "done\n", "the worker was killed before its graceful shutdown finished")
+    }
+
     /** Reads a live process's parent from ps, for failure evidence only. */
     private func parentPid(of pid: pid_t) -> String {
         shell(["/bin/ps", "-o", "ppid=", "-p", String(pid)])

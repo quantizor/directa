@@ -309,6 +309,27 @@ import Testing
                 == false)
     }
 
+    /** A zombie still answers `identity(of:)` but has exited, so it no longer
+        runs; a recycled identity never does. */
+    @Test func isRunningRejectsAZombieAndAForgedIdentity() throws {
+        let me = try #require(ProcessTree.identity(of: getpid()))
+        #expect(ProcessTree.isRunning(me))
+        let forged = ProcessIdentity(
+            pid: me.pid, startMicroseconds: me.startMicroseconds, startSeconds: me.startSeconds - 1,
+            uniqueID: me.uniqueID)
+        #expect(!ProcessTree.isRunning(forged))
+
+        let child = try spawnBare(["/usr/bin/true"])
+        defer {
+            var status: Int32 = 0
+            waitpid(child, &status, 0)
+        }
+        var info = siginfo_t()
+        try #require(waitid(P_PID, id_t(child), &info, WEXITED | WNOWAIT) == 0)
+        let zombie = try #require(ProcessTree.identity(of: child))
+        #expect(!ProcessTree.isRunning(zombie))
+    }
+
     @Test func failedDescendantsAreNotEmptySuccess() {
         /** Live sweep against a nonsense pid still returns .ok([]) (no children),
             never .failed. Failure is a sysctl errno path; assert the result type
