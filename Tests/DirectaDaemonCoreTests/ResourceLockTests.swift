@@ -264,11 +264,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             entry.pid = nil
         }
         /** A pid we know is gone: spawn and wait, then reuse the identifier. */
-        let probe = Process()
-        probe.executableURL = URL(fileURLWithPath: "/usr/bin/true")
-        try probe.run()
-        probe.waitUntilExit()
-        let deadPid = Int(probe.processIdentifier)
+        let deadPid = Int(try await TestProcess.run("/usr/bin/true", []).pid)
         #expect(kill(pid_t(deadPid), 0) != 0)
         let key = "\(canonicalProjectPath(env.projectPath))::data"
         try AtomicFile.write(
@@ -282,8 +278,13 @@ private func phaseOf(router: Router, project: String, name: String) async throws
 
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
         await router.recoverAtStartup()
-        let phase = try await phaseOf(router: router, project: env.projectPath, name: "db")
-        #expect(phase == .starting || phase == .running)
+        let list = try await handle(
+            router: router, method: .serverStatus, params: ProjectParams(project: env.projectPath),
+            expecting: ServerListResult.self)
+        let server = try #require(list.servers.first { $0.server == "db" })
+        #expect(
+            server.phase == .starting || server.phase == .running,
+            "resumed server is \(server.phase.rawValue), last exit \(String(describing: server.lastExit))")
         let locks = AtomicFile.loadDefensively(LocksFile.self, from: env.paths.locksFile)
         #expect(locks?.locks.isEmpty == true)
         _ = try await handle(

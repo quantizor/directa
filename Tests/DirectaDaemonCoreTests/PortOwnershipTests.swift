@@ -709,29 +709,46 @@ import Testing
         holding its output, standing in for an `lsof` stuck on a wedged
         socket) answers "no evidence" at its deadline rather than holding a
         lane thread until the process lets go, and the holder is killed with
-        it. The holder outlives the deadline by far, so the two are told apart
-        by a wide margin. */
+        it. The holder outlives the longest deadline by far, so the two are
+        told apart by a wide margin.
+
+        An attempt whose deadline passed before the shell started the holder
+        proves nothing (there is no pid file, and nothing held the output),
+        and a busy machine can take longer than a short deadline to spawn it,
+        so such an attempt is repeated with a longer one. The lookup runs on a
+        lane of its own: the shared system lane may be queued behind other
+        tests' helpers, and a wait there would be counted as this lookup's. */
     @Test func aHungPortLookupEndsAtItsDeadline() async throws {
         let base = try TemporaryTree.directory(named: "hung-lookup")
         let pidFile = base.appending(path: "holder.pid").path
-        let started = ContinuousClock.now
-        let answer = await BlockingLane.system.run {
-            PortGuard.output(
-                "/bin/sh", ["-c", "echo 4242; sleep 20 & echo $! > '\(pidFile)'"], timeoutSeconds: 0.5)
+        let lane = BlockingLane(name: "hung-lookup", width: 1)
+        let holderLifetime = Duration.seconds(60)
+        for timeoutSeconds in [0.5, 2, 8] {
+            try? FileManager.default.removeItem(atPath: pidFile)
+            let started = ContinuousClock.now
+            let answer = await lane.run {
+                PortGuard.output(
+                    "/bin/sh",
+                    ["-c", "echo 4242; sleep \(Int(holderLifetime / .seconds(1))) & echo $! > '\(pidFile)'"],
+                    timeoutSeconds: timeoutSeconds)
+            }
+            let elapsed = started.duration(to: .now)
+            guard
+                let holder = (try? String(contentsOfFile: pidFile, encoding: .utf8))
+                    .flatMap({ pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+            else { continue }
+            #expect(answer == nil)
+            #expect(elapsed < holderLifetime / 2, "the port lookup waited \(elapsed) for a process holding its output")
+            var gone = kill(holder, 0) != 0
+            for _ in 0..<50 where !gone {
+                try await Task.sleep(for: .milliseconds(50))
+                gone = kill(holder, 0) != 0
+            }
+            if !gone { kill(holder, SIGKILL) }
+            #expect(gone, "the process holding the lookup's output (pid \(holder)) outlived the deadline")
+            return
         }
-        let elapsed = started.duration(to: .now)
-        #expect(answer == nil)
-        #expect(elapsed < .seconds(10), "the port lookup waited \(elapsed) for a process holding its output")
-        let holder = try #require(
-            (try? String(contentsOfFile: pidFile, encoding: .utf8))
-                .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
-        var gone = kill(holder, 0) != 0
-        for _ in 0..<50 where !gone {
-            try await Task.sleep(for: .milliseconds(50))
-            gone = kill(holder, 0) != 0
-        }
-        if !gone { kill(holder, SIGKILL) }
-        #expect(gone, "the process holding the lookup's output (pid \(holder)) outlived the deadline")
+        Issue.record("the shell never started the holder, even with an 8 s deadline")
     }
 
     private func teardown(_ router: Router, _ project: String, _ name: String) async {

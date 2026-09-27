@@ -206,15 +206,15 @@ import Testing
         let main = base.appending(path: "main")
         let worktree = base.appending(path: "worktrees/review")
         try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
-        try run(in: main.path, "/usr/bin/git", "init", "-b", "main")
-        try run(in: main.path, "/usr/bin/git", "config", "user.email", "directa@test")
-        try run(in: main.path, "/usr/bin/git", "config", "user.name", "directa")
+        try await run(in: main.path, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: main.path, "/usr/bin/git", "config", "user.email", "directa@test")
+        try await run(in: main.path, "/usr/bin/git", "config", "user.name", "directa")
         try Data("ok\n".utf8).write(to: main.appending(path: "README"))
-        try run(in: main.path, "/usr/bin/git", "add", "README")
-        try run(in: main.path, "/usr/bin/git", "commit", "-m", "init")
+        try await run(in: main.path, "/usr/bin/git", "add", "README")
+        try await run(in: main.path, "/usr/bin/git", "commit", "-m", "init")
         try FileManager.default.createDirectory(
             at: worktree.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try run(in: main.path, "/usr/bin/git", "worktree", "add", "-b", "review", worktree.path)
+        try await run(in: main.path, "/usr/bin/git", "worktree", "add", "-b", "review", worktree.path)
         let fixture = try #require(Self.fixtureServerPath())
         let body = """
             {
@@ -267,20 +267,8 @@ import Testing
             ServerResult.self)
     }
 
-    private func run(in cwd: String, _ exe: String, _ args: String...) throws {
-        let proc = Process()
-        proc.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        proc.executableURL = URL(fileURLWithPath: exe)
-        proc.arguments = args
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        try proc.run()
-        proc.waitUntilExit()
-        guard proc.terminationStatus == 0 else {
-            throw WireError(
-                code: .internalError,
-                message: "\(exe) \(args.joined(separator: " ")) failed (\(proc.terminationStatus))")
-        }
+    private func run(in cwd: String, _ exe: String, _ args: String...) async throws {
+        try await TestProcess.succeed(exe, args, in: URL(fileURLWithPath: cwd))
     }
 
     private static func fixtureServerPath() -> String? { fixtureServerExecutable() }

@@ -98,48 +98,44 @@ struct PortCollisionTests {
     so a collision between them is the design working, not a fault. Needs real
     git checkouts because the exclusion asks git for the common dir. */
 @Suite(.serialized, .temporaryTree) struct PortCollisionSiblingTests {
-    @Test func siblingWorktreesAreNotReported() throws {
-        let base = try TemporaryTree.directory(named: "collide")
+    /** A main checkout with one commit and a linked worktree of it under
+        `base`. The git reads under test block on git, so they run off the
+        pool. */
+    private func checkoutWithLinkedWorktree(named name: String) async throws -> (main: URL, linked: URL) {
+        let base = try TemporaryTree.directory(named: name)
         let main = base.appending(path: "main")
         try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
-
-        /** Fail at the callsite that broke. A git command that quietly exits
-            nonzero (no git, no worktree support, a permissions problem) otherwise
-            surfaces as a confusing assertion several lines later. */
-        func run(_ args: [String], cwd: URL) throws {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-            process.arguments = args
-            process.currentDirectoryURL = cwd
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            process.waitUntilExit()
-            try #require(
-                process.terminationStatus == 0,
-                "git \(args.joined(separator: " ")) exited \(process.terminationStatus)")
+        func git(_ args: [String]) async throws {
+            try await TestProcess.succeed("/usr/bin/git", args, in: main)
         }
-        try run(["init", "-q"], cwd: main)
-        try run(["config", "user.email", "t@example.com"], cwd: main)
-        try run(["config", "user.name", "t"], cwd: main)
+        try await git(["init", "-q"])
+        try await git(["config", "user.email", "t@example.com"])
+        try await git(["config", "user.name", "t"])
         try Data("x".utf8).write(to: main.appending(path: "file.txt"))
-        try run(["add", "."], cwd: main)
-        try run(["commit", "-qm", "seed"], cwd: main)
+        try await git(["add", "."])
+        try await git(["commit", "-qm", "seed"])
         let linked = base.appending(path: "linked")
-        try run(["worktree", "add", "-q", linked.path], cwd: main)
+        try await git(["worktree", "add", "-q", linked.path])
+        return (main, linked)
+    }
+
+    @Test func siblingWorktreesAreNotReported() async throws {
+        let (main, linked) = try await checkoutWithLinkedWorktree(named: "collide")
 
         /** Control: the two paths really are siblings, so the exclusion below is
             exercised rather than passing because git said no to everything. */
-        #expect(CheckoutIdentity.shareCommonDir(main.path, linked.path))
+        #expect(await offPool { CheckoutIdentity.shareCommonDir(main.path, linked.path) })
 
-        let pairs = PortCollision.detect([
-            ServerStatus(
-                declaredPort: 6000, logPath: "/tmp/a.log", phase: .stopped, project: main.path,
-                server: "web"),
-            ServerStatus(
-                declaredPort: 6000, logPath: "/tmp/b.log", phase: .stopped, project: linked.path,
-                server: "web"),
-        ])
+        let pairs = await offPool {
+            PortCollision.detect([
+                ServerStatus(
+                    declaredPort: 6000, logPath: "/tmp/a.log", phase: .stopped, project: main.path,
+                    server: "web"),
+                ServerStatus(
+                    declaredPort: 6000, logPath: "/tmp/b.log", phase: .stopped, project: linked.path,
+                    server: "web"),
+            ])
+        }
         #expect(pairs.isEmpty)
     }
 
@@ -148,31 +144,8 @@ struct PortCollisionTests {
         checkout and for a linked worktree of it. A directory below a root
         has no `.git` of its own, is left to git, and still lands on the same
         answer. */
-    @Test func aCheckoutRootsCommonDirReadFromFilesMatchesGit() throws {
-        let base = try TemporaryTree.directory(named: "common-dir")
-        let main = base.appending(path: "main")
-        try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
-        func run(_ args: [String], cwd: URL) throws {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-            process.arguments = args
-            process.currentDirectoryURL = cwd
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            process.waitUntilExit()
-            try #require(
-                process.terminationStatus == 0,
-                "git \(args.joined(separator: " ")) exited \(process.terminationStatus)")
-        }
-        try run(["init", "-q"], cwd: main)
-        try run(["config", "user.email", "t@example.com"], cwd: main)
-        try run(["config", "user.name", "t"], cwd: main)
-        try Data("x".utf8).write(to: main.appending(path: "file.txt"))
-        try run(["add", "."], cwd: main)
-        try run(["commit", "-qm", "seed"], cwd: main)
-        let linked = base.appending(path: "linked")
-        try run(["worktree", "add", "-q", linked.path], cwd: main)
+    @Test func aCheckoutRootsCommonDirReadFromFilesMatchesGit() async throws {
+        let (main, linked) = try await checkoutWithLinkedWorktree(named: "common-dir")
         let below = linked.appending(path: "app")
         try FileManager.default.createDirectory(at: below, withIntermediateDirectories: true)
 
@@ -181,13 +154,16 @@ struct PortCollisionTests {
         #expect(CheckoutIdentity.commonDirFromFiles(linked.path) == expected)
         #expect(CheckoutIdentity.commonDirFromFiles(below.path) == nil)
         for project in [main, linked, below] {
-            #expect(CheckoutIdentity.gitCommonDir(project: project.path) == expected, "\(project.path)")
+            #expect(await offPool { CheckoutIdentity.gitCommonDir(project: project.path) } == expected, "\(project.path)")
         }
         /** git's own answer for each root, so the file read is held to git
             rather than to this test's idea of it. */
         for root in [main, linked] {
             let answer = try #require(
-                CheckoutIdentity.git(project: root.path, args: ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+                await offPool {
+                    CheckoutIdentity.git(
+                        project: root.path, args: ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+                })
             #expect(canonicalProjectPath(answer) == expected, "\(root.path)")
         }
     }

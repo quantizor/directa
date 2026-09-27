@@ -1,5 +1,6 @@
 import Darwin
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 import os
@@ -139,6 +140,13 @@ func readSetsidListenerPid(from fd: Int32) -> pid_t? {
     }
     guard let match = text.range(of: pattern, options: .regularExpression) else { return nil }
     return text[match].split(whereSeparator: \.isWhitespace).last.flatMap { pid_t($0) }
+}
+
+/** `readSetsidListenerPid` from async code: the read blocks until the
+    fixture prints, so it runs off the pool. Swift picks this form in any
+    async context, so a test that forgets `await` does not compile. */
+func readSetsidListenerPid(from fd: Int32) async -> pid_t? {
+    await offPool { readSetsidListenerPid(from: fd) }
 }
 
 /** Resolves once `signal(_:)` is called (or immediately, if it already was),

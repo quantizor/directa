@@ -666,15 +666,12 @@ import Testing
         alone one whose writer (this test process) is still running: the same
         distinction that keeps the sweep from ever touching a concurrent
         `write` mid-flight under a live daemon. */
-    @Test func sweepRemovesADeadPidTempAndKeepsALivePidTemp() throws {
+    @Test func sweepRemovesADeadPidTempAndKeepsALivePidTemp() async throws {
         let dir = try TemporaryTree.directory(named: "sweep")
 
-        let deadProcess = Process()
-        deadProcess.executableURL = URL(fileURLWithPath: "/usr/bin/true")
-        try deadProcess.run()
-        deadProcess.waitUntilExit()
+        let deadProcess = try await TestProcess.run("/usr/bin/true", [])
         let deadTemp = dir.appending(
-            path: ".registry.json.tmp-\(deadProcess.processIdentifier)-\(UUID().uuidString)")
+            path: ".registry.json.tmp-\(deadProcess.pid)-\(UUID().uuidString)")
         let liveTemp = dir.appending(path: ".registry.json.tmp-\(getpid())-\(UUID().uuidString)")
         try Data().write(to: deadTemp)
         try Data().write(to: liveTemp)

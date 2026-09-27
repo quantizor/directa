@@ -1,5 +1,6 @@
 import Darwin
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -42,21 +43,6 @@ private func spawnAndReap(_ argv: [String]) throws -> (pid: pid_t, exited: Dispa
     }
     reaper.start()
     return (spawned, exited)
-}
-
-/** `DispatchSemaphore.wait()` is unavailable from any async context, since
-    `Task.detached` still schedules onto the cooperative pool rather than
-    guaranteeing a dedicated thread. A throwaway `Thread` does own a dedicated
-    thread, so the blocking wait happens there and only resumes the
-    continuation (never itself blocking) back on the caller's task. */
-private func waitSynchronously(_ semaphore: DispatchSemaphore) async {
-    await withCheckedContinuation { continuation in
-        let thread = Thread {
-            semaphore.wait()
-            continuation.resume()
-        }
-        thread.start()
-    }
 }
 
 /** Spawns `count` bare children, reaped by a single background thread's
@@ -173,7 +159,8 @@ private func spawnManyWithOneReaper(_ argv: [String], count: Int) throws -> [pid
             Issue.record("failed to arm pid \(child.pid)")
             return
         }
-        await waitSynchronously(child.exited)
+        let exited = child.exited
+        await offPool { exited.wait() }
         let outcome = await ExitWatcher.shared.wait(pid: child.pid)
         switch outcome {
         case .exited(let code):

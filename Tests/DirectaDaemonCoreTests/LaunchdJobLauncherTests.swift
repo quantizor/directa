@@ -188,21 +188,26 @@ struct LaunchdJobLauncherTests {
     ])
     func sessionWrapperReportsAFailedExec(
         argv: [String], stdout: String, stderr: String, status: Int32
-    ) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
-        process.arguments = ["-e", LaunchdJobLauncher.sessionWrapperScript, "--"] + argv
-        let out = Pipe()
-        let err = Pipe()
-        process.standardOutput = out
-        process.standardError = err
-        try process.run()
-        process.waitUntilExit()
-        let printed = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        let complained = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    ) async throws {
+        let (printed, complained, exitStatus) = try await offPool {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+            process.arguments = ["-e", LaunchdJobLauncher.sessionWrapperScript, "--"] + argv
+            let out = Pipe()
+            let err = Pipe()
+            process.standardOutput = out
+            process.standardError = err
+            try process.run()
+            process.waitUntilExit()
+            return (
+                String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
+                String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
+                process.terminationStatus
+            )
+        }
         #expect(printed == stdout)
         #expect(complained == stderr)
-        #expect(process.terminationStatus == status)
+        #expect(exitStatus == status)
     }
 
     /** launchd's own record is what remains of a job reaped before its pid was

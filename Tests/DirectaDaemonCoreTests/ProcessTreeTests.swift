@@ -1,5 +1,6 @@
 import Darwin
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -75,9 +76,10 @@ import Testing
 
         POSIX_SPAWN_SETSID reproduces what the daemon's launcher does with
         createSession. The shell then backgrounds a sleep, giving the session a
-        second member that the sweep must find. */
-    @Test func sessionSweepFindsAMemberThatIsNotTheLeader() throws {
-        let leader = try spawnBare(["/bin/sh", "-c", "/bin/sleep 5 & sleep 5"], flags: POSIX_SPAWN_SETSID)
+        second member that the sweep must find. Both sleeps outlast any wait
+        a busy pool can put between the polls; the teardown kills them. */
+    @Test func sessionSweepFindsAMemberThatIsNotTheLeader() async throws {
+        let leader = try spawnBare(["/bin/sh", "-c", "/bin/sleep 60 & sleep 60"], flags: POSIX_SPAWN_SETSID)
         defer {
             kill(-leader, SIGKILL)
             kill(leader, SIGKILL)
@@ -93,7 +95,7 @@ import Testing
         for _ in 0..<50 {
             members = ProcessTree.sessionMembers(of: leader).identities.map(\.pid)
             if !members.isEmpty { break }
-            usleep(50_000)
+            try await Task.sleep(for: .milliseconds(50))
         }
         #expect(!members.isEmpty, "session sweep found no members of session \(leader)")
         #expect(members.contains(leader) == false, "the leader itself must not be returned")
@@ -102,9 +104,10 @@ import Testing
     /** A root pid that now names a different live process is a stranger's:
         its children and the session it leads are not this run's, so both
         sweeps keyed on the pid are skipped. The same live tree read with the
-        root's real identity is the positive control. */
-    @Test func liveDescendantsSkipsTheRootPidSweepsWhenThePidNamesAStranger() throws {
-        let leader = try spawnBare(["/bin/sh", "-c", "/bin/sleep 5 & sleep 5"], flags: POSIX_SPAWN_SETSID)
+        root's real identity is the positive control. The sleeps outlast any
+        wait a busy pool can put between the polls; the teardown kills them. */
+    @Test func liveDescendantsSkipsTheRootPidSweepsWhenThePidNamesAStranger() async throws {
+        let leader = try spawnBare(["/bin/sh", "-c", "/bin/sleep 60 & sleep 60"], flags: POSIX_SPAWN_SETSID)
         defer {
             kill(-leader, SIGKILL)
             kill(leader, SIGKILL)
@@ -119,7 +122,7 @@ import Testing
         for _ in 0..<50 where found.isEmpty {
             found = ProcessTree.liveDescendants(rootPid: leader, rootIdentity: real, snapshot: [])
                 .map(\.pid)
-            if found.isEmpty { usleep(50_000) }
+            if found.isEmpty { try await Task.sleep(for: .milliseconds(50)) }
         }
         #expect(!found.isEmpty, "the positive control found no descendants of \(leader)")
         #expect(
@@ -222,7 +225,7 @@ import Testing
     /** The real-process premise the lineage source rests on: a setsid child whose
         parent exits is reparented to launchd yet keeps naming that parent's
         unique id, and the live sweep finds it from that id alone. */
-    @Test func lineageMembersFindsASetsidChildAfterItsParentExits() throws {
+    @Test func lineageMembersFindsASetsidChildAfterItsParentExits() async throws {
         let fixture = try #require(fixtureServerExecutable())
         let (readEnd, writeEnd) = try makeOutputPipe()
         defer { close(readEnd) }
@@ -231,9 +234,12 @@ import Testing
             flags: POSIX_SPAWN_SETSID, stdoutFD: writeEnd)
         close(writeEnd)
         let rootIDs = ProcessUniqueIDs.read(of: root)
-        var status: Int32 = 0
-        waitpid(root, &status, 0)
-        let child = try #require(readSetsidListenerPid(from: readEnd))
+        let reported = await offPool { () -> pid_t? in
+            var status: Int32 = 0
+            waitpid(root, &status, 0)
+            return readSetsidListenerPid(from: readEnd)
+        }
+        let child = try #require(reported)
         defer { kill(child, SIGKILL) }
         let rootID = try #require(rootIDs?.process)
         /** The premise: alive, its parent reaped so the parent chain is gone,
@@ -311,7 +317,7 @@ import Testing
 
     /** A zombie still answers `identity(of:)` but has exited, so it no longer
         runs; a recycled identity never does. */
-    @Test func isRunningRejectsAZombieAndAForgedIdentity() throws {
+    @Test func isRunningRejectsAZombieAndAForgedIdentity() async throws {
         let me = try #require(ProcessTree.identity(of: getpid()))
         #expect(ProcessTree.isRunning(me))
         let forged = ProcessIdentity(
@@ -324,8 +330,11 @@ import Testing
             var status: Int32 = 0
             waitpid(child, &status, 0)
         }
-        var info = siginfo_t()
-        try #require(waitid(P_PID, id_t(child), &info, WEXITED | WNOWAIT) == 0)
+        let exited = await offPool {
+            var info = siginfo_t()
+            return waitid(P_PID, id_t(child), &info, WEXITED | WNOWAIT)
+        }
+        try #require(exited == 0)
         let zombie = try #require(ProcessTree.identity(of: child))
         #expect(!ProcessTree.isRunning(zombie))
     }

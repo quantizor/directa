@@ -7,11 +7,12 @@ import Testing
 @Suite struct LegacyAgentPlistTests {
     /** launchd rejects an ExitTimeOut above 60, silently clamps it, and logs
         "ExitTimeOut is larger than the maximum allowed", so the rendered value
-        has to stay inside the ceiling. */
-    @Test(.temporaryTree) func exitTimeOutStaysUnderLaunchdCeiling() throws {
+        has to stay inside the ceiling. Rendering runs the user's login shell
+        to capture PATH, so it runs off the pool. */
+    @Test(.temporaryTree) func exitTimeOutStaysUnderLaunchdCeiling() async throws {
         let dir = try TemporaryTree.path(named: "plist")
         let paths = DirectaPaths(dataDir: dir)
-        let plist = LaunchdAdmin.renderPlist(daemonPath: "/tmp/ddirecta", paths: paths)
+        let plist = await offPool { LaunchdAdmin.renderPlist(daemonPath: "/tmp/ddirecta", paths: paths) }
         let data = try #require(plist.data(using: .utf8))
         let parsed = try #require(
             try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])

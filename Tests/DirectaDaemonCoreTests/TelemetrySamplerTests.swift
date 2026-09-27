@@ -42,42 +42,46 @@ private let fastPolicy = TelemetryCadence.Policy(
 
 @Suite(.temporaryTree) struct TelemetrySamplerTests {
     /** Also holds a width-1 lane with one job running and two queued, so the
-        snapshot's lane pressure is a known answer. */
-    @Test func samplesRealKernelNumbersAndLanePressure() throws {
+        snapshot's lane pressure is a known answer. The jobs reach the lane
+        from tasks, which a busy cooperative pool can start late, so every
+        wait here is only a guard against hanging, and the gate opens however
+        the wait ends. */
+    @Test func samplesRealKernelNumbersAndLanePressure() async throws {
         let directory = try temporaryDirectory()
         let log = TelemetryLog(directory: directory)
         let lane = BlockingLane(name: "held", width: 1, activity: DaemonActivity())
         let gate = DispatchSemaphore(value: 0)
         let entered = DispatchSemaphore(value: 0)
-        let done = DispatchGroup()
-        for _ in 0..<3 {
-            done.enter()
+        let jobs = (0..<3).map { _ in
             Task.detached {
                 await lane.run {
                     entered.signal()
                     gate.wait()
                 }
-                done.leave()
             }
         }
-        try #require(entered.wait(timeout: .now() + 5) == .success)
-        let queuedDeadline = Date().addingTimeInterval(5)
-        while lane.pressure().queued < 2, Date() < queuedDeadline {
-            usleep(5_000)
-        }
-        usleep(20_000)
         let sampler = TelemetrySampler(
             configuration: .init(
                 activity: DaemonActivity(), exitWatches: { 0 }, lanes: [lane], log: log, policy: fastPolicy,
                 threadLimit: { nil }))
-        sampler.start()
-        let deadline = Date().addingTimeInterval(5)
-        while try snapshots(in: directory).count < 2, Date() < deadline {
-            usleep(10_000)
+        let held = try await offPool { () throws -> Bool in
+            defer { for _ in 0..<3 { gate.signal() } }
+            guard entered.wait(timeout: .now() + 60) == .success else { return false }
+            let queuedDeadline = Date().addingTimeInterval(60)
+            while lane.pressure().queued < 2, Date() < queuedDeadline {
+                usleep(5_000)
+            }
+            usleep(20_000)
+            sampler.start()
+            let deadline = Date().addingTimeInterval(60)
+            while try snapshots(in: directory).count < 2, Date() < deadline {
+                usleep(10_000)
+            }
+            sampler.stop()
+            return true
         }
-        sampler.stop()
-        for _ in 0..<3 { gate.signal() }
-        #expect(done.wait(timeout: .now() + 5) == .success)
+        try #require(held, "no lane job started within the guard's bound")
+        for job in jobs { await job.value }
         #expect(lane.pressure() == LanePressure(name: "held", oldestQueuedSeconds: 0, queued: 0, running: 0, width: 1))
         let first = try #require(try snapshots(in: directory).first)
         let pressure = try #require(first.lanes.first)
@@ -116,8 +120,10 @@ private let fastPolicy = TelemetryCadence.Policy(
         Under the full parallel run the other suites may already hold every
         pool thread, so none of these blockers need to have started; the
         probe is the proof either way. The window is short because it starves
-        every suite running in parallel in this process too. */
-    @Test func keepsSamplingWhileTheCooperativePoolIsBlocked() throws {
+        every suite running in parallel in this process too, and it is timed
+        and closed from a thread of its own, since a pool thread could not
+        run to close it. */
+    @Test func keepsSamplingWhileTheCooperativePoolIsBlocked() async throws {
         let directory = try temporaryDirectory()
         let log = TelemetryLog(directory: directory)
         let sampler = TelemetrySampler(
@@ -131,12 +137,15 @@ private let fastPolicy = TelemetryCadence.Policy(
             Task.detached { holdPoolThread(until: gate) }
         }
         Task.detached { probeRan.withLock { $0 = true } }
-        sampler.start()
-        usleep(250_000)
-        let during = try snapshots(in: directory)
-        let probeRanDuringWindow = probeRan.withLock { $0 }
-        for _ in 0..<blockers { gate.signal() }
-        sampler.stop()
+        let (during, probeRanDuringWindow) = try await offPool {
+            defer {
+                for _ in 0..<blockers { gate.signal() }
+                sampler.stop()
+            }
+            sampler.start()
+            usleep(250_000)
+            return (try snapshots(in: directory), probeRan.withLock { $0 })
+        }
         #expect(probeRanDuringWindow == false)
         #expect(during.count >= 3)
         let cooperative = during.last?.threads?.byName
@@ -146,7 +155,7 @@ private let fastPolicy = TelemetryCadence.Policy(
         #expect(cooperative >= 1)
     }
 
-    @Test func bootWritesMarksAndAnIncidentFromThePreviousRun() throws {
+    @Test func bootWritesMarksAndAnIncidentFromThePreviousRun() async throws {
         let root = try temporaryDirectory()
         let paths = DirectaPaths(dataDir: root.appending(path: "data"), logsDir: root.appending(path: "logs"))
         let previousLog = TelemetryLog(directory: paths.daemonTelemetryDir)
@@ -165,18 +174,18 @@ private let fastPolicy = TelemetryCadence.Policy(
             paths: paths, runningAsAgent: false, activity: activity, policy: fastPolicy, searchSystemLog: false)
         let stop = activity.begin(.stop, label: "/p::web: requested by stop")
         activity.end(stop, outcome: "stopped")
-        #expect(telemetry.waitForIncident(timeoutSeconds: 10))
+        #expect(await offPool { telemetry.waitForIncident(timeoutSeconds: 10) })
         /** The sampler thread takes its first snapshot once the scheduler
             runs it, and a stop before then leaves none, so the exit waits
             for one. */
         let deadline = Date().addingTimeInterval(10)
         while try snapshots(in: paths.daemonTelemetryDir).isEmpty, Date() < deadline {
-            usleep(10_000)
+            try await Task.sleep(for: .milliseconds(10))
         }
         telemetry.recordExit(code: 3, reason: "test")
         /** The process-exit hook after an exit that named its code writes nothing. */
         telemetry.recordExit(code: nil, reason: "exit")
-        telemetry.shutdown()
+        await offPool { telemetry.shutdown() }
 
         let incidents = try FileManager.default.contentsOfDirectory(atPath: paths.daemonIncidentsDir.path)
         #expect(incidents.count == 1)
@@ -222,7 +231,7 @@ private let fastPolicy = TelemetryCadence.Policy(
     /** A thread limit of 2 puts any real process over the threshold, so the
         first sample is a threshold sample and the next ones are not (the
         rising edge has passed and the cooldown holds). */
-    @Test func thresholdSampleCarriesDetailAMarkAndOnePersistedLogLine() throws {
+    @Test func thresholdSampleCarriesDetailAMarkAndOnePersistedLogLine() async throws {
         let recorder = try #require(DirectaLog.backend as? RecordingBackend)
         let directory = try temporaryDirectory()
         let log = TelemetryLog(directory: directory)
@@ -236,9 +245,9 @@ private let fastPolicy = TelemetryCadence.Policy(
         sampler.start()
         let deadline = Date().addingTimeInterval(5)
         while try snapshots(in: directory).count < 3, Date() < deadline {
-            usleep(10_000)
+            try await Task.sleep(for: .milliseconds(10))
         }
-        sampler.stop()
+        await offPool { sampler.stop() }
         let lines = TelemetryLog.lastLines(in: directory, count: 10_000)
         let samples = try decoded(lines, entry: .snapshot, as: TelemetrySnapshot.self)
         #expect(samples.first?.reason == .threshold)

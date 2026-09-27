@@ -1,17 +1,20 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 
 @testable import DirectaKit
 
+/** The synchronous forms under test block their thread on the child, so each
+    runs through `offPool`, never on the test's own pool thread. */
 @Suite struct LaunchdAdminShellTests {
-    @Test func capturesStatusAndOutput() {
-        let result = LaunchdAdmin.shell("/bin/echo", ["hello"])
+    @Test func capturesStatusAndOutput() async {
+        let result = await offPool { LaunchdAdmin.shell("/bin/echo", ["hello"]) }
         #expect(result.status == 0)
         #expect(result.output == "hello\n")
     }
 
-    @Test func nonZeroExitIsReported() {
-        let result = LaunchdAdmin.shell("/usr/bin/false", [])
+    @Test func nonZeroExitIsReported() async {
+        let result = await offPool { LaunchdAdmin.shell("/usr/bin/false", []) }
         #expect(result.status != 0)
     }
 
@@ -21,41 +24,45 @@ import Testing
         never drain, and blocks this process on an exit that can now never
         happen. `shell` reads the pipe to its end before waiting, so the
         child's writes always have somewhere to go. */
-    @Test func aChildWritingPastOnePipeBufferStillReturnsInFull() {
+    @Test func aChildWritingPastOnePipeBufferStillReturnsInFull() async {
         let target = 200_000
-        let result = LaunchdAdmin.shell("/bin/sh", ["-c", "yes | head -c \(target)"])
+        let result = await offPool { LaunchdAdmin.shell("/bin/sh", ["-c", "yes | head -c \(target)"]) }
         #expect(result.status == 0)
         #expect(result.output.utf8.count == target)
     }
 
     /** The timed path polls the pipe on the calling thread up to its
         deadline; it returns the same full output. */
-    @Test func aTimedChildWritingPastOnePipeBufferStillReturnsInFull() {
+    @Test func aTimedChildWritingPastOnePipeBufferStillReturnsInFull() async {
         let target = 200_000
-        let result = LaunchdAdmin.shell(
-            "/bin/sh", ["-c", "yes | head -c \(target)"], timeoutSeconds: 10)
+        let result = await offPool {
+            LaunchdAdmin.shell("/bin/sh", ["-c", "yes | head -c \(target)"], timeoutSeconds: 10)
+        }
         #expect(result.status == 0)
         #expect(result.output.utf8.count == target)
     }
 
-    @Test func aCommandThatCannotStartReportsMinusOneOnEitherPath() {
+    @Test func aCommandThatCannotStartReportsMinusOneOnEitherPath() async {
         let missing = "/nonexistent/directa-shell-\(UUID().uuidString)"
-        #expect(LaunchdAdmin.shell(missing, []).status == -1)
-        #expect(LaunchdAdmin.shell(missing, [], timeoutSeconds: 1).status == -1)
+        #expect(await offPool { LaunchdAdmin.shell(missing, []) }.status == -1)
+        #expect(await offPool { LaunchdAdmin.shell(missing, [], timeoutSeconds: 1) }.status == -1)
     }
 
-    @Test func theOutcomeOfAFinishedChildCarriesItsStatusAndOutput() {
-        #expect(
+    @Test func theOutcomeOfAFinishedChildCarriesItsStatusAndOutput() async {
+        let timed = await offPool {
             LaunchdAdmin.shellOutcome("/bin/sh", ["-c", "echo hello; exit 3"], timeoutSeconds: 10)
-                == .exited(status: 3, output: "hello\n"))
-        #expect(LaunchdAdmin.shellOutcome("/bin/echo", ["hi"]) == .exited(status: 0, output: "hi\n"))
+        }
+        let untimed = await offPool { LaunchdAdmin.shellOutcome("/bin/echo", ["hi"]) }
+        #expect(timed == .exited(status: 3, output: "hello\n"))
+        #expect(untimed == .exited(status: 0, output: "hi\n"))
     }
 
-    @Test func aChildThatCannotStartIsNotAnExit() {
+    @Test func aChildThatCannotStartIsNotAnExit() async {
         let missing = "/nonexistent/directa-shell-\(UUID().uuidString)"
         for timeout in [nil, 1.0] {
-            guard case .failedToRun = LaunchdAdmin.shellOutcome(missing, [], timeoutSeconds: timeout) else {
-                Issue.record("a missing executable read as \(LaunchdAdmin.shellOutcome(missing, []))")
+            let outcome = await offPool { LaunchdAdmin.shellOutcome(missing, [], timeoutSeconds: timeout) }
+            guard case .failedToRun = outcome else {
+                Issue.record("a missing executable read as \(outcome)")
                 continue
             }
         }
@@ -63,21 +70,29 @@ import Testing
 
     /** A timed-out child keeps what it wrote before the deadline, so a slow
         `log show` still yields the lines it found. */
-    @Test func aTimedOutChildKeepsItsPartialOutput() {
-        let started = ContinuousClock.now
-        let outcome = LaunchdAdmin.shellOutcome("/bin/sh", ["-c", "echo early; sleep 5"], timeoutSeconds: 0.5)
+    @Test func aTimedOutChildKeepsItsPartialOutput() async {
+        let (outcome, elapsed) = await offPool {
+            let started = ContinuousClock.now
+            let outcome = LaunchdAdmin.shellOutcome("/bin/sh", ["-c", "echo early; sleep 5"], timeoutSeconds: 0.5)
+            return (outcome, started.duration(to: .now))
+        }
         #expect(outcome == .timedOut(partialOutput: "early\n"))
-        #expect(started.duration(to: .now) < .seconds(3))
+        #expect(elapsed < .seconds(3))
     }
 
     /** A child that exits while a process it started still holds the output
-        open ends at the deadline rather than waiting on that process. */
-    @Test func anOutputHeldOpenPastTheDeadlineEndsTheWait() {
-        let started = ContinuousClock.now
-        let outcome = LaunchdAdmin.shellOutcome(
-            "/bin/sh", ["-c", "echo started; sleep 4 & exit 0"], timeoutSeconds: 0.5)
+        open ends at the deadline rather than waiting on that process. The
+        call is timed on the thread that makes it, so a busy pool delaying the
+        test's resumption is not counted. */
+    @Test func anOutputHeldOpenPastTheDeadlineEndsTheWait() async {
+        let (outcome, elapsed) = await offPool {
+            let started = ContinuousClock.now
+            let outcome = LaunchdAdmin.shellOutcome(
+                "/bin/sh", ["-c", "echo started; sleep 4 & exit 0"], timeoutSeconds: 0.5)
+            return (outcome, started.duration(to: .now))
+        }
         #expect(outcome == .timedOut(partialOutput: "started\n"))
-        #expect(started.duration(to: .now) < .seconds(3))
+        #expect(elapsed < .seconds(3))
     }
 
     /** The helpers the daemon runs on a fixed-width lane get a deadline when
@@ -114,14 +129,15 @@ import Testing
 
     /** Output parsed as a value (a `--version` string) excludes stderr, so a
         warning on stderr cannot corrupt it; the default keeps both. */
-    @Test func stdoutAloneWhenStderrIsExcluded() {
+    @Test func stdoutAloneWhenStderrIsExcluded() async {
         let script = ["-c", "echo warning >&2; echo 1.2.3"]
         for timeout in [nil, 10.0] {
-            #expect(
+            let alone = await offPool {
                 LaunchdAdmin.shell("/bin/sh", script, includeStderr: false, timeoutSeconds: timeout).output
-                    == "1.2.3\n")
-            #expect(
-                LaunchdAdmin.shell("/bin/sh", script, timeoutSeconds: timeout).output == "warning\n1.2.3\n")
+            }
+            let merged = await offPool { LaunchdAdmin.shell("/bin/sh", script, timeoutSeconds: timeout).output }
+            #expect(alone == "1.2.3\n")
+            #expect(merged == "warning\n1.2.3\n")
         }
     }
 

@@ -1,5 +1,6 @@
 import ArgumentParser
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -798,12 +799,9 @@ private actor FakeMonitorClock: MonitorClock {
                 == .parentChange(from: 1))
     }
 
-    @Test func registeringAnExitedProcessFailsAndALiveOneSucceeds() throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/true")
-        try process.run()
-        process.waitUntilExit()
-        #expect(MonitorLifetime.registerProcessExit(process.processIdentifier) == nil)
+    @Test func registeringAnExitedProcessFailsAndALiveOneSucceeds() async throws {
+        let exited = try await TestProcess.run("/usr/bin/true", [])
+        #expect(MonitorLifetime.registerProcessExit(exited.pid) == nil)
 
         let live = try #require(MonitorLifetime.registerProcessExit(getpid()))
         close(live)

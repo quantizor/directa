@@ -1004,7 +1004,7 @@ private func makeEnv() throws -> TestEnv {
         close(writeEnd)
         defer { kill(root, SIGKILL) }
         let child = try #require(
-            readSetsidListenerPid(from: readEnd), "root \(root) never spawned its setsid listener")
+            await readSetsidListenerPid(from: readEnd), "root \(root) never spawned its setsid listener")
         defer { kill(child, SIGKILL) }
         /** The premise: a session of its own, so the session sweep cannot
             stand in for the snapshot. */
@@ -1057,7 +1057,7 @@ private func makeEnv() throws -> TestEnv {
         let root = try #require(await supervisor.start().pid.flatMap { pid_t(exactly: $0) })
         close(writeEnd)
         let child = try #require(
-            readSetsidListenerPid(from: readEnd), "root \(root) never spawned its setsid listener")
+            await readSetsidListenerPid(from: readEnd), "root \(root) never spawned its setsid listener")
         defer { kill(child, SIGKILL) }
         for _ in 0..<250 where getsid(root) != -1 {
             try await Task.sleep(for: .milliseconds(20))

@@ -24,16 +24,11 @@ import os
                 }
             }
         }
-        let startedPastWidth = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-            let thread = Thread {
-                entered.wait()
-                entered.wait()
-                let third = entered.wait(timeout: .now() + 0.2) == .success
-                for _ in 0..<jobs { gate.signal() }
-                continuation.resume(returning: third)
-            }
-            thread.name = "blocking-lane-test-gate"
-            thread.start()
+        let startedPastWidth = await offPool {
+            defer { for _ in 0..<jobs { gate.signal() } }
+            entered.wait()
+            entered.wait()
+            return entered.wait(timeout: .now() + 0.2) == .success
         }
         var results: [Int] = []
         for call in calls {
@@ -45,7 +40,11 @@ import os
 
     /** Pressure counts running and queued jobs exactly, the oldest queued
         wait grows while the lane is full, and only a job that waited past the
-        lane's slow-wait bound is reported, once, with its lane name. */
+        lane's slow-wait bound is reported, once, with its lane name. The jobs
+        reach the lane from tasks, which a busy cooperative pool can start
+        late, so the wait for them is only a guard against hanging, and the
+        gate opens however the wait ends: a job left on a closed gate would
+        hold the test forever. */
     @Test func pressureAndSlowWaitsAreReported() async throws {
         let activity = DaemonActivity()
         let heard = OSAllocatedUnfairLock<[String]>(initialState: [])
@@ -68,21 +67,13 @@ import os
                 }
             }
         }
-        let observed = await withCheckedContinuation { (continuation: CheckedContinuation<LanePressure?, Never>) in
-            let thread = Thread {
-                guard entered.wait(timeout: .now() + 5) == .success else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-                let deadline = Date().addingTimeInterval(5)
-                while lane.pressure().queued < 2, Date() < deadline { usleep(2_000) }
-                usleep(200_000)
-                let pressure = lane.pressure()
-                for _ in 0..<3 { gate.signal() }
-                continuation.resume(returning: pressure)
-            }
-            thread.name = "blocking-lane-test-pressure"
-            thread.start()
+        let observed = await offPool { () -> LanePressure? in
+            defer { for _ in 0..<3 { gate.signal() } }
+            let deadline = Date().addingTimeInterval(60)
+            guard entered.wait(timeout: .now() + 60) == .success else { return nil }
+            while lane.pressure().queued < 2, Date() < deadline { usleep(2_000) }
+            usleep(200_000)
+            return lane.pressure()
         }
         var results: [Int] = []
         for call in calls {
@@ -123,19 +114,14 @@ import os
                 return answer
             }
         }
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let thread = Thread {
-                let ran = DispatchSemaphore(value: 0)
-                Task.detached {
-                    finishedWhenTaskRan.withLock { $0 = finished.withLock { $0 } }
-                    ran.signal()
-                }
-                _ = ran.wait(timeout: .now() + CheckoutIdentity.gitTimeoutSeconds * 2)
-                repo.release(until: { finished.withLock { $0 } == callers })
-                continuation.resume()
+        await offPool {
+            let ran = DispatchSemaphore(value: 0)
+            Task.detached {
+                finishedWhenTaskRan.withLock { $0 = finished.withLock { $0 } }
+                ran.signal()
             }
-            thread.name = "blocking-lane-test-probe"
-            thread.start()
+            _ = ran.wait(timeout: .now() + CheckoutIdentity.gitTimeoutSeconds * 2)
+            repo.release(until: { finished.withLock { $0 } == callers })
         }
         for call in calls {
             #expect(await call.value == nil)
@@ -150,29 +136,28 @@ import os
         so it cannot hold a lane thread forever. The release pump starts only
         far past the timeout, and whether the answer needed it is the
         assertion: elapsed time is not, since a loaded machine can delay the
-        spawn itself. */
+        spawn itself. The call runs on a lane of its own: the shared
+        repository lane may be queued behind another test's hung calls, and a
+        wait there would be counted as this git's. */
     @Test func aHungGitIsTerminatedAtItsTimeout() async throws {
         let repo = try HungRepository()
         let path = repo.path
+        let lane = BlockingLane(name: "hung-git", width: 1)
         let answered = OSAllocatedUnfairLock(initialState: false)
         let call = Task.detached {
-            let answer = await BlockingLane.repository.run {
+            let answer = await lane.run {
                 CheckoutIdentity.git(
                     project: path, args: ["rev-parse", "--git-common-dir"], timeoutSeconds: 0.3)
             }
             answered.withLock { $0 = true }
             return answer
         }
-        let neededRelease = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-            let thread = Thread {
-                let pumpFrom = Date().addingTimeInterval(8)
-                while !answered.withLock({ $0 }), Date() < pumpFrom { usleep(10_000) }
-                let pumped = !answered.withLock { $0 }
-                repo.release(until: { answered.withLock { $0 } })
-                continuation.resume(returning: pumped)
-            }
-            thread.name = "blocking-lane-test-timeout"
-            thread.start()
+        let neededRelease = await offPool {
+            let pumpFrom = Date().addingTimeInterval(8)
+            while !answered.withLock({ $0 }), Date() < pumpFrom { usleep(10_000) }
+            let pumped = !answered.withLock { $0 }
+            repo.release(until: { answered.withLock { $0 } })
+            return pumped
         }
         #expect(await call.value == nil)
         #expect(!neededRelease, "a hung git answered only once its repository was released")
@@ -182,31 +167,48 @@ import os
         open (here an alias that backgrounds a `sleep`) answers nil at its
         timeout rather than when that process lets go, and the holder, which
         shares git's process group, is killed with it. The holder outlives the
-        timeout by far, so waiting on it and not waiting on it are told apart
-        by a wide margin. */
+        longest timeout by far, so waiting on it and not waiting on it are
+        told apart by a wide margin.
+
+        An attempt whose deadline passed before git and the alias's shell got
+        far enough to start the holder proves nothing (there is no pid file,
+        and nothing held the output), and a busy machine can take longer than
+        a short deadline to spawn both, so such an attempt is repeated with a
+        longer one. The call runs on a lane of its own for the reason
+        `aHungGitIsTerminatedAtItsTimeout` gives. */
     @Test func aGitWhoseOutputOutlivesItEndsAtItsTimeout() async throws {
         let project = try TemporaryTree.directory(named: "held-output")
         let pidFile = project.appending(path: "holder.pid").path
-        let started = ContinuousClock.now
-        let answer = await BlockingLane.repository.run {
-            CheckoutIdentity.git(
-                project: project.path,
-                args: ["-c", "alias.hold=!sleep 20 & echo $! > '\(pidFile)'", "hold"],
-                timeoutSeconds: 0.5)
+        let lane = BlockingLane(name: "held-output", width: 1)
+        let holderLifetime = Duration.seconds(60)
+        for timeoutSeconds in [0.5, 2, 8] {
+            try? FileManager.default.removeItem(atPath: pidFile)
+            let started = ContinuousClock.now
+            let answer = await lane.run {
+                CheckoutIdentity.git(
+                    project: project.path,
+                    args: [
+                        "-c", "alias.hold=!sleep \(Int(holderLifetime / .seconds(1))) & echo $! > '\(pidFile)'", "hold",
+                    ],
+                    timeoutSeconds: timeoutSeconds)
+            }
+            let elapsed = started.duration(to: .now)
+            guard
+                let holder = (try? String(contentsOfFile: pidFile, encoding: .utf8))
+                    .flatMap({ pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+            else { continue }
+            #expect(answer == nil)
+            #expect(elapsed < holderLifetime / 2, "the git read waited \(elapsed) for a process holding its output")
+            var gone = kill(holder, 0) != 0
+            for _ in 0..<50 where !gone {
+                try await Task.sleep(for: .milliseconds(50))
+                gone = kill(holder, 0) != 0
+            }
+            if !gone { kill(holder, SIGKILL) }
+            #expect(gone, "the process holding git's output (pid \(holder)) outlived the timeout")
+            return
         }
-        let elapsed = started.duration(to: .now)
-        #expect(answer == nil)
-        #expect(elapsed < .seconds(10), "the git read waited \(elapsed) for a process holding its output")
-        let holder = try #require(
-            (try? String(contentsOfFile: pidFile, encoding: .utf8))
-                .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
-        var gone = kill(holder, 0) != 0
-        for _ in 0..<50 where !gone {
-            try await Task.sleep(for: .milliseconds(50))
-            gone = kill(holder, 0) != 0
-        }
-        if !gone { kill(holder, SIGKILL) }
-        #expect(gone, "the process holding git's output (pid \(holder)) outlived the timeout")
+        Issue.record("git never ran its alias far enough to start the holder, even with an 8 s deadline")
     }
 }
 

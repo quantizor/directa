@@ -222,8 +222,9 @@ import Testing
         worktree nested inside it the way Claude Code places one, and the
         submodule initialized inside that worktree (its git directory sits
         under `worktrees/<id>/modules/`, so a path containing `/worktrees/`
-        is not proof of a worktree). */
-    private struct GitLayout {
+        is not proof of a worktree). Building it runs git, and so do the
+        checks below a checkout root, so both run off the pool. */
+    private struct GitLayout: Sendable {
         let base: URL
         let main: URL
         let submodule: URL
@@ -231,43 +232,34 @@ import Testing
         let worktreeSubmodule: URL
     }
 
-    private func makeGitLayout(prefix: String = "gitlayout") throws -> GitLayout {
+    private func makeGitLayout(prefix: String = "gitlayout") async throws -> GitLayout {
         let base = URL(fileURLWithPath: canonicalProjectPath(try TemporaryTree.directory(named: prefix).path))
         let main = base.appending(path: "main")
         let source = base.appending(path: "sub-source")
         for dir in [main, source] {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
-        func git(_ args: [String], in cwd: URL) throws {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-            process.arguments = [
-                "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "protocol.file.allow=always",
-            ] + args
-            process.currentDirectoryURL = cwd
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            process.waitUntilExit()
-            try #require(
-                process.terminationStatus == 0,
-                "git \(args.joined(separator: " ")) exited \(process.terminationStatus)")
+        func git(_ args: [String], in cwd: URL) async throws {
+            try await TestProcess.succeed(
+                "/usr/bin/git",
+                ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "protocol.file.allow=always"] + args,
+                in: cwd)
         }
-        try git(["init", "-q"], in: source)
-        try git(["commit", "-q", "--allow-empty", "-m", "seed"], in: source)
-        try git(["init", "-q"], in: main)
-        try git(["submodule", "-q", "add", source.path, "libs/sub"], in: main)
-        try git(["commit", "-q", "-m", "seed"], in: main)
+        try await git(["init", "-q"], in: source)
+        try await git(["commit", "-q", "--allow-empty", "-m", "seed"], in: source)
+        try await git(["init", "-q"], in: main)
+        try await git(["submodule", "-q", "add", source.path, "libs/sub"], in: main)
+        try await git(["commit", "-q", "-m", "seed"], in: main)
         let worktree = main.appending(path: ".claude/worktrees/review")
-        try git(["worktree", "add", "-q", worktree.path], in: main)
-        try git(["submodule", "-q", "update", "--init"], in: worktree)
+        try await git(["worktree", "add", "-q", worktree.path], in: main)
+        try await git(["submodule", "-q", "update", "--init"], in: worktree)
         return GitLayout(
             base: base, main: main, submodule: main.appending(path: "libs/sub"), worktree: worktree,
             worktreeSubmodule: worktree.appending(path: "libs/sub"))
     }
 
-    @Test func onlyALinkedWorktreesGitFileCountsAsALinkedWorktree() throws {
-        let layout = try makeGitLayout()
+    @Test func onlyALinkedWorktreesGitFileCountsAsALinkedWorktree() async throws {
+        let layout = try await makeGitLayout()
         #expect(CheckoutIdentity.linkedWorktreeGitDir(of: layout.worktree.path) != nil)
         #expect(CheckoutIdentity.linkedWorktreeGitDir(of: layout.main.path) == nil)
         #expect(CheckoutIdentity.linkedWorktreeGitDir(of: layout.submodule.path) == nil)
@@ -275,16 +267,18 @@ import Testing
         #expect(CheckoutIdentity.linkedWorktreeGitDir(of: layout.base.path) == nil)
     }
 
-    @Test func isLinkedWorktreeIsFalseForASubmodule() throws {
-        let layout = try makeGitLayout()
-        #expect(CheckoutIdentity.isLinkedWorktree(project: layout.worktree.path))
-        #expect(!CheckoutIdentity.isLinkedWorktree(project: layout.submodule.path))
-        #expect(!CheckoutIdentity.isLinkedWorktree(project: layout.worktreeSubmodule.path))
-        #expect(!CheckoutIdentity.isLinkedWorktree(project: layout.main.path))
+    @Test func isLinkedWorktreeIsFalseForASubmodule() async throws {
+        let layout = try await makeGitLayout()
+        let answers = await offPool {
+            [layout.worktree, layout.submodule, layout.worktreeSubmodule, layout.main].map {
+                CheckoutIdentity.isLinkedWorktree(project: $0.path)
+            }
+        }
+        #expect(answers == [true, false, false, false])
     }
 
-    @Test func mainCheckoutOfALinkedWorktreeIsTheCheckoutHoldingTheCommonGitDirectory() throws {
-        let layout = try makeGitLayout()
+    @Test func mainCheckoutOfALinkedWorktreeIsTheCheckoutHoldingTheCommonGitDirectory() async throws {
+        let layout = try await makeGitLayout()
         #expect(CheckoutIdentity.mainCheckout(ofLinkedWorktree: layout.worktree.path) == layout.main.path)
         #expect(CheckoutIdentity.mainCheckout(ofLinkedWorktree: layout.main.path) == nil)
         #expect(CheckoutIdentity.mainCheckout(ofLinkedWorktree: layout.submodule.path) == nil)
@@ -293,68 +287,64 @@ import Testing
     /** A worktree root answers from its admin files and a directory below it
         through git; both name the main checkout. A main checkout, a
         directory below it, and a submodule are not worktrees. */
-    @Test func worktreeDisplayNamesTheMainCheckoutFromARootOrASubdirectory() throws {
-        let layout = try makeGitLayout()
+    @Test func worktreeDisplayNamesTheMainCheckoutFromARootOrASubdirectory() async throws {
+        let layout = try await makeGitLayout()
         let below = layout.worktree.appending(path: "Nested Dir")
         let mainBelow = layout.main.appending(path: "src")
         for dir in [below, mainBelow] {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         let mainSlug = ProjectConfigLoader.defaultSlug(project: layout.main.path)
-        #expect(
-            CheckoutIdentity.worktreeDisplay(project: layout.worktree.path)
-                == WorktreeDisplay(label: "review", mainProject: mainSlug))
-        #expect(
-            CheckoutIdentity.worktreeDisplay(project: below.path)
-                == WorktreeDisplay(label: "nested-dir", mainProject: mainSlug))
-        #expect(CheckoutIdentity.isLinkedWorktree(project: below.path))
-        #expect(!CheckoutIdentity.isLinkedWorktree(project: mainBelow.path))
-        for notWorktree in [layout.main, mainBelow, layout.submodule, layout.worktreeSubmodule] {
-            #expect(CheckoutIdentity.worktreeDisplay(project: notWorktree.path) == nil)
+        let displays = await offPool {
+            [layout.worktree, below, layout.main, mainBelow, layout.submodule, layout.worktreeSubmodule].map {
+                CheckoutIdentity.worktreeDisplay(project: $0.path)
+            }
         }
+        let linked = await offPool {
+            [below, mainBelow].map { CheckoutIdentity.isLinkedWorktree(project: $0.path) }
+        }
+        #expect(
+            displays == [
+                WorktreeDisplay(label: "review", mainProject: mainSlug),
+                WorktreeDisplay(label: "nested-dir", mainProject: mainSlug),
+                nil, nil, nil, nil,
+            ])
+        #expect(linked == [true, false])
     }
 
     /** A worktree of a bare repository: git names the bare directory itself as
         the main worktree, and the admin-file read agrees with git's own
         listing. */
-    @Test func worktreeDisplayOfABareRepositorysWorktreeMatchesGitsListing() throws {
+    @Test func worktreeDisplayOfABareRepositorysWorktreeMatchesGitsListing() async throws {
         let base = URL(fileURLWithPath: canonicalProjectPath(try TemporaryTree.directory(named: "bare").path))
         let seed = base.appending(path: "seed")
         let bare = base.appending(path: "repo.git")
         let worktree = base.appending(path: "wt")
         try FileManager.default.createDirectory(at: seed, withIntermediateDirectories: true)
-        func git(_ args: [String], in cwd: URL) throws -> String {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-            process.arguments = ["-c", "user.name=t", "-c", "user.email=t@example.com"] + args
-            process.currentDirectoryURL = cwd
-            let out = Pipe()
-            process.standardOutput = out
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            let data = try out.fileHandleForReading.readToEnd() ?? Data()
-            process.waitUntilExit()
-            try #require(process.terminationStatus == 0, "git \(args.joined(separator: " ")) failed")
-            return String(decoding: data, as: UTF8.self)
+        func git(_ args: [String], in cwd: URL) async throws -> String {
+            let result = try await TestProcess.run(
+                "/usr/bin/git", ["-c", "user.name=t", "-c", "user.email=t@example.com"] + args, currentDirectory: cwd)
+            try #require(result.status == 0, "git \(args.joined(separator: " ")) failed")
+            return result.output
         }
-        _ = try git(["init", "-q"], in: seed)
-        _ = try git(["commit", "-q", "--allow-empty", "-m", "seed"], in: seed)
-        _ = try git(["clone", "-q", "--bare", seed.path, bare.path], in: base)
-        _ = try git(["worktree", "add", "-q", worktree.path], in: bare)
-        let listing = try git(["worktree", "list", "--porcelain"], in: worktree)
+        _ = try await git(["init", "-q"], in: seed)
+        _ = try await git(["commit", "-q", "--allow-empty", "-m", "seed"], in: seed)
+        _ = try await git(["clone", "-q", "--bare", seed.path, bare.path], in: base)
+        _ = try await git(["worktree", "add", "-q", worktree.path], in: bare)
+        let listing = try await git(["worktree", "list", "--porcelain"], in: worktree)
         let listedMain = try #require(
             listing.split(separator: "\n").first { $0.hasPrefix("worktree ") }?.dropFirst("worktree ".count))
         #expect(canonicalProjectPath(String(listedMain)) == bare.path)
         #expect(
-            CheckoutIdentity.worktreeDisplay(project: worktree.path)
+            await offPool { CheckoutIdentity.worktreeDisplay(project: worktree.path) }
                 == WorktreeDisplay(label: "wt", mainProject: ProjectConfigLoader.defaultSlug(project: bare.path)))
     }
 
     /** From a linked worktree that lacks devservers.json, a name its main
         checkout declares gets both fixes; any other not-found keeps the
         plain hint. */
-    @Test func serverNotFoundNamesTheWorktreeFixesOnlyWhenTheMainCheckoutDeclaresTheName() throws {
-        let layout = try makeGitLayout()
+    @Test func serverNotFoundNamesTheWorktreeFixesOnlyWhenTheMainCheckoutDeclaresTheName() async throws {
+        let layout = try await makeGitLayout()
         let config = ProjectFileConfig(servers: ["web": ProjectFileServer(command: ["bun", "dev"])])
         try JSONCoding.fileEncoder().encode(config).write(to: layout.main.appending(path: "devservers.json"))
         let main = layout.main.path
@@ -385,8 +375,8 @@ import Testing
 
     /** The hint is a command a reader pastes, so a main checkout path with a
         quote and a space still arrives as one argument. */
-    @Test func serverNotFoundQuotesAMainCheckoutPathHoldingAQuoteAndASpace() throws {
-        let layout = try makeGitLayout(prefix: "it's a checkout")
+    @Test func serverNotFoundQuotesAMainCheckoutPathHoldingAQuoteAndASpace() async throws {
+        let layout = try await makeGitLayout(prefix: "it's a checkout")
         let config = ProjectFileConfig(servers: ["web": ProjectFileServer(command: ["bun", "dev"])])
         try JSONCoding.fileEncoder().encode(config).write(to: layout.main.appending(path: "devservers.json"))
         let quoted = layout.main.path.replacing("'", with: #"'\''"#)

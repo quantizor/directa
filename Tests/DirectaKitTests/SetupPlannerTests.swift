@@ -121,25 +121,17 @@ struct SetupPlannerTests {
         Asserted against the machine's own answer rather than a fixed list: what
         a developer puts in `.zshrc` is theirs, so the contract is "the capture
         agrees with the user's shell", not "the capture contains pnpm". */
-    @Test func theCaptureSeesWhatTheUsersShellSees() throws {
+    @Test func theCaptureSeesWhatTheUsersShellSees() async throws {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        func pathFrom(_ arguments: [String]) throws -> Set<String> {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = arguments
-            process.environment = ["HOME": home, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
+        func pathFrom(_ arguments: [String]) async throws -> Set<String> {
+            let result = try await TestProcess.run(
+                "/bin/zsh", arguments, environment: ["HOME": home, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"])
             return Set(
-                String(decoding: data, as: UTF8.self)
+                result.output
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .split(separator: ":").map(String.init))
         }
-        let interactive = try pathFrom(["-ilc", "echo $PATH"])
+        let interactive = try await pathFrom(["-ilc", "echo $PATH"])
         withKnownIssue("no .zshrc on this machine, so there is nothing to miss", isIntermittent: true) {
             try #require(FileManager.default.fileExists(atPath: "\(home)/.zshrc"))
         }
@@ -147,12 +139,12 @@ struct SetupPlannerTests {
         /** The control: login-only must MISS something an interactive shell has,
             or this machine cannot demonstrate the bug and the assertion below
             would pass against the old implementation too. */
-        let loginOnly = try pathFrom(["-lc", "echo $PATH"])
+        let loginOnly = try await pathFrom(["-lc", "echo $PATH"])
         withKnownIssue(".zshrc adds nothing to PATH here", isIntermittent: true) {
             try #require(!interactive.subtracting(loginOnly).isEmpty)
         }
         guard !interactive.subtracting(loginOnly).isEmpty else { return }
-        let captured = Set(LaunchdAdmin.capturedPath().split(separator: ":").map(String.init))
+        let captured = Set(await offPool { LaunchdAdmin.capturedPath() }.split(separator: ":").map(String.init))
         #expect(interactive.subtracting(captured).isEmpty)
     }
 
