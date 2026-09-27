@@ -705,7 +705,7 @@ private func makeEnv() throws -> TestEnv {
                 ProcessTree.identity(of: pid).map {
                     ProcessIdentity(
                         pid: $0.pid, startMicroseconds: $0.startMicroseconds,
-                        startSeconds: $0.startSeconds - 60, uniqueID: $0.uniqueID.map { $0 &+ 1 })
+                        startSeconds: $0.startSeconds - 60, uniqueID: unissuedUniqueID)
                 }
             },
             registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "web"),

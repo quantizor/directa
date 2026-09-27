@@ -114,7 +114,7 @@ import Testing
         let real = try #require(ProcessTree.identity(of: leader))
         let stranger = ProcessIdentity(
             pid: leader, startMicroseconds: real.startMicroseconds,
-            startSeconds: real.startSeconds - 60, uniqueID: real.uniqueID.map { $0 &+ 1 })
+            startSeconds: real.startSeconds - 60, uniqueID: unissuedUniqueID)
         var found: [pid_t] = []
         for _ in 0..<50 where found.isEmpty {
             found = ProcessTree.liveDescendants(rootPid: leader, rootIdentity: real, snapshot: [])

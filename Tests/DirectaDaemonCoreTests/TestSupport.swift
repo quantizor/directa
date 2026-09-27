@@ -19,6 +19,15 @@ import os
     to them, and to a concurrently running smoke.sh, as a real leftover. */
 let testLaunchdJobLabelPrefix = "dev.quantizor.directa.test-job."
 
+/** A kernel unique id no process ever carries: the kernel counts them up
+    from 1 each boot and never reuses one, so it never reaches this value.
+    A test that makes up the identity of a root other than the live one uses
+    it, since the lineage walk treats that root's unique id as a parent to
+    sweep: a neighbor of a real id (the real one plus 1) is whichever process
+    the machine created next, often a concurrent test's with children of its
+    own, which the walk would then find and a stop would signal. */
+let unissuedUniqueID = UInt64.max
+
 /** The one raw `posix_spawn` for tests that need spawn attributes Foundation's
     `Process` cannot set (a new session, a signal mask, a Darwin SPI). The
     child inherits no descriptor but stdin, stdout, and stderr, each on
