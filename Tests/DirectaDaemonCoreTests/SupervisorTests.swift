@@ -734,15 +734,19 @@ private func makeEnv() throws -> TestEnv {
         let spec = ServerSpec(
             command: [
                 "/bin/sh", "-c",
-                #"trap "exit 0" TERM; (trap "sleep 1; echo done > cleaned; exit 0" TERM; while :; do sleep 0.1; done) & while :; do sleep 0.1; done"#,
+                #"trap "exit 0" TERM; (trap "sleep 1; echo done > cleaned; exit 0" TERM; : > ready; while :; do sleep 0.1; done) & while :; do sleep 0.1; done"#,
             ],
             name: "slow-worker")
         let supervisor = ServerSupervisor(
             launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectPath,
             registry: Registry(paths: env.paths), spec: spec)
         #expect(await supervisor.start().pid != nil)
-        /** Lets the subshell start and install its trap before the stop. */
-        try await Task.sleep(for: .milliseconds(300))
+        /** The subshell writes `ready` once its trap is installed. */
+        let ready = URL(fileURLWithPath: env.projectPath).appending(path: "ready")
+        for _ in 0..<250 where !FileManager.default.fileExists(atPath: ready.path) {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try #require(FileManager.default.fileExists(atPath: ready.path), "the worker never installed its trap")
 
         let stopped = await supervisor.stop(graceSeconds: 4, reason: "test")
         #expect(stopped.phase == .stopped)
@@ -1337,13 +1341,14 @@ private func makeEnv() throws -> TestEnv {
             stopTask.withLock { $0 = Task { await supervisor.stop(graceSeconds: 3, reason: "test") } }
         }
         let marker = URL(fileURLWithPath: env.projectPath).appending(path: "cleaned")
+        let ready = URL(fileURLWithPath: env.projectPath).appending(path: "ready")
         /** The runner blocks SIGTERM in its own mask, which a bare spawn
             inherits, so the survivor resets its mask and dispositions the way
             every real launcher does, or it would never see the stop's SIGTERM. */
         let survivor = try spawnBare(
             [
                 "/bin/sh", "-c",
-                "trap 'sleep 0.5; echo done > \"\(marker.path)\"; exit 0' TERM; while :; do sleep 0.1; done",
+                "trap 'sleep 0.5; echo done > \"\(marker.path)\"; exit 0' TERM; : > \"\(ready.path)\"; while :; do sleep 0.1; done",
             ],
             flags: POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF
         ) { attributes in
@@ -1360,6 +1365,11 @@ private func makeEnv() throws -> TestEnv {
         }
         reaper.start()
         defer { kill(survivor, SIGKILL) }
+        /** The survivor writes `ready` once its trap is installed. */
+        for _ in 0..<250 where !FileManager.default.fileExists(atPath: ready.path) {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try #require(FileManager.default.fileExists(atPath: ready.path), "the survivor never installed its trap")
 
         #expect(
             await supervisor.adopt(
