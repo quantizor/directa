@@ -1,14 +1,43 @@
 import Foundation
 
 /** Git checkout identity helpers for sibling port rebind, the worktree
-    display label, and project resolution. The linked-worktree checks read
-    files; the rest shell out to `git`. Failures return nil so non-git
+    display label, and project resolution. The linked-worktree checks and a
+    checkout root's common directory read files; the rest shell out to `git`. Failures return nil so non-git
     projects keep the pre-coexistence path. */
 public enum CheckoutIdentity {
-    /** Absolute path to the shared git directory, or nil if not a git checkout. */
+    /** Absolute path to the shared git directory, or nil if not a git
+        checkout. A checkout root answers from its `.git` entry without
+        running git (`commonDirFromFiles`); anything else asks git. */
     public static func gitCommonDir(project: String) -> String? {
-        git(project: project, args: ["rev-parse", "--git-common-dir"]).map {
+        if let common = commonDirFromFiles(project) { return common }
+        return git(project: project, args: ["rev-parse", "--git-common-dir"]).map {
             canonicalProjectPath(absoluteGitPath($0, project: project))
+        }
+    }
+
+    /** The common git directory the `.git` entry at the root of `directory`
+        names, read from files alone, for the two shapes a checkout root
+        has: a `.git` directory, which git uses as its own common directory,
+        and a linked worktree's `.git` file, whose admin directory's
+        `commondir` file names it. Both are what `git rev-parse
+        --git-common-dir` answers for them. Nil for everything else (no
+        `.git` at the root, a submodule's `.git` file, a `.git` directory
+        carrying a `commondir` of its own), which is left to git. Machine-wide
+        status asks this once per latent port conflict, so it must cost file
+        reads, not a subprocess. */
+    static func commonDirFromFiles(_ directory: String) -> String? {
+        let gitEntry = URL(fileURLWithPath: directory).appending(path: ".git")
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: gitEntry.path, isDirectory: &isDirectory) else {
+            return nil
+        }
+        if isDirectory.boolValue {
+            guard !FileManager.default.fileExists(atPath: gitEntry.appending(path: "commondir").path)
+            else { return nil }
+            return canonicalProjectPath(gitEntry.path)
+        }
+        return linkedWorktreeGitDir(of: directory).flatMap(commonDir(ofAdminDir:)).map {
+            canonicalProjectPath($0.path)
         }
     }
 

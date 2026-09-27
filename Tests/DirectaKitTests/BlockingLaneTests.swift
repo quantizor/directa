@@ -212,9 +212,12 @@ import os
 
 /** A directory git treats as a repository candidate whose `HEAD` is a FIFO:
     every git that validates it blocks in `open(2)` until `release` opens the
-    write end. */
+    write end. `path` is a directory below the repository root, because a
+    checkout root answers its common directory from files without running
+    git. */
 private struct HungRepository: Sendable {
     let path: String
+    private let root: String
 
     init() throws {
         let root = try TemporaryTree.directory(named: "hung-repo")
@@ -224,14 +227,17 @@ private struct HungRepository: Sendable {
         try FileManager.default.createDirectory(
             at: gitDir.appending(path: "refs"), withIntermediateDirectories: true)
         try #require(mkfifo(gitDir.appending(path: "HEAD").path, 0o644) == 0)
-        path = root.path
+        let below = root.appending(path: "app")
+        try FileManager.default.createDirectory(at: below, withIntermediateDirectories: true)
+        path = below.path
+        self.root = root.path
     }
 
     /** Opens and closes the FIFO's write end until `done` holds, so every git
         blocked in `open` sees end of file and exits. A write-only open without
         a reader fails with ENXIO, which only means no git is waiting yet. */
     func release(until done: () -> Bool) {
-        let fifo = path + "/.git/HEAD"
+        let fifo = root + "/.git/HEAD"
         let deadline = Date().addingTimeInterval(20)
         while !done(), Date() < deadline {
             let fd = open(fifo, O_WRONLY | O_NONBLOCK)

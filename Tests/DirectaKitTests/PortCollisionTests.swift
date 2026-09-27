@@ -142,4 +142,53 @@ struct PortCollisionTests {
         ])
         #expect(pairs.isEmpty)
     }
+
+    /** A checkout root's common directory is read from files, and must be
+        exactly what git answers: the main checkout's `.git` for the main
+        checkout and for a linked worktree of it. A directory below a root
+        has no `.git` of its own, is left to git, and still lands on the same
+        answer. */
+    @Test func aCheckoutRootsCommonDirReadFromFilesMatchesGit() throws {
+        let base = try TemporaryTree.directory(named: "common-dir")
+        let main = base.appending(path: "main")
+        try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
+        func run(_ args: [String], cwd: URL) throws {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = args
+            process.currentDirectoryURL = cwd
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            try #require(
+                process.terminationStatus == 0,
+                "git \(args.joined(separator: " ")) exited \(process.terminationStatus)")
+        }
+        try run(["init", "-q"], cwd: main)
+        try run(["config", "user.email", "t@example.com"], cwd: main)
+        try run(["config", "user.name", "t"], cwd: main)
+        try Data("x".utf8).write(to: main.appending(path: "file.txt"))
+        try run(["add", "."], cwd: main)
+        try run(["commit", "-qm", "seed"], cwd: main)
+        let linked = base.appending(path: "linked")
+        try run(["worktree", "add", "-q", linked.path], cwd: main)
+        let below = linked.appending(path: "app")
+        try FileManager.default.createDirectory(at: below, withIntermediateDirectories: true)
+
+        let expected = canonicalProjectPath(main.appending(path: ".git").path)
+        #expect(CheckoutIdentity.commonDirFromFiles(main.path) == expected)
+        #expect(CheckoutIdentity.commonDirFromFiles(linked.path) == expected)
+        #expect(CheckoutIdentity.commonDirFromFiles(below.path) == nil)
+        for project in [main, linked, below] {
+            #expect(CheckoutIdentity.gitCommonDir(project: project.path) == expected, "\(project.path)")
+        }
+        /** git's own answer for each root, so the file read is held to git
+            rather than to this test's idea of it. */
+        for root in [main, linked] {
+            let answer = try #require(
+                CheckoutIdentity.git(project: root.path, args: ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+            #expect(canonicalProjectPath(answer) == expected, "\(root.path)")
+        }
+    }
 }

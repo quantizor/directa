@@ -1907,11 +1907,34 @@ public actor Router {
             if isListening { listening.insert(port) }
         }
         let holds = await managedHolds()
+        var commonDirs: [String: String?] = [:]
         var annotated: [ServerStatus] = []
         for status in statuses {
-            annotated.append(await annotateLatentPortConflict(status, holds: holds, listening: listening))
+            annotated.append(
+                await annotateLatentPortConflict(
+                    status, commonDirs: &commonDirs, holds: holds, listening: listening))
         }
         return annotated
+    }
+
+    /** `CheckoutIdentity.shareCommonDir` with each project's answer read
+        once per `memo`. A checkout root answers from files, but a project
+        below its checkout's root still runs git, and one status read can
+        annotate many servers against the same holder. Scoped to one request
+        on purpose: a checkout can become or stop being a worktree between
+        requests, and nothing signals that. */
+    private static func sharesCommonDir(_ a: String, _ b: String, memo: inout [String: String?]) async -> Bool {
+        guard let left = await commonDir(a, memo: &memo), let right = await commonDir(b, memo: &memo) else {
+            return false
+        }
+        return left == right
+    }
+
+    private static func commonDir(_ project: String, memo: inout [String: String?]) async -> String? {
+        if let known = memo[project] { return known }
+        let found = await CheckoutIdentity.gitCommonDir(project: project)
+        memo[project] = .some(found)
+        return found
     }
 
     /** The port a latent conflict is judged on: set only for a server that is
@@ -1924,14 +1947,14 @@ public actor Router {
     /** When a server is not up but its declared port is held, surface a latent
         conflict so session context warns before the agent runs ensure. */
     private func annotateLatentPortConflict(
-        _ status: ServerStatus, holds: ManagedHolds, listening: Set<Int>
+        _ status: ServerStatus, commonDirs: inout [String: String?], holds: ManagedHolds, listening: Set<Int>
     ) async -> ServerStatus {
         guard let port = Self.latentConflictPort(status) else { return status }
         var annotated = status
         if let holder = holds.holder(
             of: port, excluding: serverID(project: status.project, name: status.server))
         {
-            let sibling = await CheckoutIdentity.shareCommonDir(status.project, holder.project)
+            let sibling = await Self.sharesCommonDir(status.project, holder.project, memo: &commonDirs)
             annotated.portConflict = PortConflict(
                 declaredPort: port,
                 holder: "\(holder.server)@\(holder.project)",
