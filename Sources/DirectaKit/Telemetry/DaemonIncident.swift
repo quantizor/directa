@@ -438,10 +438,12 @@ public enum DaemonIncident {
 }
 
 /** Any JSON value, for picking one entry out of a report whose schema is
-    Apple's and unversioned. */
+    Apple's and unversioned. A number that fits `Int64` stays an integer,
+    since a `Double` rounds anything past 2^53. */
 public indirect enum JSONValue: Codable, Equatable, Sendable {
     case array([JSONValue])
     case bool(Bool)
+    case integer(Int64)
     case null
     case number(Double)
     case object([String: JSONValue])
@@ -453,6 +455,8 @@ public indirect enum JSONValue: Codable, Equatable, Sendable {
             self = .null
         } else if let value = try? container.decode(Bool.self) {
             self = .bool(value)
+        } else if let value = try? container.decode(Int64.self) {
+            self = .integer(value)
         } else if let value = try? container.decode(Double.self) {
             self = .number(value)
         } else if let value = try? container.decode(String.self) {
@@ -469,6 +473,7 @@ public indirect enum JSONValue: Codable, Equatable, Sendable {
         switch self {
         case .array(let value): try container.encode(value)
         case .bool(let value): try container.encode(value)
+        case .integer(let value): try container.encode(value)
         case .null: try container.encodeNil()
         case .number(let value): try container.encode(value)
         case .object(let value): try container.encode(value)

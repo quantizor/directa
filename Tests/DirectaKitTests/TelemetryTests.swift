@@ -712,6 +712,18 @@ private final class LockedArray: Sendable {
         #expect(!DaemonIncident.isRelevantReport(name: "ddirecta.txt", processName: "ddirecta"))
     }
 
+    /** Integers past 2^53 (a 64-bit id, a byte count) keep every digit;
+        fractions and exponents still read as numbers. */
+    @Test func jetsamReportExcerptKeepsLargeIntegersExact() {
+        let report = [
+            #"{"bug_type":"298"}"#,
+            #"{"processes":[{"name":"ddirecta","uuid":123456789012345678,"age":1.5,"big":1e300,"min":-9223372036854775808}]}"#,
+        ].joined(separator: "\n")
+        #expect(
+            DaemonIncident.reportExcerpt(text: report, name: "JetsamEvent-x.ips", processName: "ddirecta")
+                == #"{"age":1.5,"big":1e+300,"min":-9223372036854775808,"name":"ddirecta","uuid":123456789012345678}"#)
+    }
+
     @Test func pruneKeepsTheNewestIncidents() throws {
         let directory = try temporaryDirectory()
         for index in 0..<7 {
