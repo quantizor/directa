@@ -65,6 +65,25 @@ import Testing
             by the hex rule (it is still short of the 5-digit number rule). */
         #expect(LineNormalizer.normalize("port 30301") == "port <num>")
     }
+
+    /** A run of a-f letters alone is a word (decade, facade, defaced), not
+        an id: only a run mixing digits and letters is hex, so two
+        different sentences never share a repeat key. */
+    @Test func wordsSpelledOnlyWithHexLettersStayWords() {
+        #expect(
+            LineNormalizer.normalize("a decade ago the facade was defaced") == "a decade ago the facade was defaced")
+        #expect(LineNormalizer.normalize("id 1234abcd seen") == "id <hex> seen")
+        #expect(LineNormalizer.normalize("sha abcdef012345 ok") == "sha <hex> ok")
+    }
+
+    /** No digit and no dash leaves nothing any pass could match; a dash
+        with no digit still reaches the UUID pass (a UUID may be all
+        letters). */
+    @Test func linesWithoutDigitsOrDashesPassThrough() {
+        #expect(LineNormalizer.normalize("GET /health ok") == "GET /health ok")
+        #expect(
+            LineNormalizer.normalize("session aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee opened") == "session <uuid> opened")
+    }
 }
 
 @Suite struct MonitorStreamTests {
@@ -332,6 +351,13 @@ import Testing
         ]
         let events = stream.ingest(tick(5, records: records))
         #expect(events.map(\MonitorEvent.humanLine) == ["web err| TypeError: X"])
+    }
+
+    @Test func differentLinesWhoseWordsUseOnlyHexLettersBothShow() {
+        var stream = makeStream()
+        let events = stream.ingest(
+            tick(1, records: [record(0, .err, "the facade failed"), record(0.5, .err, "the decade failed")]))
+        #expect(events.map(\MonitorEvent.humanLine) == ["web err| the facade failed", "web err| the decade failed"])
     }
 
     @Test func recurrenceAfterTheWindowReprintsWithAnAgainAnnotation() {

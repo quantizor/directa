@@ -333,9 +333,10 @@ public enum MonitorSanitizer {
 /** Normalizes volatile detail out of a line before it becomes a repeat-
     suppression lookup key, so two lines that differ only in a request id or a
     timestamp are recognized as the same recurring line. Order matters: UUIDs
-    first (most specific), then timestamps, then hex runs (which require at
-    least one a-f letter so a plain digit run is left for the number pass,
-    the rule that keeps "200" and "500" distinct). */
+    first (most specific), then timestamps, then hex runs, which need both a
+    digit and an a-f letter: a plain digit run is left for the number pass
+    (the rule that keeps "200" and "500" distinct), and a word spelled only
+    with a-f letters ("decade", "facade") stays a word. */
 enum LineNormalizer {
     /** `Regex` is a value type with no shared mutable state; these are
         `nonisolated(unsafe)` purely to avoid recompiling the pattern on every
@@ -345,15 +346,26 @@ enum LineNormalizer {
     private nonisolated(unsafe) static let timestampPattern =
         /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z?/
     private nonisolated(unsafe) static let hexRunPattern =
-        /\b(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{6,}\b/
+        /\b(?=[0-9a-fA-F]*[a-fA-F])(?=[0-9a-fA-F]*[0-9])[0-9a-fA-F]{6,}\b/
     private nonisolated(unsafe) static let longNumberPattern = /\d{5,}/
 
+    /** Each pass runs only when the line holds a character its pattern
+        needs: a dash for UUIDs and timestamps, a digit for timestamps, hex
+        runs, and numbers. A UUID may be all letters, so a dash alone still
+        reaches that pass. */
     static func normalize(_ text: String) -> String {
+        let hasDigit = text.utf8.contains { $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }
+        let hasDash = text.utf8.contains(UInt8(ascii: "-"))
+        guard hasDigit || hasDash else { return text }
         var result = text
-        result.replace(uuidPattern, with: "<uuid>")
-        result.replace(timestampPattern, with: "<timestamp>")
-        result.replace(hexRunPattern, with: "<hex>")
-        result.replace(longNumberPattern, with: "<num>")
+        if hasDash {
+            result.replace(uuidPattern, with: "<uuid>")
+            if hasDigit { result.replace(timestampPattern, with: "<timestamp>") }
+        }
+        if hasDigit {
+            result.replace(hexRunPattern, with: "<hex>")
+            result.replace(longNumberPattern, with: "<num>")
+        }
         return result
     }
 }
