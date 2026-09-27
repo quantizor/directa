@@ -141,6 +141,44 @@ import Testing
                 atPath: env.paths.projectLogDir(project: canonicalProject).path))
     }
 
+    /** Any spelling of the recorded path that canonicalizes to it (a trailing
+        slash here) forgets the whole project: its running server is stopped
+        and its supervisor, lock, and log directory go with the row, not only
+        the registry entries that normalize the path themselves. */
+    @Test func forgetsEveryPieceOfAProjectGivenATrailingSlashSpelling() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let started = try await handle(
+            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+            ServerResult.self)
+        let pid = pid_t(try #require(started.server.pid))
+        defer { if kill(pid, 0) == 0 { kill(pid, SIGKILL) } }
+        _ = try await handle(
+            router, .lockAcquire,
+            LockParams(holderPid: Int(getpid()), project: env.project, resource: "db"), LockResult.self)
+
+        let canonicalProject = canonicalProjectPath(env.project)
+        try FileManager.default.removeItem(atPath: env.project)
+        let result = try await handle(
+            router, .projectForget, ProjectOnlyParams(project: canonicalProject + "/"),
+            ProjectForgetResult.self)
+
+        #expect(result.servers == ["web"])
+        #expect(kill(pid, 0) != 0, "the forgotten project's server \(pid) is still running")
+        #expect(await registry.project(canonicalProject) == nil)
+        let lock = try await handle(
+            router, .lockStatus, LockStatusParams(project: canonicalProject, resource: "db"),
+            LockStatusResult.self)
+        #expect(lock.holder == nil)
+        let events = try await handle(
+            router, .eventsQuery, EventsQueryParams(project: canonicalProject), EventsQueryResult.self)
+        #expect(events.events.filter { $0.kind == .stopped }.map(\.detail) == ["project path gone"])
+        #expect(
+            !FileManager.default.fileExists(atPath: env.paths.projectLogDir(project: canonicalProject).path))
+    }
+
     /** An ad hoc-only project (never trusted, no devservers.json at all) is
         forgotten the same way: trust is not a precondition for the teardown,
         only a thing it also drops when present. */

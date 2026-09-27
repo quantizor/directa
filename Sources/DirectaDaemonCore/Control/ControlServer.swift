@@ -194,15 +194,12 @@ public actor Router {
                 return try respond(id: head.id, result: WireEmpty())
             case .projectForget:
                 let request = try decoder.decode(WireRequest<ProjectOnlyParams>.self, from: line)
-                /** Unlike every other project-scoped arm, this one must not
-                    canonicalize the caller's path: a directory that no longer
-                    exists cannot be resolved through `canonicalProjectPath` to
-                    the same spelling recorded at registration (a
-                    `/private/var` ↔ `/var` symlink resolves only while the
-                    directory exists; see `forgetMissingProject`), so the
-                    caller is expected to pass exactly the `project` string a
-                    prior `server.status` returned. */
-                let project = request.params.project
+                /** Canonicalized like every other arm: the recorded key is
+                    already canonical and canonicalizes to itself after its
+                    directory is gone, so the `project` string a prior
+                    `server.status` returned, or any spelling that resolves to
+                    it, reaches every piece of the teardown. */
+                let project = canonicalProjectPath(request.params.project)
                 guard await registry.project(project) != nil else {
                     throw WireError(
                         code: .notFound,
@@ -952,9 +949,9 @@ public actor Router {
 
     /** Stop and forget one vanished checkout. Config is unreadable once the path
         is gone, so this walks supervisors + registry + state directly instead of
-        groupDown / mergedSpecs. `project` must be the registry key as stored
-        (already canonical at registration): re-canonicalizing a deleted path can
-        change `/private/var` ↔ `/var` spelling and miss every lookup. Returns the
+        groupDown / mergedSpecs. `project` must be the canonical registry key,
+        since the supervisor, state, and lock matches below compare raw
+        strings. Returns the
         sorted ad hoc and persisted-state server names it dropped, for a caller
         (`project.forget`) that reports what actually happened rather than
         assuming success. */
