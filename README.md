@@ -57,7 +57,7 @@ None are needed for everyday use. They point the CLI at a daemon other than the 
 - `DIRECTA_SOCKET`: the daemon socket to talk to.
 - `DIRECTA_DATA_DIR` and `DIRECTA_LOGS_DIR`: the CLI's own data and logs folders, matching the daemon's `--data-dir` and `--logs-dir`. Without `DIRECTA_SOCKET`, the socket is `daemon.sock` inside `DIRECTA_DATA_DIR`.
 
-With any of them set, the CLI never installs or starts the background daemon on its own. Details: [docs/cli-contract.md](./docs/cli-contract.md#environment).
+With any of them set, the CLI never installs or starts the background daemon on its own, and the commands that manage the background daemon (`directa daemon install`, `start`, `restart`, `uninstall`, and `directa uninstall`) refuse to run, so a test script can never remove or purge your real setup. `directa daemon stop` stops the daemon those variables point at. Details: [docs/cli-contract.md](./docs/cli-contract.md#environment).
 
 ## Building
 

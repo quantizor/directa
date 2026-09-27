@@ -18,7 +18,7 @@ Every `--timeout` and `--acquire-timeout` takes a number of seconds from 0 to 86
 
 - `DIRECTA_SOCKET`: the daemon socket every command talks to.
 - `DIRECTA_DATA_DIR` / `DIRECTA_LOGS_DIR`: the CLI's local data and logs directories, the counterparts of `ddirecta --data-dir` / `--logs-dir`. Without `DIRECTA_SOCKET`, the socket follows `DIRECTA_DATA_DIR` (`<data dir>/daemon.sock`), matching a daemon started with `--data-dir` alone. An empty value counts as unset. `daemon.info` reports the answering daemon's `dataDir` and `logsDir`, and `doctor` uses those over the local ones.
-- Any of the three set turns auto-bootstrap off: a command never installs or starts the background agent for a layout the agent does not use. `daemon install|start|stop|restart|uninstall` and `uninstall` manage that agent and always use the default locations.
+- Any of the three set turns auto-bootstrap off: a command never installs or starts the background agent for a layout the agent does not use. `daemon install|start|restart|uninstall` and `uninstall` (with or without `--purge` or `--agent-only`) manage that agent, which runs only the default locations, so with any of the three set they refuse `usage` (exit 2) before touching anything, naming the variables to unset, with hint `run: env -u DIRECTA_DATA_DIR -u DIRECTA_LOGS_DIR -u DIRECTA_SOCKET directa <command>`. `daemon stop` asks whichever daemon the resolved socket reaches to shut down, which is how a daemon started by hand with `--socket`/`--data-dir`/`--logs-dir` is stopped.
 
 ## ServerStatus (the core schema)
 

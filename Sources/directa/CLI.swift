@@ -2209,7 +2209,8 @@ struct Uninstall: AsyncParsableCommand {
     }
 
     func run() async throws {
-        let paths = DirectaPaths()
+        AgentLifecycle.requireDefaultLayout(command: "uninstall", json: global.json)
+        let paths = DirectaPaths.fromEnvironment()
         var actions: [String] = []
 
         /** Agent + launchd job (and any legacy home plist) first. Full uninstall
@@ -2245,16 +2246,68 @@ struct Uninstall: AsyncParsableCommand {
         }
 
         if purge && !agentOnly {
-            try? FileManager.default.removeItem(at: paths.dataDir)
-            try? FileManager.default.removeItem(at: paths.logsDir)
-            for url in DirectaPaths.userLibraryResidue() {
-                try? FileManager.default.removeItem(at: url)
+            if let refusal = Self.purgeData(
+                environment: ProcessInfo.processInfo.environment, paths: paths,
+                home: FileManager.default.homeDirectoryForCurrentUser)
+            {
+                CLIRunner.fail(refusal, json: global.json)
             }
             actions.append("removed data, logs, preferences, and caches")
         }
 
         let result = UninstallResult(actions: actions, agentOnly: agentOnly, purged: purge && !agentOnly)
         CLIRunner.emit(result, json: global.json) { r in r.actions.joined(separator: "\n") }
+    }
+
+    /** Deletes the default layout's data and logs folders (`paths`) and the
+        residue under `home`, or deletes nothing and answers the refusal when
+        `environment` overrides the layout. Checked here as well as at the top
+        of `run`, since this is the one step that cannot be undone. */
+    static func purgeData(environment: [String: String], paths: DirectaPaths, home: URL) -> WireError? {
+        if let refusal = AgentLifecycle.overrideRefusal(command: "uninstall", environment: environment) {
+            return refusal
+        }
+        for url in [paths.dataDir, paths.logsDir] + DirectaPaths.userLibraryResidue(home: home) {
+            try? FileManager.default.removeItem(at: url)
+        }
+        return nil
+    }
+}
+
+/** The commands that manage the background agent (`daemon
+    install|start|restart|uninstall` and `uninstall`). The agent runs only the
+    default data, logs, and socket locations, so under a layout override
+    (`DirectaPaths.hasEnvironmentOverride`) these refuse rather than act on
+    the real agent and its folders for a CLI pointed somewhere else. */
+enum AgentLifecycle {
+    static let overrideKeys = [
+        DirectaPaths.dataDirEnvironmentKey, DirectaPaths.logsDirEnvironmentKey, DirectaPaths.socketEnvironmentKey,
+    ]
+
+    static func overrideRefusal(command: String, environment: [String: String]) -> WireError? {
+        guard DirectaPaths.hasEnvironmentOverride(environment) else { return nil }
+        let set = overrideKeys.filter { environment[$0]?.isEmpty == false }
+        let listed =
+            set.count <= 2
+            ? set.joined(separator: " and ")
+            : set.dropLast().joined(separator: ", ") + ", and " + (set.last ?? "")
+        let named =
+            set.count == 1
+            ? "\(listed) points this CLI at another layout; unset it"
+            : "\(listed) point this CLI at another layout; unset them"
+        return WireError(
+            code: .usage,
+            hint: "run: env \(overrideKeys.map { "-u \($0)" }.joined(separator: " ")) directa \(command)",
+            message:
+                "\(command) manages the background agent, which runs only the default data, logs, and socket locations, but \(named) to manage the agent (a daemon started by hand with --socket, --data-dir, or --logs-dir stops with directa daemon stop)"
+        )
+    }
+
+    /** Ends the command with the refusal when the layout is overridden. */
+    static func requireDefaultLayout(command: String, json: Bool) {
+        if let refusal = overrideRefusal(command: command, environment: ProcessInfo.processInfo.environment) {
+            CLIRunner.fail(refusal, json: json)
+        }
     }
 }
 
@@ -2285,6 +2338,7 @@ struct DaemonInstall: AsyncParsableCommand {
     @OptionGroup var global: GlobalOptions
 
     func run() async throws {
+        AgentLifecycle.requireDefaultLayout(command: "daemon install", json: global.json)
         let binary = ddirecta.map { URL(fileURLWithPath: $0) }
             ?? LaunchdAdmin.resolveDaemonBinary(extraCandidates: [CLISelf.daemonSibling])
         guard let binary else {
@@ -2298,7 +2352,7 @@ struct DaemonInstall: AsyncParsableCommand {
         let restored: [(project: String, name: String)]
         do {
             restored = try await LaunchdAdmin.install(
-                daemonBinary: binary, paths: DirectaPaths(), forceLegacy: legacy)
+                daemonBinary: binary, paths: DirectaPaths.fromEnvironment(), forceLegacy: legacy)
         } catch let error as WireError {
             CLIRunner.fail(error, json: global.json)
         }
@@ -2329,7 +2383,8 @@ struct DaemonUninstall: AsyncParsableCommand {
 
     func run() async throws {
         CLIRunner.notice(CLINotice.daemonUninstallDeprecated)
-        await LaunchdAdmin.uninstall(paths: DirectaPaths(), purge: purge)
+        AgentLifecycle.requireDefaultLayout(command: "daemon uninstall", json: global.json)
+        await LaunchdAdmin.uninstall(paths: DirectaPaths.fromEnvironment(), purge: purge)
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
             purge ? "the daemon is uninstalled; data and logs removed" : "the daemon is uninstalled"
         }
@@ -2349,9 +2404,10 @@ struct DaemonStart: AsyncParsableCommand {
     @OptionGroup var global: GlobalOptions
 
     func run() async throws {
+        AgentLifecycle.requireDefaultLayout(command: "daemon start", json: global.json)
         do {
             try await LaunchdAdmin.startOrInstall(
-                paths: DirectaPaths(),
+                paths: DirectaPaths.fromEnvironment(),
                 extraDaemonCandidates: [CLISelf.daemonSibling],
                 forceLegacy: legacy)
         } catch let error as WireError {
@@ -2384,9 +2440,10 @@ struct DaemonRestart: AsyncParsableCommand {
     @OptionGroup var global: GlobalOptions
 
     func run() async throws {
+        AgentLifecycle.requireDefaultLayout(command: "daemon restart", json: global.json)
         let bounced: [(project: String, name: String)]
         do {
-            bounced = try await LaunchdAdmin.restart(paths: DirectaPaths())
+            bounced = try await LaunchdAdmin.restart(paths: DirectaPaths.fromEnvironment())
         } catch let error as WireError {
             CLIRunner.fail(error, json: global.json)
         }
