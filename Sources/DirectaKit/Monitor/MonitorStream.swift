@@ -448,6 +448,12 @@ public struct MonitorStream: Sendable {
             }
         }
 
+        /** The same for one entry, after a flush reported its count: a flush
+            is not a sighting, so the entry keeps its place. */
+        mutating func clearPendingSuppressed(for key: RepeatKey) {
+            storage[key]?.pendingSuppressed = 0
+        }
+
         subscript(key: RepeatKey) -> RepeatEntry? {
             get { storage[key] }
             set {
@@ -803,9 +809,7 @@ public struct MonitorStream: Sendable {
                     text: entry.lastDisplayText),
                 stream: key.stream)
             releaseFromSummary(entry.pendingSuppressed, key: key)
-            var updated = entry
-            updated.pendingSuppressed = 0
-            repeatLRU[key] = updated
+            repeatLRU.clearPendingSuppressed(for: key)
         }
         return events
     }

@@ -492,6 +492,26 @@ import Testing
         #expect(events.map(\MonitorEvent.humanLine) == ["web err| distinct 0"])
     }
 
+    /** Eviction follows when a line was last seen, never when its
+        `(repeated xN)` was flushed: a flush reports old sightings, so it
+        must not make the entry look recent. */
+    @Test func aFlushDoesNotRefreshAnEntrysPlaceInTheLRU() {
+        var stream = makeStream(budgets: MonitorBudgets(errorsPerArm: 10_000, errorsPerMinute: 10_000))
+        _ = stream.ingest(tick(0.01, records: [record(0, .err, "early")]))
+        _ = stream.ingest(tick(1, records: [record(1, .err, "early")]))
+        let rest = (0..<(MonitorLimits.lruCapacity - 1)).map {
+            record(2 + Double($0) * 0.001, LogStream.err, "distinct \($0)")
+        }
+        _ = stream.ingest(tick(3, records: rest))
+        #expect(stream.ingest(tick(20)).map(\MonitorEvent.humanLine) == ["web err| early (repeated x1)"])
+
+        /** One more distinct line evicts the entry seen longest ago:
+            "early", last seen at 1 s, before every "distinct" line. */
+        _ = stream.ingest(tick(30, records: [record(30, .err, "fresh")]))
+        let events = stream.ingest(tick(40, records: [record(40, .err, "early")]))
+        #expect(events.map(\MonitorEvent.humanLine) == ["web err| early"])
+    }
+
     @Test func summaryFiresOnTheThirtySecondCadenceWhileRepeatsAreCounted() {
         var stream = makeStream()
         _ = stream.ingest(tick(0, records: [record(0, .err, "boom")]))
