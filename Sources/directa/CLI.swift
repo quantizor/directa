@@ -165,6 +165,15 @@ enum CLIRunner {
         Foundation.exit(exitStatus(for: error.code))
     }
 
+    /** A negative count for `flag` is nonsense to send to the daemon: refused
+        here, before the request is built, through the same usage envelope
+        every other bad flag takes, rather than reaching the daemon and
+        coming back as a wire refusal. */
+    static func negativeCountError(_ value: Int?, flag: String, noun: String) -> WireError? {
+        guard let value, value < 0 else { return nil }
+        return WireError(code: .usage, message: "\(flag) takes 0 or more \(noun), got \(value)")
+    }
+
     /** The one mapping from an error code to the process exit status, for
         `fail` and for a command that reports its failure some other way
         (`monitor`'s ended line) but must still exit the same. */
@@ -673,7 +682,10 @@ struct Logs: AsyncParsableCommand {
     @Option(help: "Regex filter (Swift Regex dialect) applied to line text.")
     var grep: String?
 
-    @Option(help: "Only the first N lines of the window (oldest first); pairs with --since to read what came after a moment.")
+    @Option(
+        parsing: .unconditional,
+        help: "Only the first N lines of the window (oldest first); pairs with --since to read what came after a moment."
+    )
     var head: Int?
 
     @Argument(help: "Server name.")
@@ -688,15 +700,19 @@ struct Logs: AsyncParsableCommand {
     @Option(help: "Filter to one stream: out, err, sys, or mark.")
     var stream: [String] = []
 
-    @Option(help: "Only the last N lines (default: \(defaultTailLines), unless --since/--since-mark/--follow/--all is given).")
+    @Option(
+        parsing: .unconditional,
+        help: "Only the last N lines (default: \(defaultTailLines), unless --since/--since-mark/--follow/--all is given)."
+    )
     var tail: Int?
 
     /** `--all` asks for the whole history outright, which is meaningless
         alongside a bounded `--tail`: the two name incompatible amounts of
-        output. */
+        output. A negative `--tail` is refused here too, before it ever
+        reaches the wire. */
     static func usageError(all: Bool, tail: Int?) -> WireError? {
-        guard all, tail != nil else { return nil }
-        return WireError(code: .usage, message: "pass --tail or --all, not both")
+        if all, tail != nil { return WireError(code: .usage, message: "pass --tail or --all, not both") }
+        return CLIRunner.negativeCountError(tail, flag: "--tail", noun: "lines")
     }
 
     /** `--head` asks for a bounded slice from the start of the window, which
@@ -705,7 +721,7 @@ struct Logs: AsyncParsableCommand {
     static func usageError(all: Bool, follow: Bool, head: Int?, tail: Int?) -> WireError? {
         if let error = usageError(all: all, tail: tail) { return error }
         guard let head else { return nil }
-        if head < 0 { return WireError(code: .usage, message: "--head takes 0 or more lines, got \(head)") }
+        if let error = CLIRunner.negativeCountError(head, flag: "--head", noun: "lines") { return error }
         if tail != nil { return WireError(code: .usage, message: "pass --head or --tail, not both") }
         if all { return WireError(code: .usage, message: "pass --head or --all, not both") }
         if follow { return WireError(code: .usage, message: "pass --head or --follow, not both") }
@@ -914,10 +930,20 @@ struct Events: AsyncParsableCommand {
     @Option(help: "Only events after the mark with this id.")
     var sinceMark: String?
 
-    @Option(help: "Only the last N events.")
+    @Option(parsing: .unconditional, help: "Only the last N events.")
     var tail: Int?
 
+    /** A negative `--tail` names an impossible event count; refused here
+        rather than reaching the daemon, which refuses the same value as a
+        wire-level `EventsQueryParams.refusal()`. */
+    static func usageError(tail: Int?) -> WireError? {
+        CLIRunner.negativeCountError(tail, flag: "--tail", noun: "events")
+    }
+
     func run() async throws {
+        if let usage = Self.usageError(tail: tail) {
+            CLIRunner.fail(usage, json: global.json)
+        }
         var sinceDate: Date?
         if let since {
             sinceDate = Logs.parseSince(since)

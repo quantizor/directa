@@ -38,6 +38,14 @@ import Testing
         #expect(Logs.usageError(all: false, tail: 5) == nil)
     }
 
+    /** A negative `--tail` is refused client-side, before the request ever
+        reaches the daemon, the same way a negative `--head` already is. */
+    @Test func negativeTailIsAUsageError() throws {
+        let error = try #require(Logs.usageError(all: false, tail: -1))
+        #expect(error.code == .usage)
+        #expect(error.message == "--tail takes 0 or more lines, got -1")
+    }
+
     @Test func allAloneIsNotAUsageError() {
         #expect(Logs.usageError(all: true, tail: nil) == nil)
     }
@@ -91,6 +99,15 @@ import Testing
         #expect(logs.tail == 5)
     }
 
+    /** `--head`/`--tail` parse `.unconditional`, so a negative value reaches
+        `usageError` as an `Int` rather than being read as an unrecognized
+        flag and failing at the parser layer (exit 64, no `--json` envelope)
+        before the command's own usage screen ever runs. */
+    @Test func negativeHeadAndTailStillParseAsValues() throws {
+        #expect(try Logs.parse(["web", "--head", "-1"]).head == -1)
+        #expect(try Logs.parse(["web", "--tail", "-1"]).tail == -1)
+    }
+
     @Test func headParsesAndSuppressesTheImplicitTail() throws {
         let logs = try Logs.parse(["web", "--since", "2026-09-26T05:31:12.604Z", "--head", "200"])
         #expect(logs.head == 200)
@@ -111,6 +128,9 @@ import Testing
         #expect(
             Logs.usageError(all: false, follow: false, head: -1, tail: nil)?.message
                 == "--head takes 0 or more lines, got -1")
+        #expect(
+            Logs.usageError(all: false, follow: false, head: nil, tail: -1)?.message
+                == "--tail takes 0 or more lines, got -1")
         #expect(Logs.usageError(all: false, follow: false, head: 5, tail: nil) == nil)
         #expect(Logs.usageError(all: false, follow: true, head: nil, tail: 5) == nil)
         #expect(Logs.usageError(all: true, follow: false, head: nil, tail: 5)?.code == .usage)
