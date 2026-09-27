@@ -971,6 +971,16 @@ public struct EventsQueryParams: Codable, Equatable, Sendable {
         self.sinceMark = sinceMark
         self.tail = tail
     }
+
+    /** Why the daemon must refuse these parameters, or nil when they are
+        coherent. A negative tail is refused, as `LogsQueryParams` refuses
+        one, rather than trimmed. */
+    public func refusal() -> WireError? {
+        guard let tail, tail < 0 else { return nil }
+        return WireError(
+            code: .usage, hint: "send tail as 0 or more",
+            message: "tail is \(tail), but an event count cannot be negative")
+    }
 }
 
 public struct EventsQueryResult: Codable, Equatable, Sendable {

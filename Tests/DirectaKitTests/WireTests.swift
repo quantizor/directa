@@ -511,6 +511,17 @@ import Testing
             ).refusal() == nil)
     }
 
+    @Test func eventsQueryParamsRefuseANegativeTailOnly() {
+        #expect(
+            EventsQueryParams(project: "/p", tail: -1).refusal()
+                == WireError(
+                    code: .usage, hint: "send tail as 0 or more",
+                    message: "tail is -1, but an event count cannot be negative"))
+        #expect(EventsQueryParams(tail: Int.min).refusal()?.code == .usage)
+        #expect(EventsQueryParams(project: "/p", tail: 0).refusal() == nil)
+        #expect(EventsQueryParams(project: "/p").refusal() == nil)
+    }
+
     /** A pattern that does not compile, or that nests an unbounded repeat,
         is refused before any server is looked up; a safe one passes. */
     @Test func logsQueryParamsRefuseAnUnsafeGrep() throws {

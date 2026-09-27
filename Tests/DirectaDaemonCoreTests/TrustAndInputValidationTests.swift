@@ -103,6 +103,29 @@ import Testing
         }
     }
 
+    /** A negative events tail is refused `usage` at the wire, the way a logs
+        query's is, scoped or machine-wide, rather than reaching the store,
+        where trimming by a negative count traps and takes the daemon down. A
+        tail of zero is a real request for no events. */
+    @Test func eventsQueryRefusesANegativeTail() async throws {
+        let env = try makeEnv()
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths))
+        for project in [env.project, nil] {
+            let outcome = try await send(
+                router, .eventsQuery, EventsQueryParams(project: project, tail: -1), EventsQueryResult.self)
+            guard case .failure(let error) = outcome else {
+                Issue.record("events.query accepted tail -1 for project \(project ?? "(all)")")
+                continue
+            }
+            #expect(error.code == .usage)
+            #expect(error.hint == "send tail as 0 or more")
+        }
+        let zero = try await send(
+            router, .eventsQuery, EventsQueryParams(project: env.project, tail: 0), EventsQueryResult.self)
+        #expect((try? zero.get())?.events == [])
+    }
+
     /** The router hands every new field to the engine and every new answer
         back: the cursor, per-stream totals, and truncated text. */
     @Test func logsQueryPassesTheCursorTrimAndTruncationThrough() async throws {

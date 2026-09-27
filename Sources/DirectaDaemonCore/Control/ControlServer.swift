@@ -396,6 +396,7 @@ public actor Router {
                 return try respond(id: head.id, result: MarkResult(marks: marks))
             case .eventsQuery:
                 let request = try decoder.decode(WireRequest<EventsQueryParams>.self, from: line)
+                if let refusal = request.params.refusal() { throw refusal }
                 /** Empty/nil project means machine-wide; only a real project path
                     is canonicalized, matching how EventStore.query keys the feed. */
                 let project = request.params.project.map(canonicalProjectPath)
