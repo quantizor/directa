@@ -207,6 +207,23 @@ private func tempDir() throws -> URL {
         #expect(texts == ["first line", "new"])
     }
 
+    /** A stop issued from a task that is already cancelled (a supervisor
+        torn down mid-teardown) still drains what the child wrote on exit. */
+    @Test func stopFromACancelledTaskStillDrains() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data("last words\npartial".utf8).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(intervalMs: 20, store: store, stream: .out, url: spool)
+        let stopping = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            await tailer.stop()
+        }
+        await stopping.value
+        let texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
+        #expect(texts == ["last words", "partial"])
+    }
+
     @Test func stopFlushesAPartialLine() async throws {
         let dir = try tempDir()
         let spool = dir.appending(path: "out.spool")

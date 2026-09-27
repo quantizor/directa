@@ -193,17 +193,18 @@ actor SpoolTailer {
         guard task == nil else { return }
         task = Task { [intervalMs] in
             while !Task.isCancelled {
-                await self.drain()
+                await self.drain(yieldsToCancellation: true)
                 try? await Task.sleep(for: .milliseconds(intervalMs))
             }
         }
     }
 
-    /** Stops polling after a final drain so exit-time output is not lost. */
+    /** Stops polling after a final drain so exit-time output is not lost,
+        even when the caller's own task is already cancelled. */
     func stop() async {
         task?.cancel()
         task = nil
-        await drain()
+        await drain(yieldsToCancellation: false)
         await reportSkipped(skipReport.flush(now: .now))
         await flushPartial()
     }
@@ -216,12 +217,13 @@ actor SpoolTailer {
         offset advances by bytes actually read, so a child that appends
         after a size read cannot leave the cursor behind data already
         ingested (duplicate lines, doubled error tally). The polling task
-        checks cancellation between chunks so a `stop` call can run; `stop`
-        itself still drains, and the catch-up skip keeps that bounded. */
-    private func drain() async {
+        passes `yieldsToCancellation` so it stops between chunks once `stop`
+        cancels it; `stop` drains to the end, and the catch-up skip keeps
+        that bounded. */
+    private func drain(yieldsToCancellation: Bool) async {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return }
         defer { try? handle.close() }
-        while !Task.isCancelled {
+        while !(yieldsToCancellation && Task.isCancelled) {
             guard await skipToReadable(size: (try? handle.seekToEnd()) ?? 0),
                 (try? handle.seek(toOffset: offset)) != nil,
                 let data = try? handle.read(upToCount: readChunkBytes), !data.isEmpty
