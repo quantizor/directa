@@ -8,6 +8,7 @@ import os
     of every mark. Thread-safe; a write holds one unfair lock for the syscall. */
 public final class TelemetryLog: Sendable {
     public static let fileName = "telemetry.log"
+    public static let defaultKeepRotated = 4
 
     public let directory: URL
     /** Rotated files kept beside the current one, named `telemetry.log.1`
@@ -24,7 +25,7 @@ public final class TelemetryLog: Sendable {
 
     private let state = OSAllocatedUnfairLock(initialState: State())
 
-    public init(directory: URL, keepRotated: Int = 4, maxBytes: Int = 10 * 1024 * 1024) {
+    public init(directory: URL, keepRotated: Int = defaultKeepRotated, maxBytes: Int = 10 * 1024 * 1024) {
         self.directory = directory
         self.keepRotated = keepRotated
         self.maxBytes = maxBytes
@@ -32,8 +33,12 @@ public final class TelemetryLog: Sendable {
 
     public var currentURL: URL { directory.appending(path: Self.fileName) }
 
+    public static func rotatedURL(in directory: URL, index: Int) -> URL {
+        directory.appending(path: "\(fileName).\(index)")
+    }
+
     public func rotatedURL(_ index: Int) -> URL {
-        directory.appending(path: "\(Self.fileName).\(index)")
+        Self.rotatedURL(in: directory, index: index)
     }
 
     /** Writes that failed (disk full, a vanished directory). A telemetry
@@ -82,7 +87,10 @@ public final class TelemetryLog: Sendable {
         /** Resume the clamp from what a previous run left, or a clock that
             stepped back across a restart would write an earlier time after a
             later one in the same file. */
-        if let last = Self.tailLines(of: currentURL, count: 1).last.flatMap(Self.time(ofLine:)) {
+        let decoder = JSONCoding.decoder()
+        if let last = Self.tailLines(of: currentURL, count: 1).last
+            .flatMap({ LineHead(line: $0, decoder: decoder)?.time })
+        {
             state.lastTime = max(state.lastTime, last)
         }
     }
@@ -122,31 +130,28 @@ public final class TelemetryLog: Sendable {
         }
     }
 
-    private struct TimeOnly: Decodable {
-        let time: Date
-    }
+    /** The fields a reader of the previous run needs from any line. Each is
+        optional, so a line of any shape decodes; `event` stays a string so a
+        mark name this build does not know still yields the line's time. */
+    public struct LineHead: Decodable, Equatable, Sendable {
+        public var daemonPid: Int32?
+        public var event: String?
+        public var time: Date?
 
-    /** The `time` field of one telemetry line, nil when it has none. */
-    public static func time(ofLine line: String) -> Date? {
-        try? JSONCoding.decoder().decode(TimeOnly.self, from: Data(line.utf8)).time
-    }
-
-    private struct PidOnly: Decodable {
-        let daemonPid: Int32
-    }
-
-    public static func daemonPid(ofLine line: String) -> Int32? {
-        try? JSONCoding.decoder().decode(PidOnly.self, from: Data(line.utf8)).daemonPid
+        public init?(line: String, decoder: JSONDecoder) {
+            guard let head = try? decoder.decode(LineHead.self, from: Data(line.utf8)) else { return nil }
+            self = head
+        }
     }
 
     /** The newest `count` lines across the current file and its rotations,
         oldest first. Each file is read backward in chunks, so the cost tracks
         the lines asked for rather than the file sizes. */
-    public static func lastLines(in directory: URL, count: Int, keepRotated: Int = 4) -> [String] {
+    public static func lastLines(in directory: URL, count: Int, keepRotated: Int = defaultKeepRotated) -> [String] {
         var collected: [String] = []
         let files =
             [directory.appending(path: fileName)]
-            + (0..<max(0, keepRotated)).map { directory.appending(path: "\(fileName).\($0 + 1)") }
+            + (0..<max(0, keepRotated)).map { rotatedURL(in: directory, index: $0 + 1) }
         for url in files where collected.count < count {
             let lines = tailLines(of: url, count: count - collected.count)
             collected = lines + collected
@@ -154,25 +159,28 @@ public final class TelemetryLog: Sendable {
         return collected
     }
 
-    /** The last `count` complete, non-empty lines of one file, oldest first. A
-        torn final line (a write the kill interrupted) is kept: it is the last
-        thing the process said. */
+    /** The last `count` non-empty lines of one file, oldest first. A final
+        line with no newline (a write the kill interrupted) is kept: it is the
+        last thing the process said. */
     public static func tailLines(of url: URL, count: Int, chunkBytes: Int = 64 * 1024) -> [String] {
         guard count > 0, let handle = try? FileHandle(forReadingFrom: url) else { return [] }
         defer { try? handle.close() }
         guard let end = try? handle.seekToEnd(), end > 0 else { return [] }
         var offset = end
-        var buffer = Data()
+        /** Newest first; joined once at the end so each byte is copied once. */
+        var chunks: [Data] = []
+        var newlines = 0
         while offset > 0 {
             let step = min(UInt64(chunkBytes), offset)
             offset -= step
             guard (try? handle.seek(toOffset: offset)) != nil,
                 let chunk = try? handle.read(upToCount: Int(step))
             else { break }
-            buffer = chunk + buffer
-            let newlines = buffer.reduce(0) { $0 + ($1 == 0x0A ? 1 : 0) }
+            chunks.append(chunk)
+            newlines += chunk.reduce(0) { $0 + ($1 == 0x0A ? 1 : 0) }
             if newlines > count { break }
         }
+        let buffer = chunks.reversed().reduce(into: Data()) { $0.append($1) }
         var lines = buffer.split(separator: 0x0A, omittingEmptySubsequences: true)
             .map { String(decoding: $0, as: UTF8.self) }
         if offset > 0, !lines.isEmpty {

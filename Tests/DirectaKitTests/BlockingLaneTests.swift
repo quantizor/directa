@@ -11,7 +11,7 @@ import os
         job held on a gate, one more never starts, and all of them finish in
         full once the gate opens. */
     @Test func aLaneRunsAtMostWidthJobsAtOnce() async {
-        let lane = BlockingLane(label: "dev.quantizor.directa.test.lane", width: 2)
+        let lane = BlockingLane(name: "test-width", width: 2)
         let entered = DispatchSemaphore(value: 0)
         let gate = DispatchSemaphore(value: 0)
         let jobs = 6
@@ -55,7 +55,7 @@ import os
             }
         }
         let lane = BlockingLane(
-            label: "dev.quantizor.directa.test.pressure", width: 1, activity: activity, slowWaitSeconds: 0.15)
+            name: "pressure", width: 1, activity: activity, slowWaitSeconds: 0.15)
         #expect(lane.pressure() == LanePressure(name: "pressure", oldestQueuedSeconds: 0, queued: 0, running: 0, width: 1))
         let entered = DispatchSemaphore(value: 0)
         let gate = DispatchSemaphore(value: 0)

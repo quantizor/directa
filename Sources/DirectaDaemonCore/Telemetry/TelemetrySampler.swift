@@ -45,11 +45,7 @@ public final class TelemetrySampler: Sendable {
 
     public init(configuration: Configuration) {
         self.configuration = configuration
-        let identity = ProcessTree.identity(of: getpid())
-        self.processStart =
-            identity.map {
-                Date(timeIntervalSince1970: Double($0.startSeconds) + Double($0.startMicroseconds) / 1e6)
-            } ?? Date()
+        self.processStart = ProcessTree.identity(of: getpid())?.wallClockStart ?? Date()
     }
 
     public func start() {
@@ -119,7 +115,7 @@ public final class TelemetrySampler: Sendable {
     private func sampleOnce(sampler: ProcessSampler, loop: inout LoopState) -> Double {
         let began = ContinuousClock.now
         let limit = configuration.threadLimit()
-        var threads = sampler.threads(limit: limit, withDetail: false)
+        let threads = sampler.threads(limit: limit)
         let lanes = configuration.lanes.map { $0.pressure(now: began) }
         /** A queued lane job is not yet in the activity registry (its
             blocking call has not begun), so a backlog is its own trigger. */
@@ -130,39 +126,34 @@ public final class TelemetrySampler: Sendable {
         let decision = TelemetryCadence.decide(
             TelemetryCadence.Input(
                 previousAboveThreshold: loop.previousAboveThreshold,
-                secondsSinceTrigger: lastTrigger.map { DaemonActivity.seconds($0.duration(to: began)) },
-                secondsSinceThresholdSnapshot: loop.lastThresholdAt.map {
-                    DaemonActivity.seconds($0.duration(to: began))
-                },
+                secondsSinceTrigger: lastTrigger.map { $0.duration(to: began).roundedSeconds },
+                secondsSinceThresholdSnapshot: loop.lastThresholdAt.map { $0.duration(to: began).roundedSeconds },
                 threadCount: threads?.sample.total, threadLimit: limit,
                 triggerInFlight: trigger.inFlight || laneBacklog),
             policy: configuration.policy)
         if decision.threadsTrigger { loop.lastSampledTriggerAt = began }
         if decision.reason == .threshold {
             loop.lastThresholdAt = began
-            threads = sampler.threads(limit: limit, withDetail: true) ?? threads
         }
         let activity = configuration.activity.snapshot(now: began)
+        let exitWatches = configuration.exitWatches()
+        let fileDescriptors = sampler.fileDescriptors()
+        let memory = sampler.memory()
+        let system = sampler.system()
+        let cost = began.duration(to: .now)
+        let now = Date()
         let snapshot = TelemetrySnapshot(
-            activity: activity, daemonPid: loop.pid, exitWatches: configuration.exitWatches(),
-            fileDescriptors: sampler.fileDescriptors(), lanes: lanes, memory: sampler.memory(),
-            reason: decision.reason,
-            sampleMicroseconds: Self.microseconds(began.duration(to: .now)),
-            system: sampler.system(),
-            threadDetail: decision.reason == .threshold ? threads?.detail : nil,
-            threads: threads?.sample, time: Date(),
-            uptimeSeconds: (Date().timeIntervalSince(processStart) * 1000).rounded() / 1000)
+            activity: activity, daemonPid: loop.pid, exitWatches: exitWatches, fileDescriptors: fileDescriptors,
+            lanes: lanes, memory: memory, reason: decision.reason, sampleMicroseconds: cost.wholeMicroseconds,
+            system: system, threadDetail: decision.reason == .threshold ? threads?.detail : nil,
+            threads: threads?.sample, time: now,
+            uptimeSeconds: Duration.seconds(now.timeIntervalSince(processStart)).roundedSeconds)
         configuration.log.append(snapshot)
         if decision.reason == .threshold, let total = threads?.sample.total {
             recordThreshold(total: total, limit: limit, activity: activity, pid: loop.pid)
         }
         loop.previousAboveThreshold = decision.aboveThreshold
         return decision.nextSampleSeconds
-    }
-
-    static func microseconds(_ duration: Duration) -> Int {
-        let (seconds, attoseconds) = duration.components
-        return Int(seconds) * 1_000_000 + Int(attoseconds / 1_000_000_000_000)
     }
 
     /** The one persisted OSLog line per threshold crossing (error level is

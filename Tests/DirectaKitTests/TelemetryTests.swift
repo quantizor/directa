@@ -123,15 +123,21 @@ private func encoded<T: Encodable>(_ value: T) throws -> String {
     String(decoding: try NDJSON.encodeLine(value), as: UTF8.self)
 }
 
+/** Every line decoded as `T`; a line that does not decode throws. */
+private func decoded<T: Decodable>(_ lines: [String], as type: T.Type) throws -> [T] {
+    let decoder = JSONCoding.decoder()
+    return try lines.map { try decoder.decode(T.self, from: Data($0.utf8)) }
+}
+
 @Suite struct TelemetryRecordTests {
     @Test func snapshotEncodesEveryFieldSortedOnOneLine() throws {
         let snapshot = TelemetrySnapshot(
             activity: ActivitySnapshot(
                 connectedClients: 2,
                 longestRunning: [InFlightEntry(kind: .stop, label: "/p::web: requested by restart", seconds: 12.5)],
-                operations: ["stop": ActivityGroup(count: 1, oldestLabel: "/p::web: requested by restart", oldestSeconds: 12.5)],
-                requests: ["server.restart": ActivityGroup(count: 1, oldestLabel: "", oldestSeconds: 12.6)],
-                serverPhases: ["stopping": 1]),
+                operations: [.stop: ActivityGroup(count: 1, oldestLabel: "/p::web: requested by restart", oldestSeconds: 12.5)],
+                requests: ["server.restart": ActivityGroup(count: 1, oldestLabel: nil, oldestSeconds: 12.6)],
+                serverPhases: [.stopping: 1]),
             daemonPid: 4242, exitWatches: 3, fileDescriptors: 41,
             lanes: [
                 LanePressure(name: "repository", oldestQueuedSeconds: 4.25, queued: 3, running: 2, width: 2),
@@ -146,13 +152,13 @@ private func encoded<T: Encodable>(_ value: T) throws -> String {
                 ThreadDetail(cpuPercent: 0.5, name: "(unnamed)", state: .waiting, systemSeconds: 0.25, userSeconds: 1)
             ],
             threads: ThreadSample(
-                byName: ["(unnamed)": 20, "com.apple.root.default-qos.cooperative": 4], byState: ["waiting": 24],
+                byName: ["(unnamed)": 20, "com.apple.root.default-qos.cooperative": 4], byState: [.waiting: 24],
                 limit: 32, total: 24,
                 workqueue: WorkqueueSample(blocked: 18, limitsExceeded: ["constrained"], running: 2, total: 20)),
             time: try date("2026-09-26T10:00:00.123Z"), uptimeSeconds: 99.5)
         #expect(
             try encoded(snapshot)
-                == #"{"activity":{"connectedClients":2,"longestRunning":[{"kind":"stop","label":"/p::web: requested by restart","seconds":12.5}],"operations":{"stop":{"count":1,"oldestLabel":"/p::web: requested by restart","oldestSeconds":12.5}},"requests":{"server.restart":{"count":1,"oldestLabel":"","oldestSeconds":12.6}},"serverPhases":{"stopping":1}},"daemonPid":4242,"entry":"snapshot","exitWatches":3,"fileDescriptors":41,"lanes":[{"name":"repository","oldestQueuedSeconds":4.25,"queued":3,"running":2,"width":2},{"name":"system","oldestQueuedSeconds":0,"queued":0,"running":1,"width":4}],"memory":{"compressed":1,"compressedLifetime":2,"compressedPeak":3,"footprint":4,"footprintLifetimePeak":5,"internal":6,"internalPeak":7,"resident":8},"reason":"threshold","sampleMicroseconds":180,"system":{"loadAverage":[1.5,2,3.25],"memoryPressure":"normal"},"threadDetail":[{"cpuPercent":0.5,"name":"(unnamed)","state":"waiting","systemSeconds":0.25,"userSeconds":1}],"threads":{"byName":{"(unnamed)":20,"com.apple.root.default-qos.cooperative":4},"byState":{"waiting":24},"limit":32,"total":24,"workqueue":{"blocked":18,"limitsExceeded":["constrained"],"running":2,"total":20}},"time":"2026-09-26T10:00:00.123Z","uptimeSeconds":99.5}"#
+                == #"{"activity":{"connectedClients":2,"longestRunning":[{"kind":"stop","label":"/p::web: requested by restart","seconds":12.5}],"operations":{"stop":{"count":1,"oldestLabel":"/p::web: requested by restart","oldestSeconds":12.5}},"requests":{"server.restart":{"count":1,"oldestSeconds":12.6}},"serverPhases":{"stopping":1}},"daemonPid":4242,"entry":"snapshot","exitWatches":3,"fileDescriptors":41,"lanes":[{"name":"repository","oldestQueuedSeconds":4.25,"queued":3,"running":2,"width":2},{"name":"system","oldestQueuedSeconds":0,"queued":0,"running":1,"width":4}],"memory":{"compressed":1,"compressedLifetime":2,"compressedPeak":3,"footprint":4,"footprintLifetimePeak":5,"internal":6,"internalPeak":7,"resident":8},"reason":"threshold","sampleMicroseconds":180,"system":{"loadAverage":[1.5,2,3.25],"memoryPressure":"normal"},"threadDetail":[{"cpuPercent":0.5,"name":"(unnamed)","state":"waiting","systemSeconds":0.25,"userSeconds":1}],"threads":{"byName":{"(unnamed)":20,"com.apple.root.default-qos.cooperative":4},"byState":{"waiting":24},"limit":32,"total":24,"workqueue":{"blocked":18,"limitsExceeded":["constrained"],"running":2,"total":20}},"time":"2026-09-26T10:00:00.123Z","uptimeSeconds":99.5}"#
                 + "\n")
     }
 
@@ -162,10 +168,13 @@ private func encoded<T: Encodable>(_ value: T) throws -> String {
                 connectedClients: 0, longestRunning: [], operations: [:], requests: [:], serverPhases: [:]),
             daemonPid: 1, exitWatches: 0, fileDescriptors: nil, lanes: [], memory: nil, reason: .interval,
             sampleMicroseconds: 1, system: SystemSample(loadAverage: [], memoryPressure: "unreadable"),
-            threadDetail: nil, threads: nil, time: try date("2026-09-26T10:00:00.000Z"), uptimeSeconds: 0)
+            threadDetail: [
+                ThreadDetail(cpuPercent: nil, name: "(unnamed)", state: .unknown, systemSeconds: nil, userSeconds: nil)
+            ],
+            threads: nil, time: try date("2026-09-26T10:00:00.000Z"), uptimeSeconds: 0)
         #expect(
             try encoded(snapshot)
-                == #"{"activity":{"connectedClients":0,"longestRunning":[],"operations":{},"requests":{},"serverPhases":{}},"daemonPid":1,"entry":"snapshot","exitWatches":0,"lanes":[],"reason":"interval","sampleMicroseconds":1,"system":{"loadAverage":[],"memoryPressure":"unreadable"},"time":"2026-09-26T10:00:00.000Z","uptimeSeconds":0}"#
+                == #"{"activity":{"connectedClients":0,"longestRunning":[],"operations":{},"requests":{},"serverPhases":{}},"daemonPid":1,"entry":"snapshot","exitWatches":0,"lanes":[],"reason":"interval","sampleMicroseconds":1,"system":{"loadAverage":[],"memoryPressure":"unreadable"},"threadDetail":[{"name":"(unnamed)","state":"unknown"}],"time":"2026-09-26T10:00:00.000Z","uptimeSeconds":0}"#
                 + "\n")
     }
 
@@ -216,19 +225,19 @@ private func encoded<T: Encodable>(_ value: T) throws -> String {
         activity.clientConnected()
         activity.clientConnected()
         activity.clientDisconnected()
-        activity.recordPhase("running", key: "a")
-        activity.recordPhase("running", key: "b")
+        activity.recordPhase(.running, key: "a")
+        activity.recordPhase(.running, key: "b")
         activity.recordPhase("stopping", key: "c")
         activity.forgetPhase(key: "b")
         let snapshot = activity.snapshot(now: base.advanced(by: .seconds(5)))
         #expect(snapshot.connectedClients == 1)
-        #expect(snapshot.serverPhases == ["running": 1, "stopping": 1])
-        #expect(Set(snapshot.operations.keys) == ["stop", "git"])
-        #expect(snapshot.operations["stop"]?.count == 1)
-        #expect(snapshot.operations["stop"]?.oldestLabel == "/p::web: requested by stop")
+        #expect(snapshot.serverPhases == [.running: 1, .stopping: 1])
+        #expect(Set(snapshot.operations.keys) == [.stop, .git])
+        #expect(snapshot.operations[.stop]?.count == 1)
+        #expect(snapshot.operations[.stop]?.oldestLabel == "/p::web: requested by stop")
         let requestGroup = try #require(snapshot.requests["server.stop"])
         #expect(requestGroup.count == 2)
-        #expect(requestGroup.oldestLabel == "")
+        #expect(requestGroup.oldestLabel == nil)
         #expect(requestGroup.oldestSeconds > 4.9 && requestGroup.oldestSeconds <= 5)
         #expect(snapshot.longestRunning.map(\.kind) == [.stop, .git, .request, .request])
         for token in [stop, git, request, second] {
@@ -249,8 +258,8 @@ private func encoded<T: Encodable>(_ value: T) throws -> String {
         let snapshot = activity.snapshot()
         #expect(snapshot.longestRunning.count == DaemonActivity.longestRunningCap)
         #expect(snapshot.longestRunning.first?.label == "lsof 0")
-        #expect(snapshot.operations["lsof"]?.count == DaemonActivity.longestRunningCap + 4)
-        #expect(snapshot.operations["subprocess"]?.oldestLabel.count == DaemonActivity.labelCap + 3)
+        #expect(snapshot.operations[.lsof]?.count == DaemonActivity.longestRunningCap + 4)
+        #expect(snapshot.operations[.subprocess]?.oldestLabel?.count == DaemonActivity.labelCap + 3)
         for token in tokens + [long] {
             activity.end(token)
         }
@@ -271,6 +280,23 @@ private func encoded<T: Encodable>(_ value: T) throws -> String {
         let state = activity.triggerState()
         #expect(state.inFlight == false)
         #expect(try #require(state.lastAt) >= began)
+    }
+
+    /** The boot incident's `launchctl print` is a trigger kind, but it reads
+        the daemon itself, so inside `selfDirected` it neither counts as in
+        flight nor starts the burst tail; the same kind outside still does. */
+    @Test func selfDirectedWorkNeverTriggersTheBurst() throws {
+        let activity = DaemonActivity()
+        let token = DaemonActivity.selfDirected { activity.begin(.launchctl, label: "launchctl print") }
+        #expect(token.triggersBurst == false)
+        #expect(activity.triggerState().inFlight == false)
+        activity.end(token)
+        #expect(activity.triggerState().lastAt == nil)
+        let outside = activity.begin(.launchctl, label: "launchctl bootout")
+        #expect(outside.triggersBurst == true)
+        #expect(activity.triggerState().inFlight == true)
+        activity.end(outside)
+        #expect(activity.triggerState().lastAt != nil)
     }
 
     @Test func observerHearsBeginAndEndOutsideTheLock() {
@@ -424,14 +450,10 @@ private final class LockedArray: Sendable {
             #expect(size <= 1000)
         }
         #expect(log.failedWrites == 0)
-        let lines = TelemetryLog.lastLines(in: directory, count: 1000, keepRotated: 2)
-        #expect(lines.last?.contains("\"label\":\"line 199\"") == true)
-        let indices = lines.compactMap { line -> Int? in
-            guard let range = line.range(of: "\"label\":\"line ") else { return nil }
-            return Int(line[range.upperBound...].prefix { $0.isNumber })
-        }
-        #expect(indices == Array((200 - indices.count)..<200))
-        #expect(indices.count < 200)
+        let marks = try decoded(TelemetryLog.lastLines(in: directory, count: 1000, keepRotated: 2), as: TelemetryMark.self)
+        #expect(marks == ((200 - marks.count)..<200).map { mark($0, at: start.addingTimeInterval(Double($0))) })
+        #expect(marks.count < 200)
+        #expect(marks.last?.label == "line 199")
     }
 
     @Test func timesAreClampedMonotonicAcrossAReopen() throws {
@@ -445,7 +467,10 @@ private final class LockedArray: Sendable {
         let second = TelemetryLog(directory: directory)
         second.append(mark(2, at: earlier))
         second.close()
-        let times = TelemetryLog.lastLines(in: directory, count: 10).compactMap(TelemetryLog.time(ofLine:))
+        let decoder = JSONCoding.decoder()
+        let times = TelemetryLog.lastLines(in: directory, count: 10).map {
+            TelemetryLog.LineHead(line: $0, decoder: decoder)?.time
+        }
         #expect(times == [later, later, later])
     }
 
@@ -519,9 +544,9 @@ private final class LockedArray: Sendable {
         }
         #expect(rotated.count >= 2)
         let previous = DaemonIncident.readPrevious(telemetryDirectory: directory)
-        #expect(previous.lines.count == DaemonIncident.previousLineCount)
-        #expect(previous.lines.first?.contains("\"label\":\"n220\"") == true)
-        #expect(previous.lines.last?.contains("\"label\":\"n399\"") == true)
+        #expect(
+            try decoded(previous.lines, as: TelemetryMark.self).map(\.label)
+                == (220..<400).map { "n\($0)" })
         #expect(previous.pid == 555)
         #expect(previous.lastLineAt == start.addingTimeInterval(399))
         #expect(previous.exitedCleanly == false)
@@ -556,7 +581,7 @@ private final class LockedArray: Sendable {
         let boot = try date("2026-09-26T10:05:00.000Z")
         let data = try DaemonIncident.headerAndLines(
             bootTime: boot, daemonPid: 20,
-            launchd: LaunchdExitRecord.parse(printedKilled), launchdNote: nil,
+            launchd: .found(LaunchdExitRecord.parse(printedKilled)),
             previous: DaemonIncident.Previous(
                 exitedCleanly: false, lastLineAt: try date("2026-09-26T10:04:20.500Z"),
                 lines: [#"{"a":1}"#, #"{"b":2}"#], pid: 19))
@@ -569,6 +594,44 @@ private final class LockedArray: Sendable {
         #expect(Array(lines[1...]) == [#"{"a":1}"#, #"{"b":2}"#])
         #expect(
             DaemonIncident.fileName(bootTime: boot, pid: 20) == "2026-09-26T10-05-00.000Z-pid20.ndjson")
+        #expect(try decoded([lines[0]], as: IncidentHeader.self).first?.launchd == .found(LaunchdExitRecord.parse(printedKilled)))
+    }
+
+    @Test func aHeaderWithNoLaunchdRecordCarriesOnlyTheNote() throws {
+        let header = IncidentHeader(
+            daemonPid: 20, gapSeconds: nil, launchd: .unavailable(note: "not running as the launchd agent"),
+            previousExitedCleanly: false, previousLastLineAt: nil, previousLineCount: 0, previousPid: nil,
+            time: try date("2026-09-26T10:05:00.000Z"))
+        let line = try encoded(header)
+        #expect(
+            line
+                == #"{"daemonPid":20,"entry":"incident","launchdNote":"not running as the launchd agent","previousExitedCleanly":false,"previousLineCount":0,"time":"2026-09-26T10:05:00.000Z"}"#
+                + "\n")
+        #expect(try decoded([line], as: IncidentHeader.self) == [header])
+    }
+
+    @Test func lineHeadReadsAnyLineShape() throws {
+        let decoder = JSONCoding.decoder()
+        let head = try #require(
+            TelemetryLog.LineHead(
+                line: #"{"daemonPid":3,"entry":"mark","event":"a-mark-from-a-newer-build","time":"2026-09-26T10:00:00.000Z"}"#,
+                decoder: decoder))
+        #expect(head.daemonPid == 3)
+        #expect(head.event == "a-mark-from-a-newer-build")
+        #expect(head.time == (try date("2026-09-26T10:00:00.000Z")))
+        let bare = try #require(TelemetryLog.LineHead(line: #"{"entry":"snapshot"}"#, decoder: decoder))
+        #expect(bare.daemonPid == nil && bare.event == nil && bare.time == nil)
+        #expect(TelemetryLog.LineHead(line: #"{"daemonPid":3,"time":"#, decoder: decoder) == nil)
+    }
+
+    @Test func logShowTimeIsLocalWallTimeWithItsOffset() throws {
+        let instant = try date("2026-09-26T10:05:07.900Z")
+        let text = DaemonIncident.logShowTime(instant)
+        #expect(text.wholeMatch(of: /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4}/) != nil)
+        let reader = DateFormatter()
+        reader.locale = Locale(identifier: "en_US_POSIX")
+        reader.dateFormat = "yyyy-MM-dd HH:mm:ssZ"
+        #expect(reader.date(from: text) == (try date("2026-09-26T10:05:07.000Z")))
     }
 
     @Test func searchWindowIsBoundedOnBothSides() throws {
@@ -606,6 +669,7 @@ private final class LockedArray: Sendable {
             #"{"eventMessage":"memorystatus: killing largest compressed process ddirecta [94572] 176853 MB","processImagePath":"\/kernel","subsystem":"","timestamp":"2026-09-02 16:05:01.123456-0400"}"#,
             #"{"eventMessage":"exited due to SIGKILL | sent by kernel","processImagePath":"\/sbin\/launchd","subsystem":"com.apple.xpc.launchd","timestamp":"2026-09-02 16:05:01.200000-0400"}"#,
             #"{"processImagePath":"\/sbin\/launchd"}"#,
+            #"{"eventMessage":"no readable time","processImagePath":"\/kernel","timestamp":"yesterday"}"#,
         ].joined(separator: "\n")
         let parsed = DaemonIncident.parseLogShow(output)
         #expect(
@@ -616,7 +680,11 @@ private final class LockedArray: Sendable {
                 IncidentSystemLog(
                     message: "exited due to SIGKILL | sent by kernel", process: "launchd",
                     subsystem: "com.apple.xpc.launchd", time: try date("2026-09-02T20:05:01.200Z")),
+                IncidentSystemLog(message: "no readable time", process: "kernel", subsystem: nil, time: nil),
             ])
+        #expect(
+            try encoded(parsed[2])
+                == #"{"entry":"system-log","message":"no readable time","process":"kernel"}"# + "\n")
         let flood = (0..<(DaemonIncident.systemLogLineCap + 5)).map { _ in
             #"{"eventMessage":"x","processImagePath":"\/kernel","timestamp":"2026-09-02 16:05:01.000000-0400"}"#
         }.joined(separator: "\n")

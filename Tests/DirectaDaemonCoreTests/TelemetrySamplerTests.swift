@@ -10,20 +10,24 @@ private func temporaryDirectory() throws -> URL {
     try TemporaryTree.directory(named: "sampler")
 }
 
-private struct SnapshotRead: Decodable {
-    let entry: String
-    let fileDescriptors: Int?
-    let lanes: [LanePressure]
-    let memory: MemorySample?
-    let reason: String
-    let threads: ThreadSample?
+private struct EntryOnly: Decodable {
+    let entry: TelemetryEntryKind
 }
 
-private func snapshots(in directory: URL) -> [SnapshotRead] {
+/** Every line whose `entry` is `entry`, decoded as `T`. A line that is not
+    JSON (one still being written) is skipped; a line of that entry that does
+    not decode as `T` throws. */
+private func decoded<T: Decodable>(_ lines: [String], entry: TelemetryEntryKind, as type: T.Type) throws -> [T] {
     let decoder = JSONCoding.decoder()
-    return TelemetryLog.lastLines(in: directory, count: 10_000).compactMap {
-        try? decoder.decode(SnapshotRead.self, from: Data($0.utf8))
-    }.filter { $0.entry == "snapshot" }
+    return try lines.compactMap { line in
+        let data = Data(line.utf8)
+        guard (try? decoder.decode(EntryOnly.self, from: data))?.entry == entry else { return nil }
+        return try decoder.decode(T.self, from: data)
+    }
+}
+
+private func snapshots(in directory: URL) throws -> [TelemetrySnapshot] {
+    try decoded(TelemetryLog.lastLines(in: directory, count: 10_000), entry: .snapshot, as: TelemetrySnapshot.self)
 }
 
 /** A synchronous wait on purpose: holding the calling pool thread is the
@@ -42,7 +46,7 @@ private let fastPolicy = TelemetryCadence.Policy(
     @Test func samplesRealKernelNumbersAndLanePressure() throws {
         let directory = try temporaryDirectory()
         let log = TelemetryLog(directory: directory)
-        let lane = BlockingLane(label: "dev.quantizor.directa.test.held", width: 1, activity: DaemonActivity())
+        let lane = BlockingLane(name: "held", width: 1, activity: DaemonActivity())
         let gate = DispatchSemaphore(value: 0)
         let entered = DispatchSemaphore(value: 0)
         let done = DispatchGroup()
@@ -68,14 +72,14 @@ private let fastPolicy = TelemetryCadence.Policy(
                 threadLimit: { nil }))
         sampler.start()
         let deadline = Date().addingTimeInterval(5)
-        while snapshots(in: directory).count < 2, Date() < deadline {
+        while try snapshots(in: directory).count < 2, Date() < deadline {
             usleep(10_000)
         }
         sampler.stop()
         for _ in 0..<3 { gate.signal() }
         #expect(done.wait(timeout: .now() + 5) == .success)
         #expect(lane.pressure() == LanePressure(name: "held", oldestQueuedSeconds: 0, queued: 0, running: 0, width: 1))
-        let first = try #require(snapshots(in: directory).first)
+        let first = try #require(try snapshots(in: directory).first)
         let pressure = try #require(first.lanes.first)
         #expect(first.lanes.count == 1)
         #expect(pressure.name == "held")
@@ -86,7 +90,7 @@ private let fastPolicy = TelemetryCadence.Policy(
         /** Never `interval`: a backlog forces the fast cadence. `threshold`
             is possible when the parallel suites push this process's thread
             count past the assumed limit's high-water mark. */
-        #expect(first.reason != "interval")
+        #expect(first.reason != .interval)
         let threads = try #require(first.threads)
         #expect(threads.total > 1)
         /** At least one: the suite's other tests run their own samplers in
@@ -129,7 +133,7 @@ private let fastPolicy = TelemetryCadence.Policy(
         Task.detached { probeRan.withLock { $0 = true } }
         sampler.start()
         usleep(250_000)
-        let during = snapshots(in: directory)
+        let during = try snapshots(in: directory)
         let probeRanDuringWindow = probeRan.withLock { $0 }
         for _ in 0..<blockers { gate.signal() }
         sampler.stop()
@@ -146,12 +150,14 @@ private let fastPolicy = TelemetryCadence.Policy(
         let root = try temporaryDirectory()
         let paths = DirectaPaths(dataDir: root.appending(path: "data"), logsDir: root.appending(path: "logs"))
         let previousLog = TelemetryLog(directory: paths.daemonTelemetryDir)
-        let lastAt = Date().addingTimeInterval(-30)
-        for index in 0..<5 {
-            previousLog.append(
-                TelemetryMark(
-                    daemonPid: 4321, event: .slowOperation, kind: .lsof, label: "old \(index)",
-                    time: lastAt.addingTimeInterval(Double(index - 4))))
+        let lastAt = JSONCoding.canonicalMs(Date().addingTimeInterval(-30))
+        let previousMarks = (0..<5).map { index in
+            TelemetryMark(
+                daemonPid: 4321, event: .slowOperation, kind: .lsof, label: "old \(index)",
+                time: lastAt.addingTimeInterval(Double(index - 4)))
+        }
+        for mark in previousMarks {
+            previousLog.append(mark)
         }
         previousLog.close()
         let activity = DaemonActivity()
@@ -169,24 +175,36 @@ private let fastPolicy = TelemetryCadence.Policy(
             contentsOf: paths.daemonIncidentsDir.appending(path: try #require(incidents.first)), encoding: .utf8)
         let lines = incident.split(separator: "\n").map(String.init)
         #expect(lines.count == 7)
-        #expect(lines[0].contains(#""entry":"incident""#))
-        #expect(lines[0].contains(#""previousPid":4321"#))
-        #expect(lines[0].contains(#""previousLineCount":5"#))
-        #expect(lines[0].contains(#""launchdNote":"not running as the launchd agent"#))
-        #expect(lines[1...5].allSatisfy { $0.contains(#""daemonPid":4321"#) })
-        #expect(lines[6].contains(#""outcome":"skipped: system log search disabled""#))
+        let header = try #require(try decoded(lines, entry: .incident, as: IncidentHeader.self).first)
+        /** Boot time, and the gap derived from it, are the only volatile fields. */
+        #expect(
+            header
+                == IncidentHeader(
+                    daemonPid: getpid(), gapSeconds: header.gapSeconds,
+                    launchd: .unavailable(note: "not running as the launchd agent (started with --foreground or by hand)"),
+                    previousExitedCleanly: false, previousLastLineAt: lastAt, previousLineCount: 5, previousPid: 4321,
+                    time: header.time))
+        #expect(try #require(header.gapSeconds) >= 30)
+        #expect(try decoded(Array(lines[1...5]), entry: .mark, as: TelemetryMark.self) == previousMarks)
+        let finished = try #require(try decoded(lines, entry: .searchFinished, as: IncidentSearchFinished.self).last)
+        #expect(
+            finished
+                == IncidentSearchFinished(
+                    diagnosticReports: 0, logShowSeconds: nil, matches: 0,
+                    outcome: "skipped: system log search disabled", predicate: nil, time: finished.time,
+                    windowEnd: nil, windowStart: nil))
 
         let current = TelemetryLog.lastLines(in: paths.daemonTelemetryDir, count: 10_000)
-            .filter { !$0.contains(#""daemonPid":4321"#) }
-        let events = current.compactMap { line -> String? in
-            guard let range = line.range(of: #""event":""#) else { return nil }
-            return String(line[range.upperBound...].prefix { $0 != "\"" })
-        }
-        #expect(events.first == "daemon-started")
-        #expect(events.contains("stop-began"))
-        #expect(events.contains("stop-ended"))
-        #expect(events.last == "daemon-exiting")
-        #expect(current.contains { $0.contains(#""entry":"snapshot""#) })
+        let marks = try decoded(current, entry: .mark, as: TelemetryMark.self)
+            .filter { $0.daemonPid == getpid() && $0.event != .threadsHigh }
+        #expect(marks.map(\.event) == [.daemonStarted, .stopBegan, .stopEnded, .daemonExiting])
+        let ended = try #require(marks.first { $0.event == .stopEnded })
+        #expect(
+            ended
+                == TelemetryMark(
+                    daemonPid: getpid(), event: .stopEnded, label: "/p::web: requested by stop", outcome: "stopped",
+                    seconds: ended.seconds, time: ended.time))
+        #expect(try decoded(current, entry: .snapshot, as: TelemetrySnapshot.self).isEmpty == false)
     }
 
     /** A thread limit of 2 puts any real process over the threshold, so the
@@ -205,21 +223,20 @@ private let fastPolicy = TelemetryCadence.Policy(
                 threadLimit: { 2 }))
         sampler.start()
         let deadline = Date().addingTimeInterval(5)
-        while snapshots(in: directory).count < 3, Date() < deadline {
+        while try snapshots(in: directory).count < 3, Date() < deadline {
             usleep(10_000)
         }
         sampler.stop()
         let lines = TelemetryLog.lastLines(in: directory, count: 10_000)
-        let reasons = lines.compactMap { line -> String? in
-            guard let range = line.range(of: #""reason":""#) else { return nil }
-            return String(line[range.upperBound...].prefix { $0 != "\"" })
-        }
-        #expect(reasons.first == "threshold")
-        #expect(reasons.dropFirst().allSatisfy { $0 == "burst" })
-        #expect(lines.filter { $0.contains(#""threadDetail":["#) }.count == 1)
-        let marks = lines.filter { $0.contains(#""event":"threads-high""#) }
-        #expect(marks.count == 1)
-        #expect(marks.first?.contains("limit 2; longest in flight: lsof lsof -nP -tiTCP:45999") == true)
+        let samples = try decoded(lines, entry: .snapshot, as: TelemetrySnapshot.self)
+        #expect(samples.first?.reason == .threshold)
+        #expect(samples.dropFirst().allSatisfy { $0.reason == .burst })
+        #expect(samples.map { $0.threadDetail != nil } == [true] + Array(repeating: false, count: samples.count - 1))
+        let first = try #require(samples.first)
+        #expect(first.threadDetail?.count == first.threads?.total)
+        let marks = try decoded(lines, entry: .mark, as: TelemetryMark.self)
+        #expect(marks.map(\.event) == [.threadsHigh])
+        #expect(marks.first?.label?.contains("limit 2; longest in flight: lsof lsof -nP -tiTCP:45999") == true)
         let logged = recorder.entries.filter {
             $0.level == .error && $0.message.contains("limit 2; longest in flight: lsof lsof -nP -tiTCP:45999")
         }

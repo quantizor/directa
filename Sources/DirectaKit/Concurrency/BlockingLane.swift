@@ -15,9 +15,9 @@ import os
     spawn and supervise servers. */
 public final class BlockingLane: Sendable {
     /** `git` against a project checkout. */
-    public static let repository = BlockingLane(label: "dev.quantizor.directa.lane.repository", width: 2)
+    public static let repository = BlockingLane(name: "repository", width: 2)
     /** `launchctl`, `lsof`, `ps`, and loopback connect probes. */
-    public static let system = BlockingLane(label: "dev.quantizor.directa.lane.system", width: 4)
+    public static let system = BlockingLane(name: "system", width: 4)
 
     /** Every shared lane, in the order telemetry reports them. */
     public static let all = [repository, system]
@@ -34,8 +34,8 @@ public final class BlockingLane: Sendable {
     }
 
     private let activity: DaemonActivity
-    /** The label's last component (`repository`, `system`), as telemetry
-        names the lane. */
+    /** How telemetry names the lane; its Dispatch queue is labeled
+        `dev.quantizor.directa.lane.<name>`. */
     public let name: String
     private let queue: DispatchQueue
     /** A job that waited longer than this for a thread is reported to
@@ -45,12 +45,13 @@ public final class BlockingLane: Sendable {
     public let width: Int
 
     public init(
-        label: String, width: Int, activity: DaemonActivity = .shared,
-        slowWaitSeconds: Double = TelemetryCadence.slowOperationSeconds
+        name: String, width: Int, activity: DaemonActivity = .shared,
+        slowWaitSeconds: Double = TelemetryMark.slowOperationSeconds
     ) {
         self.activity = activity
-        self.name = label.split(separator: ".").last.map(String.init) ?? label
-        self.queue = DispatchQueue(label: label, qos: .userInitiated, attributes: .concurrent)
+        self.name = name
+        self.queue = DispatchQueue(
+            label: "dev.quantizor.directa.lane.\(name)", qos: .userInitiated, attributes: .concurrent)
         self.slowWaitSeconds = slowWaitSeconds
         self.width = max(1, width)
     }
@@ -71,7 +72,7 @@ public final class BlockingLane: Sendable {
             (state.running, state.pending.count, state.pending.first?.enqueuedAt)
         }
         return LanePressure(
-            name: name, oldestQueuedSeconds: oldest.map { DaemonActivity.seconds($0.duration(to: now)) } ?? 0,
+            name: name, oldestQueuedSeconds: oldest.map { $0.duration(to: now).roundedSeconds } ?? 0,
             queued: queued, running: running, width: width)
     }
 
@@ -95,7 +96,7 @@ public final class BlockingLane: Sendable {
     private func drain() {
         var finishedOne = false
         while let entry = nextJob(finishedOne: finishedOne) {
-            let waited = DaemonActivity.seconds(entry.enqueuedAt.duration(to: .now))
+            let waited = entry.enqueuedAt.duration(to: .now).roundedSeconds
             if waited > slowWaitSeconds {
                 activity.recordLaneWait(lane: name, seconds: waited)
             }

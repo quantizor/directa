@@ -57,18 +57,24 @@ public struct LaunchdExitRecord: Codable, Equatable, Sendable {
     }
 }
 
+/** What launchd said about the previous run: its record, or why there is
+    none. */
+public enum LaunchdLookup: Equatable, Sendable {
+    case found(LaunchdExitRecord)
+    case unavailable(note: String)
+}
+
 /** The first line of an incident file, written at daemon boot. The previous
     run's last telemetry lines follow verbatim, then whatever the background
     search finds (`system-log` and `diagnostic-report` lines), then one
-    `search-finished` line. */
-public struct IncidentHeader: TelemetryLine, Codable, Equatable {
+    `search-finished` line. On disk the lookup is a `launchd` record or a
+    `launchdNote`, never both. */
+public struct IncidentHeader: Codable, Equatable, Sendable {
     public var daemonPid: Int32
     public var entry = TelemetryEntryKind.incident
     /** Seconds from the previous run's last telemetry line to this boot. */
     public var gapSeconds: Double?
-    public var launchd: LaunchdExitRecord?
-    /** Why `launchd` is nil, when it is. */
-    public var launchdNote: String?
+    public var launchd: LaunchdLookup
     /** True when the previous run wrote its clean-exit mark. */
     public var previousExitedCleanly: Bool
     public var previousLastLineAt: Date?
@@ -78,31 +84,69 @@ public struct IncidentHeader: TelemetryLine, Codable, Equatable {
     public var time: Date
 
     public init(
-        daemonPid: Int32, gapSeconds: Double?, launchd: LaunchdExitRecord?, launchdNote: String?,
-        previousExitedCleanly: Bool, previousLastLineAt: Date?, previousLineCount: Int, previousPid: Int32?,
-        time: Date
+        daemonPid: Int32, gapSeconds: Double?, launchd: LaunchdLookup, previousExitedCleanly: Bool,
+        previousLastLineAt: Date?, previousLineCount: Int, previousPid: Int32?, time: Date
     ) {
         self.daemonPid = daemonPid
         self.gapSeconds = gapSeconds
         self.launchd = launchd
-        self.launchdNote = launchdNote
         self.previousExitedCleanly = previousExitedCleanly
         self.previousLastLineAt = previousLastLineAt
         self.previousLineCount = previousLineCount
         self.previousPid = previousPid
         self.time = time
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case daemonPid, entry, gapSeconds, launchd, launchdNote, previousExitedCleanly, previousLastLineAt
+        case previousLineCount, previousPid, time
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        daemonPid = try container.decode(Int32.self, forKey: .daemonPid)
+        entry = try container.decode(TelemetryEntryKind.self, forKey: .entry)
+        gapSeconds = try container.decodeIfPresent(Double.self, forKey: .gapSeconds)
+        launchd =
+            if let record = try container.decodeIfPresent(LaunchdExitRecord.self, forKey: .launchd) {
+                .found(record)
+            } else {
+                .unavailable(note: try container.decode(String.self, forKey: .launchdNote))
+            }
+        previousExitedCleanly = try container.decode(Bool.self, forKey: .previousExitedCleanly)
+        previousLastLineAt = try container.decodeIfPresent(Date.self, forKey: .previousLastLineAt)
+        previousLineCount = try container.decode(Int.self, forKey: .previousLineCount)
+        previousPid = try container.decodeIfPresent(Int32.self, forKey: .previousPid)
+        time = try container.decode(Date.self, forKey: .time)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(daemonPid, forKey: .daemonPid)
+        try container.encode(entry, forKey: .entry)
+        try container.encodeIfPresent(gapSeconds, forKey: .gapSeconds)
+        switch launchd {
+        case .found(let record): try container.encode(record, forKey: .launchd)
+        case .unavailable(let note): try container.encode(note, forKey: .launchdNote)
+        }
+        try container.encode(previousExitedCleanly, forKey: .previousExitedCleanly)
+        try container.encodeIfPresent(previousLastLineAt, forKey: .previousLastLineAt)
+        try container.encode(previousLineCount, forKey: .previousLineCount)
+        try container.encodeIfPresent(previousPid, forKey: .previousPid)
+        try container.encode(time, forKey: .time)
+    }
 }
 
-/** One unified-log line near the previous run's death. */
-public struct IncidentSystemLog: TelemetryLine, Codable, Equatable {
+/** One unified-log line near the previous run's death. `time` is nil when
+    `log show` gave a timestamp this parser could not read. */
+public struct IncidentSystemLog: Codable, Equatable, Sendable {
     public var entry = TelemetryEntryKind.systemLog
     public var message: String
     public var process: String
     public var subsystem: String?
-    public var time: Date
+    public var time: Date?
 
-    public init(message: String, process: String, subsystem: String?, time: Date) {
+    public init(message: String, process: String, subsystem: String?, time: Date?) {
         self.message = message
         self.process = process
         self.subsystem = subsystem
@@ -113,7 +157,7 @@ public struct IncidentSystemLog: TelemetryLine, Codable, Equatable {
 /** A crash or jetsam report in the death window. `excerpt` is the report's
     entry for the daemon's process when one could be picked out, else the
     report's first bytes. */
-public struct IncidentDiagnosticReport: TelemetryLine, Codable, Equatable {
+public struct IncidentDiagnosticReport: Codable, Equatable, Sendable {
     public var entry = TelemetryEntryKind.diagnosticReport
     public var excerpt: String?
     public var path: String
@@ -128,7 +172,7 @@ public struct IncidentDiagnosticReport: TelemetryLine, Codable, Equatable {
 
 /** The last line of an incident file. Absence is data: `matches` of zero, or
     an `outcome` other than `finished`, says what the search could not see. */
-public struct IncidentSearchFinished: TelemetryLine, Codable, Equatable {
+public struct IncidentSearchFinished: Codable, Equatable, Sendable {
     public var diagnosticReports: Int
     public var entry = TelemetryEntryKind.searchFinished
     public var logShowSeconds: Double?
@@ -186,30 +230,30 @@ public enum DaemonIncident {
         }
     }
 
-    private struct MarkEventOnly: Decodable {
-        let daemonPid: Int32?
-        let event: TelemetryMarkEvent?
-    }
+    /** How many of the previous run's last lines are searched for its
+        clean-exit mark: a line already in flight on another thread when the
+        exit began can land after the mark. */
+    public static let exitMarkSearchLines = 8
 
     /** Reads the previous run's last lines from the telemetry directory.
         Called before this run writes its first line. The run exited cleanly
-        when its own `daemon-exiting` mark is among them, not only when it is
-        the very last line: a mark already in flight on another thread when
-        the exit began can still land after it. */
-    public static func readPrevious(telemetryDirectory: URL, keepRotated: Int = 4) -> Previous {
+        when its own `daemon-exiting` mark is among the last
+        `exitMarkSearchLines`. */
+    public static func readPrevious(
+        telemetryDirectory: URL, keepRotated: Int = TelemetryLog.defaultKeepRotated
+    ) -> Previous {
         let lines = TelemetryLog.lastLines(
             in: telemetryDirectory, count: previousLineCount, keepRotated: keepRotated)
-        let last = lines.last
-        let pid = last.flatMap(TelemetryLog.daemonPid(ofLine:))
         let decoder = JSONCoding.decoder()
-        let exited = lines.suffix(8).contains { line in
-            guard line.contains(TelemetryMarkEvent.daemonExiting.rawValue),
-                let mark = try? decoder.decode(MarkEventOnly.self, from: Data(line.utf8))
+        let last = lines.last.flatMap { TelemetryLog.LineHead(line: $0, decoder: decoder) }
+        let pid = last?.daemonPid
+        let exitingEvent = TelemetryMarkEvent.daemonExiting.rawValue
+        let exited = lines.suffix(exitMarkSearchLines).contains { line in
+            guard line.contains(exitingEvent), let head = TelemetryLog.LineHead(line: line, decoder: decoder)
             else { return false }
-            return mark.event == .daemonExiting && mark.daemonPid == pid
+            return head.event == exitingEvent && head.daemonPid == pid
         }
-        return Previous(
-            exitedCleanly: exited, lastLineAt: last.flatMap(TelemetryLog.time(ofLine:)), lines: lines, pid: pid)
+        return Previous(exitedCleanly: exited, lastLineAt: last?.time, lines: lines, pid: pid)
     }
 
     /** `<boot time>-pid<pid>.ndjson`, colons swapped for dashes so the name
@@ -221,15 +265,12 @@ public enum DaemonIncident {
 
     /** The header and the previous run's lines, ready to write. */
     public static func headerAndLines(
-        bootTime: Date, daemonPid: Int32, launchd: LaunchdExitRecord?, launchdNote: String?,
-        previous: Previous
+        bootTime: Date, daemonPid: Int32, launchd: LaunchdLookup, previous: Previous
     ) throws -> Data {
         let header = IncidentHeader(
             daemonPid: daemonPid,
-            gapSeconds: previous.lastLineAt.map {
-                (bootTime.timeIntervalSince($0) * 1000).rounded() / 1000
-            },
-            launchd: launchd, launchdNote: launchdNote, previousExitedCleanly: previous.exitedCleanly,
+            gapSeconds: previous.lastLineAt.map { Duration.seconds(bootTime.timeIntervalSince($0)).roundedSeconds },
+            launchd: launchd, previousExitedCleanly: previous.exitedCleanly,
             previousLastLineAt: previous.lastLineAt, previousLineCount: previous.lines.count,
             previousPid: previous.pid, time: bootTime)
         var data = try NDJSON.encodeLine(header)
@@ -274,25 +315,24 @@ public enum DaemonIncident {
             "eventMessage CONTAINS \"\(label):\"",
             "eventMessage CONTAINS \"/\(label)\"",
         ]
-        var clauses: [String] = []
         if let pid = previousPid {
             kernel.append("eventMessage CONTAINS \"[\(pid)]\"")
             kernel.append("eventMessage CONTAINS \"pid \(pid)\"")
             launchd.append("eventMessage CONTAINS \"[\(pid)]\"")
+        }
+        /** The kernel logs a code-signing `evaluation result` for every exec
+            of any `ddirecta` binary on the machine, which says nothing about
+            a death. */
+        var clauses = [
+            "(process == \"kernel\" AND NOT eventMessage BEGINSWITH \"evaluation result\" AND (\(kernel.joined(separator: " OR "))))",
+            "(subsystem == \"com.apple.xpc.launchd\" AND NOT eventMessage CONTAINS \"\(label).job\" AND (\(launchd.joined(separator: " OR "))))",
+        ]
+        if let pid = previousPid {
             clauses.append("(process == \"runningboardd\" AND eventMessage CONTAINS \":\(pid)]\")")
             clauses.append(
                 "((process == \"ReportCrash\" OR process == \"osanalyticshelper\" OR process == \"spindump\") AND (eventMessage CONTAINS \"\(processName)\" OR eventMessage CONTAINS \"\(pid)\"))"
             )
         }
-        /** The kernel logs a code-signing `evaluation result` for every exec
-            of any `ddirecta` binary on the machine, which says nothing about
-            a death. */
-        clauses.insert(
-            "(process == \"kernel\" AND NOT eventMessage BEGINSWITH \"evaluation result\" AND (\(kernel.joined(separator: " OR "))))",
-            at: 0)
-        clauses.insert(
-            "(subsystem == \"com.apple.xpc.launchd\" AND NOT eventMessage CONTAINS \"\(label).job\" AND (\(launchd.joined(separator: " OR "))))",
-            at: 1)
         return clauses.joined(separator: " OR ")
     }
 
@@ -318,32 +358,35 @@ public enum DaemonIncident {
                 let parsed = try? decoder.decode(LogShowLine.self, from: Data(line.utf8)),
                 let message = parsed.eventMessage
             else { continue }
-            let time = parsed.timestamp.flatMap(Self.parseLogTimestamp) ?? Date.distantPast
             entries.append(
                 IncidentSystemLog(
                     message: message.count > systemLogMessageCap
                         ? String(message.prefix(systemLogMessageCap)) + "..." : message,
                     process: parsed.processImagePath.map { ($0 as NSString).lastPathComponent } ?? "?",
                     subsystem: parsed.subsystem.flatMap { $0.isEmpty ? nil : $0 },
-                    time: time))
+                    time: parsed.timestamp.flatMap { try? logTimestamp.parse($0) }))
         }
         return entries
     }
 
-    /** `log show` ndjson timestamps read `2026-09-26 09:30:57.217451-0700`. */
-    static func parseLogTimestamp(_ raw: String) -> Date? {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSSSSSZ"
-        return formatter.date(from: raw)
-    }
+    private static let posixLocale = Locale(identifier: "en_US_POSIX")
 
-    /** `log show --start/--end` take local wall time in this form. */
+    /** `log show` ndjson timestamps read `2026-09-26 09:30:57.217451-0700`;
+        parsed to the millisecond. */
+    static let logTimestamp = Date.ParseStrategy(
+        format:
+            "\(year: .defaultDigits)-\(month: .twoDigits)-\(day: .twoDigits) \(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits):\(second: .twoDigits).\(secondFraction: .fractional(6))\(timeZone: .iso8601(.short))",
+        locale: posixLocale, timeZone: .gmt)
+
+    /** `log show --start/--end` take local wall time in this form, with the
+        offset, so the zone captured here never changes the instant. */
+    private static let logShowTimeStyle = Date.VerbatimFormatStyle(
+        format:
+            "\(year: .defaultDigits)-\(month: .twoDigits)-\(day: .twoDigits) \(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits):\(second: .twoDigits)\(timeZone: .iso8601(.short))",
+        locale: posixLocale, timeZone: .current, calendar: Calendar(identifier: .gregorian))
+
     public static func logShowTime(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ssZ"
-        return formatter.string(from: date)
+        date.formatted(logShowTimeStyle)
     }
 
     /** Report file names worth reading: every JetsamEvent, and any report

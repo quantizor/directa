@@ -3,7 +3,7 @@ import os
 
 /** A kind of in-flight work the daemon's telemetry counts. The raw values are
     the names telemetry.log and scripts/daemon-deaths.sh read. */
-public enum ActivityKind: String, CaseIterable, Codable, Sendable {
+public enum ActivityKind: String, CaseIterable, Codable, CodingKeyRepresentable, Sendable {
     case git
     case launchctl
     case logShow = "log-show"
@@ -16,20 +16,10 @@ public enum ActivityKind: String, CaseIterable, Codable, Sendable {
     case stopWait = "stop-wait"
     case subprocess
 
-    /** Work that holds a thread in a synchronous wait (a child process the
-        caller blocks on). A mark is written when one outlasts
-        `TelemetryCadence.slowOperationSeconds`. */
-    public var isBlocking: Bool {
-        switch self {
-        case .git, .launchctl, .logShow, .lsof, .ps, .subprocess: true
-        case .request, .restart, .spawnWait, .stop, .stopWait: false
-        }
-    }
-
     /** Work that switches the sampler to its fast cadence. Requests are left
-        out because a `directa monitor` polls every second forever, and the
-        boot-time `log show` is left out because the daemon runs it on
-        itself. */
+        out because a `directa monitor` polls every second forever, and
+        `log show` because the daemon only runs it on itself at boot. Work of
+        any kind begun inside `DaemonActivity.selfDirected` is left out too. */
     public var triggersBurst: Bool {
         switch self {
         case .logShow, .request: false
@@ -50,16 +40,27 @@ public enum ActivityKind: String, CaseIterable, Codable, Sendable {
     }
 }
 
+extension ServerPhase: CodingKeyRepresentable {}
+
 /** How many of one kind of work are in flight, and the one waiting longest. */
 public struct ActivityGroup: Codable, Equatable, Sendable {
     public var count: Int
-    public var oldestLabel: String
+    /** The oldest item's label; nil for wire requests, whose group key is
+        already the method. */
+    public var oldestLabel: String?
     public var oldestSeconds: Double
 
-    public init(count: Int, oldestLabel: String, oldestSeconds: Double) {
+    public init(count: Int, oldestLabel: String?, oldestSeconds: Double) {
         self.count = count
         self.oldestLabel = oldestLabel
         self.oldestSeconds = oldestSeconds
+    }
+
+    /** This group with one more item of the given age and label. */
+    func adding(label: String?, seconds: Double) -> ActivityGroup {
+        ActivityGroup(
+            count: count + 1, oldestLabel: seconds > oldestSeconds ? label : oldestLabel,
+            oldestSeconds: max(seconds, oldestSeconds))
     }
 }
 
@@ -82,16 +83,15 @@ public struct ActivitySnapshot: Codable, Equatable, Sendable {
     /** The longest-running work of every kind, oldest first, capped at
         `DaemonActivity.longestRunningCap`. */
     public var longestRunning: [InFlightEntry]
-    /** Keyed by `ActivityKind` raw value; wire requests are under `requests`. */
-    public var operations: [String: ActivityGroup]
-    /** Keyed by wire method. */
+    /** Every kind but `request`, which is grouped under `requests`. */
+    public var operations: [ActivityKind: ActivityGroup]
+    /** Keyed by wire method, as the request's line named it. */
     public var requests: [String: ActivityGroup]
-    /** Supervisor count per phase. */
-    public var serverPhases: [String: Int]
+    public var serverPhases: [ServerPhase: Int]
 
     public init(
-        connectedClients: Int, longestRunning: [InFlightEntry], operations: [String: ActivityGroup],
-        requests: [String: ActivityGroup], serverPhases: [String: Int]
+        connectedClients: Int, longestRunning: [InFlightEntry], operations: [ActivityKind: ActivityGroup],
+        requests: [String: ActivityGroup], serverPhases: [ServerPhase: Int]
     ) {
         self.connectedClients = connectedClients
         self.longestRunning = longestRunning
@@ -115,16 +115,32 @@ public final class DaemonActivity: Sendable {
     /** Labels past this length are cut, since a command line can be long. */
     public static let labelCap = 160
 
+    @TaskLocal private static var isSelfDirected = false
+
     /** Returned by `begin`, handed back to `end`. */
     public struct Token: Sendable {
         public let id: UInt64
         public let kind: ActivityKind
         public let label: String
         public let startedAt: ContinuousClock.Instant
+        /** The kind triggers the fast cadence and the work was not begun
+            inside `selfDirected`. */
+        public let triggersBurst: Bool
+
+        init(
+            id: UInt64, kind: ActivityKind, label: String, startedAt: ContinuousClock.Instant,
+            triggersBurst: Bool? = nil
+        ) {
+            self.id = id
+            self.kind = kind
+            self.label = label
+            self.startedAt = startedAt
+            self.triggersBurst = triggersBurst ?? kind.triggersBurst
+        }
     }
 
     /** What an observer hears: a begin, an end with its duration, or a job
-        that waited past `TelemetryCadence.slowOperationSeconds` for a
+        that waited past `TelemetryMark.slowOperationSeconds` for a
         `BlockingLane` thread. */
     public enum Event: Sendable {
         case began(Token)
@@ -138,21 +154,29 @@ public final class DaemonActivity: Sendable {
         var lastTriggerAt: ContinuousClock.Instant?
         var nextID: UInt64 = 0
         var observer: (@Sendable (Event) -> Void)?
-        var phases: [String: String] = [:]
+        var phases: [String: ServerPhase] = [:]
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
 
     public init() {}
 
+    /** Runs `body` with every piece of work begun inside it, on this thread
+        or its task, kept from triggering the fast cadence: for the daemon's
+        own boot-time reads of itself, which say nothing about load. */
+    public static func selfDirected<T>(_ body: () throws -> T) rethrows -> T {
+        try $isSelfDirected.withValue(true, operation: body)
+    }
+
     public func begin(_ kind: ActivityKind, label: String) -> Token {
         let now = ContinuousClock.now
         let trimmed = label.count > Self.labelCap ? String(label.prefix(Self.labelCap)) + "..." : label
+        let triggers = kind.triggersBurst && !Self.isSelfDirected
         let (token, observer) = state.withLock { state in
             state.nextID &+= 1
-            let token = Token(id: state.nextID, kind: kind, label: trimmed, startedAt: now)
+            let token = Token(id: state.nextID, kind: kind, label: trimmed, startedAt: now, triggersBurst: triggers)
             state.inFlight[token.id] = token
-            if kind.triggersBurst { state.lastTriggerAt = now }
+            if triggers { state.lastTriggerAt = now }
             return (token, state.observer)
         }
         observer?(.began(token))
@@ -163,10 +187,10 @@ public final class DaemonActivity: Sendable {
         let now = ContinuousClock.now
         let observer = state.withLock { state in
             state.inFlight[token.id] = nil
-            if token.kind.triggersBurst { state.lastTriggerAt = now }
+            if token.triggersBurst { state.lastTriggerAt = now }
             return state.observer
         }
-        observer?(.ended(token, outcome: outcome, seconds: Self.seconds(token.startedAt.duration(to: now))))
+        observer?(.ended(token, outcome: outcome, seconds: token.startedAt.duration(to: now).roundedSeconds))
     }
 
     /** Brackets a synchronous call. */
@@ -185,15 +209,34 @@ public final class DaemonActivity: Sendable {
         state.withLock { $0.clients += 1 }
     }
 
+    /** A disconnect with no matching connect is a counting bug in the
+        caller: it traps in a debug build and is clamped at zero in release,
+        where a wrong count must not take the daemon down. */
     public func clientDisconnected() {
-        state.withLock { $0.clients = max(0, $0.clients - 1) }
+        let unmatched = state.withLock { state -> Bool in
+            guard state.clients > 0 else { return true }
+            state.clients -= 1
+            return false
+        }
+        if unmatched {
+            assertionFailure("DaemonActivity.clientDisconnected called with no connected client")
+        }
     }
 
     /** Records a supervisor's phase under a key unique to that supervisor
         (not its server id, which a replacement supervisor shares while the
         old one is still being released). */
-    public func recordPhase(_ phase: String, key: String) {
+    public func recordPhase(_ phase: ServerPhase, key: String) {
         state.withLock { $0.phases[key] = phase }
+    }
+
+    /** For a caller holding the phase's raw value. */
+    public func recordPhase(_ rawPhase: String, key: String) {
+        guard let phase = ServerPhase(rawValue: rawPhase) else {
+            assertionFailure("DaemonActivity.recordPhase got \(rawPhase), which is not a ServerPhase")
+            return
+        }
+        recordPhase(phase, key: key)
     }
 
     public func forgetPhase(key: String) {
@@ -210,7 +253,7 @@ public final class DaemonActivity: Sendable {
         work last began or ended. */
     public func triggerState() -> (inFlight: Bool, lastAt: ContinuousClock.Instant?) {
         state.withLock { state in
-            (state.inFlight.values.contains { $0.kind.triggersBurst }, state.lastTriggerAt)
+            (state.inFlight.values.contains(where: \.triggersBurst), state.lastTriggerAt)
         }
     }
 
@@ -218,25 +261,14 @@ public final class DaemonActivity: Sendable {
         let (clients, entries, phases) = state.withLock { state in
             (state.clients, Array(state.inFlight.values), state.phases)
         }
-        var operations: [String: ActivityGroup] = [:]
+        var operations: [ActivityKind: ActivityGroup] = [:]
         var requests: [String: ActivityGroup] = [:]
         for token in entries {
-            let age = Self.seconds(token.startedAt.duration(to: now))
-            let key = token.kind == .request ? token.label : token.kind.rawValue
-            let label = token.kind == .request ? "" : token.label
-            let merged: ActivityGroup
-            if let group = token.kind == .request ? requests[key] : operations[key] {
-                merged = ActivityGroup(
-                    count: group.count + 1,
-                    oldestLabel: age > group.oldestSeconds ? label : group.oldestLabel,
-                    oldestSeconds: max(age, group.oldestSeconds))
-            } else {
-                merged = ActivityGroup(count: 1, oldestLabel: label, oldestSeconds: age)
-            }
+            let age = token.startedAt.duration(to: now).roundedSeconds
             if token.kind == .request {
-                requests[key] = merged
+                requests[token.label] = Self.merge(requests[token.label], label: nil, seconds: age)
             } else {
-                operations[key] = merged
+                operations[token.kind] = Self.merge(operations[token.kind], label: token.label, seconds: age)
             }
         }
         let longest =
@@ -244,9 +276,9 @@ public final class DaemonActivity: Sendable {
             .sorted { $0.startedAt < $1.startedAt }
             .prefix(Self.longestRunningCap)
             .map {
-                InFlightEntry(kind: $0.kind, label: $0.label, seconds: Self.seconds($0.startedAt.duration(to: now)))
+                InFlightEntry(kind: $0.kind, label: $0.label, seconds: $0.startedAt.duration(to: now).roundedSeconds)
             }
-        var phaseCounts: [String: Int] = [:]
+        var phaseCounts: [ServerPhase: Int] = [:]
         for phase in phases.values {
             phaseCounts[phase, default: 0] += 1
         }
@@ -255,9 +287,8 @@ public final class DaemonActivity: Sendable {
             requests: requests, serverPhases: phaseCounts)
     }
 
-    /** Millisecond resolution, which keeps snapshot lines short and stable. */
-    public static func seconds(_ duration: Duration) -> Double {
-        let (seconds, attoseconds) = duration.components
-        return ((Double(seconds) + Double(attoseconds) / 1e18) * 1000).rounded() / 1000
+    private static func merge(_ group: ActivityGroup?, label: String?, seconds: Double) -> ActivityGroup {
+        group?.adding(label: label, seconds: seconds)
+            ?? ActivityGroup(count: 1, oldestLabel: label, oldestSeconds: seconds)
     }
 }

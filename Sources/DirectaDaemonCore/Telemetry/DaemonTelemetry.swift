@@ -12,7 +12,6 @@ public final class DaemonTelemetry: Sendable {
     /** Set to `off` to run the daemon with no telemetry at all. */
     public static let environmentKey = "DIRECTA_TELEMETRY"
 
-    public static let processName = "ddirecta"
     public static let incidentThreadName = "dev.quantizor.directa.incident"
     /** Hard ceiling on the boot-time `log show`. */
     public static let logShowTimeoutSeconds = 60.0
@@ -76,15 +75,19 @@ public final class DaemonTelemetry: Sendable {
             if let mark = TelemetryMark.forActivity(event, daemonPid: pid, time: Date()) {
                 log.append(mark)
             }
-            if case .began(let token) = event, token.kind.triggersBurst {
+            if case .began(let token) = event, token.triggersBurst {
                 sampler.wakeNow()
             }
         }
         sampler.start()
         let thread = Thread {
-            telemetry.writeIncident(
-                bootTime: bootTime, previous: previous, runningAsAgent: runningAsAgent,
-                searchSystemLog: searchSystemLog)
+            /** Every command this thread runs reads the daemon's own state,
+                so none of it is load worth the fast cadence. */
+            DaemonActivity.selfDirected {
+                telemetry.writeIncident(
+                    bootTime: bootTime, previous: previous, runningAsAgent: runningAsAgent,
+                    searchSystemLog: searchSystemLog)
+            }
             telemetry.incidentDone.signal()
         }
         thread.name = incidentThreadName
@@ -119,58 +122,59 @@ public final class DaemonTelemetry: Sendable {
         Self.active.withLock { if $0 === self { $0 = nil } }
     }
 
+    private func lookUpLaunchd(runningAsAgent: Bool) -> LaunchdLookup {
+        guard runningAsAgent else {
+            return .unavailable(note: "not running as the launchd agent (started with --foreground or by hand)")
+        }
+        let printed = LaunchdAdmin.shell(
+            "/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)"],
+            timeoutSeconds: Self.launchctlTimeoutSeconds)
+        guard printed.status == 0 else {
+            return .unavailable(note: "launchctl print exited \(printed.status): \(printed.output.prefix(200))")
+        }
+        let record = LaunchdExitRecord.parse(printed.output)
+        threadLimit.withLock { $0 = record.threadLimit }
+        return .found(record)
+    }
+
     private func writeIncident(
         bootTime: Date, previous: DaemonIncident.Previous, runningAsAgent: Bool, searchSystemLog: Bool
     ) {
-        var launchd: LaunchdExitRecord?
-        var launchdNote: String?
-        if runningAsAgent {
-            let printed = LaunchdAdmin.shell(
-                "/bin/launchctl", ["print", "gui/\(getuid())/\(LaunchdAdmin.label)"],
-                timeoutSeconds: Self.launchctlTimeoutSeconds)
-            if printed.status == 0 {
-                let record = LaunchdExitRecord.parse(printed.output)
-                launchd = record
-                threadLimit.withLock { $0 = record.threadLimit }
-            } else {
-                launchdNote = "launchctl print exited \(printed.status): \(printed.output.prefix(200))"
-            }
-        } else {
-            launchdNote = "not running as the launchd agent (started with --foreground or by hand)"
-        }
+        let launchd = lookUpLaunchd(runningAsAgent: runningAsAgent)
         let directory = paths.daemonIncidentsDir
         let file = directory.appending(path: DaemonIncident.fileName(bootTime: bootTime, pid: pid))
-        let incidentLog = IncidentFile(url: file)
+        let incident: IncidentFile
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            try incidentLog.write(
-                DaemonIncident.headerAndLines(
-                    bootTime: bootTime, daemonPid: pid, launchd: launchd, launchdNote: launchdNote,
-                    previous: previous))
+            incident = try IncidentFile(
+                url: file,
+                initial: DaemonIncident.headerAndLines(
+                    bootTime: bootTime, daemonPid: pid, launchd: launchd, previous: previous))
         } catch {
             DirectaLog.daemon.error("telemetry: cannot write incident \(file.path): \(error)")
             return
         }
+        defer { incident.close() }
         DaemonIncident.prune(directory: directory)
-        guard searchSystemLog else {
-            incidentLog.append(
+        let skipReason: String? =
+            if !searchSystemLog {
+                "system log search disabled"
+            } else if previous.exitedCleanly {
+                "the previous run exited cleanly"
+            } else {
+                nil
+            }
+        if let skipReason {
+            incident.append([
                 IncidentSearchFinished(
-                    diagnosticReports: 0, logShowSeconds: nil, matches: 0,
-                    outcome: "skipped: system log search disabled", predicate: nil, time: Date(), windowEnd: nil,
-                    windowStart: nil))
-            return
-        }
-        if previous.exitedCleanly {
-            incidentLog.append(
-                IncidentSearchFinished(
-                    diagnosticReports: 0, logShowSeconds: nil, matches: 0,
-                    outcome: "skipped: the previous run exited cleanly", predicate: nil, time: Date(),
-                    windowEnd: nil, windowStart: nil))
+                    diagnosticReports: 0, logShowSeconds: nil, matches: 0, outcome: "skipped: \(skipReason)",
+                    predicate: nil, time: Date(), windowEnd: nil, windowStart: nil)
+            ])
             return
         }
         let window = DaemonIncident.searchWindow(previousLastLineAt: previous.lastLineAt, bootTime: bootTime)
         let predicate = DaemonIncident.logPredicate(
-            previousPid: previous.pid, label: LaunchdAdmin.label, processName: Self.processName)
+            previousPid: previous.pid, label: LaunchdAdmin.label, processName: SetupPlanner.daemonBinaryName)
         let began = ContinuousClock.now
         let shown = LaunchdAdmin.shell(
             "/usr/bin/log",
@@ -179,7 +183,7 @@ public final class DaemonTelemetry: Sendable {
                 DaemonIncident.logShowTime(window.end), "--predicate", predicate, "--style", "ndjson", "--info",
             ],
             timeoutSeconds: Self.logShowTimeoutSeconds)
-        let seconds = DaemonActivity.seconds(began.duration(to: .now))
+        let seconds = began.duration(to: .now).roundedSeconds
         let outcome: String
         var matches: [IncidentSystemLog] = []
         if shown.status == 0 {
@@ -190,19 +194,16 @@ public final class DaemonTelemetry: Sendable {
         } else {
             outcome = "failed: log show exited \(shown.status): \(shown.output.prefix(200))"
         }
-        for match in matches {
-            incidentLog.append(match)
-        }
+        incident.append(matches)
         let reports = Self.diagnosticReports(
             folders: Self.reportFolders, windowStart: window.start, bootTime: bootTime)
-        for report in reports {
-            incidentLog.append(report)
-        }
-        incidentLog.append(
+        incident.append(reports)
+        incident.append([
             IncidentSearchFinished(
                 diagnosticReports: reports.count, logShowSeconds: seconds, matches: matches.count,
                 outcome: outcome, predicate: predicate, time: Date(), windowEnd: window.end,
-                windowStart: window.start))
+                windowStart: window.start)
+        ])
     }
 
     static let reportFolders = [
@@ -215,11 +216,12 @@ public final class DaemonTelemetry: Sendable {
         already respawned the daemon). */
     static func diagnosticReports(folders: [URL], windowStart: Date, bootTime: Date) -> [IncidentDiagnosticReport] {
         let fileManager = FileManager.default
+        let processName = SetupPlanner.daemonBinaryName
         var found: [IncidentDiagnosticReport] = []
         for folder in folders {
             guard let names = try? fileManager.contentsOfDirectory(atPath: folder.path) else { continue }
             for name in names.sorted()
-            where DaemonIncident.isRelevantReport(name: name, processName: Self.processName) {
+            where DaemonIncident.isRelevantReport(name: name, processName: processName) {
                 let url = folder.appending(path: name)
                 guard let modified = (try? fileManager.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
                     modified >= windowStart, modified <= bootTime.addingTimeInterval(60)
@@ -227,7 +229,7 @@ public final class DaemonTelemetry: Sendable {
                 let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
                 found.append(
                     IncidentDiagnosticReport(
-                        excerpt: DaemonIncident.reportExcerpt(text: text, name: name, processName: Self.processName),
+                        excerpt: DaemonIncident.reportExcerpt(text: text, name: name, processName: processName),
                         path: url.path, time: modified))
             }
         }
@@ -235,28 +237,38 @@ public final class DaemonTelemetry: Sendable {
     }
 }
 
-/** Appends NDJSON lines to one incident file. Only the incident thread
-    writes it. */
+/** One incident file: the header and copied lines written atomically, then
+    each later group of lines appended with one write through a handle held
+    open until `close`. Only the incident thread uses it. */
 private struct IncidentFile {
+    let handle: FileHandle
     let url: URL
 
-    func write(_ data: Data) throws {
-        try data.write(to: url, options: .atomic)
+    init(url: URL, initial: Data) throws {
+        try initial.write(to: url, options: .atomic)
+        handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        self.url = url
     }
 
-    func append<Line: TelemetryLine>(_ line: Line) {
-        guard let encoded = try? NDJSON.encodeLine(line),
-            let handle = try? FileHandle(forWritingTo: url)
-        else {
-            DirectaLog.daemon.error("telemetry: cannot append to incident \(url.path)")
-            return
-        }
-        defer { try? handle.close() }
+    func append<Line: Encodable>(_ lines: [Line]) {
+        guard !lines.isEmpty else { return }
         do {
-            try handle.seekToEnd()
-            try handle.write(contentsOf: encoded)
+            var data = Data()
+            for line in lines {
+                data.append(try NDJSON.encodeLine(line))
+            }
+            try handle.write(contentsOf: data)
         } catch {
             DirectaLog.daemon.error("telemetry: cannot append to incident \(url.path): \(error)")
+        }
+    }
+
+    func close() {
+        do {
+            try handle.close()
+        } catch {
+            DirectaLog.daemon.error("telemetry: cannot close incident \(url.path): \(error)")
         }
     }
 }

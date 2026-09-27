@@ -29,7 +29,7 @@ public enum SampleReason: String, Codable, Sendable {
 }
 
 /** Mach thread run states, named as `thread_info` reports them. */
-public enum ThreadRunState: String, Codable, Sendable {
+public enum ThreadRunState: String, Codable, CodingKeyRepresentable, Sendable {
     case halted
     case running
     case stopped
@@ -37,29 +37,31 @@ public enum ThreadRunState: String, Codable, Sendable {
     case unknown
     case waiting
 
-    /** `TH_STATE_*` from mach/thread_info.h. */
     public init(machState: Int32) {
         switch machState {
-        case 1: self = .running
-        case 2: self = .stopped
-        case 3: self = .waiting
-        case 4: self = .uninterruptible
-        case 5: self = .halted
+        case TH_STATE_RUNNING: self = .running
+        case TH_STATE_STOPPED: self = .stopped
+        case TH_STATE_WAITING: self = .waiting
+        case TH_STATE_UNINTERRUPTIBLE: self = .uninterruptible
+        case TH_STATE_HALTED: self = .halted
         default: self = .unknown
         }
     }
 }
 
-/** One thread, written only on a threshold snapshot. */
+/** One thread, written only on a threshold snapshot. The CPU and time fields
+    are nil when the kernel refused the thread's read. */
 public struct ThreadDetail: Codable, Equatable, Sendable {
-    /** `thread_basic_info.cpu_usage` as a percentage of one core. */
-    public var cpuPercent: Double
+    /** `thread_extended_info.pth_cpu_usage` as a percentage of one core. */
+    public var cpuPercent: Double?
     public var name: String
     public var state: ThreadRunState
-    public var systemSeconds: Double
-    public var userSeconds: Double
+    public var systemSeconds: Double?
+    public var userSeconds: Double?
 
-    public init(cpuPercent: Double, name: String, state: ThreadRunState, systemSeconds: Double, userSeconds: Double) {
+    public init(
+        cpuPercent: Double?, name: String, state: ThreadRunState, systemSeconds: Double?, userSeconds: Double?
+    ) {
         self.cpuPercent = cpuPercent
         self.name = name
         self.state = state
@@ -85,14 +87,18 @@ public struct WorkqueueSample: Codable, Equatable, Sendable {
         self.total = total
     }
 
-    /** Flag names for `pwq_state`, from sys/proc_info.h. */
+    /** The `pwq_state` flags that name an exceeded limit, in report order.
+        `WQ_FLAGS_AVAILABLE` shares the field but names no limit, so it is
+        left out. */
+    static let limitFlags: [(flag: Int32, name: String)] = [
+        (WQ_EXCEEDED_CONSTRAINED_THREAD_LIMIT, "constrained"),
+        (WQ_EXCEEDED_TOTAL_THREAD_LIMIT, "total"),
+        (WQ_EXCEEDED_COOPERATIVE_THREAD_LIMIT, "cooperative"),
+        (WQ_EXCEEDED_ACTIVE_CONSTRAINED_THREAD_LIMIT, "active-constrained"),
+    ]
+
     public static func limitNames(state: UInt32) -> [String] {
-        var names: [String] = []
-        if state & 0x1 != 0 { names.append("constrained") }
-        if state & 0x2 != 0 { names.append("total") }
-        if state & 0x8 != 0 { names.append("cooperative") }
-        if state & 0x10 != 0 { names.append("active-constrained") }
-        return names
+        limitFlags.filter { state & UInt32($0.flag) != 0 }.map(\.name)
     }
 }
 
@@ -120,15 +126,14 @@ public struct ThreadSample: Codable, Equatable, Sendable {
         queue the thread is serving (a cooperative-pool thread reads
         `com.apple.root.<qos>.cooperative`), else `(unnamed)`. */
     public var byName: [String: Int]
-    /** Keyed by `ThreadRunState` raw value. */
-    public var byState: [String: Int]
+    public var byState: [ThreadRunState: Int]
     /** The launchd `jetsam thread limit` for this job, when running as the agent. */
     public var limit: Int?
     public var total: Int
     public var workqueue: WorkqueueSample?
 
     public init(
-        byName: [String: Int], byState: [String: Int], limit: Int?, total: Int, workqueue: WorkqueueSample?
+        byName: [String: Int], byState: [ThreadRunState: Int], limit: Int?, total: Int, workqueue: WorkqueueSample?
     ) {
         self.byName = byName
         self.byState = byState
@@ -178,11 +183,13 @@ public struct SystemSample: Codable, Equatable, Sendable {
         self.memoryPressure = memoryPressure
     }
 
+    /** The sysctl reports the level in the dispatch memory-pressure event's
+        terms. */
     public static func pressureName(level: Int32) -> String {
-        switch level {
-        case 1: "normal"
-        case 2: "warning"
-        case 4: "critical"
+        switch UInt(bitPattern: Int(level)) {
+        case DispatchSource.MemoryPressureEvent.normal.rawValue: "normal"
+        case DispatchSource.MemoryPressureEvent.warning.rawValue: "warning"
+        case DispatchSource.MemoryPressureEvent.critical.rawValue: "critical"
         default: "level \(level)"
         }
     }
@@ -268,13 +275,17 @@ public struct TelemetryMark: TelemetryLine, Codable, Equatable {
         self.time = time
     }
 
+    /** Blocking work, a phase wait, or a lane queue wait longer than this
+        gets a mark. */
+    public static let slowOperationSeconds = 2.0
+
     /** The mark for an activity event, or nil when that event gets none:
         stops and restarts mark both ends, blocking work and phase waits mark
         only an end past `slowOperationSeconds`, and a lane reports only the
         queue waits already past it. */
     public static func forActivity(
         _ event: DaemonActivity.Event, daemonPid: Int32, time: Date,
-        slowOperationSeconds: Double = TelemetryCadence.slowOperationSeconds
+        slowOperationSeconds: Double = Self.slowOperationSeconds
     ) -> TelemetryMark? {
         switch event {
         case .laneWaited(let lane, let seconds):

@@ -4,9 +4,6 @@ import Foundation
     carries per-thread detail. A pure function of what the sampler observed,
     so every branch is testable without a clock. */
 public enum TelemetryCadence {
-    /** A blocking operation or phase wait longer than this gets a mark. */
-    public static let slowOperationSeconds = 2.0
-
     /** Used for the thread fractions when launchd reports no limit (the
         daemon is not running as the agent): the limit the agent gets. */
     public static let assumedThreadLimit = 32

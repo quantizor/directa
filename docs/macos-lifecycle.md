@@ -40,20 +40,20 @@ What and where (all under the daemon's logs dir, `~/Library/Logs/directa` unless
 
 Snapshot line (`entry: snapshot`):
 
-- `threads`: `total` from `task_threads`; `byState` from `thread_info(THREAD_BASIC_INFO)`; `byName` from the pthread name, else the label of the dispatch queue the thread is running (a cooperative-pool thread reads `com.apple.root.<qos>.cooperative`), else `(unnamed)` (an idle pool thread, or a plain thread with no name); `limit` is launchd's `jetsam thread limit`, read once at boot and present only under the agent; `workqueue` is `PROC_PIDWORKQUEUEINFO` (pool threads total, running, blocked, and which kernel thread limits are exceeded).
-- `threadDetail` (threshold snapshots only): per thread name, run state, user and system seconds, CPU percent.
+- `threads`: `total` from `task_threads`; `byState` from `thread_info(THREAD_EXTENDED_INFO)`, one read per thread that also yields the name and the detail below; `byName` from the pthread name, else the label of the dispatch queue the thread is running (a cooperative-pool thread reads `com.apple.root.<qos>.cooperative`), else `(unnamed)` (an idle pool thread, or a plain thread with no name); `limit` is launchd's `jetsam thread limit`, read once at boot and present only under the agent; `workqueue` is `PROC_PIDWORKQUEUEINFO` (pool threads total, running, blocked, and which kernel thread limits are exceeded).
+- `threadDetail` (threshold snapshots only, from the same sweep as `threads`): per thread name, run state, user and system seconds, CPU percent.
 - `memory`: `footprint` and `footprintLifetimePeak` (`proc_pid_rusage` v6), `resident`, and `TASK_VM_INFO` `compressed`, `compressedPeak`, `compressedLifetime`, `internal`, `internalPeak`. `compressed` is the process's own compressed memory, the figure to hold against a `killing largest compressed process` ledger number.
 - `fileDescriptors`: `PROC_PIDLISTFDS` count.
 - `system`: `kern.memorystatus_vm_pressure_level` by name, 1/5/15 minute load average.
-- `activity`: supervisors per phase, in-flight wire requests per method, in-flight work per kind (count, oldest age, oldest label), the eight longest-running items, connected clients; plus `exitWatches` (pids armed in ExitWatcher).
+- `activity`: supervisors per phase, in-flight wire requests per method (count, oldest age), in-flight work per kind (count, oldest age, oldest label), the eight longest-running items, connected clients; plus `exitWatches` (pids armed in ExitWatcher).
 - `lanes`: per BlockingLane (`repository`, `system`), its width, jobs running, jobs queued for a thread, and the oldest queued job's wait, read under the lane's own lock. A queued job is not yet in `activity`, since its blocking call has not begun, so a backlog shows only here.
-- `reason` (`interval`, `burst`, `threshold`), `sampleMicroseconds` (the sample's own cost), `uptimeSeconds`, `daemonPid`.
+- `reason` (`interval`, `burst`, `threshold`), `sampleMicroseconds` (the sample's own cost: every read, up to building the line), `uptimeSeconds`, `daemonPid`.
 - A kernel read that fails is omitted, never written as zero.
 
 In-flight work (`DaemonActivity`, one unfair lock, readable without awaiting any actor):
 
 - Kinds: `git` (CheckoutIdentity), `launchctl`, `lsof`, `ps`, `subprocess`, `log-show` (LaunchdAdmin.shell and PortGuard, kind by executable name; timed inside the synchronous call a lane runs, so the age is the blocking run itself, never the lane queue), `stop` (ServerSupervisor.stop from the signal to its return), `stop-wait` and `spawn-wait` (a caller waiting on a phase change), `restart` (Router restart per server, stop through ensure), `request` (a wire request from the moment its line arrives, including time spent waiting for a pool thread).
-- Every kind but `request` and `log-show` triggers the fast cadence.
+- Every kind but `request` and `log-show` triggers the fast cadence, except work the boot incident thread runs on the daemon itself (its `launchctl print`), which never does.
 
 Cadence (`TelemetryCadence.decide`, pure):
 
@@ -69,7 +69,7 @@ Boot incident (written by a utility-QoS background thread, never delaying the so
 
 - Header line (`entry: incident`): previous pid, the previous run's last line time and the gap to boot, whether the previous run wrote its own `daemon-exiting` mark among its last lines, and under the agent launchd's record from `launchctl print` (exit code, terminating signal, exit reason, immediate reason, spawn type, thread limit, plus the job's own top-level lines verbatim).
 - The previous run's last 180 telemetry lines, verbatim, read across rotations before this run writes its first line.
-- `system-log` lines from `/usr/bin/log show --style ndjson --info` over the previous run's last line minus 60 s to boot (capped at 10 minutes past the last line; 3 minutes before boot when there is no previous telemetry), 60 s hard timeout. Predicate: kernel lines naming `ddirecta`, `memorystatus`, `jetsam`, `thread limit`, `EXC_RESOURCE`, or `killing`, minus the code-signing `evaluation result` line the kernel writes for every exec; launchd (`com.apple.xpc.launchd`) lines naming the agent label but not its child job labels; kernel, launchd, RunningBoard (`:<pid>]` form, which skips its state dumps), and crash-reporter lines naming the previous pid.
+- `system-log` lines (message, process, subsystem, and `time` when the timestamp parsed) from `/usr/bin/log show --style ndjson --info` over the previous run's last line minus 60 s to boot (capped at 10 minutes past the last line; 3 minutes before boot when there is no previous telemetry), 60 s hard timeout. Predicate: kernel lines naming `ddirecta`, `memorystatus`, `jetsam`, `thread limit`, `EXC_RESOURCE`, or `killing`, minus the code-signing `evaluation result` line the kernel writes for every exec; launchd (`com.apple.xpc.launchd`) lines naming the agent label but not its child job labels; kernel, launchd, RunningBoard (`:<pid>]` form, which skips its state dumps), and crash-reporter lines naming the previous pid.
 - `diagnostic-report` lines for JetsamEvent and `ddirecta` reports in `/Library/Logs/DiagnosticReports` and `~/Library/Logs/DiagnosticReports` modified in the window: the daemon's process entry from a JetsamEvent, else the report's first 16 KB.
 - A final `search-finished` line with the match and report counts, the window, the predicate, and the outcome (`finished`, `timed out`, `failed: ...`, `skipped: ...`), so an empty search is recorded rather than silent. A clean previous exit skips the search.
 

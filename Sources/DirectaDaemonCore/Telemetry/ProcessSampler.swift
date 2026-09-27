@@ -19,13 +19,15 @@ final class ProcessSampler {
     }
 
     struct Threads {
+        /** One entry per thread, from the same sweep as `sample`; the caller
+            keeps it only for a threshold snapshot. */
         var detail: [ThreadDetail]
         var sample: ThreadSample
     }
 
-    /** Every thread of this task. `withDetail` adds one `ThreadDetail` per
-        thread for a threshold snapshot. */
-    func threads(limit: Int?, withDetail: Bool) -> Threads? {
+    /** Every thread of this task, from one `task_threads` sweep with one
+        `THREAD_EXTENDED_INFO` read per thread. */
+    func threads(limit: Int?) -> Threads? {
         var list: thread_act_array_t?
         var count: mach_msg_type_number_t = 0
         guard task_threads(mach_task_self_, &list, &count) == KERN_SUCCESS, let list else { return nil }
@@ -38,23 +40,22 @@ final class ProcessSampler {
                 vm_size_t(Int(count) * MemoryLayout<thread_t>.stride))
         }
         var byName: [String: Int] = [:]
-        var byState: [String: Int] = [:]
+        var byState: [ThreadRunState: Int] = [:]
         var detail: [ThreadDetail] = []
+        detail.reserveCapacity(Int(count))
         for index in 0..<Int(count) {
             let thread = list[index]
-            let basic = Self.basicInfo(thread)
-            let state = basic.map { ThreadRunState(machState: $0.run_state) } ?? .unknown
-            let name = threadName(thread)
+            let info = Self.extendedInfo(thread)
+            let state = info.map { ThreadRunState(machState: $0.pth_run_state) } ?? .unknown
+            let name = threadName(thread, info: info)
             byName[name, default: 0] += 1
-            byState[state.rawValue, default: 0] += 1
-            if withDetail {
-                detail.append(
-                    ThreadDetail(
-                        cpuPercent: basic.map { Double($0.cpu_usage) / Double(TH_USAGE_SCALE) * 100 } ?? 0,
-                        name: name, state: state,
-                        systemSeconds: basic.map { Self.seconds($0.system_time) } ?? 0,
-                        userSeconds: basic.map { Self.seconds($0.user_time) } ?? 0))
-            }
+            byState[state, default: 0] += 1
+            detail.append(
+                ThreadDetail(
+                    cpuPercent: info.map { Double($0.pth_cpu_usage) / Double(TH_USAGE_SCALE) * 100 },
+                    name: name, state: state,
+                    systemSeconds: info.map { Duration.nanoseconds($0.pth_system_time).roundedSeconds },
+                    userSeconds: info.map { Duration.nanoseconds($0.pth_user_time).roundedSeconds }))
         }
         return Threads(
             detail: detail,
@@ -126,12 +127,14 @@ final class ProcessSampler {
             running: Int(info.pwq_runthreads), total: Int(info.pwq_nthreads))
     }
 
-    private static func basicInfo(_ thread: thread_act_t) -> thread_basic_info? {
-        var info = thread_basic_info()
-        var count = mach_msg_type_number_t(MemoryLayout<thread_basic_info>.size / MemoryLayout<natural_t>.size)
+    /** Name, run state, CPU usage, and user and system time (nanoseconds) in
+        one read. */
+    private static func extendedInfo(_ thread: thread_act_t) -> thread_extended_info? {
+        var info = thread_extended_info()
+        var count = mach_msg_type_number_t(MemoryLayout<thread_extended_info>.size / MemoryLayout<natural_t>.size)
         let result = withUnsafeMutablePointer(to: &info) {
             $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                thread_info(thread, thread_flavor_t(THREAD_BASIC_INFO), $0, &count)
+                thread_info(thread, thread_flavor_t(THREAD_EXTENDED_INFO), $0, &count)
             }
         }
         return result == KERN_SUCCESS ? info : nil
@@ -139,17 +142,9 @@ final class ProcessSampler {
 
     /** The pthread name, else the label of the dispatch queue the thread is
         serving, else `(unnamed)`. */
-    private func threadName(_ thread: thread_act_t) -> String {
-        var extended = thread_extended_info()
-        var extendedCount = mach_msg_type_number_t(
-            MemoryLayout<thread_extended_info>.size / MemoryLayout<natural_t>.size)
-        let extendedResult = withUnsafeMutablePointer(to: &extended) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(extendedCount)) {
-                thread_info(thread, thread_flavor_t(THREAD_EXTENDED_INFO), $0, &extendedCount)
-            }
-        }
-        if extendedResult == KERN_SUCCESS {
-            let name = withUnsafeBytes(of: extended.pth_name) { raw in
+    private func threadName(_ thread: thread_act_t, info: thread_extended_info?) -> String {
+        if let info {
+            let name = withUnsafeBytes(of: info.pth_name) { raw in
                 String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
             }
             if !name.isEmpty { return name }
@@ -220,9 +215,5 @@ final class ProcessSampler {
                 return readCString(pointer, pageSize: pageSize) == label
             }
         }
-    }
-
-    private static func seconds(_ value: time_value_t) -> Double {
-        ((Double(value.seconds) + Double(value.microseconds) / 1e6) * 1000).rounded() / 1000
     }
 }
