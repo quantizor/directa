@@ -25,7 +25,12 @@ struct SettingsView: View {
     @State private var offers: [HarnessOffer] = []
     @State private var busyHarness: String?
     @State private var hookError: String?
-    @State private var launchAtLogin = AppAgentService.startsAtLogin
+    @State private var launchAtLogin = false
+    /** What starts the app at login as last read; nil until the first read
+        lands and while a change is in flight, which keeps the toggle
+        disabled. */
+    @State private var launchAtLoginActual: Bool?
+    @State private var launchAtLoginError: String?
     @State private var checkForUpdates = UpdatePreference.enabled
     @State private var confirmingUninstall = false
 
@@ -46,6 +51,10 @@ struct SettingsView: View {
         .onAppear {
             AppFocus.promote()
             refreshOffers()
+        }
+        .task {
+            let actual = await BlockingLane.system.run { AppAgentService.startsAtLogin }
+            showLaunchAtLogin(actual)
         }
     }
 
@@ -98,31 +107,29 @@ struct SettingsView: View {
     private var generalSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             sectionTitle("General")
-            /** Backed by the app's own KeepAlive agent (AppAgentService), not
-                the plain SMAppService.mainApp login item it replaced: a login
-                item does not relaunch mid-session after a TAL idle-cull or a
-                jetsam kill, so "Start at login" now also means "and stay
-                running." The user-facing label and meaning are unchanged.
-                `onChange` acts only when the new value differs from what
-                actually starts the app at login, and then resyncs the toggle
-                to that, so the resync after a failed enable never reaches
-                the Off path and never records Off for someone who asked for
-                On. */
+            /** `onChange` acts only on a value that differs from the last
+                read, and the resync after a failed On sets the toggle to that
+                read, so the resync never reaches the Off path and never
+                records Off for someone who asked for On. */
             Toggle("Start at login", isOn: $launchAtLogin)
                 .toggleStyle(.checkbox)
+                .disabled(launchAtLoginActual == nil)
                 .onChange(of: launchAtLogin) { _, wanted in
-                    guard wanted != AppAgentService.startsAtLogin else { return }
-                    if wanted {
-                        do {
-                            try AppAgentService.enableAtUserRequest()
-                        } catch {
-                            DirectaLog.app.error("Start at login on: \(error.localizedDescription)")
-                        }
-                    } else {
-                        AppAgentService.disableAtUserRequest()
+                    guard let actual = launchAtLoginActual, wanted != actual else { return }
+                    launchAtLoginActual = nil
+                    Task {
+                        let outcome = await BlockingLane.system.run { AppAgentService.applyUserChoice(wanted) }
+                        launchAtLoginError = outcome.error
+                        showLaunchAtLogin(outcome.startsAtLogin)
                     }
-                    launchAtLogin = AppAgentService.startsAtLogin
                 }
+            if let launchAtLoginError {
+                Text(launchAtLoginError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Toggle("Check for updates in the background", isOn: $checkForUpdates)
                 .toggleStyle(.checkbox)
                 .onChange(of: checkForUpdates) { _, wanted in
@@ -181,6 +188,13 @@ struct SettingsView: View {
     private func sectionTitle(_ text: String) -> some View {
         Text(text)
             .font(.headline)
+    }
+
+    /** The read lands before the toggle moves, so the `onChange` this
+        assignment fires finds nothing to apply. */
+    private func showLaunchAtLogin(_ actual: Bool) {
+        launchAtLoginActual = actual
+        launchAtLogin = actual
     }
 
     private func refreshOffers() {

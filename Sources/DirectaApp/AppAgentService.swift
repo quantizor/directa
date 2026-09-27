@@ -2,111 +2,62 @@ import DirectaKit
 import Foundation
 import ServiceManagement
 
-/** SMAppService registration for the app's own in-bundle KeepAlive LaunchAgent
-    (`dev.quantizor.directa.app`), mirroring `AgentService`'s daemon-agent
-    pattern but for the app process itself.
-
-    The problem this closes: a plain `SMAppService.mainApp` login item has no
-    KeepAlive, so Transparent Application Lifecycle idle-culling a windowless
-    MenuBarExtra, or a memory-pressure jetsam pass in the login-item band
-    (100), kills the app and it stays dead for the rest of the session. A
-    `KeepAlive { SuccessfulExit: false }` LaunchAgent relaunches within
-    launchd's throttle after an abnormal exit (a TAL cull or a jetsam SIGKILL,
-    both non-zero/signaled), never after a deliberate Quit (`NSApp.terminate`
-    exits 0), and runs in the daemon jetsam band (40) instead of 100, where
-    it is far less likely to be chosen at all.
-
-    Must run inside the app process, same as `AgentService`: `SMAppService`
-    resolves the plist relative to `Bundle.main`. Nonisolated for the same
-    reason. */
+/** SMAppService registration for the app's own in-bundle KeepAlive
+    LaunchAgent (`dev.quantizor.directa.app`), the "Start at login" setting.
+    Why an agent rather than a login item, and the opt-in rules
+    `AppAgentPolicy` encodes: docs/macos-lifecycle.md, "Menu bar extra". */
 enum AppAgentService {
-    nonisolated static let plistName = "dev.quantizor.directa.app.plist"
+    nonisolated static let agent = BundledAgent(plistName: "dev.quantizor.directa.app.plist")
 
     enum Failure: Error, LocalizedError, Sendable {
-        case missingPlist
         case needsApproval
 
         var errorDescription: String? {
             switch self {
-            case .missingPlist:
-                return
-                    "This copy of directa.app is missing \(AppAgentService.plistName). Reinstall from the DMG or run make app."
             case .needsApproval:
-                return
-                    "macOS is waiting for you to allow directa to start automatically. Turn on quantizor/directa in System Settings > General > Login Items & Extensions."
+                "macOS is waiting for you to allow directa to start automatically. Turn on quantizor/directa in System Settings > General > Login Items & Extensions."
             }
         }
     }
 
-    private nonisolated static var agent: SMAppService {
-        SMAppService.agent(plistName: plistName)
-    }
-
-    nonisolated static var status: SMAppService.Status { agent.status }
-
-    nonisolated static var statusDescription: String {
-        switch agent.status {
-        case .enabled: "enabled"
-        case .notFound: "not found"
-        case .notRegistered: "not registered"
-        case .requiresApproval: "requires approval"
-        @unknown default: "unknown"
-        }
-    }
-
-    /** True when this process ships the in-bundle app LaunchAgent plist. A
-        copy built before this feature, or a debug build assembled without
-        `make app`'s plist write, has none: registering then would throw on a
-        plist `SMAppService` cannot find. */
-    nonisolated static var bundleHasPlist: Bool {
-        let url = Bundle.main.bundleURL
-            .appending(path: "Contents/Library/LaunchAgents")
-            .appending(path: plistName)
-        return FileManager.default.fileExists(atPath: url.path)
-    }
-
-    /** Register the agent. Tolerates an already-registered job (registering
-        twice throws), same idempotence guard as `AgentService.register`. */
-    nonisolated static func register() throws {
-        guard bundleHasPlist else { throw Failure.missingPlist }
-        if agent.status != .enabled {
-            do {
-                try agent.register()
-            } catch {
-                if agent.status != .requiresApproval { throw error }
-            }
-        }
-        if agent.status == .requiresApproval {
+    /** Register the agent and answer the status registration ended in,
+        throwing `Failure.needsApproval` when that is `requiresApproval`. */
+    @discardableResult
+    nonisolated static func register() throws -> AppAgentPolicy.RegistrationStatus {
+        let status = try agent.registerTolerant()
+        if status == .requiresApproval {
             throw Failure.needsApproval
         }
+        return status
     }
 
     /** Idempotent when never registered. A failure is logged, not thrown:
         every caller goes on to its next step either way. */
     nonisolated static func unregister() {
-        guard agent.status != .notRegistered else { return }
+        let service = agent.service
+        guard service.status != .notRegistered else { return }
         do {
-            try agent.unregister()
+            try service.unregister()
             DirectaLog.app.info("app agent unregistered")
         } catch {
             DirectaLog.app.error("app agent unregister: \(error.localizedDescription)")
         }
     }
 
-    nonisolated static var legacyLoginItemEnabled: Bool { SMAppService.mainApp.status == .enabled }
-
     /** What the Settings toggle shows; see `AppAgentPolicy.startsAtLogin`. */
     nonisolated static var startsAtLogin: Bool {
-        AppAgentPolicy.startsAtLogin(agentStatus: policyStatus, legacyLoginItemEnabled: legacyLoginItemEnabled)
+        AppAgentPolicy.startsAtLogin(
+            agentStatus: agent.status, legacyLoginItemEnabled: SMAppService.mainApp.status == .enabled)
     }
 
-    /** Unregister the pre-migration `SMAppService.mainApp` login item when it
-        is enabled; a no-op status read otherwise. A failure is logged, not
-        thrown: a kept legacy item is read again at the next launch, which
-        retries this. */
-    nonisolated static func unregisterLegacyLoginItem(because reason: String) {
+    /** Unregister the older `SMAppService.mainApp` login item in any state
+        but `notRegistered`, `requiresApproval` included, since a login item
+        waiting on approval would come back on the moment the user allowed
+        it. A failure is logged, not thrown: a kept item is read again at the
+        next launch, which retries this. */
+    nonisolated static func retireLegacyLoginItem(because reason: String) {
         let item = SMAppService.mainApp
-        guard item.status == .enabled else { return }
+        guard item.status != .notRegistered else { return }
         do {
             try item.unregister()
             DirectaLog.app.info("Start at Login item unregistered: \(reason)")
@@ -115,29 +66,28 @@ enum AppAgentService {
         }
     }
 
-    nonisolated static var policyStatus: AppAgentPolicy.AgentStatus {
-        switch agent.status {
-        case .enabled: .enabled
-        case .notFound: .notFound
-        case .notRegistered: .notRegistered
-        case .requiresApproval: .requiresApproval
-        @unknown default: .unknown
-        }
+    /** Everything that starts the app at login: the older login item, then
+        the app agent. */
+    nonisolated static func removeAll(because reason: String) {
+        retireLegacyLoginItem(because: reason)
+        unregister()
     }
 
-    /** At launch, act on `AppAgentPolicy.launchAction`. The legacy login
-        item's status is read before `unregisterLegacyLoginItem`: a read after
-        would always be false and record Off for someone who had Start at
-        login on. Registration runs before that unregister, so a registration
-        that does not end with the agent enabled keeps the legacy item. */
+    /** At launch, act on `AppAgentPolicy.launchAction`. Every status is read
+        once, before anything changes: the legacy item's read in particular
+        must come before `retireLegacyLoginItem`, or it would always read off
+        and record Off for someone who had Start at login on. Registration
+        runs before that retirement, so a registration that does not end with
+        the agent enabled keeps the legacy item. */
     nonisolated static func ensureRegisteredAtLaunch(paths: DirectaPaths = DirectaPaths()) {
         let action = AppAgentPolicy.launchAction(
-            agentStatus: policyStatus,
-            bundleHasPlist: bundleHasPlist,
-            legacyLoginItemEnabled: legacyLoginItemEnabled,
-            markerPresent: FileManager.default.fileExists(atPath: paths.appAutostartDisabledFile.path),
-            runningOutsideApplications: SetupPlanner.isRunningOutsideApplications(
-                bundlePath: Bundle.main.bundlePath))
+            AppAgentPolicy.LaunchInputs(
+                agentStatus: agent.status,
+                bundleHasPlist: agent.bundleHasPlist,
+                legacyLoginItemEnabled: SMAppService.mainApp.status == .enabled,
+                markerPresent: FileManager.default.fileExists(atPath: paths.appAutostartDisabledFile.path),
+                runningOutsideApplications: SetupPlanner.isRunningOutsideApplications(
+                    bundlePath: Bundle.main.bundlePath)))
         switch action {
         case .leaveAlone:
             return
@@ -151,17 +101,19 @@ enum AppAgentService {
                 )
             }
         case .register:
+            let after: AppAgentPolicy.RegistrationStatus
             do {
-                try register()
-                DirectaLog.app.info("app agent register at launch: \(statusDescription)")
+                after = try agent.registerTolerant()
+                DirectaLog.app.info("app agent register at launch: \(after)")
             } catch {
+                after = agent.status
                 DirectaLog.app.error("app agent register at launch: \(error.localizedDescription)")
             }
-            if AppAgentPolicy.retiresLegacyLoginItem(agentStatusAfterRegister: policyStatus) {
-                unregisterLegacyLoginItem(because: "the app agent now starts directa at login")
+            if AppAgentPolicy.retiresLegacyLoginItem(agentStatusAfterRegister: after) {
+                retireLegacyLoginItem(because: "the app agent now starts directa at login")
             } else {
                 DirectaLog.app.error(
-                    "app agent register at launch left the agent \(statusDescription); kept the Start at Login item so the next launch retries"
+                    "app agent register at launch left the agent \(after); kept the Start at Login item so the next launch retries"
                 )
             }
         }
@@ -173,7 +125,7 @@ enum AppAgentService {
         turn it back on. */
     nonisolated static func disableAtUserRequest(paths: DirectaPaths = DirectaPaths()) {
         unregister()
-        unregisterLegacyLoginItem(because: "Start at login turned off in Settings")
+        retireLegacyLoginItem(because: "Start at login turned off in Settings")
         do {
             try AtomicFile.write(Data(), to: paths.appAutostartDisabledFile)
         } catch {
@@ -183,11 +135,39 @@ enum AppAgentService {
         }
     }
 
-    /** Settings toggle On: clear the marker, then register. Throws exactly as
-        `register()` does, so the caller can resync the toggle to the real
-        status on failure the same way the pre-migration code did. */
+    /** Settings toggle On: clear the marker, then register. A registration
+        waiting on approval opens the Login Items pane, where the user
+        answers it. */
     nonisolated static func enableAtUserRequest(paths: DirectaPaths = DirectaPaths()) throws {
         try? FileManager.default.removeItem(at: paths.appAutostartDisabledFile)
-        try register()
+        do {
+            try register()
+        } catch Failure.needsApproval {
+            SMAppService.openSystemSettingsLoginItems()
+            throw Failure.needsApproval
+        }
+    }
+
+    /** Apply a Settings toggle change and answer what the toggle should show
+        afterward, with the error to display when the change did not take.
+        Acts only when `wanted` differs from what starts the app at login
+        right now, so the toggle's resync to a failed On never reaches the
+        Off path and never records Off for someone who asked for On. */
+    nonisolated static func applyUserChoice(
+        _ wanted: Bool, paths: DirectaPaths = DirectaPaths()
+    ) -> (error: String?, startsAtLogin: Bool) {
+        guard wanted != startsAtLogin else { return (nil, wanted) }
+        var failure: String?
+        if wanted {
+            do {
+                try enableAtUserRequest(paths: paths)
+            } catch {
+                DirectaLog.app.error("Start at login on: \(error.localizedDescription)")
+                failure = error.localizedDescription
+            }
+        } else {
+            disableAtUserRequest(paths: paths)
+        }
+        return (failure, startsAtLogin)
     }
 }

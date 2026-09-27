@@ -7,8 +7,13 @@ SIGN_IDENTITY ?= $(shell scripts/signing-identity.sh)
 
 .PHONY: build test sweep-test-temp app dmg release-dmg install clean icon
 
+# The shipped products only. A bare `swift build -c release` also compiles the
+# test-only targets (DirectaTestSupport imports Testing). `--product` keeps
+# only its last value, hence one invocation per product.
 build:
-	swift build -c release
+	swift build -c release --product directa
+	swift build -c release --product ddirecta
+	swift build -c release --product DirectaApp
 
 # A run killed part way leaves its scratch trees under the user temp dir
 # (directa-run.*, directa-test-*) with no one to clean up after it. This sweeps

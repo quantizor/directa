@@ -355,10 +355,8 @@ struct TimelinePane: View {
         case .crashed, .failed: .red
         case .healthy, .started: .green
         case .marked: .blue
-        case .registered, .unregistered: .secondary
-        case .stopped: .secondary
+        case .registered, .stopped, .unknown, .unregistered: .secondary
         case .unhealthy: .orange
-        case .unknown: .secondary
         }
     }
 }

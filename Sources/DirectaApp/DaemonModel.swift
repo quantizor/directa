@@ -321,7 +321,7 @@ final class DaemonModel {
         approval is pending would write back the very `~/Library/LaunchAgents`
         job the migration removed, and Login Items would name it `ddirecta` again. */
     private func recoverAgent() async -> Bool {
-        if AgentService.bundleHasAgentPlist {
+        if AgentService.agent.bundleHasPlist {
             do {
                 try await AgentService.ensureRunning()
                 daemonNeedsApproval = false
@@ -347,7 +347,7 @@ final class DaemonModel {
             daemonRecovering = true
             daemonRecoveryError = nil
             do {
-                if AgentService.bundleHasAgentPlist {
+                if AgentService.agent.bundleHasPlist {
                     try await AgentService.ensureRunning()
                 } else {
                     try await LaunchdAdmin.startOrInstall(

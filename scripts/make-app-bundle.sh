@@ -78,13 +78,9 @@ cat > "$APP/Contents/Library/LaunchAgents/${LABEL}.plist" <<PLIST
 </plist>
 PLIST
 
-# The app's own resilience: KeepAlive on any exit but a clean Quit
-# (NSApp.terminate exits 0), so a Transparent Application Lifecycle idle-cull
-# or a memory-pressure jetsam kill relaunches within launchd's throttle
-# instead of leaving a login item dead for the rest of the session, and this
-# process moves from the login-item jetsam band (100) to the daemon band (40).
-# No PATH floor: the GUI app never spawns dev servers, only Terminal logins
-# (TerminalRunner) for brew, which get a real login shell's PATH already.
+# The app's own agent (Start at login; why: docs/macos-lifecycle.md "Menu bar
+# extra"). No PATH floor: the GUI app never spawns dev servers, only Terminal
+# logins (TerminalRunner) for brew, which get a real login shell's PATH already.
 APP_LABEL="dev.quantizor.directa.app"
 cat > "$APP/Contents/Library/LaunchAgents/${APP_LABEL}.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -194,18 +194,18 @@ final class AppActivationDelegate: NSObject, NSApplicationDelegate, UNUserNotifi
         }
         /** MenuBarExtra is not a window TAL counts as "in use", so AppKit's
             automatic termination will quit an LSUIElement extra that looks idle,
-            especially after a memory-pressure pass. Start at Login does not
-            relaunch mid-session. The matching Info.plist keys refuse TAL at
-            Launch Services; these calls refuse it in-process. */
+            especially after a memory-pressure pass. The matching Info.plist
+            keys refuse TAL at Launch Services; these calls refuse it
+            in-process. With Start at login off, nothing relaunches the app
+            after such a quit. */
         ProcessInfo.processInfo.disableAutomaticTermination("menu bar extra")
         ProcessInfo.processInfo.disableSuddenTermination()
-        /** Belt and suspenders for the in-session TAL case above: once Start
-            at login is on, this also covers the jetsam SIGKILL the opt-out
-            cannot touch. Off the main thread: SMAppService's register call is
-            a synchronous XPC round-trip, and launch has no reason to wait on
-            it. */
-        Task.detached(priority: .utility) {
-            AppAgentService.ensureRegisteredAtLaunch()
+        /** Start at login's agent relaunches the app after the kills the
+            opt-out above cannot refuse (a jetsam SIGKILL). Service Management
+            calls are synchronous XPC round-trips, so they run on a blocking
+            lane, not the cooperative pool. */
+        Task {
+            await BlockingLane.system.run { AppAgentService.ensureRegisteredAtLaunch() }
         }
         AppFocus.installObservers()
         AppDeepLinkDispatch.registerNotificationCategories()

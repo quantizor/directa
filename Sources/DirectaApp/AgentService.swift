@@ -2,79 +2,41 @@ import DirectaKit
 import Foundation
 import ServiceManagement
 
-/** SMAppService registration for the in-bundle LaunchAgent.
-    Must run inside the app process: `SMAppService.agent(plistName:)` resolves
-    the plist relative to `Bundle.main`. Nonisolated: setup runs off the main
-    actor and Service Management is thread-safe for these calls. */
+/** SMAppService registration for the daemon's in-bundle LaunchAgent
+    (`dev.quantizor.directa`). */
 enum AgentService {
-    nonisolated static let plistName = "dev.quantizor.directa.plist"
+    nonisolated static let agent = BundledAgent(plistName: "dev.quantizor.directa.plist")
 
     /** Why registration could not finish. `needsApproval` is not a malfunction:
         macOS registered the job and is waiting for the user to switch it on, so
         callers must say so rather than retry or fall back to another install. */
     enum Failure: Error, LocalizedError, Sendable {
-        case missingPlist(String)
         case needsApproval
 
         var errorDescription: String? {
             switch self {
-            case .missingPlist(let name):
-                return
-                    "This copy of directa.app is missing \(name). Reinstall from the DMG or run make app."
             case .needsApproval:
-                return
-                    "macOS is waiting for you to allow directa to run in the background. Turn on quantizor/directa in System Settings > General > Login Items & Extensions."
+                "macOS is waiting for you to allow directa to run in the background. Turn on quantizor/directa in System Settings > General > Login Items & Extensions."
             }
         }
-    }
-
-    private nonisolated static var agent: SMAppService {
-        SMAppService.agent(plistName: plistName)
-    }
-
-    nonisolated static var status: SMAppService.Status { agent.status }
-
-    /** Status by name: the raw values are easy to misread in a log line
-        (`enabled` is 1, `requiresApproval` is 2). */
-    nonisolated static var statusDescription: String {
-        switch agent.status {
-        case .enabled: "enabled"
-        case .notFound: "not found"
-        case .notRegistered: "not registered"
-        case .requiresApproval: "requires approval"
-        @unknown default: "unknown"
-        }
-    }
-
-    /** True when this process ships the in-bundle LaunchAgents plist. */
-    nonisolated static var bundleHasAgentPlist: Bool {
-        let url = Bundle.main.bundleURL
-            .appending(path: "Contents/Library/LaunchAgents")
-            .appending(path: plistName)
-        return FileManager.default.fileExists(atPath: url.path)
     }
 
     /** Register the agent. Writes agent.path first so the daemon inherits the
         login-shell PATH after start. Registering often lands in
-        `requiresApproval`, which reads as success from `register()` alone, so the
-        status is re-read afterwards and reported as `Failure.needsApproval`. */
-    nonisolated static func register() throws {
-        guard bundleHasAgentPlist else { throw Failure.missingPlist(plistName) }
+        `requiresApproval`, which reads as success from `register()` alone, so
+        that status is reported as `Failure.needsApproval`. Answers the status
+        registration ended in. */
+    @discardableResult
+    nonisolated static func register() throws -> AppAgentPolicy.RegistrationStatus {
+        guard agent.bundleHasPlist else { throw BundledAgent.Failure.missingPlist(agent.plistName) }
         try LaunchdAdmin.writeAgentPath()
         migrateLegacyHomeAgent()
-        if agent.status != .enabled {
-            /** Registering an already-registered job throws; the status check
-                above plus this tolerance keeps re-launches idempotent. */
-            do {
-                try agent.register()
-            } catch {
-                if agent.status != .requiresApproval { throw error }
-            }
-        }
-        if agent.status == .requiresApproval {
+        let status = try agent.registerTolerant()
+        if status == .requiresApproval {
             SMAppService.openSystemSettingsLoginItems()
             throw Failure.needsApproval
         }
+        return status
     }
 
     /** Unregister then register: required after the helper binary or plist
@@ -88,16 +50,17 @@ enum AgentService {
     nonisolated static func reregister() async throws {
         try LaunchdAdmin.writeAgentPath()
         migrateLegacyHomeAgent()
-        if agent.status == .enabled || agent.status == .requiresApproval {
-            try? await agent.unregister()
+        let service = agent.service
+        if service.status == .enabled || service.status == .requiresApproval {
+            try? await service.unregister()
             let unloaded = await LaunchdAdmin.waitUntilAgentUnloaded()
             if !unloaded {
                 DirectaLog.app.error(
                     "agent still loaded after unregister; register may hit a Launch Constraint Violation")
             }
         }
-        try agent.register()
-        if agent.status == .requiresApproval {
+        try service.register()
+        if service.status == .requiresApproval {
             SMAppService.openSystemSettingsLoginItems()
             throw Failure.needsApproval
         }
@@ -109,34 +72,17 @@ enum AgentService {
     nonisolated static func unregister(paths: DirectaPaths = DirectaPaths()) async throws {
         try AtomicFile.write(Data(), to: paths.stoppedIntentFile)
         migrateLegacyHomeAgent()
-        guard agent.status != .notRegistered else { return }
-        try await agent.unregister()
+        let service = agent.service
+        guard service.status != .notRegistered else { return }
+        try await service.unregister()
         DirectaLog.app.info("agent unregistered on request")
-    }
-
-    /** Drop Start at Login: both the legacy `SMAppService.mainApp` login item
-        (idempotent when it was never on) and the app's own KeepAlive agent
-        (AppAgentService.unregister, equally idempotent), so a full uninstall
-        or `directa://daemon/unregister-all` never leaves either mechanism
-        behind regardless of which one this install migrated through. */
-    nonisolated static func unregisterLoginItem() {
-        let item = SMAppService.mainApp
-        if item.status != .notRegistered {
-            do {
-                try item.unregister()
-                DirectaLog.app.info("Start at Login unregistered on request")
-            } catch {
-                DirectaLog.app.error("Start at Login unregister on request: \(error.localizedDescription)")
-            }
-        }
-        AppAgentService.unregister()
     }
 
     /** Agent plus Start at Login. Full uninstall uses this; `--agent-only` does
         not, so a Homebrew upgrade keeps the user's login preference. */
     nonisolated static func unregisterAllLaunchItems(paths: DirectaPaths = DirectaPaths()) async throws {
         try await unregister(paths: paths)
-        unregisterLoginItem()
+        AppAgentService.removeAll(because: "uninstall")
     }
 
     /** Deep-link / recovery entry: register, then wait until the socket answers.
@@ -163,7 +109,7 @@ enum AgentService {
         KeepAlive's in-place LWCR repair fails (`smd` error 22), so a brief hello
         miss forces unregister+register instead of waiting out ThrottleInterval. */
     nonisolated static func ensureAtLaunchIfNeeded() async {
-        guard bundleHasAgentPlist else {
+        guard agent.bundleHasPlist else {
             DirectaLog.app.info("no in-bundle LaunchAgent; leaving the daemon to the CLI")
             return
         }
@@ -187,8 +133,8 @@ enum AgentService {
             if rebind {
                 try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
             }
-            try register()
-            DirectaLog.app.info("agent register at launch: \(statusDescription)")
+            let status = try register()
+            DirectaLog.app.info("agent register at launch: \(status)")
             if AgentRebindPolicy.shouldForceReregisterAfterHelloMiss(rebindNeeded: rebind) {
                 if (try? await LaunchdAdmin.pollHello(
                     paths: paths, timeoutSeconds: AgentRebindPolicy.postReplaceHelloSeconds))
@@ -233,7 +179,7 @@ enum AgentService {
         if (try? await LaunchdAdmin.pollHello(paths: paths, timeoutSeconds: 2)) != nil {
             return
         }
-        guard agent.status == .enabled else {
+        guard agent.service.status == .enabled else {
             throw WireError(code: .daemonUnreachable, message: "the daemon never answered")
         }
         guard !LaunchdAdmin.deliberatelyStopped(paths: paths) else { return }

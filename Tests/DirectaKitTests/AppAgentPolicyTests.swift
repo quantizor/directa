@@ -4,33 +4,42 @@ import Testing
 
 @Suite struct AppAgentPolicyTests {
     typealias Action = AppAgentPolicy.LaunchAction
-    typealias Status = AppAgentPolicy.AgentStatus
+    typealias Inputs = AppAgentPolicy.LaunchInputs
+    typealias Status = AppAgentPolicy.RegistrationStatus
 
     struct Case: CustomTestStringConvertible, Sendable {
-        var agentStatus: Status = .notRegistered
-        var bundleHasPlist = true
         var expected: Action
-        var legacyLoginItemEnabled = false
-        var markerPresent = false
+        var inputs: Inputs
         var name: String
-        var runningOutsideApplications = false
 
         var testDescription: String { name }
 
-        var actual: Action {
-            AppAgentPolicy.launchAction(
+        init(
+            agentStatus: Status = .notRegistered, bundleHasPlist: Bool = true, expected: Action,
+            legacyLoginItemEnabled: Bool = false, markerPresent: Bool = false, name: String,
+            runningOutsideApplications: Bool = false
+        ) {
+            self.expected = expected
+            self.inputs = Inputs(
                 agentStatus: agentStatus,
                 bundleHasPlist: bundleHasPlist,
                 legacyLoginItemEnabled: legacyLoginItemEnabled,
                 markerPresent: markerPresent,
                 runningOutsideApplications: runningOutsideApplications)
+            self.name = name
         }
     }
 
+    /** The rows with the legacy item on and the agent not enabled are also
+        the retry: a registration that did not end `enabled` keeps the legacy
+        item, so the next launch reads these same inputs and registers again. */
     static let cases: [Case] = [
         Case(expected: .recordOff, name: "never turned on: agent not registered"),
         Case(agentStatus: .notFound, expected: .recordOff, name: "never turned on: agent not found"),
         Case(expected: .register, legacyLoginItemEnabled: true, name: "legacy on migrates"),
+        Case(
+            agentStatus: .notFound, expected: .register, legacyLoginItemEnabled: true,
+            name: "legacy on beside a not-found agent registers"),
         Case(
             agentStatus: .enabled, expected: .register, legacyLoginItemEnabled: true,
             name: "legacy on beside an enabled agent still migrates"),
@@ -60,7 +69,7 @@ import Testing
     ]
 
     @Test(arguments: cases) func launchAction(_ c: Case) {
-        #expect(c.actual == c.expected)
+        #expect(AppAgentPolicy.launchAction(c.inputs) == c.expected)
     }
 
     static let allStatuses: [Status] = [.enabled, .notFound, .notRegistered, .requiresApproval, .unknown]
@@ -75,17 +84,11 @@ import Testing
         #expect(retired == [.enabled])
     }
 
-    /** A kept legacy item plus an agent that is not enabled must read as
-        `.register` on the next launch, never `.recordOff` or `.leaveAlone`,
-        so the carry-forward is retried until the agent takes over. */
-    @Test func aRegistrationThatDidNotEnableRetriesOnTheNextLaunch() {
-        for status: Status in [.notFound, .notRegistered, .requiresApproval] {
-            #expect(!AppAgentPolicy.retiresLegacyLoginItem(agentStatusAfterRegister: status), "\(status)")
-            let next = AppAgentPolicy.launchAction(
-                agentStatus: status, bundleHasPlist: true, legacyLoginItemEnabled: true,
-                markerPresent: false, runningOutsideApplications: false)
-            #expect(next == .register, "\(status)")
-        }
+    /** Log lines name a status in words, never by raw value. */
+    @Test func statusDescriptionsAreWords() {
+        #expect(Self.allStatuses.map(\.description) == [
+            "enabled", "not found", "not registered", "requires approval", "unknown",
+        ])
     }
 
     /** The Settings toggle reads On whenever something starts the app at
@@ -104,9 +107,9 @@ import Testing
         #expect(on == [
             "enabled legacy=false",
             "enabled legacy=true",
-            "notFound legacy=true",
-            "notRegistered legacy=true",
-            "requiresApproval legacy=true",
+            "not found legacy=true",
+            "not registered legacy=true",
+            "requires approval legacy=true",
             "unknown legacy=true",
         ])
     }
@@ -122,11 +125,12 @@ import Testing
                     for markerPresent in [false, true] {
                         for runningOutsideApplications in [false, true] {
                             let action = AppAgentPolicy.launchAction(
-                                agentStatus: agentStatus,
-                                bundleHasPlist: bundleHasPlist,
-                                legacyLoginItemEnabled: legacyLoginItemEnabled,
-                                markerPresent: markerPresent,
-                                runningOutsideApplications: runningOutsideApplications)
+                                Inputs(
+                                    agentStatus: agentStatus,
+                                    bundleHasPlist: bundleHasPlist,
+                                    legacyLoginItemEnabled: legacyLoginItemEnabled,
+                                    markerPresent: markerPresent,
+                                    runningOutsideApplications: runningOutsideApplications))
                             if action == .register { #expect(legacyLoginItemEnabled) }
                             if action == .recordOff { #expect(!legacyLoginItemEnabled) }
                             if !bundleHasPlist || runningOutsideApplications || markerPresent {
