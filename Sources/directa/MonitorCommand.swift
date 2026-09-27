@@ -16,6 +16,11 @@ struct Monitor: AsyncParsableCommand {
             "Stream one server's output shaped for an agent's own monitor tool: Claude Code's Monitor tool, or Grok Build's monitor tool."
     )
 
+    /** Set to "1" to print one line per poll on stderr: scripts/smoke.sh's
+        idle-CPU check counts polls this way without any daemon-side
+        instrumentation. */
+    static let debugEnvironmentKey = "DIRECTA_MONITOR_DEBUG"
+
     @Option(
         help:
             "Total stderr lines for this run (\(MonitorFlagOption.rangeText(MonitorLimits.errorsPerArmRange))); re-arm (run the command again) to reset.",
@@ -67,7 +72,7 @@ struct Monitor: AsyncParsableCommand {
             instrumentation. Every `step()` call makes exactly one
             `logs.query`, attaching or ticking, so counting calls to
             `step()` is counting `logs.query` calls. */
-        let debugPolls = ProcessInfo.processInfo.environment["DIRECTA_MONITOR_DEBUG"] == "1"
+        let debugPolls = ProcessInfo.processInfo.environment[Self.debugEnvironmentKey] == "1"
 
         let lifetime = MonitorLifetime()
         let loopTask = Task<MonitorRunOutcome, Never> {

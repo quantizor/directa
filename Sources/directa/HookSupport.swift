@@ -717,10 +717,11 @@ enum GrokSessionHook {
 /** On-disk half of `GrokSessionHook.TurnState`. Files are keyed by Grok's
     session id; `DIRECTA_GROK_HOOK_STATE_DIR` relocates the directory for tests. */
 enum GrokTurnGate {
+    static let stateDirEnvironmentKey = "DIRECTA_GROK_HOOK_STATE_DIR"
     static let stateDirName = "directa-grok-hook"
 
     static func directory(environment: [String: String]) -> URL {
-        if let override = environment["DIRECTA_GROK_HOOK_STATE_DIR"], !override.isEmpty {
+        if let override = environment[stateDirEnvironmentKey], !override.isEmpty {
             return URL(fileURLWithPath: override)
         }
         let tmp = environment["TMPDIR"].flatMap { $0.isEmpty ? nil : $0 } ?? NSTemporaryDirectory()
