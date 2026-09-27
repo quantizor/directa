@@ -846,8 +846,7 @@ public actor Router {
             the group, and the root's unique id reaches one that also left the
             session and reparented, the same union stop() and the crash path
             use. */
-        let descendants = ProcessTree.liveDescendants(
-            rootPid: pid, rootUniqueID: root.uniqueID, sessionID: pid, snapshot: [])
+        let descendants = ProcessTree.liveDescendants(rootPid: pid, rootIdentity: root, snapshot: [])
         ProcessTree.signalTree(
             descendants: descendants, revalidate: true, rootIdentity: root, rootPid: pid,
             signal: SIGTERM)

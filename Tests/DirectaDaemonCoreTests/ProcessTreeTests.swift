@@ -56,18 +56,14 @@ import Testing
         session and teardown would signal the daemon and every other server it
         supervises. */
     @Test func sessionSweepRefusesTheCallersOwnSession() {
-        let mine = getsid(getpid())
-        #expect(
-            ProcessTree.sessionMembers(of: mine, sessionLeaderPid: mine).identities.isEmpty)
+        #expect(ProcessTree.sessionMembers(of: getsid(getpid())).identities.isEmpty)
     }
 
-    /** A root that is not its own session leader cannot have had createSession
-        applied, so its session belongs to somebody else and is not ours to
-        sweep. */
-    @Test func sessionSweepRefusesARootThatIsNotTheSessionLeader() {
-        #expect(
-            ProcessTree.sessionMembers(of: 1, sessionLeaderPid: 4242).identities.isEmpty)
-        #expect(ProcessTree.sessionMembers(of: 0, sessionLeaderPid: 0).identities.isEmpty)
+    /** Zero and negatives name no session leader; `getsid` would read them as
+        the caller's own session or an error, never as a root to sweep. */
+    @Test(arguments: [0, -1] as [pid_t])
+    func sessionSweepRefusesASelector(leader: pid_t) {
+        #expect(ProcessTree.sessionMembers(of: leader).identities.isEmpty)
     }
 
     /** The positive control, and the reason it uses posix_spawn directly:
@@ -95,13 +91,39 @@ import Testing
 
         var members: [pid_t] = []
         for _ in 0..<50 {
-            members = ProcessTree.sessionMembers(of: leader, sessionLeaderPid: leader)
-                .identities.map(\.pid)
+            members = ProcessTree.sessionMembers(of: leader).identities.map(\.pid)
             if !members.isEmpty { break }
             usleep(50_000)
         }
         #expect(!members.isEmpty, "session sweep found no members of session \(leader)")
         #expect(members.contains(leader) == false, "the leader itself must not be returned")
+    }
+
+    /** A root pid that now names a different live process is a stranger's:
+        its children and the session it leads are not this run's, so both
+        sweeps keyed on the pid are skipped. The same live tree read with the
+        root's real identity is the positive control. */
+    @Test func liveDescendantsSkipsTheRootPidSweepsWhenThePidNamesAStranger() throws {
+        let leader = try spawnBare(["/bin/sh", "-c", "/bin/sleep 5 & sleep 5"], flags: POSIX_SPAWN_SETSID)
+        defer {
+            kill(-leader, SIGKILL)
+            kill(leader, SIGKILL)
+            var status: Int32 = 0
+            waitpid(leader, &status, 0)
+        }
+        let real = try #require(ProcessTree.identity(of: leader))
+        let stranger = ProcessIdentity(
+            pid: leader, startMicroseconds: real.startMicroseconds,
+            startSeconds: real.startSeconds - 60, uniqueID: real.uniqueID.map { $0 &+ 1 })
+        var found: [pid_t] = []
+        for _ in 0..<50 where found.isEmpty {
+            found = ProcessTree.liveDescendants(rootPid: leader, rootIdentity: real, snapshot: [])
+                .map(\.pid)
+            if found.isEmpty { usleep(50_000) }
+        }
+        #expect(!found.isEmpty, "the positive control found no descendants of \(leader)")
+        #expect(
+            ProcessTree.liveDescendants(rootPid: leader, rootIdentity: stranger, snapshot: []).isEmpty)
     }
 
     @Test func shouldSignalRejectsMissingAndReusedPid() {

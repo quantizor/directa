@@ -82,8 +82,8 @@ public enum ProcessTree {
         }
     }
 
-    /** Live processes belonging to `session`, excluding the session leader and
-        this process's own session.
+    /** Live members of the session `leader` leads (a session id is its
+        leader's pid), excluding the leader and this process's own session.
 
         This is the one handle on an escaped descendant that does not depend on
         when a snapshot was taken. A child that setpgid's out of the group (every
@@ -92,16 +92,16 @@ public enum ProcessTree {
         the orphan reparenting to launchd. So a descendant missed by the snapshot
         because it appeared moments before the crash is still reachable here.
 
-        The safety guard is the whole design. `sessionLeaderPid` must equal
-        `session`, which is true exactly when the spawn used createSession and
-        the root really is its own session leader. Without that check, a root
-        sharing the daemon's session would turn this into a sweep of the daemon
-        and everything the daemon owns, so the caller's session is refused
-        outright rather than trusted to differ. */
-    public static func sessionMembers(of session: pid_t, sessionLeaderPid: pid_t)
-        -> DescendantsResult
-    {
-        guard session == sessionLeaderPid, session != getsid(getpid()), session > 0 else {
+        Every launcher spawns the root as a session leader, so its pid is the
+        session to sweep, never a `getsid` read that answers ESRCH once a
+        short-lived root has exited. A root that somehow did not lead a session
+        names none, since the kernel never hands out a pid still in use as a
+        session id, so the sweep then finds nothing rather than a stranger. The
+        caller's own session is refused outright rather than trusted to differ:
+        sweeping it would signal the daemon and everything it owns. */
+    public static func sessionMembers(of leader: pid_t) -> DescendantsResult {
+        let session = leader
+        guard session > 0, session != getsid(getpid()) else {
             return .ok([])
         }
         switch fetchProcessTable() {
@@ -279,37 +279,43 @@ public enum ProcessTree {
 
     /** Every way a live descendant of a run can be found, deduped by pid: the
         snapshot taken while the root still parented them, a fresh parent-chain
-        sweep, the session members that kept the root's session after
+        sweep, the members of the session the root leads, which kept it after
         setpgid/setsid took them out of the group, and the lineage walk from
-        `rootUniqueID` and every unique id the other three found, which reaches
-        a setsid child that reparented after the last snapshot refresh. No
-        single source is enough (see the note on
+        the root's unique id and every unique id the other three found, which
+        reaches a setsid child that reparented after the last snapshot
+        refresh. No single source is enough (see the note on
         ServerSupervisor.startDescendantWatch), so both the deliberate-stop and
         crash paths union all four and revalidate each pid at signal time. A
         failed sweep contributes nothing rather than throwing.
 
-        `priorSignaled` carries the identities an earlier pass already signaled,
-        so an escalation pass can re-signal a descendant that answered that pass
-        by ignoring it (SIG_IGN is inherited across fork/exec when a root passes
-        it down) and then became invisible to every live source: setsid gave it
-        a session of its own, the dead root broke the parent chain, and it was
-        younger than the last snapshot refresh. Revalidation still applies, so a
-        recycled pid is never hit. */
+        `rootIdentity` is the root as recorded while it was alive (nil when
+        that read failed). The two sweeps keyed on `rootPid` are skipped while
+        that pid names a different live process: a recycled pid's children and
+        session belong to a stranger. Once no process wears the pid, both still
+        run, since a session outlives its leader and nothing can be parented by
+        a pid that names no process.
+
+        `priorCandidates` carries the identities an earlier pass already
+        signaled, so an escalation pass can re-signal a descendant that
+        answered that pass by ignoring it (SIG_IGN is inherited across
+        fork/exec when a root passes it down) and then became invisible to
+        every live source: setsid gave it a session of its own, the dead root
+        broke the parent chain, and it was younger than the last snapshot
+        refresh. Revalidation still applies, so a recycled pid is never hit. */
     public static func liveDescendants(
-        rootPid: pid_t, rootUniqueID: UInt64?, sessionID: pid_t?, snapshot: [ProcessIdentity],
-        priorSignaled: [ProcessIdentity] = []
+        rootPid: pid_t, rootIdentity: ProcessIdentity?, snapshot: [ProcessIdentity],
+        priorCandidates: [ProcessIdentity] = []
     ) -> [ProcessIdentity] {
         var byPid: [pid_t: ProcessIdentity] = [:]
-        for identity in priorSignaled { byPid[identity.pid] = identity }
+        for identity in priorCandidates { byPid[identity.pid] = identity }
         for identity in snapshot { byPid[identity.pid] = identity }
-        for identity in descendants(of: rootPid).identities { byPid[identity.pid] = identity }
-        if let sessionID {
-            for identity in sessionMembers(of: sessionID, sessionLeaderPid: rootPid).identities {
-                byPid[identity.pid] = identity
-            }
+        let wearer = identity(of: rootPid)
+        if rootIdentity == nil || wearer == nil || wearer == rootIdentity {
+            for identity in descendants(of: rootPid).identities { byPid[identity.pid] = identity }
+            for identity in sessionMembers(of: rootPid).identities { byPid[identity.pid] = identity }
         }
         var seeds = Set(byPid.values.compactMap(\.uniqueID))
-        if let rootUniqueID { seeds.insert(rootUniqueID) }
+        if let rootUniqueID = rootIdentity?.uniqueID { seeds.insert(rootUniqueID) }
         for identity in lineageMembers(of: seeds).identities { byPid[identity.pid] = identity }
         return Array(byPid.values)
     }

@@ -688,6 +688,40 @@ private func makeEnv() throws -> TestEnv {
         #expect(getpid() > 0)
     }
 
+    /** A launchd job's root is reaped by launchd the moment it exits, so by
+        the time a stop runs its pid can name a stranger that happens to lead a
+        process group. Stop must revalidate against the root recorded at spawn,
+        never against a read of whatever wears the pid at stop time. The
+        injected reader records a different start time and unique id for the
+        real root, which is the view teardown gets of a recycled pid: the live
+        process must come through the stop unsignaled, with the stop giving up
+        honestly as `.stopping`. */
+    @Test func stopNeverSignalsAGroupWhosePidNoLongerNamesTheSpawnedRoot() async throws {
+        let env = try makeEnv()
+        let gate = AdoptGate()
+        let supervisor = ServerSupervisor(
+            launcher: StuckRunLauncher(gate: gate), paths: env.paths, projectPath: env.projectPath,
+            readIdentity: { pid in
+                ProcessTree.identity(of: pid).map {
+                    ProcessIdentity(
+                        pid: $0.pid, startMicroseconds: $0.startMicroseconds,
+                        startSeconds: $0.startSeconds - 60, uniqueID: $0.uniqueID.map { $0 &+ 1 })
+                }
+            },
+            registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "web"),
+            stopTiming: StopTiming(graceSeconds: 0.2, overtimeSeconds: 0.2))
+        let root = try #require(await supervisor.start().pid.flatMap { pid_t(exactly: $0) })
+        defer { kill(root, SIGKILL) }
+
+        let stopped = await supervisor.stop(reason: "test")
+        #expect(stopped.phase == .stopping)
+        #expect(kill(root, 0) == 0, "stop signaled pid \(root), which no longer names the spawned root")
+
+        kill(root, SIGKILL)
+        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        #expect(try await waitForPhase(supervisor, .stopped).phase == .stopped)
+    }
+
     /** Reads a live process's parent from ps, for failure evidence only. */
     private func parentPid(of pid: pid_t) -> String {
         shell(["/bin/ps", "-o", "ppid=", "-p", String(pid)])

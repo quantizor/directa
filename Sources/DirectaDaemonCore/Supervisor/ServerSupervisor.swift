@@ -63,14 +63,16 @@ public actor ServerSupervisor {
         a crash can orphan it, and long enough that the sweeps cost nothing over
         a startup window. */
     private let descendantWatchIntervalMs = 200
-    /** The run's session, recorded at spawn while the root is certainly alive.
-        Read at teardown to find descendants that left the process group, which
-        the parent-pid chain can no longer reach once the root has exited. */
-    private var rootSessionID: pid_t?
-    /** The run root's kernel unique id, read at spawn or adopt. The crash path
-        has no live root to read it from, and it is the lineage walk's first
-        key (ProcessTree.liveDescendants). */
-    private var rootUniqueID: UInt64?
+    /** The run's root as it was when its pid was recorded (spawn or adopt),
+        nil when that read found the root already reaped. Every teardown pass
+        revalidates against this and never against a read taken at teardown
+        time: a launchd job's root is reaped by launchd the moment it exits,
+        so by then its pid may name a stranger. It is also the lineage walk's
+        first key (ProcessTree.liveDescendants). */
+    private var rootIdentity: ProcessIdentity?
+    /** `ProcessTree.identity(of:)` outside tests; a test injects a reader to
+        stand in for a pid recycled between spawn and teardown. */
+    private let readIdentity: @Sendable (pid_t) -> ProcessIdentity?
     private let launcher: any ProcessLauncher
     /** Resolved named secondaries for this run (status.ports). */
     private var namedPorts: [String: Int]?
@@ -183,6 +185,7 @@ public actor ServerSupervisor {
         paths: DirectaPaths,
         prober: any HealthProber = NetworkHealthProber(),
         projectPath: String,
+        readIdentity: @escaping @Sendable (pid_t) -> ProcessIdentity? = { ProcessTree.identity(of: $0) },
         registry: Registry,
         spec: ServerSpec,
         stallBounds: (minSeconds: Int, maxSeconds: Int) = (10, 300),
@@ -197,6 +200,7 @@ public actor ServerSupervisor {
         self.paths = paths
         self.prober = prober
         self.projectPath = project
+        self.readIdentity = readIdentity
         self.registry = registry
         self.spec = spec
         self.stallBounds = stallBounds
@@ -457,10 +461,7 @@ public actor ServerSupervisor {
         runningSpecHash = Self.specHash(spec)
         let id = serverID(project: projectPath, name: spec.name)
         pid = childPid
-        /** The launchd launcher that spawned this job made it a session
-            leader; same rule as `recordSpawn`. */
-        rootSessionID = childPid
-        rootUniqueID = ProcessUniqueIDs.read(of: childPid)?.process
+        rootIdentity = readIdentity(childPid)
         refreshDescendantSnapshot()
         let spawnedAt = runStartedAt ?? Date()
         startedAt = spawnedAt
@@ -626,18 +627,13 @@ public actor ServerSupervisor {
         phase = .stopping
         let activity = DaemonActivity.shared.begin(.stop, label: "\(activityID): \(reason)")
         defer { DaemonActivity.shared.end(activity, outcome: phase.rawValue) }
-        /** Capture the run's identity and its session before any signal and
-            before any await: after the grace window the pid number may name a
-            different process, recordOutcome for this same exit can run during the
-            awaits below and clear the live fields, and signalRun revalidates
-            against the captured identity so a recycled pid is never hit. The log
-            append is itself an await (actor hop to logStore), so it runs after
-            this capture too, not before it. */
-        let rootIdentity = ProcessTree.identity(of: target)
+        /** Captured before any await: recordOutcome for this same exit can run
+            during the awaits below and clear the live fields. The log append
+            is itself an await (actor hop to logStore), so it runs after this
+            capture too, not before it. */
         let keys = teardownKeys
         await logStore.append(stream: .sys, text: "stopping: \(reason)")
-        let signaled = signalRun(
-            target: target, rootIdentity: rootIdentity, keys: keys, signal: SIGTERM)
+        let signaled = signalRun(target: target, keys: keys, signalGroup: true, signal: SIGTERM)
         let deadline = ContinuousClock.now.advanced(by: .seconds(graceSeconds))
         while ContinuousClock.now < deadline {
             if runTask == nil { break }
@@ -653,8 +649,8 @@ public actor ServerSupervisor {
             while the root still lives, and otherwise the survivors
             individually. */
         signalRun(
-            target: target, rootIdentity: rootIdentity, keys: keys, signal: SIGKILL,
-            priorSignaled: signaled)
+            target: target, keys: keys, signalGroup: true, signal: SIGKILL,
+            priorCandidates: signaled)
         if await !waitForStoppingToClear(timeout: stopWaitTimeout) {
             await recordStuckStop(after: stopWaitTimeout)
         }
@@ -682,44 +678,42 @@ public actor ServerSupervisor {
 
     /** What a teardown pass keys on besides the root pid, read together from
         the live fields so a caller captures them in one step before any await
-        (a concurrent start or recordOutcome replaces all three). */
+        (a concurrent start or recordOutcome replaces both). */
     private struct TeardownKeys: Sendable {
-        let rootUniqueID: UInt64?
-        let sessionID: pid_t?
+        let rootIdentity: ProcessIdentity?
         let snapshot: [ProcessIdentity]
     }
 
     private var teardownKeys: TeardownKeys {
-        TeardownKeys(
-            rootUniqueID: rootUniqueID, sessionID: rootSessionID, snapshot: lastDescendantSnapshot)
+        TeardownKeys(rootIdentity: rootIdentity, snapshot: lastDescendantSnapshot)
     }
 
     /** One revalidated teardown pass. Descendants come from every source at once
         (the startup snapshot, a fresh parent-chain sweep, the root's session
         members, and the lineage walk over kernel unique ids), so a child that
         escaped the group by setpgid or setsid is still found, even one that
-        reparented after the last snapshot. The root's process group is
-        signaled only while `rootPid` still names the process `rootIdentity`
-        recorded; once it has exited (or been
-        recycled) the group is never touched and only the descendants that still
-        match their recorded identity are signaled individually. Pass
-        `rootIdentity: nil` from the crash path, where the root is already reaped,
+        reparented after the last snapshot. With `signalGroup`, the root's
+        process group is signaled only while `target` still names the process
+        `keys.rootIdentity` recorded at spawn or adopt; once it has exited (or
+        been recycled) the group is never touched and only the descendants that
+        still match their recorded identity are signaled individually. The
+        crash path, whose root is already reaped, passes `signalGroup: false`,
         so `kill(-pid)` can never follow a recycled id. This is the one home for
-        turning a run's descendants into kernel signals. Returns the identities
-        it signaled, so an escalation pass can remember what to re-signal even
-        after every live source has lost it. */
+        turning a run's descendants into kernel signals. Returns the candidate
+        union it signaled over, so an escalation pass can remember what to
+        re-signal even after every live source has lost it. */
     @discardableResult
     private func signalRun(
-        target: pid_t, rootIdentity: ProcessIdentity?, keys: TeardownKeys, signal: Int32,
-        priorSignaled: [ProcessIdentity] = []
+        target: pid_t, keys: TeardownKeys, signalGroup: Bool, signal: Int32,
+        priorCandidates: [ProcessIdentity] = []
     ) -> [ProcessIdentity] {
-        let descendants = ProcessTree.liveDescendants(
-            rootPid: target, rootUniqueID: keys.rootUniqueID, sessionID: keys.sessionID,
-            snapshot: keys.snapshot, priorSignaled: priorSignaled)
+        let candidates = ProcessTree.liveDescendants(
+            rootPid: target, rootIdentity: keys.rootIdentity, snapshot: keys.snapshot,
+            priorCandidates: priorCandidates)
         ProcessTree.signalTree(
-            descendants: descendants, revalidate: true, rootIdentity: rootIdentity,
-            rootPid: target, signal: signal)
-        return descendants
+            descendants: candidates, revalidate: true,
+            rootIdentity: signalGroup ? keys.rootIdentity : nil, rootPid: target, signal: signal)
+        return candidates
     }
 
     public func status() -> ServerStatus {
@@ -1103,18 +1097,10 @@ public actor ServerSupervisor {
 
     private func recordSpawn(pid childPid: pid_t, id: String) async {
         pid = childPid
-        /** From the launcher contract, never from `getsid`: `onSpawn` reports a
-            pid that leads its own session, and this hop can run after a
-            short-lived root has already exited, when `getsid` answers ESRCH (a
-            zombie included) and the escaped-descendant sweep would lose its
-            only key. A pid that somehow did not lead a session names no live
-            session, since the kernel never hands out a pid that is still some
-            session's id, so the sweep then finds nothing rather than a
-            stranger. */
-        rootSessionID = childPid
-        /** Nil when a short-lived root was already reaped before this hop ran;
-            the lineage walk then keys on the snapshot's ids alone. */
-        rootUniqueID = ProcessUniqueIDs.read(of: childPid)?.process
+        /** Nil when a short-lived root was already reaped before this hop ran:
+            teardown then never signals the group, and the lineage walk keys on
+            the snapshot's ids alone. */
+        rootIdentity = readIdentity(childPid)
         refreshDescendantSnapshot()
         if let removalReason {
             await stopRemovedSpawn(target: childPid, reason: removalReason)
@@ -1163,27 +1149,23 @@ public actor ServerSupervisor {
         stoppingWaitBound = .seconds(grace + stopTiming.overtimeSeconds)
         phase = .stopping
         settleSpawnWaiters()
-        let rootIdentity = ProcessTree.identity(of: target)
         let keys = teardownKeys
         await logStore.append(stream: .sys, text: "stopping: \(reason)")
-        let signaled = signalRun(
-            target: target, rootIdentity: rootIdentity, keys: keys, signal: SIGTERM)
+        let signaled = signalRun(target: target, keys: keys, signalGroup: true, signal: SIGTERM)
         Task {
             try? await Task.sleep(for: .seconds(grace))
-            self.escalateRemovedSpawn(
-                target: target, rootIdentity: rootIdentity, keys: keys, priorSignaled: signaled)
+            self.escalateRemovedSpawn(target: target, keys: keys, priorCandidates: signaled)
         }
     }
 
     /** The SIGKILL half of `stopRemovedSpawn`, the same revalidated pass
         `stop()` escalates with. */
     private func escalateRemovedSpawn(
-        target: pid_t, rootIdentity: ProcessIdentity?, keys: TeardownKeys,
-        priorSignaled: [ProcessIdentity]
+        target: pid_t, keys: TeardownKeys, priorCandidates: [ProcessIdentity]
     ) {
         signalRun(
-            target: target, rootIdentity: rootIdentity, keys: keys, signal: SIGKILL,
-            priorSignaled: priorSignaled)
+            target: target, keys: keys, signalGroup: true, signal: SIGKILL,
+            priorCandidates: priorCandidates)
     }
 
     /** The launcher learned of the process only after it had already exited
@@ -1342,8 +1324,7 @@ public actor ServerSupervisor {
         descendantTask?.cancel()
         descendantTask = nil
         lastDescendantSnapshot = []
-        rootSessionID = nil
-        rootUniqueID = nil
+        rootIdentity = nil
         pid = nil
         startedAt = nil
         observedPort = nil
@@ -1440,20 +1421,21 @@ public actor ServerSupervisor {
         not enough: a descendant that ignores it (a disposition inherited across
         fork/exec when the root passed SIG_IGN down) survives holding its
         listeners, and the resume or ensure that comes after races it for the
-        port and crashes. The root is already reaped, so `rootIdentity` is nil
-        and the process group is never touched: only the descendants that still
-        match their recorded identity are swept, drawn from the snapshot, a
-        parent-chain sweep, the session, and the lineage walk at once. Runs
-        after the waiters settle so the short grace never delays a status
-        answer, and the SIGKILL pass rides the prior pass's union so a
-        descendant every live source has since lost is still re-signaled. */
+        port and crashes. The root is already reaped, so the process group is
+        never touched: the recorded root identity only seeds the lineage walk,
+        and only the descendants that still match their recorded identity are
+        swept, drawn from the snapshot, a parent-chain sweep, the session, and
+        the lineage walk at once. Runs after the waiters settle so the short
+        grace never delays a status answer, and the SIGKILL pass rides the
+        prior pass's union so a descendant every live source has since lost is
+        still re-signaled. */
     private func escalateCrashDescendants(rootPid: pid_t?, keys: TeardownKeys) async {
         guard let rootPid else { return }
-        let signaled = signalRun(target: rootPid, rootIdentity: nil, keys: keys, signal: SIGTERM)
+        let signaled = signalRun(target: rootPid, keys: keys, signalGroup: false, signal: SIGTERM)
         try? await Task.sleep(for: .milliseconds(Self.crashEscalationGraceMilliseconds))
         signalRun(
-            target: rootPid, rootIdentity: nil, keys: keys, signal: SIGKILL,
-            priorSignaled: signaled)
+            target: rootPid, keys: keys, signalGroup: false, signal: SIGKILL,
+            priorCandidates: signaled)
     }
 
     /** How long a crashed run's descendants get to answer SIGTERM before the
