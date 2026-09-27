@@ -17,8 +17,8 @@ import Testing
             "d1", "--acquire-timeout", "5", "--timeout", "300", "--", "somecmd",
         ])
         #expect(lock.resource == "d1")
-        #expect(lock.acquireTimeout == 5)
-        #expect(lock.timeout == 300)
+        #expect(lock.acquireTimeout == TimeoutOption(seconds: 5))
+        #expect(lock.timeout == TimeoutOption(seconds: 300))
         #expect(lock.command == ["somecmd"])
     }
 

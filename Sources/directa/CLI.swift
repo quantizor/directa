@@ -68,6 +68,16 @@ struct GlobalOptions: ParsableArguments {
         return Self.resolveProject(from: FileManager.default.currentDirectoryPath)
     }
 
+    /** A timeout option's seconds, or the usage failure for a bad value. */
+    func seconds(_ option: TimeoutOption, flag: String = "--timeout") -> Double {
+        switch option.seconds(flag: flag) {
+        case .success(let seconds):
+            return seconds
+        case .failure(let error):
+            CLIRunner.fail(error, json: json)
+        }
+    }
+
     /** One walk up from `cwd`: it answers the first directory holding a
         devservers.json or rooting a linked worktree, and remembers the nearest
         `.git` on the way for when neither turns up. */
@@ -294,29 +304,49 @@ enum CLINotice {
         "the daemon connection closed during the restart; waiting for it to come back and checking the server instead of restarting it again"
 }
 
-/** Screens every `--timeout`/`--acquire-timeout` option at the argument-parser
-    boundary, before an untrusted value ever reaches the wire: a non-finite
-    seconds value (`inf`, `nan`) fatally traps `Duration.seconds` downstream
-    (`ServerSupervisor.boundedTimeoutSeconds`, the client's own SO_RCVTIMEO
-    deadline), and the daemon clamps those cases silently rather than telling
-    the caller their input was nonsense. Rejecting here, with a message naming
-    the bad value and the accepted range, is more useful than a silent clamp. */
-enum TimeoutOption {
+/** A `--timeout`/`--acquire-timeout` value as typed. The parser accepts any
+    text (each option parses `.unconditional`, so `-1` is a value rather than
+    an unknown flag) so a bad value reaches the command, which screens it with `seconds`
+    before it ever reaches the wire and fails through the usage path every
+    other bad flag takes (under `--json`, the error envelope on stdout, exit
+    2). A non-finite seconds value (`inf`, `nan`) fatally traps
+    `Duration.seconds` downstream (`ServerSupervisor.boundedTimeoutSeconds`,
+    the client's own SO_RCVTIMEO deadline), and the daemon clamps those cases
+    silently rather than telling the caller their input was nonsense, so a
+    message naming the bad value and the accepted range is more useful. */
+struct TimeoutOption: ExpressibleByArgument, Equatable {
     static let validRange: ClosedRange<Double> = 0...86400
 
-    static func parse(_ raw: String) throws -> Double {
+    let raw: String
+
+    init(argument: String) {
+        raw = argument
+    }
+
+    /** A default, written the way `--help` shows it. */
+    init(seconds: Int) {
+        raw = String(seconds)
+    }
+
+    var defaultValueDescription: String { raw }
+
+    /** The value in seconds, or the usage error naming `flag`. */
+    func seconds(flag: String) -> Result<Double, WireError> {
+        func refusal(_ message: String) -> Result<Double, WireError> {
+            .failure(WireError(code: .usage, message: "\(flag) \(message)"))
+        }
         guard let value = Double(raw) else {
-            throw ValidationError("'\(raw)' is not a number of seconds")
+            return refusal("takes a number of seconds, got '\(raw)'")
         }
         guard value.isFinite else {
-            throw ValidationError("a timeout must be a finite number of seconds, got '\(raw)'")
+            return refusal("must be a finite number of seconds, got '\(raw)'")
         }
-        guard validRange.contains(value) else {
-            throw ValidationError(
-                "a timeout must be between \(Int(validRange.lowerBound)) and \(Int(validRange.upperBound)) seconds, got \(raw)"
+        guard Self.validRange.contains(value) else {
+            return refusal(
+                "must be between \(Int(Self.validRange.lowerBound)) and \(Int(Self.validRange.upperBound)) seconds, got \(raw)"
             )
         }
-        return value
+        return .success(value)
     }
 }
 
@@ -332,10 +362,11 @@ struct Ensure: AsyncParsableCommand {
     @Option(help: "Override the declared port for this run.")
     var port: Int?
 
-    @Option(help: "Seconds to wait for health before giving up.", transform: TimeoutOption.parse)
-    var timeout: Double = 60
+    @Option(parsing: .unconditional, help: "Seconds to wait for health before giving up.")
+    var timeout = TimeoutOption(seconds: 60)
 
     func run() async throws {
+        let timeout = global.seconds(timeout)
         let params = EnsureParams(
             name: name, port: port, project: global.resolvedProject(), timeoutSeconds: timeout)
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
@@ -369,10 +400,11 @@ struct Wait: AsyncParsableCommand {
     @Flag(help: "Wait for the server to be fully stopped instead.")
     var stopped = false
 
-    @Option(help: "Seconds to wait before giving up.", transform: TimeoutOption.parse)
-    var timeout: Double = 60
+    @Option(parsing: .unconditional, help: "Seconds to wait before giving up.")
+    var timeout = TimeoutOption(seconds: 60)
 
     func run() async throws {
+        let timeout = global.seconds(timeout)
         let condition: WaitCondition = stopped ? .stopped : .healthy
         let params = WaitParams(
             condition: condition, name: name, project: global.resolvedProject(), timeoutSeconds: timeout)
@@ -529,8 +561,8 @@ struct Restart: AsyncParsableCommand {
     @Option(help: "Override the declared port for this run.")
     var port: Int?
 
-    @Option(help: "Per-server seconds to wait for health.", transform: TimeoutOption.parse)
-    var timeout: Double = 60
+    @Option(parsing: .unconditional, help: "Per-server seconds to wait for health.")
+    var timeout = TimeoutOption(seconds: 60)
 
     func run() async throws {
         /** A bare `restart` is far likelier to be typed by reflex than `down`
@@ -547,7 +579,7 @@ struct Restart: AsyncParsableCommand {
         }
         let params = RestartParams(
             names: name.map { [$0] }, port: port, project: global.resolvedProject(),
-            timeoutSeconds: timeout)
+            timeoutSeconds: global.seconds(timeout))
         let session = RestartSession(
             clock: SystemRestartClock(),
             notice: { CLIRunner.notice($0) },
@@ -1350,8 +1382,8 @@ struct Up: AsyncParsableCommand {
     @Option(help: "Override the declared port for each server this up starts.")
     var port: Int?
 
-    @Option(help: "Per-server seconds to wait for health.", transform: TimeoutOption.parse)
-    var timeout: Double = 60
+    @Option(parsing: .unconditional, help: "Per-server seconds to wait for health.")
+    var timeout = TimeoutOption(seconds: 60)
 
     /** Pure so the exact message is asserted without spawning the CLI: the
         positional name is shorthand for `--only <name>`, so both at once names
@@ -1368,6 +1400,7 @@ struct Up: AsyncParsableCommand {
         if let usage = Self.usageError(name: name, only: only) {
             CLIRunner.fail(usage, json: global.json)
         }
+        let timeout = global.seconds(timeout)
         let params = GroupParams(
             only: name.map { [$0] } ?? only.map { $0.split(separator: ",").map(String.init) },
             port: port,
@@ -2436,12 +2469,11 @@ struct Switch: AsyncParsableCommand {
     @Flag(help: "Skip the git fetch before switching.")
     var noFetch = false
 
-    @Option(
-        help: "Per-server seconds to wait for health when coming back up.",
-        transform: TimeoutOption.parse)
-    var timeout: Double = 120
+    @Option(parsing: .unconditional, help: "Per-server seconds to wait for health when coming back up.")
+    var timeout = TimeoutOption(seconds: 120)
 
     func run() async throws {
+        let timeout = global.seconds(timeout)
         let project = global.resolvedProject()
         let dirty = Self.git(["status", "--porcelain"], in: project)
         guard dirty.status == 0 else {
@@ -2769,10 +2801,8 @@ struct Lock: AsyncParsableCommand {
     @Argument(help: "Resource name (matches servers' `locks` in devservers.json).")
     var resource: String
 
-    @Option(
-        help: "Seconds to wait for the resource if another holder has it.",
-        transform: TimeoutOption.parse)
-    var acquireTimeout: Double = 300
+    @Option(parsing: .unconditional, help: "Seconds to wait for the resource if another holder has it.")
+    var acquireTimeout = TimeoutOption(seconds: 300)
 
     /** Explicit opt-in to stopping declarers; the default leaves them running.
         A bare `@Flag` (default false), not an inversion pair, so there is exactly
@@ -2780,10 +2810,8 @@ struct Lock: AsyncParsableCommand {
     @Flag(name: .customLong("pause"), help: "Stop servers that declare the resource for the command, then resume them.")
     var pause = false
 
-    @Option(
-        help: "Per-server seconds to wait for health when servers return.",
-        transform: TimeoutOption.parse)
-    var timeout: Double = 120
+    @Option(parsing: .unconditional, help: "Per-server seconds to wait for health when servers return.")
+    var timeout = TimeoutOption(seconds: 120)
 
     /** `.postTerminator`, not `.captureForPassthrough`: the latter ends option
         parsing at the first positional value, so the resource itself stopped it
@@ -2814,6 +2842,8 @@ struct Lock: AsyncParsableCommand {
         if let usage = Self.usageError(command: command, resource: resource) {
             CLIRunner.fail(usage, json: global.json)
         }
+        let acquireTimeout = global.seconds(acquireTimeout, flag: "--acquire-timeout")
+        let timeout = global.seconds(timeout)
         /** Captured before anything below resolves `--project` or touches the
             filesystem, so the guarded command runs where the caller actually
             stood, which the resolved project can differ from (a monorepo

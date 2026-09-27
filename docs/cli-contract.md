@@ -12,6 +12,8 @@ A request line the daemon has not yet seen a newline for is capped at a fixed si
 
 Exit codes: 0 ok · 1 operation failed (crash, timeout, conflict) · 2 usage · 3 daemon unreachable · 4 named server not found. Unnamed `status` in an unconfigured project exits 0 with `{"servers": []}`. `--project` must name an existing directory; a project name is refused `usage` (exit 2) rather than answered as an empty project.
 
+Every `--timeout` and `--acquire-timeout` takes a number of seconds from 0 to 86400. Anything else (text, `inf`, `nan`, a negative number, a larger number) fails `usage` (exit 2) with a message naming the flag, the value, and the range, through the envelope above under `--json`, before any request reaches the daemon.
+
 ## Environment
 
 - `DIRECTA_SOCKET`: the daemon socket every command talks to.

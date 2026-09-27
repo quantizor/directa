@@ -5,64 +5,88 @@ import Testing
 
 @testable import directa
 
-/** Every `--timeout`/`--acquire-timeout` option used to accept anything
-    `Double.init?(String)` would parse, including `inf` and `nan`, and hand it
-    straight to the daemon, which clamps a non-finite or absurd value silently
-    (`ServerSupervisor.boundedTimeoutSeconds`; `Duration.seconds` itself traps
-    on a non-finite value). Screening at the argument-parser boundary tells the
-    caller their input was nonsense instead of quietly doing something else. */
+/** Every `--timeout`/`--acquire-timeout` value is screened before it reaches
+    the daemon, which would otherwise clamp a non-finite or absurd value
+    silently (`ServerSupervisor.boundedTimeoutSeconds`; `Duration.seconds`
+    itself traps on a non-finite value). A bad value is a `usage` failure
+    naming the flag, the value, and the accepted range, delivered through the
+    same path as every other usage error so `--json` gets the envelope. */
 @Suite struct TimeoutOptionTests {
-    @Test func aFiniteInRangeValueParses() throws {
-        #expect(try TimeoutOption.parse("60") == 60)
-        #expect(try TimeoutOption.parse("0") == 0)
-        #expect(try TimeoutOption.parse("86400") == 86400)
+    private func seconds(_ raw: String, flag: String = "--timeout") -> Result<Double, WireError> {
+        TimeoutOption(argument: raw).seconds(flag: flag)
+    }
+
+    @Test func aFiniteInRangeValueParses() {
+        #expect(seconds("60") == .success(60))
+        #expect(seconds("0") == .success(0))
+        #expect(seconds("86400") == .success(86400))
+        #expect(seconds("0.5") == .success(0.5))
     }
 
     @Test func infinityIsRejected() {
-        #expect(throws: ValidationError.self) { try TimeoutOption.parse("inf") }
+        #expect(
+            seconds("inf")
+                == .failure(
+                    WireError(code: .usage, message: "--timeout must be a finite number of seconds, got 'inf'")))
     }
 
     @Test func nanIsRejected() {
-        #expect(throws: ValidationError.self) { try TimeoutOption.parse("nan") }
+        #expect(
+            seconds("nan", flag: "--acquire-timeout")
+                == .failure(
+                    WireError(
+                        code: .usage, message: "--acquire-timeout must be a finite number of seconds, got 'nan'")))
     }
 
     @Test func negativeIsRejected() {
-        let error = #expect(throws: ValidationError.self) { try TimeoutOption.parse("-1") }
-        #expect(error?.message.contains("-1") == true)
-        #expect(error?.message.contains("between 0 and 86400") == true)
+        #expect(
+            seconds("-1")
+                == .failure(
+                    WireError(code: .usage, message: "--timeout must be between 0 and 86400 seconds, got -1")))
     }
 
     @Test func aboveTheDayLongCapIsRejected() {
-        #expect(throws: ValidationError.self) { try TimeoutOption.parse("86401") }
+        #expect(
+            seconds("86401")
+                == .failure(
+                    WireError(code: .usage, message: "--timeout must be between 0 and 86400 seconds, got 86401")))
     }
 
     @Test func garbageTextIsRejected() {
-        #expect(throws: ValidationError.self) { try TimeoutOption.parse("soon") }
-    }
-
-    /** Every command that takes a timeout routes its option through the shared
-        validator, so a bad value fails at parse time with the same message
-        rather than reaching the daemon. */
-    @Test func everyTimeoutOptionRejectsANonFiniteValueAtTheParserBoundary() {
-        #expect(throws: (any Error).self) { try Ensure.parse(["web", "--timeout", "inf"]) }
-        #expect(throws: (any Error).self) { try Wait.parse(["web", "--timeout", "nan"]) }
-        #expect(throws: (any Error).self) { try Restart.parse(["web", "--timeout", "-1"]) }
-        #expect(throws: (any Error).self) { try Up.parse(["--timeout", "86401"]) }
-        #expect(throws: (any Error).self) { try Switch.parse(["main", "--timeout", "inf"]) }
-        #expect(throws: (any Error).self) { try Lock.parse(["d1", "--timeout", "nan", "--", "cmd"]) }
         #expect(
-            throws: (any Error).self
-        ) { try Lock.parse(["d1", "--acquire-timeout", "inf", "--", "cmd"]) }
+            seconds("soon")
+                == .failure(WireError(code: .usage, message: "--timeout takes a number of seconds, got 'soon'")))
     }
 
-    @Test func everyTimeoutOptionAcceptsAValidValue() throws {
-        #expect(try Ensure.parse(["web", "--timeout", "30"]).timeout == 30)
-        #expect(try Wait.parse(["web", "--timeout", "30"]).timeout == 30)
-        #expect(try Restart.parse(["web", "--timeout", "30"]).timeout == 30)
-        #expect(try Up.parse(["--timeout", "30"]).timeout == 30)
-        #expect(try Switch.parse(["main", "--timeout", "30"]).timeout == 30)
-        let lock = try Lock.parse(["d1", "--timeout", "30", "--acquire-timeout", "45", "--", "cmd"])
-        #expect(lock.timeout == 30)
-        #expect(lock.acquireTimeout == 45)
+    /** A bad value must reach the command's own usage failure, which `--json`
+        renders as the error envelope on stdout (exit 2), so the parser itself
+        accepts it rather than printing its own error and exiting 64. */
+    @Test func aBadValueGetsPastTheParserToTheUsageEnvelope() throws {
+        _ = try Ensure.parse(["web", "--timeout", "inf", "--json"])
+        _ = try Lock.parse(["d1", "--acquire-timeout", "nan", "--", "cmd"])
+    }
+
+    /** Every command that takes a timeout carries the raw text to the shared
+        screen, so a bad value fails the same way everywhere. */
+    @Test func everyTimeoutOptionCarriesABadValueToTheScreen() throws {
+        #expect(try Ensure.parse(["web", "--timeout", "inf"]).timeout == TimeoutOption(argument: "inf"))
+        #expect(try Wait.parse(["web", "--timeout", "nan"]).timeout == TimeoutOption(argument: "nan"))
+        #expect(try Restart.parse(["web", "--timeout", "-1"]).timeout == TimeoutOption(argument: "-1"))
+        #expect(try Up.parse(["--timeout", "86401"]).timeout == TimeoutOption(argument: "86401"))
+        #expect(try Switch.parse(["main", "--timeout", "inf"]).timeout == TimeoutOption(argument: "inf"))
+        let lock = try Lock.parse(["d1", "--timeout", "nan", "--acquire-timeout", "inf", "--", "cmd"])
+        #expect(lock.timeout == TimeoutOption(argument: "nan"))
+        #expect(lock.acquireTimeout == TimeoutOption(argument: "inf"))
+    }
+
+    @Test func everyTimeoutOptionAcceptsAValidValueAndKeepsItsDefault() throws {
+        #expect(try Ensure.parse(["web", "--timeout", "30"]).timeout.seconds(flag: "--timeout") == .success(30))
+        #expect(try Wait.parse(["web"]).timeout == TimeoutOption(seconds: 60))
+        #expect(try Restart.parse(["web"]).timeout == TimeoutOption(seconds: 60))
+        #expect(try Up.parse([]).timeout == TimeoutOption(seconds: 60))
+        #expect(try Switch.parse(["main"]).timeout == TimeoutOption(seconds: 120))
+        let lock = try Lock.parse(["d1", "--", "cmd"])
+        #expect(lock.timeout == TimeoutOption(seconds: 120))
+        #expect(lock.acquireTimeout == TimeoutOption(seconds: 300))
     }
 }
