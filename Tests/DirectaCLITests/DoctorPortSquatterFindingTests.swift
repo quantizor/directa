@@ -9,13 +9,14 @@ import Testing
     are injected, so every branch runs without binding a port. */
 @Suite struct DoctorPortSquatterFindingTests {
     private func status(
-        effective: Int? = nil, phase: ServerPhase, pid: Int? = nil, port: Int?,
+        effective: Int? = nil, observed: Int? = nil, phase: ServerPhase, pid: Int? = nil, port: Int?,
         project: String = "/code/a", server: String
     ) -> ServerStatus {
         var status = ServerStatus(
             declaredPort: port,
             effectivePort: effective ?? port,
             logPath: "/tmp/\(server).log",
+            observedPort: observed,
             phase: phase,
             project: project,
             server: server)
@@ -80,6 +81,30 @@ import Testing
         let servers = [
             status(phase: .stopped, port: 3000, server: "web"),
             status(effective: 3742, phase: .running, pid: 7, port: 3000, project: "/code/b", server: "sib"),
+        ]
+        #expect(
+            lines(servers, listening: [3000]) == [
+                "[warning] port-squatter: port 3000 has an unmanaged listener while web is down"
+            ])
+    }
+
+    /** A port-failed run keeps its process, so one still listening where it
+        was seen is the managed owner of that listener. */
+    @Test func aPortFailedRunStillListeningOwnsThePort() {
+        let servers = [
+            status(phase: .stopped, port: 3000, server: "web"),
+            status(
+                effective: 3100, observed: 3000, phase: .failed, pid: 7, port: 3100,
+                project: "/code/b", server: "drifted"),
+        ]
+        #expect(lines(servers, listening: [3000]).isEmpty)
+    }
+
+    /** A port-failed row with no process holds nothing. */
+    @Test func aPortFailedRowWithoutAProcessDoesNotOwnThePort() {
+        let servers = [
+            status(phase: .stopped, port: 3000, server: "web"),
+            status(observed: 3000, phase: .failed, port: 3100, project: "/code/b", server: "gone"),
         ]
         #expect(
             lines(servers, listening: [3000]) == [

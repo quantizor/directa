@@ -1917,11 +1917,13 @@ struct Doctor: AsyncParsableCommand {
 
     /** `port-squatter` findings: a server that is down while something listens
         on its declared port. Only a listener no managed server accounts for is
-        a squatter: when another supervised server is up on that port, calling
-        it unmanaged is wrong, and the port-collision finding already names both
-        sides. `isListening` is the loopback probe, injected so the decision is
-        tested without binding ports. A server whose checkout is gone is never
-        a candidate (the stale-project finding covers it), though a live run of
+        a squatter: when another supervised server holds that port (a live
+        port-failed run included), calling it unmanaged is wrong, and the
+        port-collision finding already names both sides. Status carries no
+        claim, so a held span member no status field names is not seen here.
+        `isListening` is the loopback probe, injected so the decision is tested
+        without binding ports. A server whose checkout is gone is never a
+        candidate (the stale-project finding covers it), though a live run of
         one still counts as a managed owner. */
     static func portSquatterFindings(
         servers: [ServerStatus], isListening: (Int) -> Bool, projectExists: (String) -> Bool
@@ -1930,9 +1932,8 @@ struct Doctor: AsyncParsableCommand {
             guard let port = server.declaredPort, !server.hasLiveRun, projectExists(server.project)
             else { return nil }
             let managedOwner = servers.first { other in
-                (other.effectivePort ?? other.declaredPort) == port
-                    && !(other.project == server.project && other.server == server.server)
-                    && other.phase.holdsPort
+                !(other.project == server.project && other.server == server.server)
+                    && other.heldPorts(claim: nil).contains(port)
             }
             guard managedOwner == nil, isListening(port) else { return nil }
             return Finding(

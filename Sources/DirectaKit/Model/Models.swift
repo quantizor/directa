@@ -486,18 +486,22 @@ extension ServerStatus {
     public var hasLiveRun: Bool { phase.hasLiveRun(pid: pid) }
 
     /** The ports this server's run holds right now. A holding phase answers
-        for its whole claim: the status port fields plus `claim`, the full set
-        resolved at spawn, whose span members no status field names. A live
-        port-failed run holds only the port it was seen listening on, since its
-        failure says the claim is not what it holds. A `stopping` run is live
-        but holds nothing (`ServerPhase.holdsPort`). Empty otherwise. */
+        for its whole claim: the port it binds, the observed and named ports,
+        plus `claim`, the full set resolved at spawn, whose span members no
+        status field names. The bound port is the effective one; the declared
+        port counts only when no effective port was resolved, since a sibling
+        rebound off its committed port has left that port to the checkout it
+        moved away from. A live port-failed run holds only the port it was
+        seen listening on, since its failure says the claim is not what it
+        holds. A `stopping` run is live but holds nothing
+        (`ServerPhase.holdsPort`). Empty otherwise. */
     public func heldPorts(claim: PortClaim?) -> Set<Int> {
         guard hasLiveRun else { return [] }
         guard phase.holdsPort else {
             return phase == .failed ? Set([observedPort].compactMap { $0 }) : []
         }
         var held = Set(claim?.allPorts ?? [])
-        held.formUnion([declaredPort, effectivePort, observedPort].compactMap { $0 })
+        held.formUnion([effectivePort ?? declaredPort, observedPort].compactMap { $0 })
         if let ports { held.formUnion(ports.values) }
         return held
     }

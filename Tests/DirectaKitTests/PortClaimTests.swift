@@ -228,6 +228,24 @@ import os
         #expect(status(phase: .failed, pid: 7).heldPorts(claim: claim) == [])
     }
 
+    /** A sibling rebound off its committed port binds its effective port; the
+        committed one belongs to whoever it was rebound away from, so it is not
+        among the rebound run's holdings. Without an effective port the
+        committed one is what binds. */
+    @Test func heldPortsFollowTheEffectivePortNotTheCommittedOne() {
+        let rebound = ServerStatus(
+            declaredPort: 45_200, effectivePort: 45_210, logPath: "/dev/null",
+            observedPort: 45_210, phase: .running, pid: 7, project: "/sibling", server: "web")
+        let reboundClaim = PortClaim.resolve(spec: spanSpec, effectivePort: 45_210).claim
+        #expect(rebound.heldPorts(claim: reboundClaim) == [45_210, 45_211, 45_212])
+        #expect(rebound.heldPorts(claim: nil) == [45_210])
+
+        let unresolved = ServerStatus(
+            declaredPort: 45_200, logPath: "/dev/null", phase: .running, pid: 7,
+            project: "/main", server: "web")
+        #expect(unresolved.heldPorts(claim: nil) == [45_200])
+    }
+
     /** A port failure keeps its process, so it is the one terminal-looking
         phase that can still have a live run. */
     @Test func hasLiveRunCountsALivePortFailedRun() {
