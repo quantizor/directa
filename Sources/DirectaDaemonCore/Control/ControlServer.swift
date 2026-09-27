@@ -369,22 +369,7 @@ public actor Router {
                     }
                     since = markDate
                 }
-                if let pattern = request.params.grep, let why = LogQuery.grepRejection(pattern) {
-                    throw WireError(
-                        code: .usage,
-                        hint: "fix the pattern, or drop --grep to see every line",
-                        message: "--grep is not a valid regular expression: \(why)")
-                }
-                let options = LogQueryOptions(
-                    after: request.params.after,
-                    grep: request.params.grep,
-                    head: request.params.head,
-                    maxLineCharacters: request.params.maxLineCharacters,
-                    since: since,
-                    streams: request.params.streams.map(Set.init),
-                    tail: request.params.tail,
-                    tailByStream: request.params.tailByStream)
-                let window = await supervisor.logQuery(options)
+                let window = await supervisor.logQuery(LogQueryOptions(request.params, since: since))
                 return try respond(
                     id: head.id,
                     result: LogsQueryResult(cursor: window.cursor, lines: window.lines, totals: window.totals))

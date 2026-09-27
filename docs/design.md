@@ -118,7 +118,7 @@ NDJSON over the unix socket (one JSON object per line; JSONEncoder without prett
 
 ## Log design
 
-Structured line format: `ISO8601\t<stream>\t<payload>` with streams `out`, `err`, `sys` (start/stop/exit/rotation/drop events), `mark`. Markers flow through the same append path as tailed output, so ordering against process output is exact; each carries the requester's label (client pid or `--label`) so an agent can tell its own actions from a concurrent session's. Rotation at 10 MB × 5 files, line-boundary only. `--since` binary-searches the timestamp prefix within each file (safe under the monotonic clamp) and skips whole files by their last line; `--grep` is a daemon-side Swift Regex scan streamed back (dialect documented in `--help` and `schema`). `status`/`ensure` always print `logPath`; agents may also grep the files directly, both paths supported on purpose.
+Structured line format: `ISO8601\t<stream>\t<payload>` with streams `out`, `err`, `sys` (start/stop/exit/rotation/drop events), `mark`. Markers flow through the same append path as tailed output, so ordering against process output is exact; each carries the requester's label (client pid or `--label`) so an agent can tell its own actions from a concurrent session's. Rotation at 10 MB × 5 files, line-boundary only. `--since` binary-searches the timestamp prefix within each file (safe under the monotonic clamp) and skips whole files by their last record; `--grep` is a daemon-side Swift Regex scan streamed back (dialect documented in `--help` and `schema`). `status`/`ensure` always print `logPath`; agents may also grep the files directly, both paths supported on purpose.
 
 ## CLI surface (agents are the primary consumer)
 

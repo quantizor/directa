@@ -275,8 +275,7 @@ public enum MonitorSanitizer {
     }
 
     public static func truncate(_ text: String, limit: Int) -> String {
-        guard text.count > limit else { return text }
-        return String(text.prefix(limit)) + "…"
+        LogSanitizer.truncated(text, toCharacters: limit)
     }
 }
 

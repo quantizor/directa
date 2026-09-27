@@ -373,6 +373,10 @@ import Testing
             try encoded(LogStreamCounts(err: 1, mark: 0, out: 20, sys: 4))
                 == #"{"err":1,"mark":0,"out":20,"sys":4}"#)
         #expect(try encoded(LogStreamCounts(out: 300)) == #"{"out":300}"#)
+        #expect(
+            try encoded(LogStreamTotals(err: 1, mark: 0, out: 20, sys: 4))
+                == #"{"err":1,"mark":0,"out":20,"sys":4}"#)
+        #expect(try encoded(LogStreamTotals()) == #"{"err":0,"mark":0,"out":0,"sys":0}"#)
         #expect(try encoded(LogCursor.origin) == #"{"at":"1970-01-01T00:00:00.000Z","count":0}"#)
         #expect(
             try encoded(LogCursor(at: logAt, count: 30_000, position: LogFilePosition(file: 1_234_567, offset: 2_097_151)))
@@ -406,7 +410,7 @@ import Testing
     @Test func logsQueryResultSchemaGolden() throws {
         let result = LogsQueryResult(
             cursor: LogCursor(at: logAt, count: 1), lines: [LogRecord(at: logAt, stream: .out, text: "ready")],
-            totals: LogStreamCounts(err: 0, mark: 0, out: 1, sys: 0))
+            totals: LogStreamTotals(err: 0, mark: 0, out: 1, sys: 0))
         #expect(
             try encoded(result)
                 == #"{"cursor":{"at":"2025-07-18T19:46:40.000Z","count":1},"lines":[{"at":"2025-07-18T19:46:40.000Z","stream":"out","text":"ready"}],"totals":{"err":0,"mark":0,"out":1,"sys":0}}"#
@@ -465,6 +469,21 @@ import Testing
             LogsQueryParams(
                 name: "w", project: "/p", tailByStream: LogStreamCounts(err: 0, mark: 0, out: Int.max, sys: 0)
             ).refusal() == nil)
+    }
+
+    /** A pattern that does not compile, or that nests an unbounded repeat,
+        is refused before any server is looked up; a safe one passes. */
+    @Test func logsQueryParamsRefuseAnUnsafeGrep() throws {
+        let broken = try #require(LogsQueryParams(grep: "(unbalanced", name: "w", project: "/p").refusal())
+        #expect(broken.code == .usage)
+        #expect(broken.hint == "fix the pattern, or drop --grep to see every line")
+        #expect(broken.message.hasPrefix("--grep is not a valid regular expression: "))
+        let nested = try #require(LogsQueryParams(grep: "^(a+)+$", name: "w", project: "/p").refusal())
+        #expect(
+            nested.message
+                == "--grep is not a valid regular expression: '^(a+)+$' repeats a group that itself repeats without bound (like (a+)+), which can make the log reader run for minutes on a single line; rewrite it without the nested repeat"
+        )
+        #expect(LogsQueryParams(grep: "error|warn", name: "w", project: "/p").refusal() == nil)
     }
 }
 

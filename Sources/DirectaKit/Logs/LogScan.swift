@@ -1,6 +1,28 @@
 import Darwin
 import Foundation
 
+/** The one positional read loop behind every log and spool read. */
+public enum PositionalRead {
+    /** Fills `buffer` from `offset` of `descriptor` with `pread`, retrying
+        an interrupted call; answers how many bytes arrived, fewer than the
+        buffer holds at end of file or on an error. */
+    public static func read(_ descriptor: Int32, at offset: Int, into buffer: UnsafeMutableRawBufferPointer) -> Int {
+        guard let base = buffer.baseAddress, offset >= 0 else { return 0 }
+        var filled = 0
+        while filled < buffer.count {
+            let got = pread(descriptor, base + filled, buffer.count - filled, off_t(offset + filled))
+            if got > 0 {
+                filled += got
+            } else if got < 0, errno == EINTR {
+                continue
+            } else {
+                break
+            }
+        }
+        return filled
+    }
+}
+
 /** One log file opened read-only and read with `pread`, so a scan holds one
     chunk at a time rather than the file. */
 final class LogFileReader {
@@ -29,22 +51,17 @@ final class LogFileReader {
         close(descriptor)
     }
 
+    /** A reader per file that opens, in order; a file gone between listing
+        and opening (a rotation mid-query) is left out. */
+    static func readers(for urls: [URL], onDiskRead: (@Sendable (Int) -> Void)?) -> [LogFileReader] {
+        urls.compactMap { LogFileReader(url: $0, onDiskRead: onDiskRead) }
+    }
+
     /** Up to `count` bytes from `offset`; fewer at end of file or on error. */
     func read(at offset: Int, count: Int) -> [UInt8] {
         guard count > 0, offset >= 0 else { return [] }
         let bytes = [UInt8](unsafeUninitializedCapacity: count) { buffer, initialized in
-            initialized = 0
-            guard let base = buffer.baseAddress else { return }
-            while initialized < count {
-                let got = pread(descriptor, base + initialized, count - initialized, off_t(offset + initialized))
-                if got > 0 {
-                    initialized += got
-                } else if got < 0, errno == EINTR {
-                    continue
-                } else {
-                    break
-                }
-            }
+            initialized = PositionalRead.read(descriptor, at: offset, into: UnsafeMutableRawBufferPointer(buffer))
         }
         onDiskRead?(bytes.count)
         return bytes
@@ -146,7 +163,7 @@ final class LogFileReader {
     func lineStart(atOrBefore offset: Int) -> Int {
         var end = min(offset, size)
         while end > 0 {
-            let start = max(0, end - 4096)
+            let start = max(0, end - LogScan.probeChunkBytes)
             let chunk = read(at: start, count: end - start)
             guard !chunk.isEmpty else { return 0 }
             if let index = chunk.lastIndex(of: LogScan.newline) { return start + index + 1 }
@@ -159,7 +176,7 @@ final class LogFileReader {
     func nextLineStart(after offset: Int) -> Int {
         var start = offset
         while start < size {
-            let chunk = read(at: start, count: min(4096, size - start))
+            let chunk = read(at: start, count: min(LogScan.probeChunkBytes, size - start))
             guard !chunk.isEmpty else { break }
             if let index = chunk.firstIndex(of: LogScan.newline) { return start + index + 1 }
             start += chunk.count
@@ -171,12 +188,23 @@ final class LogFileReader {
         milliseconds; nil when the line has none. A timestamp is short, so
         only the first bytes are read. */
     func milliseconds(atLineStart offset: Int) -> Int64? {
-        let head = read(at: offset, count: 64)
+        let head = read(at: offset, count: LogScan.timestampProbeBytes)
         let line = head.prefix { $0 != LogScan.newline }
         guard let tab = line.firstIndex(of: LogScan.tab) else { return nil }
         return head.withUnsafeBufferPointer {
             LogScan.epochMilliseconds(UnsafeBufferPointer(rebasing: $0[..<tab]))
         }
+    }
+
+    /** The millisecond of the file's last record, walking back in small
+        chunks only as far as that record; nil when the file holds none. */
+    func lastRecordMilliseconds() -> Int64? {
+        var found: Int64?
+        forEachLineBackward(before: size, chunkBytes: LogScan.probeChunkBytes) { line, _ in
+            found = LogScan.recordMilliseconds(line)
+            return found == nil
+        }
+        return found
     }
 }
 
@@ -192,13 +220,24 @@ final class LogFileReader {
 enum LogScan {
     static let backwardChunkBytes = 64 * 1024
     static let chunkBytes = 256 * 1024
+    /** The read size of a probe that needs only the bytes around one line
+        (a line boundary, the last record of a file). */
+    static let probeChunkBytes = 4096
+    /** Enough bytes to hold any timestamp prefix a record can carry. */
+    static let timestampProbeBytes = 64
     static let newline: UInt8 = 0x0A
     static let tab: UInt8 = 0x09
 
+    /** The length of the timestamp `JSONCoding.formatISO8601` writes, which
+        the digit-by-digit parser reads. */
+    private static let canonicalTimestampLength = 24
     /** Lines kept for reading back sit within this many bytes of each other
         to share one read, and one read never spans more than `maxRunBytes`. */
     private static let maxGapBytes = 4096
     private static let maxRunBytes = 1024 * 1024
+    /** Milliseconds beyond this either side of 1970 (about 31,000 years)
+        are clamped, so converting an impossible wire date never traps. */
+    private static let millisecondLimit = 1e15
 
     /** What the scan keeps of the lines that pass every filter: the trim
         the options ask for, or only the first and last (a summary needs the
@@ -208,34 +247,26 @@ enum LogScan {
         case trim
     }
 
-    /** The newest record of a family: its millisecond, how many records in
-        a row carry it, and where its line ends. */
-    struct Newest {
+    /** The last `count` records in a row stamped `ms`, the newest of them
+        ending at byte `end` of reader `file`: a family's newest group, or
+        where a positioned cursor lets a scan resume. */
+    struct GroupEnd {
         var count: Int
         var end: Int
         var file: Int
         var ms: Int64
     }
 
-    /** Where a scan past a cursor with a usable position picked up, and the
-        cursor's own millisecond and count for the records behind it. */
-    struct Resume {
-        var count: Int
-        var file: Int
-        var ms: Int64
-        var offset: Int
-    }
-
     static func scan(
         files: [URL], options: LogQueryOptions, grep: Regex<AnyRegexOutput>?, retention: Retention = .trim,
         onDiskRead: (@Sendable (Int) -> Void)?
-    ) -> (lines: [LogRecord], readers: [LogFileReader?], resume: Resume?, totals: LogStreamCounts) {
+    ) -> (lines: [LogRecord], readers: [LogFileReader], resume: GroupEnd?, totals: LogStreamTotals) {
         let cursorMs = options.after.map { milliseconds(of: $0.at) }
         let boundMs = cursorMs ?? options.since.map(ceilingMilliseconds)
-        var skipRemaining = max(0, options.after?.count ?? 0)
+        var skipRemaining = options.after?.count ?? 0
         var collector = Collector(options: options, retention: retention)
-        var totals = LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0)
-        let readers = files.map { LogFileReader(url: $0, onDiskRead: onDiskRead) }
+        var totals = LogStreamTotals()
+        let readers = LogFileReader.readers(for: files, onDiskRead: onDiskRead)
         let resume = options.after.flatMap { after in
             after.position.flatMap { resumePoint($0, after: after, readers: readers) }
         }
@@ -244,19 +275,19 @@ enum LogScan {
         /** A head that reports no totals has its whole answer once it holds
             its lines; reading on would only count what nobody asked for. */
         let stopsWhenFull = !options.reportsTotals
-        for (fileIndex, url) in files.enumerated() {
+        for (fileIndex, reader) in readers.enumerated() {
             if stopsWhenFull, collector.headIsFull { break }
-            guard let reader = readers[fileIndex], reader.size > 0 else { continue }
+            guard reader.size > 0 else { continue }
             let start: Int
             var passedBound: Bool
             if let resume {
                 guard fileIndex >= resume.file else { continue }
-                start = fileIndex == resume.file ? resume.offset : 0
+                start = fileIndex == resume.file ? resume.end : 0
                 passedBound = true
             } else {
-                /** Whole-file skip: a file whose last line predates the bound
-                    cannot contribute. */
-                if let boundMs, let last = LogQuery.lastLineTimestamp(of: url), milliseconds(of: last) < boundMs {
+                /** Whole-file skip: a file whose last record predates the
+                    bound cannot contribute. */
+                if let boundMs, let last = reader.lastRecordMilliseconds(), last < boundMs {
                     continue
                 }
                 start = boundMs.map { firstLineStart(atOrAfter: $0, in: reader) } ?? 0
@@ -284,7 +315,7 @@ enum LogScan {
                     let text = String(decoding: UnsafeBufferPointer(rebasing: line[(shape.secondTab + 1)...]), as: UTF8.self)
                     guard (try? grep.firstMatch(in: text)) != nil else { return true }
                 }
-                totals[shape.stream] = (totals[shape.stream] ?? 0) + 1
+                totals[shape.stream] += 1
                 sequence += 1
                 collector.add(
                     Retained(file: fileIndex, length: line.count, offset: offset, sequence: sequence),
@@ -300,16 +331,17 @@ enum LogScan {
         no file in this family or no record ending there stamped with the
         cursor's millisecond (a file rotated out of the family, or a
         position a caller made up), in which case the count applies. */
-    static func resumePoint(_ position: LogFilePosition, after: LogCursor, readers: [LogFileReader?]) -> Resume? {
+    static func resumePoint(_ position: LogFilePosition, after: LogCursor, readers: [LogFileReader]) -> GroupEnd? {
         let cursorMs = milliseconds(of: after.at)
-        guard let file = readers.firstIndex(where: { $0?.inode == position.file }), let reader = readers[file],
-            position.offset > 0, position.offset <= reader.size,
+        guard let file = readers.firstIndex(where: { $0.inode == position.file }) else { return nil }
+        let reader = readers[file]
+        guard position.offset > 0, position.offset <= reader.size,
             position.offset == reader.size || reader.byte(at: position.offset) == newline
         else { return nil }
         let start = reader.lineStart(atOrBefore: position.offset)
         let line = reader.read(at: start, count: position.offset - start)
         guard line.withUnsafeBufferPointer({ recordMilliseconds($0) }) == cursorMs else { return nil }
-        return Resume(count: max(0, after.count), file: file, ms: cursorMs, offset: position.offset)
+        return GroupEnd(count: after.count, end: position.offset, file: file, ms: cursorMs)
     }
 
     /** The newest record of the family, and how many records in a row
@@ -320,17 +352,16 @@ enum LogScan {
         poll after a clock step (which pins every later record to one
         millisecond) reads back only what arrived since the last one, not
         the whole millisecond. */
-    static func newestGroup(readers: [LogFileReader?], resume: Resume?) -> Newest? {
-        var newest: Newest?
+    static func newestGroup(readers: [LogFileReader], resume: GroupEnd?) -> GroupEnd? {
+        var newest: GroupEnd?
         for (file, reader) in readers.enumerated().reversed() {
-            guard let reader else { continue }
             if let resume, file < resume.file { break }
-            let floor = resume.flatMap { file == $0.file ? $0.offset : nil } ?? 0
+            let floor = resume.flatMap { file == $0.file ? $0.end : nil } ?? 0
             let stopped = !reader.forEachLineBackward(before: reader.size) { line, offset in
                 guard offset >= floor else { return false }
                 guard let ms = recordMilliseconds(line) else { return true }
                 guard let current = newest else {
-                    newest = Newest(count: 1, end: offset + line.count, file: file, ms: ms)
+                    newest = GroupEnd(count: 1, end: offset + line.count, file: file, ms: ms)
                     return true
                 }
                 guard current.ms == ms else { return false }
@@ -340,20 +371,18 @@ enum LogScan {
             if stopped { break }
         }
         guard let resume else { return newest }
-        guard let found = newest else {
-            return Newest(count: resume.count, end: resume.offset, file: resume.file, ms: resume.ms)
-        }
+        guard let found = newest else { return resume }
         /** Timestamps never fall within a family and the record behind the
             resume point carries the cursor's millisecond, so a newest group
             in that same millisecond runs unbroken back to the resume point. */
         guard found.ms == resume.ms else { return found }
-        return Newest(count: found.count + resume.count, end: found.end, file: found.file, ms: found.ms)
+        return GroupEnd(count: found.count + resume.count, end: found.end, file: found.file, ms: found.ms)
     }
 
-    /** Port of the in-memory search this file family always used, over byte
-        offsets: the start of the first line stamped at or after `boundMs`.
-        An unparseable midpoint line narrows the search to before it, so the
-        scan falls back to reading forward from there. */
+    /** The start of the first line stamped at or after `boundMs`, by binary
+        search over byte offsets. An unparseable midpoint line narrows the
+        search to before it, so the scan falls back to reading forward from
+        there. */
     static func firstLineStart(atOrAfter boundMs: Int64, in reader: LogFileReader) -> Int {
         var low = 0
         var high = reader.size
@@ -389,7 +418,7 @@ enum LogScan {
         else goes through `JSONCoding.parseISO8601`, so both answer the same
         instant for every input the store can hold. */
     static func epochMilliseconds(_ prefix: UnsafeBufferPointer<UInt8>) -> Int64? {
-        if prefix.count == 24, let fast = canonicalMilliseconds(prefix) { return fast }
+        if prefix.count == canonicalTimestampLength, let fast = canonicalMilliseconds(prefix) { return fast }
         guard let date = JSONCoding.parseISO8601(String(decoding: prefix, as: UTF8.self)) else { return nil }
         return milliseconds(of: date)
     }
@@ -413,7 +442,7 @@ enum LogScan {
     /** `Int64(_:)` traps on a non-finite or out-of-range Double; a wire date
         is finite in practice, and this keeps an impossible one from trapping. */
     private static func clampedMilliseconds(_ value: Double) -> Int64 {
-        let limit = 1e15
+        let limit = millisecondLimit
         guard value.isFinite else { return value < 0 ? -Int64(limit) : Int64(limit) }
         return Int64(min(max(value, -limit), limit))
     }
@@ -460,7 +489,7 @@ enum LogScan {
     }
 
     /** Reads the kept lines back, nearby ones in one read, and parses them. */
-    private static func readBack(_ items: [Retained], readers: [LogFileReader?]) -> [LogRecord] {
+    private static func readBack(_ items: [Retained], readers: [LogFileReader]) -> [LogRecord] {
         var records: [LogRecord] = []
         records.reserveCapacity(items.count)
         var index = 0
@@ -475,17 +504,15 @@ enum LogScan {
                 runEnd = items[end].offset + items[end].length
                 end += 1
             }
-            if let reader = readers[first.file] {
-                let bytes = reader.read(at: first.offset, count: runEnd - first.offset)
-                bytes.withUnsafeBufferPointer { buffer in
-                    for item in items[index..<end] {
-                        let lower = item.offset - first.offset
-                        let upper = lower + item.length
-                        guard upper <= buffer.count,
-                            let record = record(from: UnsafeBufferPointer(rebasing: buffer[lower..<upper]))
-                        else { continue }
-                        records.append(record)
-                    }
+            let bytes = readers[first.file].read(at: first.offset, count: runEnd - first.offset)
+            bytes.withUnsafeBufferPointer { buffer in
+                for item in items[index..<end] {
+                    let lower = item.offset - first.offset
+                    let upper = lower + item.length
+                    guard upper <= buffer.count,
+                        let record = record(from: UnsafeBufferPointer(rebasing: buffer[lower..<upper]))
+                    else { continue }
+                    records.append(record)
                 }
             }
             index = end
@@ -512,8 +539,9 @@ private struct Retained {
     var sequence: Int
 }
 
-/** The tab positions and stream of a record line, the parts
-    `LogRecord.parse` splits on, found without decoding the line. */
+/** The tab positions and stream of a record line (the
+    `timestamp\tstream\tpayload` layout `LogRecord.formatted` writes), found
+    without decoding the line. */
 private struct LineShape {
     let firstTab: Int
     let secondTab: Int
@@ -542,17 +570,19 @@ private struct LineShape {
 }
 
 /** Newest-N positions, or every position when `capacity` is nil. Grows only
-    as lines arrive, so a large capacity costs nothing until it fills. */
-private struct LineRing {
-    let capacity: Int?
+    as lines arrive, so a large capacity costs nothing until it fills. A
+    class, so the collector's mode can hold it and append in place: a struct
+    bound out of an enum case would copy its array on every append. */
+private final class LineRing {
+    private let capacity: Int?
     private var items: [Retained] = []
     private var start = 0
 
     init(capacity: Int?) {
-        self.capacity = capacity.map { max(0, $0) }
+        self.capacity = capacity
     }
 
-    mutating func append(_ item: Retained) {
+    func append(_ item: Retained) {
         guard let capacity else {
             items.append(item)
             return
@@ -571,65 +601,70 @@ private struct LineRing {
     }
 }
 
+/** Oldest-N positions. A class for the same reason as `LineRing`. */
+private final class LineHead {
+    private(set) var items: [Retained] = []
+    private let limit: Int
+
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    var isFull: Bool { items.count >= limit }
+
+    func append(_ item: Retained) {
+        if !isFull { items.append(item) }
+    }
+}
+
 /** The trim a query asked for, applied as lines match. */
 private struct Collector {
-    private var first: Retained?
-    private var headItems: [Retained] = []
-    private let headLimit: Int?
-    private var last: Retained?
-    private let perStream: Bool
-    private let retention: LogScan.Retention
-    /** One ring per stream under `tailByStream`, else one ring for all. */
-    private var rings: [LineRing]
+    private enum Mode {
+        case firstAndLast(first: Retained?, last: Retained?)
+        case head(LineHead)
+        case tail(LineRing)
+        case tailByStream([LogStream: LineRing])
+    }
 
+    private var mode: Mode
+
+    /** A summary keeps two lines whatever the options say; otherwise a
+        head wins over a per-stream tail, which wins over a plain tail. */
     init(options: LogQueryOptions, retention: LogScan.Retention) {
-        self.retention = retention
-        headLimit = retention == .trim ? options.head.map { max(0, $0) } : nil
-        if let byStream = options.tailByStream {
-            perStream = true
-            rings = LogStream.allCases.map { LineRing(capacity: byStream[$0]) }
+        if retention == .firstAndLast {
+            mode = .firstAndLast(first: nil, last: nil)
+        } else if let head = options.head {
+            mode = .head(LineHead(limit: head))
+        } else if let byStream = options.tailByStream {
+            mode = .tailByStream(
+                Dictionary(uniqueKeysWithValues: LogStream.allCases.map { ($0, LineRing(capacity: byStream[$0])) }))
         } else {
-            perStream = false
-            rings = [LineRing(capacity: options.tail)]
+            mode = .tail(LineRing(capacity: options.tail))
         }
     }
 
     /** True once a head trim holds every line it will keep. */
     var headIsFull: Bool {
-        guard let headLimit else { return false }
-        return headItems.count >= headLimit
+        guard case .head(let head) = mode else { return false }
+        return head.isFull
     }
 
     mutating func add(_ item: Retained, stream: LogStream) {
-        if retention == .firstAndLast {
-            if first == nil { first = item }
-            last = item
-            return
-        }
-        if let headLimit {
-            if headItems.count < headLimit { headItems.append(item) }
-            return
-        }
-        rings[perStream ? Self.ringIndex(stream) : 0].append(item)
-    }
-
-    /** Position in `LogStream.allCases`, the order the rings are built in. */
-    private static func ringIndex(_ stream: LogStream) -> Int {
-        switch stream {
-        case .err: 0
-        case .mark: 1
-        case .out: 2
-        case .sys: 3
+        switch mode {
+        case .firstAndLast(let first, _): mode = .firstAndLast(first: first ?? item, last: item)
+        case .head(let head): head.append(item)
+        case .tail(let ring): ring.append(item)
+        case .tailByStream(let rings): rings[stream]?.append(item)
         }
     }
 
     func ordered() -> [Retained] {
-        if retention == .firstAndLast {
-            guard let first, let last else { return [] }
-            return first.sequence == last.sequence ? [first] : [first, last]
+        switch mode {
+        case .firstAndLast(let first?, let last?): first.sequence == last.sequence ? [first] : [first, last]
+        case .firstAndLast: []
+        case .head(let head): head.items
+        case .tail(let ring): ring.ordered()
+        case .tailByStream(let rings): rings.values.flatMap { $0.ordered() }.sorted { $0.sequence < $1.sequence }
         }
-        if headLimit != nil { return headItems }
-        guard perStream else { return rings[0].ordered() }
-        return rings.flatMap { $0.ordered() }.sorted { $0.sequence < $1.sequence }
     }
 }

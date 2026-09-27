@@ -36,6 +36,29 @@ private func tempDir() throws -> URL {
         #expect(all.last?.text.hasPrefix("line 39 ") == true)
     }
 
+    /** A burst lands in order, one timestamp for every line up to the first
+        rotation, and each rotated file ends on the line that carried it past
+        the cap, exactly where appending one line at a time would rotate. */
+    @Test func aBurstIsWrittenInOrderAndRotatesOnTheLineThatCrossesTheCap() async throws {
+        let current = try tempDir().appending(path: "current.log")
+        let maxBytes = 1200
+        let store = LogStore(currentURL: current, maxBytes: maxBytes)
+        let at = Date(timeIntervalSince1970: 1_700_000_000.123)
+        let texts = (0..<40).map { "line \($0) padding padding padding" }
+        await store.append(stream: .out, texts: texts, at: at)
+        let all = await store.query(LogQueryOptions())
+        #expect(all.filter { $0.stream == .out }.map(\.text) == texts)
+        #expect(all.filter { $0.stream == .sys }.map(\.text) == ["rotated", "rotated"])
+        #expect(zip(all, all.dropFirst()).allSatisfy { $0.at <= $1.at })
+        #expect(all.prefix { $0.stream == .out }.allSatisfy { $0.at == at })
+        for rotation in [2, 1] {
+            let bytes = try Data(contentsOf: current.appendingPathExtension("\(rotation)"))
+            let lastLine = try #require(bytes.dropLast().split(separator: 0x0A).last)
+            #expect(bytes.count > maxBytes, "rotation \(rotation)")
+            #expect(bytes.count - (lastLine.count + 1) <= maxBytes, "rotation \(rotation)")
+        }
+    }
+
     @Test func marksCarryIDAndResolve() async throws {
         let currentURL = try tempDir().appending(path: "current.log")
         let store = LogStore(currentURL: currentURL)
@@ -48,55 +71,6 @@ private func tempDir() throws -> URL {
         #expect(await store.resolveMark(mark.id) == mark.at)
         let since = await store.query(LogQueryOptions(since: mark.at, streams: [.out]))
         #expect(since.map(\.text) == ["after"])
-    }
-}
-
-@Suite struct SpoolLineSplitTests {
-    @Test func splitsLinesAndKeepsIncompleteTail() {
-        let pulled = SpoolLineSplit.pull(
-            from: Data("one\ntwo\nthree".utf8), maxPartialBytes: 16 * 1024)
-        #expect(pulled.lines.map { String(decoding: $0, as: UTF8.self) } == ["one", "two"])
-        #expect(String(decoding: pulled.remainder, as: UTF8.self) == "three")
-    }
-
-    @Test func skipsEmptyLines() {
-        let pulled = SpoolLineSplit.pull(from: Data("a\n\nb\n".utf8), maxPartialBytes: 16)
-        #expect(pulled.lines.map { String(decoding: $0, as: UTF8.self) } == ["a", "b"])
-        #expect(pulled.remainder.isEmpty)
-    }
-
-    @Test func segmentsANewlineLessTailPastTheCap() {
-        let pulled = SpoolLineSplit.pull(
-            from: Data(repeating: 0x61, count: 10), maxPartialBytes: 4)
-        #expect(pulled.lines.map(\.count) == [4, 4])
-        #expect(pulled.remainder.count == 2)
-        #expect(pulled.remainder == Data(repeating: 0x61, count: 2))
-    }
-
-    @Test func aTailAtTheCapStaysUnflushed() {
-        let pulled = SpoolLineSplit.pull(
-            from: Data(repeating: 0x61, count: 4), maxPartialBytes: 4)
-        #expect(pulled.lines.isEmpty)
-        #expect(pulled.remainder.count == 4)
-    }
-
-    @Test func pullDoesNotCopyTheUnreadTailOncePerLine() {
-        /** 50k short lines is enough that a per-line `removeSubrange` from the
-            front of `Data` spends seconds memmoving the remainder; an index
-            walk finishes immediately. */
-        var buffer = Data()
-        buffer.reserveCapacity(50_000 * 8)
-        for index in 0..<50_000 {
-            buffer.append(contentsOf: "l\(index)\n".utf8)
-        }
-        let started = ContinuousClock.now
-        let pulled = SpoolLineSplit.pull(from: buffer, maxPartialBytes: 16 * 1024)
-        let elapsed = ContinuousClock.now - started
-        #expect(pulled.lines.count == 50_000)
-        #expect(String(decoding: pulled.lines[0], as: UTF8.self) == "l0")
-        #expect(String(decoding: pulled.lines[49_999], as: UTF8.self) == "l49999")
-        #expect(pulled.remainder.isEmpty)
-        #expect(elapsed < Duration.seconds(1))
     }
 }
 
@@ -311,7 +285,6 @@ private func tempDir() throws -> URL {
         try handle.write(contentsOf: Data("appended after attach\n".utf8))
         try handle.close()
         await tailer.start()
-        try await Task.sleep(for: .milliseconds(200))
         await tailer.stop()
         texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
         #expect(texts == ["appended after attach"])
@@ -452,7 +425,6 @@ private func tempDir() throws -> URL {
         try handle.seekToEnd()
         try handle.write(contentsOf: Data(String(repeating: "more\n", count: 8 * 1024).utf8))
         try handle.close()
-        try await Task.sleep(for: .milliseconds(200))
         await tailer.stop()
         #expect(attempts.withLock { $0 } == 1)
         let sys = await store.query(LogQueryOptions(streams: [.sys])).map(\.text)
@@ -667,10 +639,9 @@ private func tempDir() throws -> URL {
 
     /** A watch-change detail names an arbitrary project file path, which can
         legitimately contain the literal substring "(external)" as a
-        directory or file name. A bare `contains` used to read that as the
-        external-signal marker; the anchored `ExternalSignalDetail.matches`
-        must not, so the summary stays the bare "stopped" a directa-requested
-        stop gets. */
+        directory or file name. The anchored `ExternalSignalDetail.matches`
+        must not read that as the external-signal marker, so the summary
+        stays the bare "stopped" a directa-requested stop gets. */
     @Test func aWatchChangeDetailContainingTheSubstringIsNotMisreadAsExternal() {
         var stopped = status("web", .stopped, exit: 0)
         stopped.lastExit = LastExit(

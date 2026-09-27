@@ -1,35 +1,6 @@
 import DirectaKit
 import Foundation
 
-/** Split a byte buffer on 0x0A without copying the unread tail once per line.
-    Incomplete tail is `remainder`, except a tail longer than `maxPartialBytes`
-    is emitted in segments of that size so a newline-less flood cannot grow
-    without bound. Each returned slice is copied so the caller can drop
-    `buffer`. Peak extra memory is the returned lines, so the caller must bound
-    `buffer` (the tailer reads a fixed chunk). */
-enum SpoolLineSplit {
-    static func pull(from buffer: Data, maxPartialBytes: Int) -> (lines: [Data], remainder: Data) {
-        var lines: [Data] = []
-        var start = buffer.startIndex
-        while start < buffer.endIndex {
-            guard let newline = buffer[start...].firstIndex(of: 0x0A) else { break }
-            if start < newline {
-                lines.append(Data(buffer[start..<newline]))
-            }
-            start = buffer.index(after: newline)
-        }
-        if maxPartialBytes > 0 {
-            while buffer.endIndex - start > maxPartialBytes {
-                let cut = start + maxPartialBytes
-                lines.append(Data(buffer[start..<cut]))
-                start = cut
-            }
-        }
-        let remainder = start < buffer.endIndex ? Data(buffer[start...]) : Data()
-        return (lines, remainder)
-    }
-}
-
 /** Which already-ingested spool bytes can have their disk blocks released.
     The spool is written by a child through a descriptor directa cannot
     reopen or reposition (the daemon's own open for a direct spawn, launchd's
@@ -120,26 +91,23 @@ struct SkipReport {
 }
 
 /** Tails one raw spool file (the fd the child writes; survives daemon death)
-    into the structured LogStore. Polling keeps it simple and restart-safe; an
-    idle tick still opens the file and seeks to the end, not a cheap stat. */
+    into the structured LogStore. Polling keeps it simple and restart-safe.
+    The spool is opened once and held until `stop`, since it is never
+    truncated or renamed while its run lasts, so an idle tick costs one
+    `fstat`. */
 actor SpoolTailer {
-    /** Set by a catch-up skip, which lands mid-line: the rest of that line
-        is dropped rather than ingested as if it were whole, however many
-        chunks or drains it takes to reach its newline. */
-    private var droppingUntilNewline = false
+    /** Splits read bytes into lines. A line longer than 16 KB flushes in
+        segments of that size; after a catch-up skip, which lands mid-line,
+        the rest of that line is dropped rather than ingested as if it were
+        whole, however many chunks or drains it takes to reach its newline. */
+    private var framer = LineFramer(maxPartialBytes: 16 * 1024)
     private let intervalMs: Int
     /** Unread bytes above this are skipped to the recent tail. Replaying a
         flood into a rotating structured log (10 MB) is wasted work, and a
         drain of that backlog would block `stop`. */
     private let maxCatchUpBytes: Int
-    /** Partial-line cap: a line longer than this flushes in segments. */
-    private let maxPartialBytes = 16 * 1024
     private var offset: UInt64 = 0
-    private var partial = Data()
-    /** One drain never holds more than this plus `maxPartialBytes` of leftover.
-        Reading the whole unread tail and then removing each line from the front
-        of that `Data` copies the remainder once per line and keeps the original
-        allocation alive for the whole drain. */
+    /** One drain never holds more than this plus the framer's partial line. */
     private let readChunkBytes: Int
     /** Returns 0 or an errno; a seam so a test can stand in for a volume
         that refuses hole punching. */
@@ -156,6 +124,10 @@ actor SpoolTailer {
         applies once, at attach, and never again on a later drain. */
     private var seedingAtEnd: Bool
     private var skipReport = SkipReport(interval: .seconds(1))
+    /** The open spool, read-only; nil until a drain opens it and after
+        `stop` closes it. Read afresh after every suspension, since `stop`
+        can close it while a polling drain is suspended. */
+    private var spool: Int32?
     private let store: LogStore
     private let stream: LogStream
     private var task: Task<Void, Never>?
@@ -169,9 +141,8 @@ actor SpoolTailer {
         appended from this point forward. Lines written while no daemon was
         tailing the file stay in the raw spool only, never reaching the
         structured log; the alternative, back-reading from offset 0, would
-        duplicate every line the prior run's tailer already ingested. Defaults
-        to false, which preserves ingesting from the start for an ordinary
-        spawn. */
+        duplicate every line the prior run's tailer already ingested. An
+        ordinary spawn leaves it false and ingests from the start. */
     init(
         intervalMs: Int = 100, maxCatchUpBytes: Int = 1_048_576, readChunkBytes: Int = 64 * 1024,
         releaseHole: @escaping @Sendable (String, Range<UInt64>) -> Int32 = SpoolRelease.punchHole,
@@ -187,6 +158,10 @@ actor SpoolTailer {
         self.store = store
         self.stream = stream
         self.url = url
+    }
+
+    deinit {
+        if let spool { close(spool) }
     }
 
     func start() {
@@ -207,39 +182,53 @@ actor SpoolTailer {
         await drain(yieldsToCancellation: false)
         await reportSkipped(skipReport.flush(now: .now))
         await flushPartial()
+        if let spool { close(spool) }
+        spool = nil
     }
 
     /** Reads the unread tail one chunk per pass, re-reading the size before
         each: a child that writes as fast as the tailer reads never lets a
         drain reach end of file, so the catch-up skip and the block release
         both run per chunk rather than once per drain, or neither would ever
-        run under a sustained flood. Chunked reads, never `readToEnd`; the
+        run under a sustained flood. Chunked reads, never the whole tail; the
         offset advances by bytes actually read, so a child that appends
         after a size read cannot leave the cursor behind data already
         ingested (duplicate lines, doubled error tally). The polling task
         passes `yieldsToCancellation` so it stops between chunks once `stop`
         cancels it; `stop` drains to the end, and the catch-up skip keeps
-        that bounded. */
+        that bounded. A spool that does not exist yet is retried next tick. */
     private func drain(yieldsToCancellation: Bool) async {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return }
-        defer { try? handle.close() }
+        if spool == nil {
+            let opened = open(url.path, O_RDONLY | O_CLOEXEC)
+            guard opened >= 0 else { return }
+            spool = opened
+        }
         while !(yieldsToCancellation && Task.isCancelled) {
-            guard await skipToReadable(size: (try? handle.seekToEnd()) ?? 0),
-                (try? handle.seek(toOffset: offset)) != nil,
-                let data = try? handle.read(upToCount: readChunkBytes), !data.isEmpty
-            else { break }
-            offset += UInt64(data.count)
-            var chunk = data
-            if droppingUntilNewline {
-                guard let newline = chunk.firstIndex(of: 0x0A) else { continue }
-                chunk = Data(chunk[chunk.index(after: newline)...])
-                droppingUntilNewline = false
-            }
-            if !chunk.isEmpty { await ingest(chunk: chunk) }
+            guard let size = spoolSize() else { break }
+            let readable = await skipToReadable(size: size)
+            guard readable, let chunk = readChunk(), !chunk.isEmpty else { break }
+            offset += UInt64(chunk.count)
+            await emit(lines: framer.feed(chunk))
             await releaseIngested()
         }
         await releaseIngested()
         await reportSkipped(skipReport.due(now: .now))
+    }
+
+    private func spoolSize() -> UInt64? {
+        guard let spool else { return nil }
+        var info = stat()
+        guard fstat(spool, &info) == 0 else { return nil }
+        return UInt64(info.st_size)
+    }
+
+    /** Up to `readChunkBytes` from `offset`; empty at end of file. */
+    private func readChunk() -> Data? {
+        guard let spool else { return nil }
+        var chunk = Data(count: readChunkBytes)
+        let got = chunk.withUnsafeMutableBytes { PositionalRead.read(spool, at: Int(offset), into: $0) }
+        chunk.count = got
+        return chunk
     }
 
     private func reportSkipped(_ bytes: UInt64?) async {
@@ -253,13 +242,12 @@ actor SpoolTailer {
     private func skipToReadable(size: UInt64) async -> Bool {
         if seedingAtEnd {
             offset = size
-            partial.removeAll()
+            framer.reset()
             seedingAtEnd = false
         }
         if size < offset {
             offset = 0
-            partial.removeAll()
-            droppingUntilNewline = false
+            framer.reset()
             releasedThrough = 0
         }
         guard size > offset else { return false }
@@ -267,8 +255,7 @@ actor SpoolTailer {
         if maxCatchUpBytes > 0, size - offset > cap {
             let skipped = size - offset - cap
             offset = size - cap
-            partial.removeAll()
-            droppingUntilNewline = true
+            framer.discardThroughNextNewline()
             await reportSkipped(skipReport.add(skipped, now: .now))
         }
         return true
@@ -296,24 +283,8 @@ actor SpoolTailer {
     }
 
     private func flushPartial() async {
-        guard !partial.isEmpty else { return }
-        let chunk = partial
-        partial.removeAll()
-        await emit(lines: [chunk])
-    }
-
-    private func ingest(chunk: Data) async {
-        let buffer: Data
-        if partial.isEmpty {
-            buffer = chunk
-        } else {
-            partial.append(chunk)
-            buffer = partial
-            partial = Data()
-        }
-        let pulled = SpoolLineSplit.pull(from: buffer, maxPartialBytes: maxPartialBytes)
-        partial = pulled.remainder
-        await emit(lines: pulled.lines)
+        guard let partial = framer.flush() else { return }
+        await emit(lines: [partial])
     }
 
     private func emit(lines: [Data]) async {

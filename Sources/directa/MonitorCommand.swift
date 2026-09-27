@@ -419,13 +419,13 @@ struct MonitorSession: Sendable {
     /** What the daemon matched on out and err past `cursor` but did not
         return (its per-stream trim), stamped at the cursor it read past. */
     private static func tick(
-        _ result: LogsQueryResult, totals: LogStreamCounts, after cursor: LogCursor, at now: Date,
+        _ result: LogsQueryResult, totals: LogStreamTotals, after cursor: LogCursor, at now: Date,
         health: String? = nil
     ) -> MonitorTick {
         var trimmed: [LogStream: Int] = [:]
         for streamKind in [LogStream.out, .err] {
             let returned = result.lines.count { $0.stream == streamKind }
-            let total = totals[streamKind] ?? 0
+            let total = totals[streamKind]
             if total > returned { trimmed[streamKind] = total - returned }
         }
         return MonitorTick(at: now, health: health, records: result.lines, trimmed: trimmed, windowStart: cursor.at)

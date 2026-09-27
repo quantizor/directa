@@ -135,7 +135,7 @@ import Testing
             result
                 == LogsQueryResult(
                     cursor: LogCursor(at: at, count: 3), lines: [LogRecord(at: at, stream: .out, text: "GET /")],
-                    totals: LogStreamCounts(err: 0, mark: 0, out: 2, sys: 0)))
+                    totals: LogStreamTotals(err: 0, mark: 0, out: 2, sys: 0)))
         let truncated = try await send(
             router, .logsQuery,
             LogsQueryParams(head: 1, maxLineCharacters: 5, name: "web", project: env.project, streams: [.out]),

@@ -1,9 +1,10 @@
 import Darwin
 import Foundation
 
-/** Formats and recognizes the `daemon-restart` event-detail marker
-    `ControlServer`'s bounce and adopt paths stamp on an event when a daemon
-    restart, not a real crash, reset a server. Shared by every writer and
+/** Formats and recognizes the `daemon-restart` event-detail marker that
+    `ControlServer`'s restore and bounce paths and `ServerSupervisor.adopt`
+    stamp on an event when a daemon restart, not a real crash, reset a
+    server. Shared by every writer and
     reader so a watch-change detail (`"watch change in <path>"`,
     `"watch suspended: <paths>"`) that happens to embed the literal substring
     "daemon-restart" in a project's own file path is never misread as one:

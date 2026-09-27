@@ -81,11 +81,11 @@ private actor FakeMonitorClock: MonitorClock {
     }
 
     private func attachLogsResult(cursor: LogCursor = LogCursor(at: Self.epoch, count: 0)) -> LogsQueryResult {
-        LogsQueryResult(cursor: cursor, lines: [], totals: LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0))
+        LogsQueryResult(cursor: cursor, lines: [], totals: LogStreamTotals(err: 0, mark: 0, out: 0, sys: 0))
     }
 
     private func tickLogsResult(
-        cursor: LogCursor, lines: [LogRecord] = [], totals: LogStreamCounts = LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0)
+        cursor: LogCursor, lines: [LogRecord] = [], totals: LogStreamTotals = LogStreamTotals(err: 0, mark: 0, out: 0, sys: 0)
     ) -> LogsQueryResult {
         LogsQueryResult(cursor: cursor, lines: lines, totals: totals)
     }
@@ -407,7 +407,7 @@ private actor FakeMonitorClock: MonitorClock {
             .success(
                 tickLogsResult(
                     cursor: LogCursor(at: lineAt, count: 1), lines: [LogRecord(at: lineAt, stream: .out, text: "last words")],
-                    totals: LogStreamCounts(err: 0, mark: 0, out: 1, sys: 0))))
+                    totals: LogStreamTotals(err: 0, mark: 0, out: 1, sys: 0))))
         guard case .ended(let events) = await session.step() else {
             Issue.record("expected the hard cap to end the run")
             return
@@ -534,7 +534,7 @@ private actor FakeMonitorClock: MonitorClock {
         let nextCursor = LogCursor(at: Self.epoch.addingTimeInterval(2), count: 1)
         let line = LogRecord(at: Self.epoch.addingTimeInterval(2), stream: .out, text: "hello")
         await requester.enqueueLogs(
-            .success(tickLogsResult(cursor: nextCursor, lines: [line], totals: LogStreamCounts(err: 0, mark: 0, out: 301, sys: 0))))
+            .success(tickLogsResult(cursor: nextCursor, lines: [line], totals: LogStreamTotals(err: 0, mark: 0, out: 301, sys: 0))))
         guard case .events(let events, _) = await session.step() else {
             Issue.record("expected a normal tick")
             return
@@ -656,7 +656,7 @@ private actor FakeMonitorClock: MonitorClock {
         let clock = FakeMonitorClock(start: Self.epoch)
         let attachCursor = LogCursor(at: Self.epoch, count: 0)
         await requester.enqueueLogs(
-            .success(LogsQueryResult(cursor: attachCursor, lines: [], totals: LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0))))
+            .success(LogsQueryResult(cursor: attachCursor, lines: [], totals: LogStreamTotals(err: 0, mark: 0, out: 0, sys: 0))))
         await requester.enqueueStatus(
             .success(
                 ServerListResult(servers: [
@@ -677,7 +677,7 @@ private actor FakeMonitorClock: MonitorClock {
             .success(
                 LogsQueryResult(
                     cursor: LogCursor(at: lineAt, count: 1), lines: [LogRecord(at: lineAt, stream: .out, text: "hello")],
-                    totals: LogStreamCounts(err: 0, mark: 0, out: 1, sys: 0))))
+                    totals: LogStreamTotals(err: 0, mark: 0, out: 1, sys: 0))))
         guard case .events(let tickEvents, _) = await session.step() else {
             Issue.record("expected a normal tick")
             return

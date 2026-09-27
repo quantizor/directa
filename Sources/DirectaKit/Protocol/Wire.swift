@@ -690,8 +690,8 @@ public struct LogFilePosition: Codable, Equatable, Sendable {
     }
 }
 
-/** One number per log stream. As a trim (`tailByStream`), nil leaves that
-    stream untrimmed and 0 excludes it; as `totals`, every field is set. */
+/** A per-stream trim (`tailByStream`): nil leaves that stream untrimmed and
+    0 excludes it. */
 public struct LogStreamCounts: Codable, Equatable, Sendable {
     public var err: Int?
     public var mark: Int?
@@ -706,6 +706,43 @@ public struct LogStreamCounts: Codable, Equatable, Sendable {
     }
 
     public subscript(stream: LogStream) -> Int? {
+        get {
+            switch stream {
+            case .err: err
+            case .mark: mark
+            case .out: out
+            case .sys: sys
+            }
+        }
+        set {
+            switch stream {
+            case .err: err = newValue
+            case .mark: mark = newValue
+            case .out: out = newValue
+            case .sys: sys = newValue
+            }
+        }
+    }
+}
+
+/** Records matched per stream, every stream counted. Encodes exactly as a
+    `LogStreamCounts` with every field set. */
+public struct LogStreamTotals: Codable, Equatable, Sendable {
+    public var err: Int
+    public var mark: Int
+    public var out: Int
+    public var sys: Int
+
+    public init(err: Int = 0, mark: Int = 0, out: Int = 0, sys: Int = 0) {
+        self.err = err
+        self.mark = mark
+        self.out = out
+        self.sys = sys
+    }
+
+    public var sum: Int { err + mark + out + sys }
+
+    public subscript(stream: LogStream) -> Int {
         get {
             switch stream {
             case .err: err
@@ -771,9 +808,10 @@ public struct LogsQueryParams: Codable, Equatable, Sendable {
 
     /** Why the daemon must refuse these parameters, or nil when they are
         coherent. The wire is untrusted: a negative count is refused rather
-        than trimmed, since a trim of a negative size has no meaning and the
-        older engine trapped on one. Every count is otherwise safe at any size,
-        because nothing is allocated ahead of the records that fill it. */
+        than trimmed, since a trim of a negative size has no meaning. Every
+        count is otherwise safe at any size, because nothing is allocated
+        ahead of the records that fill it. A grep pattern must pass
+        `LogQuery.grepRejection`. */
     public func refusal() -> WireError? {
         if after != nil, since != nil || sinceMark != nil {
             return WireError(
@@ -806,6 +844,12 @@ public struct LogsQueryParams: Codable, Equatable, Sendable {
                 code: .usage, hint: "send maxLineCharacters as 1 or more, or omit it",
                 message: "maxLineCharacters is \(maxLineCharacters), but a line needs room for at least one character")
         }
+        if let grep, let why = LogQuery.grepRejection(grep) {
+            return WireError(
+                code: .usage,
+                hint: "fix the pattern, or drop --grep to see every line",
+                message: "--grep is not a valid regular expression: \(why)")
+        }
         return nil
     }
 }
@@ -819,9 +863,9 @@ public struct LogsQueryResult: Codable, Equatable, Sendable {
     /** Records matched per stream before trimming, present when the query
         carried `after` or `tailByStream`. A `head` without `after` omits it,
         so the daemon can stop reading at the Nth line. */
-    public var totals: LogStreamCounts?
+    public var totals: LogStreamTotals?
 
-    public init(cursor: LogCursor? = nil, lines: [LogRecord], totals: LogStreamCounts? = nil) {
+    public init(cursor: LogCursor? = nil, lines: [LogRecord], totals: LogStreamTotals? = nil) {
         self.cursor = cursor
         self.lines = lines
         self.totals = totals
@@ -889,55 +933,12 @@ public struct EventsQueryResult: Codable, Equatable, Sendable {
 
 // MARK: - NDJSON framing
 
-/** Incremental NDJSON line assembler: feed raw bytes, get complete frames.
-    JSONEncoder never emits interior newlines (no prettyPrinted), so framing on
-    0x0A is safe. */
-public struct NDJSONBuffer: Sendable {
-    private var buffer = Data()
-    /** Count of leading bytes in `buffer` already scanned for a newline with
-        none found. Resuming from here on the next `feed` keeps framing one very
-        long line (a `directa logs` response with no bound) linear in its
-        length: without it, every appended chunk rescans the whole buffer
-        accumulated so far, which is quadratic in the line's length. */
-    private var scanned = 0
-
-    public init() {}
-
-    /** Bytes buffered with no newline seen yet: the current request or response
-        line in progress. The control server caps this on its (untrusted-client)
-        side to bound memory; a client reading the daemon's own responses, which
-        can legitimately run tens of megabytes, never consults it. */
-    public var pendingByteCount: Int { buffer.count }
-
-    /** Appends bytes and returns any newly completed lines (without the
-        newline). Scans only the bytes appended since the previous call, and
-        drops every consumed line with one `removeSubrange` rather than one per
-        line. */
-    public mutating func feed(_ data: Data) -> [Data] {
-        guard !data.isEmpty else { return [] }
-        buffer.append(data)
-        var lines: [Data] = []
-        var lineStart = buffer.startIndex
-        var searchFrom = buffer.index(buffer.startIndex, offsetBy: scanned)
-        while let newline = buffer[searchFrom...].firstIndex(of: 0x0A) {
-            let line = buffer[lineStart..<newline]
-            if !line.isEmpty { lines.append(Data(line)) }
-            lineStart = buffer.index(after: newline)
-            searchFrom = lineStart
-        }
-        if lineStart > buffer.startIndex {
-            buffer.removeSubrange(buffer.startIndex..<lineStart)
-        }
-        /** Whether or not a line was consumed above, everything now in `buffer`
-            has just been scanned end to end with no newline in it (the `while`
-            condition that exited the loop confirmed exactly that range), so the
-            whole remaining buffer is clean; `buffer.count` alone, not the
-            pre-removal `searchFrom` position, is what the next `feed` must skip
-            past. */
-        scanned = buffer.count
-        return lines
-    }
-}
+/** NDJSON frame assembly. JSONCoding never emits an interior newline, so a
+    frame is exactly one line. The control server caps `pendingByteCount` on
+    its untrusted-client side to bound memory; a client reading the daemon's
+    own responses, which can legitimately run tens of megabytes, never
+    consults it. */
+public typealias NDJSONBuffer = LineFramer
 
 public enum NDJSON {
     /** Encodes one frame with its trailing newline. */

@@ -32,10 +32,14 @@ import Testing
         #expect(MonitorSanitizer.sanitizeLabel(hostile) == "web_evil_name")
     }
 
+    /** The limit counts the ellipsis, the same convention the daemon's
+        `maxLineCharacters` cut uses, so a line the daemon already cut to the
+        limit passes through unchanged. */
     @Test func truncatesPastTheLimitWithEllipsis() {
         let long = String(repeating: "x", count: 401)
         let truncated = MonitorSanitizer.truncate(long, limit: MonitorLimits.truncationCharacterLimit)
-        #expect(truncated == String(repeating: "x", count: 400) + "…")
+        #expect(truncated == String(repeating: "x", count: 399) + "…")
+        #expect(MonitorSanitizer.truncate(truncated, limit: MonitorLimits.truncationCharacterLimit) == truncated)
         let exact = String(repeating: "x", count: 400)
         #expect(MonitorSanitizer.truncate(exact, limit: MonitorLimits.truncationCharacterLimit) == exact)
     }

@@ -32,8 +32,9 @@ public actor EventStore {
         }
     }
 
+    /** Reads need no flush first: `post` hands each line to write(2) with no
+        user-space buffer, so a read on another descriptor already sees it. */
     public func query(project: String? = nil, since: Date? = nil, tail: Int? = nil) -> [EventRecord] {
-        try? handle?.synchronize()
         var events: [EventRecord] = []
         let decoder = JSONCoding.decoder()
         for file in [url.appendingPathExtension("1"), url] {

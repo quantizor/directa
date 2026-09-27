@@ -5,20 +5,23 @@ import os
 
 @testable import DirectaKit
 
+/** The record a formatted line parses back to, through the scan's parser. */
+private func parsedRecord(_ line: some StringProtocol) -> LogRecord? {
+    Array(line.utf8).withUnsafeBufferPointer { LogScan.record(from: $0) }
+}
+
 @Suite struct LogFormatTests {
     @Test func recordRoundTrip() {
         let record = LogRecord(
             at: Date(timeIntervalSince1970: 1_752_868_000.5), stream: .out, text: "hello\tworld")
-        let line = record.formatted()
-        let parsed = LogRecord.parse(line[...])
         /** Payload tabs survive: parsers split on the first two tabs only. */
-        #expect(parsed == record)
+        #expect(parsedRecord(record.formatted()) == record)
     }
 
     @Test func unparseableLinesReturnNil() {
-        #expect(LogRecord.parse("no tabs here") == nil)
-        #expect(LogRecord.parse("2026-01-01T00:00:00.000Z\tbogus\ttext") == nil)
-        #expect(LogRecord.parse("not-a-date\tout\ttext") == nil)
+        #expect(parsedRecord("no tabs here") == nil)
+        #expect(parsedRecord("2026-01-01T00:00:00.000Z\tbogus\ttext") == nil)
+        #expect(parsedRecord("not-a-date\tout\ttext") == nil)
     }
 
     @Test func contextLineTagsStream() {
@@ -33,6 +36,121 @@ import os
         #expect(LogSanitizer.sanitize("\u{1B}[31mred\u{1B}[0m plain") == "red plain")
         #expect(LogSanitizer.sanitize("\u{1B}]0;title\u{7}after") == "after")
         #expect(LogSanitizer.sanitize("nul\u{0}led") == "nulled")
+        #expect(LogSanitizer.sanitize("trailing return\r") == "")
+    }
+
+    /** A line holding none of NUL, CR, or ESC comes back exactly as given,
+        multi-byte characters and other control bytes included. */
+    @Test func sanitizerLeavesALineWithNothingToStripAlone() {
+        for line in ["plain", "", "tab\there", "é 👩‍👩‍👧‍👦 ☃", "bell\u{7} and \u{7F} stay"] {
+            #expect(LogSanitizer.sanitize(line) == line)
+        }
+    }
+
+    /** At most `limit` characters, counted as a reader sees them, the last
+        being the ellipsis whenever anything was cut. */
+    @Test func truncationKeepsTheLimitIncludingTheEllipsis() {
+        #expect(LogSanitizer.truncated("abcdef", toCharacters: 4) == "abc…")
+        #expect(LogSanitizer.truncated("abcd", toCharacters: 4) == "abcd")
+        #expect(LogSanitizer.truncated("abcde", toCharacters: 1) == "…")
+        #expect(LogSanitizer.truncated("", toCharacters: 1) == "")
+        #expect(LogSanitizer.truncated("👩‍👩‍👧‍👦 family", toCharacters: 3) == "👩‍👩‍👧‍👦 …")
+        #expect(LogSanitizer.truncated("abcdef", toCharacters: 0) == "abcdef")
+        #expect(LogSanitizer.truncated("abcdef", toCharacters: -2) == "abcdef")
+    }
+}
+
+@Suite struct LineFramerTests {
+    private func texts(_ lines: [Data]) -> [String] {
+        lines.map { String(decoding: $0, as: UTF8.self) }
+    }
+
+    @Test func splitsLinesAndHoldsTheIncompleteTail() {
+        var framer = LineFramer(maxPartialBytes: 16 * 1024)
+        #expect(texts(framer.feed(Data("one\ntwo\nthree".utf8))) == ["one", "two"])
+        #expect(framer.pendingByteCount == 5)
+        #expect(texts(framer.feed(Data(" more\n".utf8))) == ["three more"])
+        #expect(framer.pendingByteCount == 0)
+        #expect(framer.flush() == nil)
+    }
+
+    @Test func skipsEmptyLines() {
+        var framer = LineFramer(maxPartialBytes: 16)
+        #expect(texts(framer.feed(Data("a\n\nb\n".utf8))) == ["a", "b"])
+        #expect(framer.pendingByteCount == 0)
+    }
+
+    @Test func segmentsANewlineLessTailPastTheCap() {
+        var framer = LineFramer(maxPartialBytes: 4)
+        #expect(framer.feed(Data(repeating: 0x61, count: 10)).map(\.count) == [4, 4])
+        #expect(framer.flush() == Data(repeating: 0x61, count: 2))
+    }
+
+    @Test func aTailAtTheCapStaysHeld() {
+        var framer = LineFramer(maxPartialBytes: 4)
+        #expect(framer.feed(Data(repeating: 0x61, count: 4)).isEmpty)
+        #expect(framer.pendingByteCount == 4)
+    }
+
+    /** With no cap, a line of any length is held whole until its newline. */
+    @Test func withNoCapALongLineIsHeldWhole() {
+        var framer = LineFramer()
+        #expect(framer.feed(Data(repeating: 0x61, count: 100_000)).isEmpty)
+        #expect(framer.feed(Data("\n".utf8)).map(\.count) == [100_000])
+    }
+
+    /** After a jump into the middle of a line, the rest of that line is
+        dropped however many feeds it spans, and nothing after it is. */
+    @Test func discardDropsThroughTheNextNewlineAcrossFeeds() {
+        var framer = LineFramer(maxPartialBytes: 4)
+        #expect(framer.feed(Data("held".utf8)).isEmpty)
+        framer.discardThroughNextNewline()
+        #expect(framer.pendingByteCount == 0)
+        #expect(framer.feed(Data("rest of a long cut line".utf8)).isEmpty)
+        #expect(texts(framer.feed(Data(" still\nkept\nnext".utf8))) == ["kept"])
+        #expect(framer.flush() == Data("next".utf8))
+    }
+
+    @Test func resetDropsTheHeldLineAndEndsADiscard() {
+        var framer = LineFramer()
+        framer.discardThroughNextNewline()
+        framer.reset()
+        #expect(texts(framer.feed(Data("whole\n".utf8))) == ["whole"])
+        #expect(framer.feed(Data("held".utf8)).isEmpty)
+        framer.reset()
+        #expect(framer.flush() == nil)
+    }
+
+    /** Framing works from any slice of a larger buffer, as the daemon's
+        socket reads deliver, and copies each line out of it. */
+    @Test func framesASliceThatDoesNotStartAtIndexZero() {
+        var framer = LineFramer()
+        let whole = Data("xxxxone\ntwo\nthr".utf8)
+        let slice = whole[whole.startIndex + 4..<whole.endIndex]
+        let lines = framer.feed(slice)
+        #expect(texts(lines) == ["one", "two"])
+        #expect(lines.map(\.startIndex) == [0, 0])
+        #expect(framer.flush() == Data("thr".utf8))
+    }
+
+    @Test func splittingDoesNotCopyTheUnreadTailOncePerLine() {
+        /** 50k short lines is enough that a per-line removal from the front
+            of `Data` spends seconds moving the remainder; one scan finishes
+            immediately. */
+        var buffer = Data()
+        buffer.reserveCapacity(50_000 * 8)
+        for index in 0..<50_000 {
+            buffer.append(contentsOf: "l\(index)\n".utf8)
+        }
+        var framer = LineFramer(maxPartialBytes: 16 * 1024)
+        let started = ContinuousClock.now
+        let lines = framer.feed(buffer)
+        let elapsed = ContinuousClock.now - started
+        #expect(lines.count == 50_000)
+        #expect(String(decoding: lines[0], as: UTF8.self) == "l0")
+        #expect(String(decoding: lines[49_999], as: UTF8.self) == "l49999")
+        #expect(framer.pendingByteCount == 0)
+        #expect(elapsed < Duration.seconds(1))
     }
 }
 
@@ -96,9 +214,9 @@ import os
     }
 
     @Test func invalidGrepIsRejectedNotIgnored() throws {
-        /** An unbalanced group cannot compile; the old `try? Regex` turned it into
-            "no filter" and returned every line, which reads exactly like a query
-            that matched everything. Fail closed instead. */
+        /** An unbalanced group cannot compile. Treating it as "no filter"
+            would return every line, which reads exactly like a query that
+            matched everything, so the query fails closed instead. */
         #expect(LogQuery.grepRejection("(unbalanced") != nil)
         #expect(LogQuery.grepRejection("error|warn") == nil)
         let lines = [record(1, .err, "error: boom"), record(2, .out, "fine")]
@@ -239,7 +357,7 @@ import os
     @Test func tailIgnoresATrailingPartialLine() throws {
         /** A line with no trailing newline (a crash mid-write, or a read
             racing an in-flight append) must not surface as a phantom record:
-            LogRecord.parse rejects it for lacking a full timestamp/stream/
+            the record parser rejects it for lacking a full timestamp/stream/
             payload shape, the same as the full-parse path already does. */
         let dir = try TemporaryTree.directory(named: "logq")
         let current = dir.appending(path: "current.log")
@@ -347,7 +465,7 @@ import os
         let caughtUp = LogQuery.window(current: current, options: LogQueryOptions(after: window.cursor))
         #expect(caughtUp.lines.isEmpty)
         #expect(caughtUp.cursor == window.cursor)
-        #expect(caughtUp.totals == LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0))
+        #expect(caughtUp.totals == LogStreamTotals(err: 0, mark: 0, out: 0, sys: 0))
     }
 
     @Test func anEmptyFamilyAnswersTheOriginCursor() throws {
@@ -406,7 +524,7 @@ import os
             current: current,
             options: LogQueryOptions(tailByStream: LogStreamCounts(err: 5, mark: 5, out: 3, sys: 5)))
         #expect(window.lines.map(\.text) == ["exited code=1", "started pid=9", "out 497", "out 498", "out 499"])
-        #expect(window.totals == LogStreamCounts(err: 0, mark: 0, out: 500, sys: 2))
+        #expect(window.totals == LogStreamTotals(err: 0, mark: 0, out: 500, sys: 2))
         let plainTail = LogQuery.run(current: current, options: LogQueryOptions(tail: 5))
         #expect(!plainTail.contains { $0.stream == .sys })
     }
@@ -424,7 +542,7 @@ import os
             current: current,
             options: LogQueryOptions(tailByStream: LogStreamCounts(err: 1, mark: 0, out: 2, sys: nil)))
         #expect(window.lines.map(\.text) == ["s1", "o2", "s2", "o3", "e3"])
-        #expect(window.totals == LogStreamCounts(err: 3, mark: 1, out: 3, sys: 2))
+        #expect(window.totals == LogStreamTotals(err: 3, mark: 1, out: 3, sys: 2))
     }
 
     @Test func headKeepsTheOldestMatches() throws {
@@ -439,7 +557,7 @@ import os
         let afterCursor = LogQuery.window(
             current: current, options: LogQueryOptions(after: LogCursor(at: stamped(4, .out, "").at, count: 1), head: 2))
         #expect(afterCursor.lines.map(\.text) == ["line 5", "line 6"])
-        #expect(afterCursor.totals == LogStreamCounts(err: 8, mark: 0, out: 7, sys: 0))
+        #expect(afterCursor.totals == LogStreamTotals(err: 8, mark: 0, out: 7, sys: 0))
     }
 
     /** A head with no cursor stops reading once it holds its lines: the
@@ -578,7 +696,7 @@ import os
             options: LogQueryOptions(after: .origin, tailByStream: LogStreamCounts(err: 300, out: 300)),
             onDiskRead: { bytes in reads.withLock { $0.append(bytes) } })
         #expect(window.lines.count == 600)
-        #expect(window.totals == LogStreamCounts(err: 960, mark: 0, out: 47_040, sys: 0))
+        #expect(window.totals == LogStreamTotals(err: 960, mark: 0, out: 47_040, sys: 0))
         let observed = reads.withLock { $0 }
         #expect(familyBytes > 3 * 1024 * 1024)
         #expect((observed.max() ?? 0) <= 1024 * 1024)
@@ -612,28 +730,35 @@ import os
             let current = try writeFamily(family)
             defer { try? FileManager.default.removeItem(at: current.deletingLastPathComponent()) }
             let records = family.flatMap { $0 }
-            var options = LogQueryOptions()
+            var after: LogCursor?
+            var since: Date?
             switch random.next() % 3 {
             case 0:
-                options.after = LogCursor(
+                after = LogCursor(
                     at: stamped(Int(random.next() % UInt64(ms + 2)), .out, "").at, count: Int(random.next() % 5))
             case 1:
-                options.since = stamped(Int(random.next() % UInt64(ms + 2)), .out, "").at
+                since = stamped(Int(random.next() % UInt64(ms + 2)), .out, "").at
                     .addingTimeInterval(random.next() % 2 == 0 ? 0 : 0.0004)
             default:
                 break
             }
-            if random.next() % 3 == 0 { options.streams = [.out, .sys] }
-            if random.next() % 4 == 0 { options.grep = "needle" }
+            let streams: Set<LogStream>? = random.next() % 3 == 0 ? [.out, .sys] : nil
+            let grep = random.next() % 4 == 0 ? "needle" : nil
+            var head: Int?
+            var tail: Int?
+            var tailByStream: LogStreamCounts?
             switch random.next() % 4 {
-            case 0: options.tail = Int(random.next() % 10)
-            case 1: options.head = Int(random.next() % 10)
+            case 0: tail = Int(random.next() % 10)
+            case 1: head = Int(random.next() % 10)
             case 2:
-                options.tailByStream = LogStreamCounts(
+                tailByStream = LogStreamCounts(
                     err: Int(random.next() % 4), mark: nil, out: Int(random.next() % 6), sys: 0)
             default: break
             }
-            if random.next() % 3 == 0 { options.maxLineCharacters = Int(random.next() % 8) + 1 }
+            let maxLineCharacters = random.next() % 3 == 0 ? Int(random.next() % 8) + 1 : nil
+            let options = LogQueryOptions(
+                after: after, grep: grep, head: head, maxLineCharacters: maxLineCharacters, since: since,
+                streams: streams, tail: tail, tailByStream: tailByStream)
             let got = LogQuery.window(current: current, options: options)
             #expect(got == naiveWindow(records, options), "iteration \(iteration)")
         }
@@ -699,6 +824,50 @@ import os
         }
     }
 
+    /** The last record of a file is found past trailing lines that are not
+        records, in small reads off the end, and a file with no record (or
+        none at all) answers nil. */
+    @Test func theLastRecordDateSkipsTrailingNonRecordsAndReadsLittle() throws {
+        let dir = try TemporaryTree.directory(named: "logq")
+        let url = dir.appending(path: "current.log")
+        let records = (0..<5_000).map { stamped($0, .out, "line \($0) padding-padding") }
+        let body = records.map { $0.formatted() + "\n" }.joined()
+            + "2026-01-01T00:00:00.000Z\tbogus\tnot a stream\nno tabs at all\n\n"
+        try Data(body.utf8).write(to: url)
+        #expect(LogQuery.lastRecordDate(of: url) == stamped(4_999, .out, "").at)
+        let reads = OSAllocatedUnfairLock<[Int]>(initialState: [])
+        let record: @Sendable (Int) -> Void = { count in reads.withLock { $0.append(count) } }
+        let reader = try #require(LogFileReader(url: url, onDiskRead: record))
+        #expect(reader.lastRecordMilliseconds() == LogScan.milliseconds(of: stamped(4_999, .out, "").at))
+        #expect(reads.withLock { $0 } == [LogScan.probeChunkBytes])
+
+        let empty = dir.appending(path: "empty.log")
+        try Data().write(to: empty)
+        #expect(LogQuery.lastRecordDate(of: empty) == nil)
+        let noRecords = dir.appending(path: "garbage.log")
+        try Data("no tabs\nstill none\n".utf8).write(to: noRecords)
+        #expect(LogQuery.lastRecordDate(of: noRecords) == nil)
+        #expect(LogQuery.lastRecordDate(of: dir.appending(path: "missing.log")) == nil)
+    }
+
+    /** Every count is stored at zero or more however it arrives, so a
+        negative one can never size a trim. */
+    @Test func negativeCountsAreStoredAsZero() throws {
+        let options = LogQueryOptions(
+            after: LogCursor(at: stamped(1, .out, "").at, count: -3), head: -1, tail: -2,
+            tailByStream: LogStreamCounts(err: -1, mark: nil, out: 4, sys: -9))
+        #expect(options.after?.count == 0)
+        #expect(options.head == 0)
+        #expect(options.tail == 0)
+        #expect(options.tailByStream == LogStreamCounts(err: 0, mark: nil, out: 4, sys: 0))
+        let current = try writeFamily([[stamped(1, .out, "a"), stamped(2, .err, "b")]])
+        #expect(LogQuery.run(current: current, options: LogQueryOptions(tail: -5)).isEmpty)
+        let perStream = LogQuery.window(
+            current: current, options: LogQueryOptions(tailByStream: LogStreamCounts(err: -1, out: -1)))
+        #expect(perStream.lines.isEmpty)
+        #expect(perStream.totals == LogStreamTotals(err: 1, mark: 0, out: 1, sys: 0))
+    }
+
     /** A tail whose stream filter thins the file out walks back past many
         chunk edges, some of them splitting a multi-byte character, and must
         answer exactly what parsing the whole file would, in reads no larger
@@ -727,7 +896,7 @@ import os
         #expect(bytes.count > 4 * chunk)
         #expect(splitsACharacter(bytes))
         let wholeFile = String(decoding: bytes, as: UTF8.self)
-            .split(separator: "\n", omittingEmptySubsequences: true).compactMap(LogRecord.parse)
+            .split(separator: "\n", omittingEmptySubsequences: true).compactMap(parsedRecord)
         for (streams, tail) in [([LogStream.err], 1), ([.err], 50), ([.err], 10_000), ([.mark], 5), ([.out, .err], 7)] {
             let reads = OSAllocatedUnfairLock<[Int]>(initialState: [])
             let got = LogQuery.runMeasured(
@@ -791,7 +960,7 @@ import os
             current: current, options: pollOptions(attach.cursor),
             onDiskRead: { count in read.withLock { $0 += count } })
         #expect(poll.lines.map(\.text) == (0..<10).map { "new \($0)" })
-        #expect(poll.totals == LogStreamCounts(err: 0, mark: 0, out: 10, sys: 0))
+        #expect(poll.totals == LogStreamTotals(err: 0, mark: 0, out: 10, sys: 0))
         #expect(
             poll.cursor
                 == LogCursor(
@@ -927,8 +1096,8 @@ import os
         }
         if let streams = options.streams { matched.removeAll { !streams.contains($0.stream) } }
         if options.grep != nil { matched.removeAll { !$0.text.contains("needle") } }
-        var totals = LogStreamCounts(err: 0, mark: 0, out: 0, sys: 0)
-        for record in matched { totals[record.stream] = (totals[record.stream] ?? 0) + 1 }
+        var totals = LogStreamTotals()
+        for record in matched { totals[record.stream] += 1 }
         if let head = options.head {
             matched = Array(matched.prefix(head))
         } else if let byStream = options.tailByStream {
