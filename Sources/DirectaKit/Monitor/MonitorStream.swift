@@ -41,6 +41,18 @@ public enum MonitorLimits {
         budget has room left. */
     public static let perTickFetchCap = 300
 
+    /** The same per-query count for sys and mark, independent of out/err's
+        and much smaller: lifecycle can never be crowded out by a stdout
+        flood, and there is normally very little of it to fetch. */
+    public static let lifecycleFetchCap = 50
+
+    public static func fetchCap(for stream: LogStream) -> Int {
+        switch stream {
+        case .err, .out: perTickFetchCap
+        case .mark, .sys: lifecycleFetchCap
+        }
+    }
+
     /** Claude Code's Monitor tool kills its command after this long; the
         session context's Monitor call asks for exactly this `timeout_ms`. */
     public static let harnessKillSeconds: TimeInterval = 30 * 60
@@ -388,6 +400,15 @@ public struct MonitorStream: Sendable {
     private enum ChildStream {
         case err
         case out
+
+        /** Nil for sys and mark. */
+        init?(_ stream: LogStream) {
+            switch stream {
+            case .err: self = .err
+            case .out: self = .out
+            case .mark, .sys: return nil
+            }
+        }
 
         var logStream: LogStream {
             switch self {
@@ -790,19 +811,20 @@ public struct MonitorStream: Sendable {
     }
 
     /** Daemon-side trimming (the query's `totals` minus what it returned)
-        never disappears silently: while a stream is already inside an
+        never disappears silently: while out or err is already inside an
         over-budget window it folds into that window's resume count (the
-        same suppression the user was already told about); otherwise it gets
-        its own marker here, since the client budget never got a chance to
-        suppress lines the daemon itself never sent. */
+        same suppression the user was already told about); otherwise, and
+        always for sys and mark, which have no budget, it gets its own
+        marker here, since nothing else ever saw lines the daemon never
+        sent. */
     private mutating func applyDaemonTrimmed(_ trimmed: [LogStream: Int], at: Date) -> [MonitorEvent] {
         var events: [MonitorEvent] = []
-        for stream in [ChildStream.out, .err] {
-            guard let count = trimmed[stream.logStream], count > 0 else { continue }
-            if budgets[stream].minuteOverBudget {
-                budgets[stream].daemonTrimmedSinceMarker += count
+        for stream in [LogStream.out, .err, .sys, .mark] {
+            guard let count = trimmed[stream], count > 0 else { continue }
+            if let child = ChildStream(stream), budgets[child].minuteOverBudget {
+                budgets[child].daemonTrimmedSinceMarker += count
             } else {
-                events.append(trimmedSkippedEvent(stream: stream.logStream, at: at, count: count))
+                events.append(trimmedSkippedEvent(stream: stream, at: at, count: count))
             }
         }
         return events
@@ -811,7 +833,8 @@ public struct MonitorStream: Sendable {
     private func trimmedSkippedEvent(stream: LogStream, at: Date, count: Int) -> MonitorEvent {
         let since = JSONCoding.formatISO8601(at)
         let text =
-            "\(Self.lines(count, of: stream.rawValue)) skipped (more than \(MonitorLimits.perTickFetchCap) in one tick); "
+            "\(Self.lines(count, of: stream.rawValue)) skipped "
+            + "(more than \(MonitorLimits.fetchCap(for: stream)) in one tick); "
             + "read them: directa logs \(hintName) --since \(since) --stream \(stream.rawValue) --head 200"
         return .suppressed(at: at, count: count, label: label, stream: stream, text: text)
     }

@@ -269,11 +269,6 @@ enum MonitorTransient: Equatable {
 enum MonitorRunTuning {
     /** The exponential backoff ceiling while a transient failure persists. */
     static let backoffCeilingSeconds: Double = 10
-    /** Per tick, sys and mark are fetched with their own small cap,
-        independent of `MonitorLimits.perTickFetchCap` (out/err's, much
-        larger): lifecycle can never be crowded out by a stdout flood, and
-        there is normally very little of it to fetch anyway. */
-    static let lifecycleFetchCap = 50
     static let statusPollInterval: TimeInterval = 10
     /** Continuous "the daemon is unreachable" past this long ends the run
         (mid-stream) or gives up on attaching (before any output), rather
@@ -425,18 +420,18 @@ struct MonitorSession: Sendable {
             after: cursor, maxLineCharacters: MonitorLimits.truncationCharacterLimit, name: config.name,
             project: config.project,
             tailByStream: LogStreamCounts(
-                err: MonitorLimits.perTickFetchCap, mark: MonitorRunTuning.lifecycleFetchCap,
-                out: MonitorLimits.perTickFetchCap, sys: MonitorRunTuning.lifecycleFetchCap))
+                err: MonitorLimits.fetchCap(for: .err), mark: MonitorLimits.fetchCap(for: .mark),
+                out: MonitorLimits.fetchCap(for: .out), sys: MonitorLimits.fetchCap(for: .sys)))
     }
 
-    /** What the daemon matched on out and err past `cursor` but did not
+    /** What the daemon matched on each stream past `cursor` but did not
         return (its per-stream trim), stamped at the cursor it read past. */
     private static func tick(
         _ result: LogsQueryResult, totals: LogStreamTotals, after cursor: LogCursor, at now: Date,
         health: String? = nil
     ) -> MonitorTick {
         var trimmed: [LogStream: Int] = [:]
-        for streamKind in [LogStream.out, .err] {
+        for streamKind in LogStream.allCases {
             let returned = result.lines.count { $0.stream == streamKind }
             let total = totals[streamKind]
             if total > returned { trimmed[streamKind] = total - returned }

@@ -544,6 +544,7 @@ private actor FakeMonitorClock: MonitorClock {
             stream's shaper as `trimmed`, not silently. */
         #expect(events.map(\.humanLine).contains { $0.contains("300 out lines skipped") })
         #expect(events.map(\.humanLine).contains("web out| hello"))
+        #expect(await requester.logsParamsSeen.last?.tailByStream == LogStreamCounts(err: 300, mark: 50, out: 300, sys: 50))
 
         /** The next tick's `after` is this tick's returned cursor, not the
             attach cursor: nothing already seen is re-fetched. */
@@ -553,6 +554,32 @@ private actor FakeMonitorClock: MonitorClock {
         let paramsSeen = await requester.logsParamsSeen
         #expect(paramsSeen.last?.after == nextCursor)
         #expect(await requester.logsCallCount == 3)
+    }
+
+    /** Lifecycle lines past the per-tick sys cap are counted from `totals`
+        like out and err, and reach the stream as a named skip, never a
+        silent loss. */
+    @Test func aSysTrimReachesTheStreamAsASkippedMarker() async {
+        let requester = FakeMonitorRequester()
+        let clock = FakeMonitorClock(start: Self.epoch)
+        var session = await attachedSession(requester, clock: clock)
+
+        await clock.advance(by: 2)
+        let lines = (0..<50).map { LogRecord(at: Self.epoch.addingTimeInterval(1), stream: .sys, text: "started pid=\($0)") }
+        await requester.enqueueLogs(
+            .success(
+                tickLogsResult(
+                    cursor: LogCursor(at: Self.epoch.addingTimeInterval(1), count: 50), lines: lines,
+                    totals: LogStreamTotals(err: 0, mark: 0, out: 0, sys: 53))))
+        guard case .events(let events, _) = await session.step() else {
+            Issue.record("expected a normal tick")
+            return
+        }
+        #expect(
+            events.first?.humanLine
+                == "directa web: 3 sys lines skipped (more than 50 in one tick); read them: "
+                + "directa logs web --since \(JSONCoding.formatISO8601(Self.epoch)) --stream sys --head 200")
+        #expect(events.count == 51)
     }
 }
 

@@ -680,6 +680,24 @@ import Testing
         ])
     }
 
+    /** Lifecycle and marks have no budget to fold a trim into, so a sys or
+        mark trim always gets its own marker, naming that stream's smaller
+        per-tick cap, even while out is over its budget. */
+    @Test func aLifecycleOrMarkTrimAlwaysGetsItsOwnSkippedMarker() {
+        var stream = makeStream(budgets: MonitorBudgets(linesPerArm: 1_000, linesPerMinute: 60))
+        _ = stream.ingest(tick(0.016, records: distinctOutTexts(16)))
+        let events = stream.ingest(tick(0.5, trimmed: [.mark: 2, .out: 7, .sys: 3], windowStart: date(0.2)))
+        let since = JSONCoding.formatISO8601(date(0.2))
+        #expect(events.map(\MonitorEvent.humanLine) == [
+            "directa web: 3 sys lines skipped (more than 50 in one tick); read them: "
+                + "directa logs web --since \(since) --stream sys --head 200",
+            "directa web: 2 mark lines skipped (more than 50 in one tick); read them: "
+                + "directa logs web --since \(since) --stream mark --head 200",
+        ])
+        #expect(events.map(\.kind) == [.suppressed, .suppressed])
+        #expect(events.map(\.count) == [3, 2])
+    }
+
     /** The daemon keeps the newest lines of a trimmed window, so the skipped
         ones start at the cursor the query read past: the marker's command
         starts there, and the marker sorts ahead of the lines this tick did
