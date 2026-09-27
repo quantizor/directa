@@ -192,7 +192,7 @@ private let fastPolicy = TelemetryCadence.Policy(
                 == IncidentSearchFinished(
                     diagnosticReports: 0, logShowSeconds: nil, matches: 0,
                     outcome: "skipped: system log search disabled", predicate: nil, time: finished.time,
-                    windowEnd: nil, windowStart: nil))
+                    truncated: false, windowEnd: nil, windowStart: nil))
 
         let current = TelemetryLog.lastLines(in: paths.daemonTelemetryDir, count: 10_000)
         let marks = try decoded(current, entry: .mark, as: TelemetryMark.self)

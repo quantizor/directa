@@ -168,7 +168,7 @@ public final class DaemonTelemetry: Sendable {
             incident.append([
                 IncidentSearchFinished(
                     diagnosticReports: 0, logShowSeconds: nil, matches: 0, outcome: "skipped: \(skipReason)",
-                    predicate: nil, time: Date(), windowEnd: nil, windowStart: nil)
+                    predicate: nil, time: Date(), truncated: false, windowEnd: nil, windowStart: nil)
             ])
             return
         }
@@ -185,24 +185,24 @@ public final class DaemonTelemetry: Sendable {
             timeoutSeconds: Self.logShowTimeoutSeconds)
         let seconds = began.duration(to: .now).roundedSeconds
         let outcome: String
-        var matches: [IncidentSystemLog] = []
+        var parsed = DaemonIncident.ParsedLogShow(lines: [], matches: 0)
         if shown.status == 0 {
-            matches = DaemonIncident.parseLogShow(shown.output)
+            parsed = DaemonIncident.parseLogShow(shown.output)
             outcome = "finished"
         } else if seconds >= Self.logShowTimeoutSeconds {
             outcome = "timed out"
         } else {
             outcome = "failed: log show exited \(shown.status): \(shown.output.prefix(200))"
         }
-        incident.append(matches)
+        incident.append(parsed.lines)
         let reports = Self.diagnosticReports(
             folders: Self.reportFolders, windowStart: window.start, bootTime: bootTime)
         incident.append(reports)
         incident.append([
             IncidentSearchFinished(
-                diagnosticReports: reports.count, logShowSeconds: seconds, matches: matches.count,
-                outcome: outcome, predicate: predicate, time: Date(), windowEnd: window.end,
-                windowStart: window.start)
+                diagnosticReports: reports.count, logShowSeconds: seconds, matches: parsed.matches,
+                outcome: outcome, predicate: predicate, time: Date(), truncated: parsed.truncated,
+                windowEnd: window.end, windowStart: window.start)
         ])
     }
 

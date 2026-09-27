@@ -65,7 +65,7 @@ def summary($h):
        (if $unparsed then ($h.launchd.rawLines | map("    " + .) | join("\n")) else empty end)
      else "  launchd: \($h.launchdNote // "no record")" end),
     (if $search == null then "  system log: search never finished (daemon died again, or still running)"
-     else "  system log: \($search.outcome), \($search.matches) matching lines\(if $search.logShowSeconds then ", \($search.logShowSeconds)s" else "" end)\(if $search.windowStart then ", window \($search.windowStart | clock) to \($search.windowEnd | clock)" else "" end)"
+     else "  system log: \($search.outcome), \($search.matches) matching lines\(if $search.truncated then " (only the first \($logs | length) kept)" else "" end)\(if $search.logShowSeconds then ", \($search.logShowSeconds)s" else "" end)\(if $search.windowStart then ", window \($search.windowStart | clock) to \($search.windowEnd | clock)" else "" end)"
      end),
     ($logs | .[0:20] | orNone("    \(.time | clock) \(.process): \(.message | .[0:240])")),
     "  diagnostic reports:",

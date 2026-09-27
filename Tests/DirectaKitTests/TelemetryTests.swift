@@ -671,7 +671,8 @@ private final class LockedArray: Sendable {
             #"{"processImagePath":"\/sbin\/launchd"}"#,
             #"{"eventMessage":"no readable time","processImagePath":"\/kernel","timestamp":"yesterday"}"#,
         ].joined(separator: "\n")
-        let parsed = DaemonIncident.parseLogShow(output)
+        let parsed = DaemonIncident.parseLogShow(output).lines
+        #expect(DaemonIncident.parseLogShow(output).truncated == false)
         #expect(
             parsed == [
                 IncidentSystemLog(
@@ -688,7 +689,21 @@ private final class LockedArray: Sendable {
         let flood = (0..<(DaemonIncident.systemLogLineCap + 5)).map { _ in
             #"{"eventMessage":"x","processImagePath":"\/kernel","timestamp":"2026-09-02 16:05:01.000000-0400"}"#
         }.joined(separator: "\n")
-        #expect(DaemonIncident.parseLogShow(flood).count == DaemonIncident.systemLogLineCap)
+        let capped = DaemonIncident.parseLogShow(flood)
+        #expect(capped.lines.count == DaemonIncident.systemLogLineCap)
+        #expect(capped.matches == DaemonIncident.systemLogLineCap + 5)
+        #expect(capped.truncated)
+    }
+
+    @Test func searchFinishedRecordsTruncation() throws {
+        let finished = IncidentSearchFinished(
+            diagnosticReports: 1, logShowSeconds: 2.5, matches: 305, outcome: "finished", predicate: "p",
+            time: try date("2026-09-26T10:05:04.000Z"), truncated: true,
+            windowEnd: try date("2026-09-26T10:05:00.000Z"), windowStart: try date("2026-09-26T10:03:00.000Z"))
+        #expect(
+            try encoded(finished)
+                == #"{"diagnosticReports":1,"entry":"search-finished","logShowSeconds":2.5,"matches":305,"outcome":"finished","predicate":"p","time":"2026-09-26T10:05:04.000Z","truncated":true,"windowEnd":"2026-09-26T10:05:00.000Z","windowStart":"2026-09-26T10:03:00.000Z"}"#
+                + "\n")
     }
 
     @Test func jetsamReportExcerptPicksTheDaemonEntry() {

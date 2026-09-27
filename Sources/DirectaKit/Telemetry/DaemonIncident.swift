@@ -176,17 +176,21 @@ public struct IncidentSearchFinished: Codable, Equatable, Sendable {
     public var diagnosticReports: Int
     public var entry = TelemetryEntryKind.searchFinished
     public var logShowSeconds: Double?
+    /** Every matching line `log show` printed, including any past
+        `DaemonIncident.systemLogLineCap` that the file does not hold. */
     public var matches: Int
     /** `finished`, `timed out`, `failed: <why>`, or `skipped: <why>`. */
     public var outcome: String
     public var predicate: String?
     public var time: Date
+    /** True when the file holds fewer `system-log` lines than `matches`. */
+    public var truncated: Bool
     public var windowEnd: Date?
     public var windowStart: Date?
 
     public init(
         diagnosticReports: Int, logShowSeconds: Double?, matches: Int, outcome: String, predicate: String?,
-        time: Date, windowEnd: Date?, windowStart: Date?
+        time: Date, truncated: Bool, windowEnd: Date?, windowStart: Date?
     ) {
         self.diagnosticReports = diagnosticReports
         self.logShowSeconds = logShowSeconds
@@ -194,6 +198,7 @@ public struct IncidentSearchFinished: Codable, Equatable, Sendable {
         self.outcome = outcome
         self.predicate = predicate
         self.time = time
+        self.truncated = truncated
         self.windowEnd = windowEnd
         self.windowStart = windowStart
     }
@@ -349,15 +354,32 @@ public enum DaemonIncident {
     /** Most unified-log lines kept per incident. */
     public static let systemLogLineCap = 300
 
+    /** `log show` output as incident lines: the first `systemLogLineCap`,
+        and how many matching lines there were in all. */
+    public struct ParsedLogShow: Equatable, Sendable {
+        public var lines: [IncidentSystemLog]
+        public var matches: Int
+
+        public init(lines: [IncidentSystemLog], matches: Int) {
+            self.lines = lines
+            self.matches = matches
+        }
+
+        public var truncated: Bool { matches > lines.count }
+    }
+
     /** Parses `log show --style ndjson` output into incident lines, capped. */
-    public static func parseLogShow(_ output: String) -> [IncidentSystemLog] {
+    public static func parseLogShow(_ output: String) -> ParsedLogShow {
         var entries: [IncidentSystemLog] = []
+        var matches = 0
         let decoder = JSONCoding.decoder()
         for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
-            guard entries.count < systemLogLineCap, line.hasPrefix("{"),
+            guard line.hasPrefix("{"),
                 let parsed = try? decoder.decode(LogShowLine.self, from: Data(line.utf8)),
                 let message = parsed.eventMessage
             else { continue }
+            matches += 1
+            guard entries.count < systemLogLineCap else { continue }
             entries.append(
                 IncidentSystemLog(
                     message: message.count > systemLogMessageCap
@@ -366,7 +388,7 @@ public enum DaemonIncident {
                     subsystem: parsed.subsystem.flatMap { $0.isEmpty ? nil : $0 },
                     time: parsed.timestamp.flatMap { try? logTimestamp.parse($0) }))
         }
-        return entries
+        return ParsedLogShow(lines: entries, matches: matches)
     }
 
     private static let posixLocale = Locale(identifier: "en_US_POSIX")
