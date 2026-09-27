@@ -162,45 +162,19 @@ public enum CheckoutIdentity {
         behind it, forever. */
     static let gitTimeoutSeconds: Double = 10
 
-    /** Blocks the calling thread until git exits. stderr goes to /dev/null
-        (only stdout answers the caller, and a git warning must not mix in),
-        which leaves one pipe, read to end of file on this same thread before
-        the wait: a git that fills the stdout buffer never blocks on a write
-        nothing is reading, and no helper thread is needed. */
+    /** Blocks the calling thread until git exits, or until its timeout, when
+        git and anything it started that still holds its output are killed.
+        stderr goes to /dev/null: only stdout answers the caller, and a git
+        warning must not mix in. */
     static func git(
         project: String, args: [String], timeoutSeconds: Double = gitTimeoutSeconds
     ) -> String? {
-        DaemonActivity.shared.measure(.git, label: "git \(args.joined(separator: " ")) in \(project)") {
-            gitUnmeasured(project: project, args: args, timeoutSeconds: timeoutSeconds)
-        }
-    }
-
-    private static func gitUnmeasured(project: String, args: [String], timeoutSeconds: Double) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = args
-        process.currentDirectoryURL = URL(fileURLWithPath: project)
-        let out = Pipe()
-        process.standardOutput = out
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-        /** Terminating git closes its end of the pipe, which ends the read
-            below. A timer, not a thread: nothing waits for it. */
-        let deadline = DispatchWorkItem { process.terminate() }
-        DispatchQueue.global(qos: .utility).asyncAfter(
-            deadline: .now() + timeoutSeconds, execute: deadline)
-        let data = (try? out.fileHandleForReading.readToEnd()) ?? Data()
-        process.waitUntilExit()
-        deadline.cancel()
-        guard process.terminationReason == .exit, process.terminationStatus == 0 else { return nil }
-        guard let text = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty
-        else { return nil }
-        return text
+        let outcome = HelperCommand.run(
+            "/usr/bin/git", args, currentDirectory: project, includeStderr: false,
+            timeoutSeconds: timeoutSeconds)
+        guard case .exited(status: 0, let output) = outcome else { return nil }
+        let text = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 }
 

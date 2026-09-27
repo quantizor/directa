@@ -177,6 +177,37 @@ import os
         #expect(await call.value == nil)
         #expect(!neededRelease, "a hung git answered only once its repository was released")
     }
+
+    /** A git that exits at once while a process it started keeps its output
+        open (here an alias that backgrounds a `sleep`) answers nil at its
+        timeout rather than when that process lets go, and the holder, which
+        shares git's process group, is killed with it. The holder outlives the
+        timeout by far, so waiting on it and not waiting on it are told apart
+        by a wide margin. */
+    @Test func aGitWhoseOutputOutlivesItEndsAtItsTimeout() async throws {
+        let project = try TemporaryTree.directory(named: "held-output")
+        let pidFile = project.appending(path: "holder.pid").path
+        let started = ContinuousClock.now
+        let answer = await BlockingLane.repository.run {
+            CheckoutIdentity.git(
+                project: project.path,
+                args: ["-c", "alias.hold=!sleep 20 & echo $! > '\(pidFile)'", "hold"],
+                timeoutSeconds: 0.5)
+        }
+        let elapsed = started.duration(to: .now)
+        #expect(answer == nil)
+        #expect(elapsed < .seconds(10), "the git read waited \(elapsed) for a process holding its output")
+        let holder = try #require(
+            (try? String(contentsOfFile: pidFile, encoding: .utf8))
+                .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        var gone = kill(holder, 0) != 0
+        for _ in 0..<50 where !gone {
+            try await Task.sleep(for: .milliseconds(50))
+            gone = kill(holder, 0) != 0
+        }
+        if !gone { kill(holder, SIGKILL) }
+        #expect(gone, "the process holding git's output (pid \(holder)) outlived the timeout")
+    }
 }
 
 /** A directory git treats as a repository candidate whose `HEAD` is a FIFO:
