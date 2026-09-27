@@ -236,20 +236,23 @@ struct SettingsView: View {
 
     /** Non-Homebrew uninstall: drop launch items in-process (this is already
         the hosting app), then shell the CLI for hooks and binaries, then move
-        this bundle to the Trash and quit. A running bundle can be trashed
-        because the process holds the inode. */
+        this bundle to the Trash, and only then unregister the app's own
+        agent, which ends this process when launchd started it. A running
+        bundle can be trashed because the process holds the inode. */
     private func performLocalUninstall() {
         guard let cli = SetupPerformer.resourceURLs()?.cli else {
             hookError = "This copy of directa.app is missing its bundled CLI."
             return
         }
+        AppAgentService.uninstallInProgress = true
         Task { @MainActor in
             _ = await Task.detached(priority: .userInitiated) {
-                try? await AgentService.unregisterAllLaunchItems()
+                try? await AgentService.unregisterLaunchItemsButAppAgent()
                 await LaunchdAdmin.shell(cli.path, ["uninstall"])
             }.value
             try? FileManager.default.trashItem(
                 at: Bundle.main.bundleURL, resultingItemURL: nil)
+            await BlockingLane.system.run { AppAgentService.unregister() }
             NSApp.terminate(nil)
         }
     }

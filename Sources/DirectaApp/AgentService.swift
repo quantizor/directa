@@ -78,11 +78,15 @@ enum AgentService {
         DirectaLog.app.info("agent unregistered on request")
     }
 
-    /** Agent plus Start at Login. Full uninstall uses this; `--agent-only` does
-        not, so a Homebrew upgrade keeps the user's login preference. */
-    nonisolated static func unregisterAllLaunchItems(paths: DirectaPaths = DirectaPaths()) async throws {
+    /** The daemon agent and the older Start at Login item. Full uninstall
+        uses this; `--agent-only` does not, so a Homebrew upgrade keeps the
+        user's login preference. The app's own agent is left to the caller,
+        which unregisters it after everything else it does:
+        `AppAgentService.unregister` ends this process when launchd started
+        it. */
+    nonisolated static func unregisterLaunchItemsButAppAgent(paths: DirectaPaths = DirectaPaths()) async throws {
         try await unregister(paths: paths)
-        AppAgentService.removeAll(because: "uninstall")
+        AppAgentService.retireLegacyLoginItem(because: "uninstall")
     }
 
     /** Deep-link / recovery entry: register, then wait until the socket answers.

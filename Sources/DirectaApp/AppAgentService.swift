@@ -9,6 +9,13 @@ import ServiceManagement
 enum AppAgentService {
     nonisolated static let agent = BundledAgent(plistName: "dev.quantizor.directa.app.plist")
 
+    /** Set by the in-app uninstall, which unregisters this agent itself once
+        its other steps finish. The CLI uninstall it runs sends a
+        `daemon/unregister-all` link back to this app; that handler leaves
+        the agent alone while this is set, or it would end the process
+        mid-uninstall. */
+    static var uninstallInProgress = false
+
     enum Failure: Error, LocalizedError, Sendable {
         case needsApproval
 
