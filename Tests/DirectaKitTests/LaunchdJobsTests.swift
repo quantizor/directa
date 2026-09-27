@@ -5,7 +5,7 @@ import Testing
 @testable import DirectaKit
 
 @Suite struct LaunchdJobsTests {
-    @Test func parseAgentPrintReadsJetsamExitAndRunCount() {
+    @Test func parseJobPrintReadsJetsamExitAndRunCount() {
         let printed = """
             gui/501/dev.quantizor.directa = {
             state = running
@@ -19,7 +19,7 @@ import Testing
             }
             }
             """
-        let status = LaunchdJobs.parseAgentPrint(printed)
+        let status = LaunchdJobs.parseJobPrint(printed)
         #expect(status.state == "running")
         #expect(status.pid == 46668)
         #expect(status.runs == 13)
@@ -31,7 +31,7 @@ import Testing
         keeps the run count and exit code, which is how the launcher tells an
         instant exit from a job that has not started yet. Captured from a real
         `launchctl print` of an `exit 7` job. */
-    @Test func parseAgentPrintReadsAnExitedJobsLastExitCode() {
+    @Test func parseJobPrintReadsAnExitedJobsLastExitCode() {
         let printed = """
             gui/501/dev.quantizor.directa.test-job.probe = {
             state = not running
@@ -40,8 +40,8 @@ import Testing
             }
             """
         #expect(
-            LaunchdJobs.parseAgentPrint(printed)
-                == LaunchdJobs.AgentStatus(lastExitCode: 7, runs: 1, state: "not running"))
+            LaunchdJobs.parseJobPrint(printed)
+                == LaunchdJobs.JobStatus(lastExitCode: 7, runs: 1, state: "not running"))
     }
 
     /** For an exit code with a sysexits.h name, launchd appends it after the
@@ -55,15 +55,15 @@ import Testing
         ("last exit code = 78: EX_CONFIG", 78),
         ("last exit code = 127", 127),
     ])
-    func parseAgentPrintReadsTheLeadingExitCodeNumber(line: String, code: Int) {
+    func parseJobPrintReadsTheLeadingExitCodeNumber(line: String, code: Int) {
         let printed = """
             state = not running
             runs = 1
             \(line)
             """
         #expect(
-            LaunchdJobs.parseAgentPrint(printed)
-                == LaunchdJobs.AgentStatus(lastExitCode: code, runs: 1, state: "not running"))
+            LaunchdJobs.parseJobPrint(printed)
+                == LaunchdJobs.JobStatus(lastExitCode: code, runs: 1, state: "not running"))
     }
 
     /** A job a signal ended prints no exit code line at all, only the signal
@@ -73,19 +73,19 @@ import Testing
         ("last terminating signal = Killed: 9", 9),
         ("last terminating signal = Terminated: 15", 15),
     ])
-    func parseAgentPrintReadsTheTerminatingSignalNumber(line: String, signal: Int) {
+    func parseJobPrintReadsTheTerminatingSignalNumber(line: String, signal: Int) {
         let printed = """
             state = not running
             runs = 1
             \(line)
             """
         #expect(
-            LaunchdJobs.parseAgentPrint(printed)
-                == LaunchdJobs.AgentStatus(lastTerminatingSignal: signal, runs: 1, state: "not running"))
+            LaunchdJobs.parseJobPrint(printed)
+                == LaunchdJobs.JobStatus(lastTerminatingSignal: signal, runs: 1, state: "not running"))
     }
 
     /** Before its first exit launchd prints `(never exited)`, which is no code. */
-    @Test func parseAgentPrintReadsNeverExitedAsNoCode() {
+    @Test func parseJobPrintReadsNeverExitedAsNoCode() {
         let printed = """
             state = running
             runs = 1
@@ -93,17 +93,17 @@ import Testing
             last exit code = (never exited)
             """
         #expect(
-            LaunchdJobs.parseAgentPrint(printed)
-                == LaunchdJobs.AgentStatus(pid: 99, runs: 1, state: "running"))
+            LaunchdJobs.parseJobPrint(printed)
+                == LaunchdJobs.JobStatus(pid: 99, runs: 1, state: "running"))
     }
 
-    @Test func parseAgentPrintWithoutJetsamIsNotJetsammed() {
+    @Test func parseJobPrintWithoutJetsamIsNotJetsammed() {
         let printed = """
             state = running
             runs = 1
             pid = 99
             """
-        let status = LaunchdJobs.parseAgentPrint(printed)
+        let status = LaunchdJobs.parseJobPrint(printed)
         #expect(status.jetsammed == false)
         #expect(status.lastExitReason == nil)
         #expect(status.runs == 1)
@@ -119,14 +119,14 @@ import Testing
             """
         let jobs = LaunchdJobs.parseChildJobs(fromList: listed)
         #expect(jobs.count == 2)
-        #expect(jobs[0] == LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.live", lastExitStatus: 0, pid: 48080))
-        #expect(jobs[1] == LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.dead", lastExitStatus: -15, pid: nil))
+        #expect(jobs[0] == LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.live", pid: 48080))
+        #expect(jobs[1] == LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.dead", pid: nil))
     }
 
     @Test func staleKeepsOnlyPidsTheDaemonStillSupervises() {
         let live = LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.a", pid: 10)
         let ghostRunning = LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.b", pid: 11)
-        let ghostGone = LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.c", lastExitStatus: -15)
+        let ghostGone = LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.c")
         let stale = LaunchdJobs.stale([live, ghostRunning, ghostGone], keepingPids: [10])
         #expect(stale.map(\.label) == [
             "dev.quantizor.directa.job.b", "dev.quantizor.directa.job.c",

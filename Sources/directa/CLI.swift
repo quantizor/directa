@@ -1930,7 +1930,7 @@ struct Doctor: AsyncParsableCommand {
                 detail: LaunchdAdmin.launchdState(from: printed), kind: "launchd",
                 severity: "info"))
         if printed.status == 0 {
-            let agent = LaunchdJobs.parseAgentPrint(printed.output)
+            let agent = LaunchdJobs.parseJobPrint(printed.output)
             if agent.jetsammed {
                 let runs = agent.runs.map { " (\($0) runs)" } ?? ""
                 let burstDetail = await Self.recentRestartBurstCount(client: client).map {

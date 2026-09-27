@@ -10,7 +10,8 @@ public enum LaunchdJobs {
     public static let childLabelPrefix = "dev.quantizor.directa.job."
     public static var guiDomain: String { "gui/\(getuid())" }
 
-    public struct AgentStatus: Equatable, Sendable {
+    /** One job's `launchctl print` fields: the agent's own, or a child job's. */
+    public struct JobStatus: Equatable, Sendable {
         /** `last exit code`, the leading number of `64: EX_USAGE` and the like;
             nil while the job has never exited (launchd prints `(never
             exited)`) and for a death launchd reports only as a terminating
@@ -44,20 +45,18 @@ public enum LaunchdJobs {
 
     public struct ChildJob: Equatable, Sendable {
         public var label: String
-        public var lastExitStatus: Int32?
         public var pid: pid_t?
 
-        public init(label: String, lastExitStatus: Int32? = nil, pid: pid_t? = nil) {
+        public init(label: String, pid: pid_t? = nil) {
             self.label = label
-            self.lastExitStatus = lastExitStatus
             self.pid = pid
         }
     }
 
-    /** `launchctl print gui/$UID/dev.quantizor.directa`. First `state` / `pid`
-        at the job level; later coalition blocks repeat `state = active`. */
-    public static func parseAgentPrint(_ output: String) -> AgentStatus {
-        var status = AgentStatus()
+    /** `launchctl print gui/$UID/<label>`. First `state` / `pid` at the job
+        level; later coalition blocks repeat `state = active`. */
+    public static func parseJobPrint(_ output: String) -> JobStatus {
+        var status = JobStatus()
         for line in output.split(separator: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if status.state == nil, trimmed.hasPrefix("state =") {
@@ -103,12 +102,7 @@ public enum LaunchdJobs {
                 guard raw != "-", let parsed = pid_t(raw), parsed > 0 else { return nil }
                 return parsed
             }()
-            let lastExitStatus: Int32? = {
-                let raw = parts[1]
-                guard raw != "-" else { return nil }
-                return Int32(raw)
-            }()
-            jobs.append(ChildJob(label: label, lastExitStatus: lastExitStatus, pid: pid))
+            jobs.append(ChildJob(label: label, pid: pid))
         }
         return jobs
     }
@@ -123,11 +117,27 @@ public enum LaunchdJobs {
         }
     }
 
-    public static func loadAgentStatus() -> AgentStatus? {
-        let printed = LaunchdAdmin.shell(
-            "/bin/launchctl", ["print", "\(guiDomain)/\(LaunchdAdmin.label)"])
-        guard printed.status == 0 else { return nil }
-        return parseAgentPrint(printed.output)
+    public static func loadAgentStatus() -> JobStatus? {
+        printJob(label: LaunchdAdmin.label)
+    }
+
+    /** `launchctl print` of one gui-domain job, nil when launchd has no such
+        job (or the print failed). */
+    public static func printJob(label: String) -> JobStatus? {
+        parsedPrint(LaunchdAdmin.shell("/bin/launchctl", printArguments(label: label)))
+    }
+
+    /** `printJob` on `BlockingLane.system`, the overload an async caller gets. */
+    public static func printJob(label: String) async -> JobStatus? {
+        parsedPrint(await LaunchdAdmin.shell("/bin/launchctl", printArguments(label: label)))
+    }
+
+    private static func printArguments(label: String) -> [String] {
+        ["print", "\(guiDomain)/\(label)"]
+    }
+
+    private static func parsedPrint(_ printed: (status: Int32, output: String)) -> JobStatus? {
+        printed.status == 0 ? parseJobPrint(printed.output) : nil
     }
 
     public static func loadChildJobs() -> [ChildJob] {
@@ -136,12 +146,22 @@ public enum LaunchdJobs {
         return parseChildJobs(fromList: listed.output)
     }
 
-    /** Boot out one child job. Never called for the agent label itself; the
-        caller decides which jobs qualify (see `stale`). Production code must
-        reach this only through `AgentJobs`, whose optionality on `Router` is
-        what keeps a non-agent process (every unit test, `ddirecta
-        --foreground`) from ever running a real `launchctl bootout`. */
-    public static func bootOut(_ job: ChildJob) {
-        _ = LaunchdAdmin.shell("/bin/launchctl", ["bootout", "\(guiDomain)/\(job.label)"])
+    /** Boot out one child job. Never called for the agent label itself: the
+        daemon's own teardown boots out each job it launched or adopted once
+        that job exits, and the leftover-job reap reaches this only through
+        `AgentJobs`, whose optionality on `Router` is what keeps a non-agent
+        process (every unit test, `ddirecta --foreground`) from ever running a
+        real `launchctl bootout` there. */
+    public static func bootOut(label: String) {
+        _ = LaunchdAdmin.shell("/bin/launchctl", bootOutArguments(label: label))
+    }
+
+    /** `bootOut` on `BlockingLane.system`, the overload an async caller gets. */
+    public static func bootOut(label: String) async {
+        _ = await LaunchdAdmin.shell("/bin/launchctl", bootOutArguments(label: label))
+    }
+
+    private static func bootOutArguments(label: String) -> [String] {
+        ["bootout", "\(guiDomain)/\(label)"]
     }
 }

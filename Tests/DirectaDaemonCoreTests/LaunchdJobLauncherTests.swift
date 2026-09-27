@@ -209,10 +209,10 @@ struct LaunchdJobLauncherTests {
         ever seen: a terminating signal wins, then the exit code, else unknown. */
     @Test func unseenExitOutcomeReadsSignalThenCodeThenUnknown() {
         let signaled = LaunchdJobLauncher.unseenExitOutcome(
-            LaunchdJobs.AgentStatus(lastTerminatingSignal: 9, runs: 1))
+            LaunchdJobs.JobStatus(lastTerminatingSignal: 9, runs: 1))
         let exited = LaunchdJobLauncher.unseenExitOutcome(
-            LaunchdJobs.AgentStatus(lastExitCode: 64, runs: 1))
-        let unknown = LaunchdJobLauncher.unseenExitOutcome(LaunchdJobs.AgentStatus(runs: 1))
+            LaunchdJobs.JobStatus(lastExitCode: 64, runs: 1))
+        let unknown = LaunchdJobLauncher.unseenExitOutcome(LaunchdJobs.JobStatus(runs: 1))
         #expect("\(signaled)" == "signaled(signal: 9)")
         #expect("\(exited)" == "exited(code: 64)")
         #expect("\(unknown)" == "exitedStatusUnknown")
@@ -223,15 +223,15 @@ struct LaunchdJobLauncherTests {
         fail, or that still show a pid or no exit record, are polled past, and
         the first record of a job not running decides the outcome. */
     @Test(arguments: [
-        ([nil, LaunchdJobs.AgentStatus(pid: 4242, runs: 1), LaunchdJobs.AgentStatus(runs: 1),
-          LaunchdJobs.AgentStatus(lastExitCode: 127, runs: 1)], "exited(code: 127)", 4),
-        ([LaunchdJobs.AgentStatus(lastTerminatingSignal: 9, runs: 1)], "signaled(signal: 9)", 1),
-        ([LaunchdJobs.AgentStatus(lastExitCode: 0, runs: 1)], "exited(code: 0)", 1),
-        ([LaunchdJobs.AgentStatus(lastExitCode: 3, pid: 4242, runs: 1)], "exitedStatusUnknown", 5),
+        ([nil, LaunchdJobs.JobStatus(pid: 4242, runs: 1), LaunchdJobs.JobStatus(runs: 1),
+          LaunchdJobs.JobStatus(lastExitCode: 127, runs: 1)], "exited(code: 127)", 4),
+        ([LaunchdJobs.JobStatus(lastTerminatingSignal: 9, runs: 1)], "signaled(signal: 9)", 1),
+        ([LaunchdJobs.JobStatus(lastExitCode: 0, runs: 1)], "exited(code: 0)", 1),
+        ([LaunchdJobs.JobStatus(lastExitCode: 3, pid: 4242, runs: 1)], "exitedStatusUnknown", 5),
         ([nil], "exitedStatusUnknown", 5),
-    ] as [([LaunchdJobs.AgentStatus?], String, Int)])
+    ] as [([LaunchdJobs.JobStatus?], String, Int)])
     func exitRecordPollsUntilLaunchdShowsTheExit(
-        reads: [LaunchdJobs.AgentStatus?], expected: String, readCount: Int
+        reads: [LaunchdJobs.JobStatus?], expected: String, readCount: Int
     ) async {
         let made = OSAllocatedUnfairLock(initialState: 0)
         let outcome = await LaunchdJobLauncher.exitRecord(attempts: 5, interval: .zero) {
@@ -249,14 +249,14 @@ struct LaunchdJobLauncherTests {
         fallback) takes launchd's own record of the still-bootstrapped job;
         any outcome the watch did report stands without a launchd read. */
     @Test(arguments: [
-        ("exitedStatusUnknown", [LaunchdJobs.AgentStatus(lastExitCode: 3, runs: 1)], "exited(code: 3)", 1),
-        ("exitedStatusUnknown", [LaunchdJobs.AgentStatus(lastTerminatingSignal: 15, runs: 1)], "signaled(signal: 15)", 1),
+        ("exitedStatusUnknown", [LaunchdJobs.JobStatus(lastExitCode: 3, runs: 1)], "exited(code: 3)", 1),
+        ("exitedStatusUnknown", [LaunchdJobs.JobStatus(lastTerminatingSignal: 15, runs: 1)], "signaled(signal: 15)", 1),
         ("exitedStatusUnknown", [nil], "exitedStatusUnknown", 3),
-        ("exited", [LaunchdJobs.AgentStatus(lastExitCode: 3, runs: 1)], "exited(code: 0)", 0),
-        ("signaled", [LaunchdJobs.AgentStatus(lastExitCode: 3, runs: 1)], "signaled(signal: 9)", 0),
-    ] as [(String, [LaunchdJobs.AgentStatus?], String, Int)])
+        ("exited", [LaunchdJobs.JobStatus(lastExitCode: 3, runs: 1)], "exited(code: 0)", 0),
+        ("signaled", [LaunchdJobs.JobStatus(lastExitCode: 3, runs: 1)], "signaled(signal: 9)", 0),
+    ] as [(String, [LaunchdJobs.JobStatus?], String, Int)])
     func armedOutcomeReadsLaunchdOnlyWhenTheStatusIsUnknown(
-        watched: String, reads: [LaunchdJobs.AgentStatus?], expected: String, readCount: Int
+        watched: String, reads: [LaunchdJobs.JobStatus?], expected: String, readCount: Int
     ) async {
         let outcome: ProcessOutcome =
             switch watched {

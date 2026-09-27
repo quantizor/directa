@@ -386,7 +386,7 @@ public enum LaunchdAdmin {
 
     public static func launchdState(from result: (status: Int32, output: String)) -> String {
         if result.status != 0 { return "not bootstrapped" }
-        let status = LaunchdJobs.parseAgentPrint(result.output)
+        let status = LaunchdJobs.parseJobPrint(result.output)
         if let state = status.state { return "state = \(state)" }
         if let pid = status.pid { return "pid = \(pid)" }
         return "bootstrapped"

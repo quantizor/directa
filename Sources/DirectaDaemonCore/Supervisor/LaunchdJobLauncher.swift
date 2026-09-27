@@ -40,23 +40,19 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         guard argv.first?.isEmpty == false else {
             return .spawnFailed(SpawnError(errno: Int(EINVAL), message: "empty command"))
         }
-        let stdoutPath = capture.stdoutPath
-        let stderrPath = capture.stderrPath
         let label = labelPrefix + UUID().uuidString.lowercased()
-        let domain = LaunchdJobs.guiDomain
-        let plistURL = FileManager.default.temporaryDirectory.appending(
-            path: "\(label).plist")
+        let plistURL = Self.plistURL(label: label)
         do {
             try Self.writePlist(
                 argv: argv, cwd: cwd, environment: environment, label: label,
-                stderrPath: stderrPath, stdoutPath: stdoutPath, url: plistURL)
+                stderrPath: capture.stderrPath, stdoutPath: capture.stdoutPath, url: plistURL)
         } catch {
             return .spawnFailed(
                 SpawnError(
                     errno: nil, message: "cannot write job plist: \(error.localizedDescription)"))
         }
         let bootstrap = await LaunchdAdmin.shell(
-            "/bin/launchctl", ["bootstrap", domain, plistURL.path])
+            "/bin/launchctl", ["bootstrap", LaunchdJobs.guiDomain, plistURL.path])
         if bootstrap.status != 0 {
             try? FileManager.default.removeItem(at: plistURL)
             return .spawnFailed(
@@ -65,29 +61,33 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                     message: "launchctl bootstrap failed: \(bootstrap.output)"))
         }
         let outcome = await watchBootstrapped(
-            domain: domain, label: label, onExitedBeforeWatch: onExitedBeforeWatch, onSpawn: onSpawn)
-        await Self.bootOut(domain: domain, label: label)
+            label: label, onExitedBeforeWatch: onExitedBeforeWatch, onSpawn: onSpawn)
+        await Self.bootOut(label: label)
         return outcome
+    }
+
+    /** Where `run` writes a job's plist for `launchctl bootstrap`. */
+    private static func plistURL(label: String) -> URL {
+        FileManager.default.temporaryDirectory.appending(path: "\(label).plist")
     }
 
     /** `launchctl bootout` for a finished job, then best-effort removal of its
         temp plist. */
-    private static func bootOut(domain: String, label: String) async {
-        _ = await LaunchdAdmin.shell("/bin/launchctl", ["bootout", "\(domain)/\(label)"])
-        let plistURL = FileManager.default.temporaryDirectory.appending(path: "\(label).plist")
-        try? FileManager.default.removeItem(at: plistURL)
+    private static func bootOut(label: String) async {
+        await LaunchdJobs.bootOut(label: label)
+        try? FileManager.default.removeItem(at: plistURL(label: label))
     }
 
     /** Everything `run` does between a successful bootstrap and the bootout:
         the job stays bootstrapped throughout, which is what keeps launchd's
         exit record readable on every path here. */
     private func watchBootstrapped(
-        domain: String, label: String,
+        label: String,
         onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
         onSpawn: @escaping @Sendable (pid_t) async -> Void
     ) async -> ProcessOutcome {
         let pid: pid_t
-        switch await Self.waitUntilPidPublished(domain: domain, label: label) {
+        switch await Self.waitUntilPidPublished(label: label) {
         case .published(let published):
             pid = published
         case .exitedUnseen(let outcome):
@@ -114,7 +114,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                 await onSpawn(pid)
                 let watched = await ExitWatcher.shared.wait(pid: pid)
                 return await Self.armedOutcome(watched) {
-                    await Self.launchdExitRecord(domain: domain, label: label)
+                    await Self.launchdExitRecord(label: label)
                 }
             case .failed(let error):
                 /** Measured on a real machine: a session leader that dies in
@@ -132,7 +132,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                     that was never watched. */
                 guard error.errno == Int(ESRCH) else { return .spawnFailed(error) }
                 await onExitedBeforeWatch(pid)
-                return await Self.launchdExitRecord(domain: domain, label: label)
+                return await Self.launchdExitRecord(label: label)
             }
         case .died:
             /** The process exited before it could confirm session leadership,
@@ -152,7 +152,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                 early-return branch in this method does, would silence that
                 output from the structured log entirely. */
             await onExitedBeforeWatch(pid)
-            return await Self.launchdExitRecord(domain: domain, label: label)
+            return await Self.launchdExitRecord(label: label)
         case .timedOut:
             return .spawnFailed(
                 SpawnError(
@@ -192,12 +192,11 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         daemon that spawned it wrote and removed that file itself; the removal
         here only covers a plist a crashed prior daemon left behind). */
     public func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
-        let domain = LaunchdJobs.guiDomain
         let watched = await ExitWatcher.shared.wait(pid: pid)
         let outcome = await Self.armedOutcome(watched) {
-            await Self.launchdExitRecord(domain: domain, label: label)
+            await Self.launchdExitRecord(label: label)
         }
-        await Self.bootOut(domain: domain, label: label)
+        await Self.bootOut(label: label)
         return outcome
     }
 
@@ -235,7 +234,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         var nofile = rlimit()
         let files =
             getrlimit(RLIMIT_NOFILE, &nofile) == 0
-            ? Int(nofile.rlim_cur) : 8192
+            ? Int(nofile.rlim_cur) : fallbackOpenFileLimit
         let wrapped = ["/usr/bin/perl", "-e", sessionWrapperScript, "--"] + argv
         var job: [String: Any] = [
             "EnvironmentVariables": env,
@@ -267,7 +266,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
     /** How a job launchd already reaped ended, read from its `launchctl print`
         status: the terminating signal when launchd printed one, else the last
         exit code, else unknown. */
-    static func unseenExitOutcome(_ status: LaunchdJobs.AgentStatus) -> ProcessOutcome {
+    static func unseenExitOutcome(_ status: LaunchdJobs.JobStatus) -> ProcessOutcome {
         if let signal = status.lastTerminatingSignal { return .signaled(signal: signal) }
         if let code = status.lastExitCode { return .exited(code: code) }
         return .exitedStatusUnknown
@@ -279,15 +278,24 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         launchd is slow, and past it the exit stays status-unknown. */
     static let exitRecordAttempts = 10
     static let exitRecordInterval = Duration.milliseconds(50)
+    /** How long `run` polls `launchctl print` for a freshly bootstrapped
+        job's pid before reporting that it never published one. */
+    static let pidPublishAttempts = 40
+    static let pidPublishInterval = Duration.milliseconds(50)
+    /** How long `run` waits for the perl wrapper's setsid to make the job's
+        pid a session leader before reporting that it never did. */
+    static let sessionLeaderAttempts = 40
+    static let sessionLeaderInterval = Duration.milliseconds(25)
+    /** The job's open-file limit when this process cannot read its own. */
+    static let fallbackOpenFileLimit = 8192
 
     /** The exit of a still-bootstrapped job, read from `launchctl print` once
         launchd shows the job not running with an exit record: for a process
         that died before its watch was armed, and for an armed watch the
         kernel gave no exit status. */
-    private static func launchdExitRecord(domain: String, label: String) async -> ProcessOutcome {
+    private static func launchdExitRecord(label: String) async -> ProcessOutcome {
         await exitRecord(attempts: exitRecordAttempts, interval: exitRecordInterval) {
-            let printed = await LaunchdAdmin.shell("/bin/launchctl", ["print", "\(domain)/\(label)"])
-            return printed.status == 0 ? LaunchdJobs.parseAgentPrint(printed.output) : nil
+            await LaunchdJobs.printJob(label: label)
         }
     }
 
@@ -296,7 +304,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         through `unseenExitOutcome`. Status-unknown once `attempts` reads pass
         without one. */
     static func exitRecord(
-        attempts: Int, interval: Duration, read: () async -> LaunchdJobs.AgentStatus?
+        attempts: Int, interval: Duration, read: () async -> LaunchdJobs.JobStatus?
     ) async -> ProcessOutcome {
         for attempt in 0..<attempts {
             let status = await read()
@@ -312,21 +320,19 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         return .exitedStatusUnknown
     }
 
-    private static func waitUntilPidPublished(domain: String, label: String) async -> PidPoll {
-        for _ in 0..<40 {
-            let printed = await LaunchdAdmin.shell("/bin/launchctl", ["print", "\(domain)/\(label)"])
-            if printed.status == 0 {
-                let status = LaunchdJobs.parseAgentPrint(printed.output)
+    private static func waitUntilPidPublished(label: String) async -> PidPoll {
+        for _ in 0..<pidPublishAttempts {
+            if let status = await LaunchdJobs.printJob(label: label) {
                 if let pid = status.pid { return .published(pid) }
                 if let runs = status.runs, runs > 0 { return .exitedUnseen(unseenExitOutcome(status)) }
             }
-            try? await Task.sleep(for: .milliseconds(50))
+            try? await Task.sleep(for: pidPublishInterval)
         }
         return .timedOut
     }
 
     private static func waitUntilSessionLeader(_ pid: pid_t) async -> SessionLeaderCheck {
-        for _ in 0..<40 {
+        for _ in 0..<sessionLeaderAttempts {
             if getpgid(pid) == pid { return .leader }
             /** `errno == ESRCH` specifically, not merely a nonzero return: a
                 launchd child freshly spawned by this same user can transiently
@@ -336,7 +342,7 @@ public struct LaunchdJobLauncher: ProcessLauncher {
                 NOTE_EXITSTATUS (see ExitWatcher.arm). Only ESRCH means the
                 kernel has no such process left to check. */
             if kill(pid, 0) != 0, errno == ESRCH { return .died }
-            try? await Task.sleep(for: .milliseconds(25))
+            try? await Task.sleep(for: sessionLeaderInterval)
         }
         return .timedOut
     }

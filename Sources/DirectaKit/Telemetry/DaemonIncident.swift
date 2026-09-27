@@ -35,7 +35,7 @@ public struct LaunchdExitRecord: Codable, Equatable, Sendable {
     ]
 
     public static func parse(_ printed: String) -> LaunchdExitRecord {
-        let status = LaunchdJobs.parseAgentPrint(printed)
+        let status = LaunchdJobs.parseJobPrint(printed)
         var fields: [String: String] = [:]
         var raw: [String] = []
         for line in printed.split(separator: "\n", omittingEmptySubsequences: true) {

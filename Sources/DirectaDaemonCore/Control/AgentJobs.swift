@@ -31,6 +31,6 @@ public struct AgentJobs: Sendable {
         constructed Router (every test, any embedder) never touches real
         launchd state unless it opts in explicitly. */
     public static let live = AgentJobs(
-        bootOut: { job in await BlockingLane.system.run { LaunchdJobs.bootOut(job) } },
+        bootOut: { job in await LaunchdJobs.bootOut(label: job.label) },
         listChildJobs: { await BlockingLane.system.run(LaunchdJobs.loadChildJobs) })
 }
