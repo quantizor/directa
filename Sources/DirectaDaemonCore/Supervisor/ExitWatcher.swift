@@ -79,9 +79,13 @@ final class ExitWatcher: Sendable {
         needed to remember which mode a pid armed under). */
     func arm(pid: pid_t) -> ExitArm {
         state.withLock { $0.slots[pid] = Slot() }
-        guard let kq = ensureQueue() else {
+        let kq: Int32
+        switch ensureQueue() {
+        case .success(let queue):
+            kq = queue
+        case .failure(let failure):
             state.withLock { $0.slots[pid] = nil }
-            return .failed(SpawnError(errno: Int(errno), message: "kqueue failed for pid \(pid)"))
+            return .failed(SpawnError(errno: Int(failure.errno), message: "kqueue failed for pid \(pid)"))
         }
         if let err = Self.register(kq: kq, pid: pid, fflags: NOTE_EXIT | UInt32(NOTE_EXITSTATUS)) {
             guard err == EACCES else {
@@ -121,22 +125,28 @@ final class ExitWatcher: Sendable {
     /** Lazily creates the shared kqueue and starts its dedicated reader thread
         on first use, so a daemon that never watches a launchd job never pays
         for either. A creation failure (fd exhaustion) is not cached: the next
-        `arm` call retries, since the pressure may have cleared. */
-    private func ensureQueue() -> Int32? {
-        let created: (kq: Int32, isNew: Bool)? = state.withLock { state in
-            if let kq = state.kq { return (kq, false) }
+        `arm` call retries, since the pressure may have cleared. The failure
+        carries `kqueue`'s errno, read before anything else can overwrite it. */
+    private func ensureQueue() -> Result<Int32, QueueFailure> {
+        let created: Result<(kq: Int32, isNew: Bool), QueueFailure> = state.withLock { state in
+            if let kq = state.kq { return .success((kq, false)) }
             let kq = kqueue()
-            guard kq >= 0 else { return nil }
+            guard kq >= 0 else { return .failure(QueueFailure(errno: errno)) }
             state.kq = kq
-            return (kq, true)
+            return .success((kq, true))
         }
-        guard let created else { return nil }
-        if created.isNew {
-            let thread = Thread { [self] in runLoop(kq: created.kq) }
-            thread.name = "dev.quantizor.directa.exit-watcher"
-            thread.start()
+        return created.map { created in
+            if created.isNew {
+                let thread = Thread { [self] in runLoop(kq: created.kq) }
+                thread.name = "dev.quantizor.directa.exit-watcher"
+                thread.start()
+            }
+            return created.kq
         }
-        return created.kq
+    }
+
+    private struct QueueFailure: Error {
+        let errno: Int32
     }
 
     /** The one dedicated thread: blocks in `kevent` for real (non-receipt)
@@ -146,20 +156,42 @@ final class ExitWatcher: Sendable {
         registration call from also draining a real pending event meant for
         this loop (confirmed empirically, since the man page's "without
         draining any pending events" is the only documentation of that
-        guarantee). */
+        guarantee). A read that keeps failing backs off (`readRetryDelay`)
+        instead of spinning, and logs once per run of the same error. */
     private func runLoop(kq: Int32) {
         var events: [kevent] = Array(repeating: kevent(), count: 32)
+        var failures = 0
+        var loggedError: Int32?
         while true {
             let n = kevent(kq, nil, 0, &events, Int32(events.count), nil)
             if n < 0 {
-                if errno == EINTR { continue }
-                DirectaLog.supervisor.error("exit watcher lost its kevent read: errno \(errno)")
+                let error = errno
+                if error == EINTR { continue }
+                if error != loggedError {
+                    DirectaLog.supervisor.error(
+                        "exit watcher cannot read its kqueue: errno \(error) (\(String(cString: strerror(error)))); exits of watched servers wait until the read recovers"
+                    )
+                    loggedError = error
+                }
+                failures += 1
+                Thread.sleep(forTimeInterval: Self.readRetryDelay(afterFailures: failures) / .seconds(1))
                 continue
             }
+            failures = 0
+            loggedError = nil
             for index in 0..<Int(n) {
                 deliver(event: events[index])
             }
         }
+    }
+
+    /** The pause after `failures` consecutive failed `kevent` reads: doubling
+        from 10 ms, capped at one second. */
+    static func readRetryDelay(afterFailures failures: Int) -> Duration {
+        let ceiling = Duration.seconds(1)
+        guard failures > 0 else { return .zero }
+        guard failures <= 7 else { return ceiling }
+        return min(.milliseconds(10 << (failures - 1)), ceiling)
     }
 
     private func deliver(event: kevent) {

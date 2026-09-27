@@ -183,6 +183,20 @@ private func spawnManyWithOneReaper(_ argv: [String], count: Int) throws -> [pid
         }
     }
 
+    /** A `kevent` read that keeps failing must not spin the watcher thread:
+        each consecutive failure waits longer than the last, from a short first
+        pause up to a ceiling, so a persistent error costs a few wakeups a
+        second rather than a whole core. */
+    @Test func aFailingReadBacksOffToACeiling() {
+        let delays = (1...10).map { ExitWatcher.readRetryDelay(afterFailures: $0) }
+        #expect(delays == [
+            .milliseconds(10), .milliseconds(20), .milliseconds(40), .milliseconds(80),
+            .milliseconds(160), .milliseconds(320), .milliseconds(640), .seconds(1), .seconds(1),
+            .seconds(1),
+        ])
+        #expect(ExitWatcher.readRetryDelay(afterFailures: Int.max) == .seconds(1))
+    }
+
     /** `NOTE_EXITSTATUS` is refused (EACCES) for a process this daemon may not
         signal; pid 1 (launchd, root-owned) is always available and never
         exits, so arming it exercises the fallback without waiting on a real
