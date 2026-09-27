@@ -41,7 +41,7 @@ public actor Router {
         launcher: any ProcessLauncher, paths: DirectaPaths, portProbe: PortProbe = .live,
         registry: Registry,
         stopTiming: StopTiming = .standard,
-        watchEnabled: Bool = ProcessInfo.processInfo.environment["DIRECTA_NO_WATCH"] != "1"
+        watchEnabled: Bool = ProcessInfo.processInfo.environment[WatchPolicy.disableEnvironmentKey] != "1"
     ) {
         self.agentJobs = agentJobs
         self.watchEnabled = watchEnabled
@@ -1134,7 +1134,7 @@ public actor Router {
         let directory = paths.logsDir.appending(path: name)
         let removal = OrphanProjectLogs.remove(
             directory, logsDir: paths.logsDir,
-            claimedSlugDirs: Set(claimed.map { DirectaPaths.projectLogDirName(project: $0) }))
+            claimedSlugDirs: DirectaPaths.projectLogDirNames(projects: claimed))
         return LogsRemoveOrphanResult(path: directory, removal: removal)
     }
 

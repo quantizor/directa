@@ -4,6 +4,10 @@ import Foundation
     and status: injects PORT / portEnv, substitutes `{port}` / `{host}` tokens, and
     rewrites derived url / heads / healthcheck URLs. Pure; unit-tested. */
 public enum PortMaterializer {
+    /** The variable a spawned server reads its effective host from, injected
+        beside its port. */
+    public static let hostEnvironmentKey = "DIRECTA_HOST"
+
     /** Apply `effectivePort` (and optional `effectiveHost`) to a committed/ad-hoc
         spec. `declaredPort` on status remains the pre-materialization `spec.port`.
         `matchHost` gates URL host replacement to URLs already printed with that
@@ -29,7 +33,7 @@ public enum PortMaterializer {
                 env[key] = String(value)
             }
             if let host {
-                env["DIRECTA_HOST"] = host
+                env[hostEnvironmentKey] = host
             }
             next.env = env
         } else if let effectivePort {
@@ -37,7 +41,7 @@ public enum PortMaterializer {
             var env = next.env ?? [:]
             env[envKey] = String(effectivePort)
             if let host {
-                env["DIRECTA_HOST"] = host
+                env[hostEnvironmentKey] = host
             }
             next.env = env
         }

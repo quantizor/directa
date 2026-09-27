@@ -11,6 +11,10 @@ import Foundation
     re-execs the canonical installed binary instead, so its process image is always
     on the boot volume regardless of how launchd resolved the spawn. */
 public enum DaemonImagePolicy {
+    /** Set to "1" in the environment of a daemon re-exec'd off a mounted
+        volume: the sentinel `decide`'s `alreadyReexeced` reads. */
+    public static let reexecEnvironmentKey = "DIRECTA_DAEMON_REEXECED"
+
     public enum Decision: Equatable, Sendable {
         /** The current image is on the boot volume (or nothing better exists);
             proceed here. */

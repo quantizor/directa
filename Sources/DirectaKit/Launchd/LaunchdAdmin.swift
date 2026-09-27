@@ -402,6 +402,10 @@ public enum LaunchdAdmin {
         1.2s, so this is roughly ten times the real cost. */
     public static let pathCaptureTimeoutSeconds = 12.0
 
+    /** "1" in the environment of the shell `capturedPath` runs, the variable
+        the README tells a profile to check. */
+    public static let resolvingEnvironmentKey = "DIRECTA_RESOLVING_ENVIRONMENT"
+
     /** The PATH the user actually has, so launchd children can find the tools
         the user installed; launchd agents otherwise get a minimal PATH. Goes
         stale after a Homebrew migration, which doctor surfaces via daemon.info.
@@ -452,7 +456,7 @@ public enum LaunchdAdmin {
                 whatever needs a terminal. VS Code and the JetBrains IDEs both
                 publish one for the same purpose; ours is documented in the
                 README so it is worth guarding against. */
-            "DIRECTA_RESOLVING_ENVIRONMENT": "1",
+            resolvingEnvironmentKey: "1",
             "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
             "LOGNAME": NSUserName(),
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",

@@ -54,14 +54,14 @@ if let selfExecutable = currentExecutablePath() {
     let decision = DaemonImagePolicy.decide(
         currentExecutable: selfExecutable,
         candidates: candidates,
-        alreadyReexeced: ProcessInfo.processInfo.environment["DIRECTA_DAEMON_REEXECED"] == "1",
+        alreadyReexeced: ProcessInfo.processInfo.environment[DaemonImagePolicy.reexecEnvironmentKey] == "1",
         fileExists: { FileManager.default.fileExists(atPath: $0) })
     if case .reexec(let target) = decision {
         FileHandle.standardError.write(
             Data(
                 "ddirecta: image is on a mounted volume (\(selfExecutable)); re-exec from \(target)\n"
                     .utf8))
-        setenv("DIRECTA_DAEMON_REEXECED", "1", 1)
+        setenv(DaemonImagePolicy.reexecEnvironmentKey, "1", 1)
         var argv = CommandLine.arguments
         argv[0] = target
         let cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
@@ -76,7 +76,7 @@ if let selfExecutable = currentExecutablePath() {
 }
 
 if let socketOverride {
-    setenv("DIRECTA_SOCKET", socketOverride, 1)
+    setenv(DirectaPaths.socketEnvironmentKey, socketOverride, 1)
 }
 
 let paths = DirectaPaths(
