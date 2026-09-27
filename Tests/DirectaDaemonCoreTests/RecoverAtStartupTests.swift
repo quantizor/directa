@@ -90,6 +90,21 @@ private final class RecordingAgentJobs: Sendable {
     }
 }
 
+/** The pid a fixture's `--orphan-grandchild-ignterm` prints, read from `fd`
+    up to that line (the fixture keeps writing heartbeats after it). */
+private func readGrandchildPid(from fd: Int32) -> pid_t? {
+    let pattern = #"grandchild pid (\d+)\n"#
+    var text = ""
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while text.range(of: pattern, options: .regularExpression) == nil {
+        let count = read(fd, &buffer, buffer.count)
+        guard count > 0 else { return nil }
+        text += String(decoding: buffer.prefix(count), as: UTF8.self)
+    }
+    guard let match = text.range(of: pattern, options: .regularExpression) else { return nil }
+    return text[match].split(whereSeparator: \.isWhitespace).last.flatMap { pid_t($0) }
+}
+
 private func logTexts(router: Router, project: String, name: String) async throws -> [String] {
     let line = try NDJSON.encodeLine(
         WireRequest(
@@ -244,6 +259,53 @@ private func logTexts(router: Router, project: String, name: String) async throw
             events.contains {
                 $0.kind == .crashed && $0.detail == DaemonRestartDetail.orphanBounced(pid: survivor)
             } == recordedJustNow)
+    }
+
+    /** A bounced survivor whose root exits on SIGTERM while a descendant
+        ignores it (a disposition inherited through the shell that started it;
+        the descendant left the root's group but kept its session): the bounce
+        waits out that descendant's grace too and then SIGKILLs it, rather
+        than stopping at the root's exit and leaving it running unsupervised. */
+    @Test func aBounceKillsADescendantThatIgnoresSigtermAfterTheRootExits() async throws {
+        let fixture = try #require(fixtureServerExecutable(), "fixture-server is not built; run swift build")
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath,
+            serversJSON: """
+            {
+              "myproj": {
+                "command": ["/bin/sh", "-c", "sleep 30"]
+              }
+            }
+            """)
+        let registry = Registry(paths: env.paths)
+        let output = try makeOutputPipe()
+        defer { close(output.read) }
+        let startedAt = Date()
+        let root = try spawnReapedSessionLeader(
+            [fixture, "--orphan-grandchild-ignterm"], defaultSignalMask: true, stdoutFD: output.write)
+        close(output.write)
+        defer { if kill(root, 0) == 0 { kill(root, SIGKILL) } }
+        let grandchild = try #require(readGrandchildPid(from: output.read))
+        defer { if kill(grandchild, 0) == 0 { kill(grandchild, SIGKILL) } }
+        try await registry.updateState(serverID: serverID(project: env.projectPath, name: "dev"), writer: .router) {
+            entry in
+            entry.phase = .running
+            entry.pid = Int(root)
+            entry.startedAt = startedAt
+        }
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+
+        /** The bounce has already sent its SIGKILL by the time recover
+            returns; only launchd's reap of the orphan is left to wait for. */
+        var gone = kill(grandchild, 0) != 0
+        for _ in 0..<40 where !gone {
+            try await Task.sleep(for: .milliseconds(50))
+            gone = kill(grandchild, 0) != 0
+        }
+        #expect(gone, "descendant \(grandchild) ignoring SIGTERM survived the bounce of root \(root)")
+        #expect(kill(root, 0) != 0)
     }
 
     /** A stopped row under a deleted name (no resume intent) is still pruned. */

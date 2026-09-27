@@ -844,32 +844,36 @@ public actor Router {
             return
         }
         let pid = root.pid
-        /** A server is spawned as a session leader (createSession), so its
-            session id is its own pid; sweeping the session as well as the parent
-            chain catches an orphan descendant that setpgid'd or setsid'd out of
-            the group, and the root's unique id reaches one that also left the
-            session and reparented, the same union stop() and the crash path
-            use. */
-        let descendants = ProcessTree.liveDescendants(rootPid: pid, rootIdentity: root, snapshot: [])
-        ProcessTree.signalTree(descendants: descendants, rootIdentity: root, signal: SIGTERM)
-        /** Poll with identity, not kill(pid,0): a recycled number must end the
-            wait as "gone" rather than escalate into the new process. A shorter
-            grace than an ordinary stop's 7s default: an orphan bounce runs during
+        /** The shape of the supervisor's stop. A server is spawned as a
+            session leader (createSession), so its session id is its own pid;
+            sweeping the session as well as the parent chain catches an orphan
+            descendant that setpgid'd or setsid'd out of the group, and the
+            root's unique id reaches one that also left the session and
+            reparented, the same union stop() and the crash path use. */
+        let candidates = ProcessTree.liveDescendants(rootPid: pid, rootIdentity: root, snapshot: [])
+        ProcessTree.signalTree(descendants: candidates, rootIdentity: root, signal: SIGTERM)
+        /** The grace ends early only once the root and every SIGTERM candidate
+            have exited, polled by identity so a recycled number reads as gone:
+            a descendant that ignores SIGTERM outlives a root that obeys it.
+            Shorter than an ordinary stop's grace: an orphan bounce runs during
             boot restore, where a prior daemon's leftover child should yield
             quickly so the fresh supervisor can claim the port. */
         let orphanBounceGraceSeconds = 2.0
         let graceDeadline = ContinuousClock.now.advanced(by: .seconds(orphanBounceGraceSeconds))
         while ContinuousClock.now < graceDeadline,
-            ProcessTree.shouldSignal(
-                snapshotted: root, live: ProcessTree.identity(of: pid))
+            ProcessTree.isRunning(root) || candidates.contains(where: ProcessTree.isRunning)
         {
             try? await Task.sleep(for: .milliseconds(50))
         }
-        if ProcessTree.shouldSignal(
-            snapshotted: root, live: ProcessTree.identity(of: pid))
-        {
-            ProcessTree.signalTree(descendants: descendants, rootIdentity: root, signal: SIGKILL)
-        }
+        /** A fresh union, since a child may have appeared during the grace,
+            plus every SIGTERM candidate, since the root's exit may have hidden
+            one from every live source; each is signaled only while it still
+            names the identity recorded for it, and the group only while the
+            root does. */
+        ProcessTree.signalTree(
+            descendants: ProcessTree.liveDescendants(
+                rootPid: pid, rootIdentity: root, snapshot: [], priorCandidates: candidates),
+            rootIdentity: root, signal: SIGKILL)
         await events.post(
             kind: .crashed, project: project, server: name,
             detail: DaemonRestartDetail.orphanBounced(pid: pid))

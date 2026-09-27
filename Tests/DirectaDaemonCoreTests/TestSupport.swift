@@ -77,9 +77,21 @@ func spawnSurvivor() throws -> pid_t {
 
 /** `argv` as a session leader nothing supervises, reaped the moment it exits,
     its stdout on `stdoutFD` when given (as `spawnBare`). The caller owns
-    killing it. */
-func spawnReapedSessionLeader(_ argv: [String], stdoutFD: Int32? = nil) throws -> pid_t {
-    let pid = try spawnBare(argv, flags: POSIX_SPAWN_SETSID, stdoutFD: stdoutFD)
+    killing it. `defaultSignalMask` clears the signal mask the child would
+    otherwise inherit from the spawning test thread, which blocks SIGTERM, so
+    a SIGTERM reaches the child the way it reaches a real server. */
+func spawnReapedSessionLeader(
+    _ argv: [String], defaultSignalMask: Bool = false, stdoutFD: Int32? = nil
+) throws -> pid_t {
+    let pid = try spawnBare(
+        argv, flags: POSIX_SPAWN_SETSID | (defaultSignalMask ? POSIX_SPAWN_SETSIGMASK : 0),
+        stdoutFD: stdoutFD
+    ) { attr in
+        guard defaultSignalMask else { return }
+        var empty = sigset_t()
+        sigemptyset(&empty)
+        posix_spawnattr_setsigmask(&attr, &empty)
+    }
     /** `swift-subprocess` reaps its own children as part of awaiting their
         termination status; a bare `posix_spawn` here has no one else doing
         that. Without a reaper, a test's `kill(pid, 0)` liveness check can
