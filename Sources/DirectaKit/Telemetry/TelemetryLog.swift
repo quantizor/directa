@@ -42,31 +42,49 @@ public final class TelemetryLog: Sendable {
     }
 
     /** Writes that failed (disk full, a vanished directory). A telemetry
-        write never throws into the daemon; this count is how a test or a
-        reader learns lines were lost. */
+        write never throws into the daemon: the first failure is logged once
+        at error level, and this count is how a test or a reader learns how
+        many lines were lost. */
     public var failedWrites: Int { state.withLock { $0.failedWrites } }
 
     public func append<Line: TelemetryLine>(_ line: Line) {
-        state.withLock { state in
-            openIfNeeded(&state)
+        let firstFailure = state.withLock { state -> String? in
+            let openError = openIfNeeded(&state)
             let clamped = JSONCoding.canonicalMs(max(line.time, state.lastTime))
             var stamped = line
             stamped.time = clamped
-            guard let encoded = try? NDJSON.encodeLine(stamped) else {
-                state.failedWrites += 1
-                return
+            let encoded: Data
+            do {
+                encoded = try NDJSON.encodeLine(stamped)
+            } catch {
+                return Self.recordFailure(&state, "cannot encode a line: \(error)")
             }
+            var reopenError: Int32?
             if state.writtenBytes > 0, state.writtenBytes + encoded.count > maxBytes {
                 rotate(&state)
-                openIfNeeded(&state)
+                reopenError = openIfNeeded(&state)
             }
-            guard state.descriptor >= 0, Self.writeAll(encoded, to: state.descriptor) else {
-                state.failedWrites += 1
-                return
+            guard state.descriptor >= 0 else {
+                let code = reopenError ?? openError ?? 0
+                return Self.recordFailure(&state, "cannot open \(currentURL.path): \(String(cString: strerror(code)))")
+            }
+            guard Self.writeAll(encoded, to: state.descriptor) else {
+                return Self.recordFailure(&state, "cannot write \(currentURL.path): \(String(cString: strerror(errno)))")
             }
             state.writtenBytes += encoded.count
             state.lastTime = clamped
+            return nil
         }
+        if let firstFailure {
+            DirectaLog.daemon.error("telemetry: \(firstFailure); later lost lines are only counted")
+        }
+    }
+
+    /** Counts a lost line; returns `why` only for the first, so it is logged
+        once however long the failure lasts. */
+    private static func recordFailure(_ state: inout State, _ why: String) -> String? {
+        state.failedWrites += 1
+        return state.failedWrites == 1 ? why : nil
     }
 
     public func close() {
@@ -76,11 +94,15 @@ public final class TelemetryLog: Sendable {
         }
     }
 
-    private func openIfNeeded(_ state: inout State) {
-        guard state.descriptor < 0 else { return }
+    /** Opens the current file when it is not open; returns `open`'s errno
+        when that fails. A directory that cannot be created shows up as that
+        failure. */
+    @discardableResult
+    private func openIfNeeded(_ state: inout State) -> Int32? {
+        guard state.descriptor < 0 else { return nil }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let descriptor = open(currentURL.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0o644)
-        guard descriptor >= 0 else { return }
+        guard descriptor >= 0 else { return errno }
         var info = stat()
         state.writtenBytes = fstat(descriptor, &info) == 0 ? Int(info.st_size) : 0
         state.descriptor = descriptor
@@ -93,6 +115,7 @@ public final class TelemetryLog: Sendable {
         {
             state.lastTime = max(state.lastTime, last)
         }
+        return nil
     }
 
     private func rotate(_ state: inout State) {

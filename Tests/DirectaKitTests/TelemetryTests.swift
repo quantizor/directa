@@ -474,6 +474,32 @@ private final class LockedArray: Sendable {
         #expect(times == [later, later, later])
     }
 
+    /** A write never throws into the daemon, so the first lost line is
+        reported once at error level (the level macOS keeps), naming where;
+        later losses are only counted. */
+    @Test func theFirstFailedWriteIsLoggedOnce() throws {
+        let recorder = try #require(DirectaLog.backend as? RecordingBackend)
+        let blocker = try temporaryDirectory().appending(path: "not-a-directory")
+        try Data().write(to: blocker)
+        let unwritable = blocker.appending(path: "telemetry")
+        let log = TelemetryLog(directory: unwritable)
+        let time = try date("2026-09-26T10:00:00.000Z")
+        for index in 0..<3 {
+            log.append(mark(index, at: time))
+        }
+        log.close()
+        #expect(log.failedWrites == 3)
+        let logged = recorder.entries.filter { $0.message.contains(unwritable.path) }
+        #expect(
+            logged == [
+                RecordingBackend.Entry(
+                    category: .daemon, level: .error,
+                    message:
+                        "telemetry: cannot open \(log.currentURL.path): Not a directory; later lost lines are only counted"
+                )
+            ])
+    }
+
     @Test func tailReadsAcrossChunksAndKeepsATornLastLine() throws {
         let directory = try temporaryDirectory()
         let url = directory.appending(path: "t.log")

@@ -33,7 +33,7 @@ The daemon records its own threads, memory, and in-flight work so a death can be
 
 What and where (all under the daemon's logs dir, `~/Library/Logs/directa` unless `--logs-dir`):
 
-- `daemon/telemetry.log`: NDJSON through JSONCoding, one line per snapshot or mark, `time` clamped monotonic per file. Plain `write(2)` per line, no fsync (a SIGKILL keeps page-cache writes).
+- `daemon/telemetry.log`: NDJSON through JSONCoding, one line per snapshot or mark, `time` clamped monotonic per file. Plain `write(2)` per line, no fsync (a SIGKILL keeps page-cache writes). A failed write never reaches the daemon's work: the first one logs one error-level OSLog line naming the file and the reason, and later ones are only counted.
 - Rotation: 10 MB per file, the current file plus `telemetry.log.1` (newest) to `.4`. Disk bound 50 MB.
 - `daemon/incidents/<boot time>-pid<pid>.ndjson`: one per daemon boot, newest 50 kept. Each holds 180 copied lines (a few KB each), at most 300 unified-log lines of at most 1000 characters, and report excerpts of at most 16 KB each, so under 1 MB; with the telemetry files, the whole record stays under about 100 MB.
 - `DIRECTA_TELEMETRY=off` in the daemon's environment disables all of it. Tests and the smoke gate get it under their temp `--logs-dir`.
