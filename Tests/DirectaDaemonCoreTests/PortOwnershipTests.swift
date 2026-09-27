@@ -143,6 +143,43 @@ import Testing
         #expect(error.message.contains(env.projectA))
     }
 
+    /** The same holder running on the port its checkout's `directa.local.json`
+        gives it, with no rebind recorded: the listener there is that managed
+        server's, named as such, never an unmanaged squatter. */
+    @Test func aHolderWithNoResidentSupervisorIsFoundOnItsOverlayPort() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        let holder = Process()
+        holder.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        holder.arguments = ["60"]
+        try holder.run()
+        defer { holder.terminate() }
+        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: 45020))
+        try Data(#"{"servers":{"web":{"port":45021}}}"#.utf8)
+            .write(to: LocalOverlay.overlayURL(project: env.projectA))
+        try await registry.updateState(serverID: serverID(project: env.projectA, name: "web"), writer: .router) {
+            entry in
+            entry.phase = .running
+            entry.pid = Int(holder.processIdentifier)
+        }
+        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: 45021))
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths,
+            portProbe: PortProbe { $0 == 45021 }, registry: registry)
+
+        let refused = await handle(
+            router, .serverEnsure, EnsureParams(name: "web", project: env.projectB, timeoutSeconds: 3),
+            EnsureResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("expected refusal from the persisted holder on its overlay port")
+            return
+        }
+        #expect(error.code == .portHeld)
+        #expect(
+            error.message
+                == "port 45021 is held by managed server 'web' in \(canonicalProjectPath(env.projectA))")
+    }
+
     /** `why` is the command a reader reaches for after a refusal, so it has to
         name the holder itself rather than answering only "not running
         (stopped)". That requires it to annotate latent conflicts the way the

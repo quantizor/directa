@@ -1557,8 +1557,11 @@ public actor Router {
             if specsByProject[parsed.project] == nil {
                 specsByProject[parsed.project] = (try? await mergedSpecs(project: parsed.project))?.specs ?? []
             }
-            guard let spec = specsByProject[parsed.project]?.first(where: { $0.name == parsed.name })
+            guard let committed = specsByProject[parsed.project]?.first(where: { $0.name == parsed.name })
             else { continue }
+            /** The spec the run was spawned from: the checkout's overlay can
+                move its port and reshape its claim. */
+            let spec = Self.overlaid(committed, project: parsed.project).spec
             let bound = persisted.boundPort ?? spec.port
             let ports = Set(
                 PortClaim.resolve(spec: spec, effectivePort: bound).claim?.allPorts ?? bound.map { [$0] } ?? [])
