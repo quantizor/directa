@@ -258,7 +258,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.projectPath)
         let id = serverID(project: env.projectPath, name: "db")
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .stopped
             entry.resumeOnBoot = true
             entry.pid = nil
@@ -300,7 +300,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.projectPath)
         let id = serverID(project: env.projectPath, name: "db")
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .stopped
             entry.resumeOnBoot = true
             entry.pid = nil

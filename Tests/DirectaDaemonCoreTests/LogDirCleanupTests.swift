@@ -32,8 +32,8 @@ import Testing
             project: project.path)
     }
 
-    private static func isRefused(_ result: LogsRemoveOrphanResult) -> Bool {
-        if case .refused = result.outcome { return true }
+    private static func isRefused(_ result: LogsRemoveOrphanResult?) -> Bool {
+        if case .refused = result?.outcome { return true }
         return false
     }
 
@@ -220,6 +220,7 @@ import Testing
             launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
         let id = serverID(project: env.project, name: "web")
+        let canonicalID = serverID(project: canonicalProjectPath(env.project), name: "web")
 
         let started = try await handle(
             router, .serverStart, ServerTargetParams(name: "web", project: env.project),
@@ -238,17 +239,19 @@ import Testing
         #expect(retired.startedAt == startedAt)
         #expect(retired.resumeOnBoot == nil)
         #expect(retired.lastExit == nil)
+        /** The registry refuses the dropped supervisor's writer from here on,
+            which is what keeps the late exit below off the row. */
+        let writer = try #require(await registry.retiredWriters[canonicalID]?.first)
+        try await registry.updateState(serverID: id, writer: .supervisor(writer)) { $0.resumeOnBoot = true }
+        #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == nil)
 
         await gate.signal(.signaled(signal: Int(SIGKILL)))
         try await awaitStoppedEvent(router: router, project: env.project, detail: "unregistered")
-        for _ in 0..<10 {
-            let row = await registry.persistedState(serverID: id)
-            #expect(row?.phase == .stopped)
-            #expect(row?.pid == pid)
-            #expect(row?.resumeOnBoot == nil)
-            #expect(row?.lastExit == nil)
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        let row = await registry.persistedState(serverID: id)
+        #expect(row?.phase == .stopped)
+        #expect(row?.pid == pid)
+        #expect(row?.resumeOnBoot == nil)
+        #expect(row?.lastExit == nil)
         let events = try await handle(
             router, .eventsQuery, EventsQueryParams(project: env.project), EventsQueryResult.self)
         #expect(events.events.filter { $0.kind == .unregistered }.count == 1)
@@ -329,7 +332,7 @@ import Testing
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         let id = serverID(project: env.project, name: "web")
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .crashed
             entry.resumeOnBoot = true
         }
@@ -627,57 +630,70 @@ import Testing
             ServerResult.self)
     }
 
-    /** A removal racing a first start of the project the directory belongs
-        to: whichever lands first, the started run ends with its spool files
-        in place, so a claimed directory is never deleted. A leftover
-        directory from an earlier run is planted first so the removal always
-        has something to delete. The removal is held back by a growing delay
-        so the iterations spread across the start: early ones land before the
-        supervisor exists, later ones after its spawn made the directory. */
-    @Test func removeOrphanRacingAFirstStartNeverDeletesTheLiveRunsDirectory() async throws {
-        for iteration in 0..<8 {
-            let env = try makeEnv()
-            let router = Router(
-                launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths))
-            try plantLogFile(paths: env.paths, project: env.project, server: "old")
-            let name = DirectaPaths.projectLogDirName(project: env.project)
-            let project = env.project
-            let spec = sleeperSpec(name: "web")
+    /** Where a removal lands in a first start of the project its directory
+        belongs to. */
+    enum RemovalPoint: CaseIterable, Sendable {
+        case afterRegister
+        case afterStart
+        case beforeRegister
+        /** The spawn is held with the spool files already open and no pid
+            reported yet. */
+        case duringSpawn
+    }
 
-            async let removal = delayedRemoval(
-                router, name: name, delay: .milliseconds(15 * iteration))
-            async let started = registerThenStart(router, project: project, spec: spec)
-            let (removed, run) = try await (removal, started)
+    /** A removal at each point of a first start: whichever it is, the started
+        run ends with its spool files in place, so a claimed directory is never
+        deleted, and only a removal before anything claims the project
+        deletes. A leftover directory from an earlier run is planted first so
+        the removal always has something to delete. */
+    @Test(arguments: RemovalPoint.allCases)
+    func removeOrphanAtAnyPointOfAFirstStartNeverDeletesTheLiveRunsDirectory(
+        point: RemovalPoint
+    ) async throws {
+        let env = try makeEnv()
+        let gate = SpawnGate()
+        let launcher = DelayedSpawnLauncher(gate: gate)
+        let router = Router(launcher: launcher, paths: env.paths, registry: Registry(paths: env.paths))
+        defer { for pid in launcher.pids { kill(pid, SIGKILL) } }
+        try plantLogFile(paths: env.paths, project: env.project, server: "old")
+        let project = env.project
+        let removeOrphan = LogsRemoveOrphanParams(directory: DirectaPaths.projectLogDirName(project: project))
+        let spec = sleeperSpec(name: "web")
+        let target = ServerTargetParams(name: spec.name, project: project)
+        var removed: LogsRemoveOrphanResult?
 
-            if case .failed(let reason) = removed.outcome {
-                Issue.record("removal failed: \(reason)")
-            }
-            #expect(run.server.pid != nil)
-            #expect(
-                FileManager.default.fileExists(
-                    atPath: env.paths.spoolOutFile(project: project, server: "web").path))
-            _ = try await handle(
-                router, .serverStop, ServerTargetParams(name: "web", project: project),
-                ServerResult.self)
+        if point == .beforeRegister {
+            removed = try await handle(router, .logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
         }
-    }
-
-    private func delayedRemoval(
-        _ router: Router, name: String, delay: Duration
-    ) async throws -> LogsRemoveOrphanResult {
-        try await Task.sleep(for: delay)
-        return try await handle(
-            router, .logsRemoveOrphan, LogsRemoveOrphanParams(directory: name),
-            LogsRemoveOrphanResult.self)
-    }
-
-    private func registerThenStart(
-        _ router: Router, project: String, spec: ServerSpec
-    ) async throws -> ServerResult {
         _ = try await handle(
             router, .serverRegister, RegisterParams(project: project, spec: spec), ServerResult.self)
-        return try await handle(
-            router, .serverStart, ServerTargetParams(name: spec.name, project: project),
-            ServerResult.self)
+        if point == .afterRegister {
+            removed = try await handle(router, .logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
+        }
+        if point != .duringSpawn { await gate.open() }
+        async let started = handle(router, .serverStart, target, ServerResult.self)
+        if point == .duringSpawn {
+            for _ in 0..<100 where launcher.pids.isEmpty {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            try #require(!launcher.pids.isEmpty, "the held spawn never produced a process")
+            removed = try await handle(router, .logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
+            await gate.open()
+        }
+        let run = try await started
+        if point == .afterStart {
+            removed = try await handle(router, .logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
+        }
+
+        if point == .beforeRegister {
+            #expect(removed?.outcome == .removed)
+        } else {
+            #expect(Self.isRefused(removed))
+        }
+        #expect(run.server.pid != nil)
+        #expect(
+            FileManager.default.fileExists(
+                atPath: env.paths.spoolOutFile(project: project, server: "web").path))
+        _ = try await handle(router, .serverStop, target, ServerResult.self)
     }
 }

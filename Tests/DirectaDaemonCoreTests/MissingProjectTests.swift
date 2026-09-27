@@ -80,8 +80,10 @@ import Testing
     /** A forgotten server whose stop never finishes: `removeState` deletes its
         row, and the exit that lands afterward must not recreate it (the row
         would otherwise carry the server's resume intent into a project directa
-        no longer tracks). That late `recordOutcome` still posts the one
-        `stopped` event; the teardown adds none of its own. */
+        no longer tracks). The forget retires the dropped supervisor's writer,
+        so the registry refuses that late write whenever it lands. That late
+        `recordOutcome` still posts the one `stopped` event; the teardown adds
+        none of its own. */
     @Test func forgottenServerWhoseStopHangsStaysForgotten() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
@@ -104,6 +106,9 @@ import Testing
         await router.pruneMissingProjects(
             now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
         #expect(await registry.persistedState(serverID: id) == nil)
+        let retired = try #require(await registry.retiredWriters[id]?.first)
+        try await registry.updateState(serverID: id, writer: .supervisor(retired)) { $0.resumeOnBoot = true }
+        #expect(await registry.persistedState(serverID: id) == nil)
 
         await gate.signal(.signaled(signal: Int(SIGKILL)))
         var stopped: [EventRecord] = []
@@ -115,10 +120,7 @@ import Testing
             if stopped.isEmpty { try await Task.sleep(for: .milliseconds(20)) }
         }
         #expect(stopped.map(\.detail) == ["project path gone"])
-        for _ in 0..<10 {
-            #expect(await registry.persistedState(serverID: id) == nil)
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        #expect(await registry.persistedState(serverID: id) == nil)
     }
 
     /** A retirement the forget cannot save (state.json refuses the write) is

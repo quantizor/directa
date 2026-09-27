@@ -66,3 +66,11 @@ public enum ExternalSignalDetail {
         return Int(prefix.dropFirst("signal=".count)) != nil
     }
 }
+
+/** Why the daemon removed a server: the reason its removal stop writes into
+    the server's own log and onto the `stopped` event, and the detail on a
+    vanished checkout's `unregistered` events. */
+public enum RemovalReason {
+    public static let projectPathGone = "project path gone"
+    public static let unregistered = "unregistered"
+}

@@ -15,14 +15,7 @@ enum WhyEngine {
             (structured-log window since last exit or start). */
         evidenceLines: (String) -> [String],
         /** The most recent `stopped` event's detail for a server, or nil when
-            there is none. `ServerSupervisor` writes `ExternalSignalDetail`'s
-            `"signal=N (external)"` shape there for a graceful external signal
-            (SIGTERM/SIGINT/SIGHUP) and a plain reason clause (`"requested by
-            stop"`, `"watch change in …"`) for a directa-requested one;
-            `describe` reads `ExternalSignalDetail.matches`, an exact anchored
-            check, never a bare `contains`, so a watch-change detail naming a
-            path that happens to contain the literal substring "(external)" is
-            never mistaken for the marker. */
+            there is none; recognized only through `ExternalSignalDetail`. */
         lastStopDetail: (String) -> String? = { _ in nil }
     ) -> WhyResult {
         var findings: [WhyFinding] = []
@@ -53,7 +46,7 @@ enum WhyEngine {
 
     private static func describe(
         status: ServerStatus, evidenceLines: (String) -> [String],
-        lastStopDetail: (String) -> String? = { _ in nil }
+        lastStopDetail: (String) -> String?
     ) -> WhyFinding {
         var evidence: [String] = []
         var summary: String

@@ -1118,7 +1118,7 @@ private func makeEnv() throws -> TestEnv {
         /** A prior daemon left a crashed row with a tally; a fresh supervisor for
             the same server surfaces it without re-running anything. */
         let seed = Registry(paths: paths)
-        try await seed.updateState(serverID: id) { entry in
+        try await seed.updateState(serverID: id, writer: .router) { entry in
             entry.errorSummary = ErrorSummary(
                 count: 4,
                 firstAt: Date(timeIntervalSince1970: 1_700_000_000),
@@ -1148,7 +1148,7 @@ private func makeEnv() throws -> TestEnv {
         let seedLog = LogStore(currentURL: logURL)
         await seedLog.append(stream: .out, text: "rehydrate-marker-original")
         let seed = Registry(paths: paths)
-        try await seed.updateState(serverID: id) { entry in
+        try await seed.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .crashed
         }
         let registry = Registry(paths: paths)
@@ -1548,7 +1548,7 @@ private func makeEnv() throws -> TestEnv {
         let paths = env.paths
         let registry = Registry(paths: paths)
         let id = serverID(project: env.projectPath, name: "web")
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .stopped
             entry.resumeOnBoot = true
         }
@@ -1630,8 +1630,8 @@ private func makeEnv() throws -> TestEnv {
         #expect(await supervisor.start().pid != nil)
         #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
 
-        #expect(await supervisor.stopForRemoval(reason: "unregistered"))
-        try await registry.updateState(serverID: id) { $0 = PersistedServerState(phase: .stopped) }
+        #expect(await supervisor.stopForRemoval(reason: "unregistered") == .gaveUp)
+        try await registry.updateState(serverID: id, writer: .router) { $0 = PersistedServerState(phase: .stopped) }
 
         await gate.signal(.signaled(signal: Int(SIGKILL)))
         let settled = try await waitForPhase(supervisor, .stopped)
@@ -1655,14 +1655,14 @@ private func makeEnv() throws -> TestEnv {
             launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
             registry: registry, spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web"))
         _ = await supervisor.start()
-        #expect(await supervisor.stopForRemoval(reason: "unregistered") == false)
+        #expect(await supervisor.stopForRemoval(reason: "unregistered") == .stopped)
         let persisted = await registry.persistedState(serverID: id)
         #expect(persisted?.phase == .stopped)
         #expect(persisted?.resumeOnBoot == nil)
     }
 
-    /** A removal that joins a restart's non-deliberate stop returns false (the
-        stop finished), and the restart then calls `ensure` on the same
+    /** A removal that joins a restart's non-deliberate stop returns `.stopped`
+        (the stop finished), and the restart then calls `ensure` on the same
         reference. The router has already dropped this supervisor, so a spawn
         here would run with nothing supervising it: `ensure` and `start` must
         read as stopped and spawn nothing. */
@@ -1684,7 +1684,7 @@ private func makeEnv() throws -> TestEnv {
         try await Task.sleep(for: .milliseconds(100))
         await gate.signal(.signaled(signal: Int(SIGKILL)))
         _ = await restartStop
-        #expect(await removal == false)
+        #expect(await removal == .stopped)
 
         let ensured = await supervisor.ensure(timeoutSeconds: 1)
         let started = await supervisor.start()
@@ -1706,7 +1706,7 @@ private func makeEnv() throws -> TestEnv {
         let supervisor = ServerSupervisor(
             launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, projectPath: env.projectPath,
             registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "web"))
-        #expect(await supervisor.stopForRemoval(reason: "unregistered") == false)
+        #expect(await supervisor.stopForRemoval(reason: "unregistered") == .alreadyTerminal)
         let survivor = try spawnSurvivor()
         defer {
             kill(survivor, SIGKILL)
@@ -1784,7 +1784,7 @@ private func makeEnv() throws -> TestEnv {
             try await Task.sleep(for: .milliseconds(20))
         }
         let child = try #require(launcher.pids.first)
-        #expect(await supervisor.stopForRemoval(reason: "unregistered"))
+        #expect(await supervisor.stopForRemoval(reason: "unregistered") == .gaveUp)
         #expect(await supervisor.status().phase == .starting)
 
         await gate.open()
@@ -1887,14 +1887,14 @@ private struct AlwaysHealthyProber: HealthProber {
         let registry = Registry(paths: env.paths)
         let id = serverID(project: env.projectPath, name: "web")
         let retired = UUID()
-        try await registry.updateState(serverID: id, writer: retired) { entry in
+        try await registry.updateState(serverID: id, writer: .supervisor(retired)) { entry in
             entry.phase = .running
             entry.pid = 4242
             entry.resumeOnBoot = true
         }
         try await registry.retireState(
             serverID: id, final: PersistedServerState(phase: .stopped), writer: retired)
-        try await registry.updateState(serverID: id, writer: retired) { entry in
+        try await registry.updateState(serverID: id, writer: .supervisor(retired)) { entry in
             entry.phase = .crashed
             entry.pid = 4243
             entry.resumeOnBoot = true
@@ -1907,12 +1907,12 @@ private struct AlwaysHealthyProber: HealthProber {
 
         try await registry.removeState(serverID: id)
         #expect(await registry.persistedState(serverID: id) == nil)
-        try await registry.updateState(serverID: id, writer: retired) { $0.resumeOnBoot = true }
+        try await registry.updateState(serverID: id, writer: .supervisor(retired)) { $0.resumeOnBoot = true }
         #expect(await registry.persistedState(serverID: id) == nil)
     }
 
     /** Retirement is scoped to the writer: a later supervisor for the same id
-        and the router's own writes (writer nil) persist normally, including
+        and the router's own writes persist normally, including
         the insert of a row `removeState` deleted. */
     @Test func otherWritersStillPersistForARetiredID() async throws {
         let env = try makeEnv()
@@ -1923,7 +1923,7 @@ private struct AlwaysHealthyProber: HealthProber {
         try await registry.removeState(serverID: id)
 
         let successor = UUID()
-        try await registry.updateState(serverID: id, writer: successor) { entry in
+        try await registry.updateState(serverID: id, writer: .supervisor(successor)) { entry in
             entry.phase = .starting
             entry.pid = 4244
             entry.resumeOnBoot = true
@@ -1932,7 +1932,7 @@ private struct AlwaysHealthyProber: HealthProber {
         #expect(inserted.pid == 4244)
         #expect(inserted.resumeOnBoot == true)
 
-        try await registry.updateState(serverID: id) { $0.boundPort = 4000 }
+        try await registry.updateState(serverID: id, writer: .router) { $0.boundPort = 4000 }
         #expect(await registry.persistedState(serverID: id)?.boundPort == 4000)
         #expect(await Registry(paths: env.paths).persistedState(serverID: id)?.pid == 4244)
     }
@@ -1949,7 +1949,9 @@ private struct AlwaysHealthyProber: HealthProber {
         try await registry.retireState(
             serverID: serverID(project: lexical, name: "web"), final: PersistedServerState(phase: .stopped),
             writer: retired)
-        try await registry.updateState(serverID: serverID(project: canonical, name: "web"), writer: retired) {
+        try await registry.updateState(
+            serverID: serverID(project: canonical, name: "web"), writer: .supervisor(retired)
+        ) {
             $0.resumeOnBoot = true
         }
         #expect(

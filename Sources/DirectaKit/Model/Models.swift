@@ -9,7 +9,7 @@ public enum DirectaVersion {
 
 /** Lifecycle phase of a supervised server. `failed` means the spawn itself never
     succeeded (ENOENT, EACCES) and is distinct from `crashed` (ran, then died). */
-public enum ServerPhase: String, Codable, Sendable {
+public enum ServerPhase: String, CaseIterable, Codable, Sendable {
     case crashed
     case failed
     case running
@@ -489,20 +489,17 @@ extension ServerStatus {
         for its whole claim: the status port fields plus `claim`, the full set
         resolved at spawn, whose span members no status field names. A live
         port-failed run holds only the port it was seen listening on, since its
-        failure says the claim is not what it holds. Empty otherwise. */
+        failure says the claim is not what it holds. A `stopping` run is live
+        but holds nothing (`ServerPhase.holdsPort`). Empty otherwise. */
     public func heldPorts(claim: PortClaim?) -> Set<Int> {
-        if phase.holdsPort {
-            var ports = Set(claim?.allPorts ?? [])
-            for port in [declaredPort, effectivePort, observedPort] {
-                if let port { ports.insert(port) }
-            }
-            if let named = self.ports { ports.formUnion(named.values) }
-            return ports
+        guard hasLiveRun else { return [] }
+        guard phase.holdsPort else {
+            return phase == .failed ? Set([observedPort].compactMap { $0 }) : []
         }
-        if phase == .failed, pid != nil, let observedPort {
-            return [observedPort]
-        }
-        return []
+        var held = Set(claim?.allPorts ?? [])
+        held.formUnion([declaredPort, effectivePort, observedPort].compactMap { $0 })
+        if let ports { held.formUnion(ports.values) }
+        return held
     }
 }
 
@@ -544,20 +541,14 @@ public enum EventKind: Codable, Equatable, Sendable {
         }
     }
 
+    /** Every kind this build names, which decoding matches by `rawValue`. */
+    static let known: [EventKind] = [
+        .crashed, .failed, .healthy, .marked, .registered, .started, .stopped, .unhealthy, .unregistered,
+    ]
+
     public init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        switch raw {
-        case "crashed": self = .crashed
-        case "failed": self = .failed
-        case "healthy": self = .healthy
-        case "marked": self = .marked
-        case "registered": self = .registered
-        case "started": self = .started
-        case "stopped": self = .stopped
-        case "unhealthy": self = .unhealthy
-        case "unregistered": self = .unregistered
-        default: self = .unknown(raw)
-        }
+        self = Self.known.first { $0.rawValue == raw } ?? .unknown(raw)
     }
 
     public func encode(to encoder: Encoder) throws {

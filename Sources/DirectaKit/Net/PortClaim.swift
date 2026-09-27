@@ -210,10 +210,12 @@ public enum SiblingRebind {
         search would only take longer to say so. */
     public static let attempts = 200
 
-    /** Where a rebind is allowed to land. Stays clear of the low ports a
-        project actually declares and stops short of the ephemeral range the
+    /** The walk's bounds. The top stops short of the ephemeral range the
         kernel hands to outbound connections, which a listener cannot hold
-        reliably. */
+        reliably; a walk past it wraps to the bottom, which stays clear of the
+        low ports projects declare. A start below the bottom (a low declared
+        port, `CheckoutIdentity.siblingPortCandidate`) walks up from where it
+        is rather than jumping to the bottom. */
     public static let range = 10_000...65_000
 
     /** The first base port from `start` whose whole claim is disjoint from

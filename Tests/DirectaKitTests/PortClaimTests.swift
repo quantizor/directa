@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import os
 
 @testable import DirectaKit
 
@@ -177,6 +178,36 @@ import Testing
         #expect(rebound == SiblingRebind.range.lowerBound)
     }
 
+    /** A start below the range (a low declared port) walks up from itself;
+        only a walk past the top lands in the range's bottom. */
+    @Test func aSiblingRebindBelowItsRangeWalksUpFromTheStart() async {
+        let spec = ServerSpec(command: ["serve"], name: "web", port: 3000)
+        let rebound = await SiblingRebind.search(
+            isListening: { $0 == 3_001 }, reserved: [3_002], spec: spec, start: 3_001)
+        #expect(rebound == 3_003)
+    }
+
+    /** Once every candidate it tries is taken, the search stops after
+        `attempts` and hands back the next port, which then fails the ordinary
+        port-held way. */
+    @Test func aSiblingRebindGivesUpAfterItsAttempts() async {
+        let spec = ServerSpec(command: ["serve"], name: "web", port: 3000)
+        let probed = OSAllocatedUnfairLock(initialState: 0)
+        let rebound = await SiblingRebind.search(
+            isListening: { _ in probed.withLock { $0 += 1 }; return true }, reserved: [], spec: spec,
+            start: 20_000)
+        #expect(rebound == 20_000 + SiblingRebind.attempts)
+        #expect(probed.withLock { $0 } == SiblingRebind.attempts)
+    }
+
+    /** The candidate never passes the top of the range the search walks. */
+    @Test func aSiblingPortCandidateNeverStartsAboveTheRange() {
+        #expect(
+            CheckoutIdentity.siblingPortCandidate(declared: 65_500, project: "/tmp/proj-a")
+                == SiblingRebind.range.upperBound)
+        #expect(CheckoutIdentity.siblingPortCandidate(declared: 1, project: "/tmp/proj-a") >= 1024)
+    }
+
     /** Which ports each phase holds, the question every port check asks.
         `stopping` holds nothing although it still counts as a live run. */
     @Test func heldPortsFollowThePhase() {
@@ -184,7 +215,7 @@ import Testing
         let named = ["admin": 45_300]
         let whole: Set<Int> = [45_200, 45_201, 45_202, 45_300]
         var held: [ServerPhase: Set<Int>] = [:]
-        for phase in [ServerPhase.crashed, .failed, .running, .starting, .stopped, .stopping, .unhealthy] {
+        for phase in ServerPhase.allCases {
             held[phase] = status(observedPort: 45_201, phase: phase, pid: 7, ports: named)
                 .heldPorts(claim: claim)
         }
@@ -201,7 +232,7 @@ import Testing
         phase that can still have a live run. */
     @Test func hasLiveRunCountsALivePortFailedRun() {
         var live: [ServerPhase: [Bool]] = [:]
-        for phase in [ServerPhase.crashed, .failed, .running, .starting, .stopped, .stopping, .unhealthy] {
+        for phase in ServerPhase.allCases {
             live[phase] = [phase.hasLiveRun(pid: nil), phase.hasLiveRun(pid: 7)]
         }
         #expect(

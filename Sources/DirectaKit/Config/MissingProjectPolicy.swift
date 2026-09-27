@@ -2,12 +2,12 @@ import Foundation
 
 /** Whether a registered project whose checkout path failed a stat should be
     forgotten yet. Pure and clock-driven, mirroring `WatchPolicy`, so the
-    two-consecutive-miss debounce is exercised without sleeping on a real
-    timer. One rule serves every automatic trigger (boot restore, machine-wide
-    status, the timer sweep): a project is forgotten only once its path has
-    been observed missing continuously for at least the sweep interval, never
-    on the first miss, so a network mount blip or a slow unmount does not cost
-    a project its trust and log history. */
+    debounce is exercised without sleeping on a real timer. One rule serves
+    every automatic trigger (boot restore, machine-wide status, the timer
+    sweep): a project is forgotten only once its path has been observed
+    missing continuously for at least the sweep interval, never on the first
+    miss, however many checks land in between, so a network mount blip or a
+    slow unmount does not cost a project its trust and log history. */
 public enum MissingProjectPolicy {
     public enum Decision: Equatable, Sendable {
         /** The path exists; any earlier miss should be cleared. */

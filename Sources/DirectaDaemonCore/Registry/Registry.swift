@@ -87,10 +87,10 @@ public struct PersistedServerState: Codable, Sendable {
 public actor Registry {
     private let paths: DirectaPaths
     private var registry: RegistryFile
-    /** Per server id, the writers `retireState` retired. In memory only: a
-        restart starts empty, and every supervisor it creates has a new
+    /** Per normalized server id, the writers `retireState` retired. In memory
+        only: a restart starts empty, and every supervisor it creates has a new
         writer. */
-    private var retiredWriters: [String: Set<UUID>] = [:]
+    private(set) var retiredWriters: [String: Set<UUID>] = [:]
     private var state: StateFile
 
     public init(paths: DirectaPaths) {
@@ -174,17 +174,23 @@ public actor Registry {
         state.servers
     }
 
-    /** `writer` is the calling supervisor's `ServerSupervisor.writerID`, nil
-        for the router's own writes. A no-op for a writer `retireState`
-        retired for this id, including when the row is missing: a dropped
-        supervisor's late write must not recreate a row its removal settled.
-        Every other writer, a later supervisor for the same id included, goes
-        through. */
+    /** Who is writing a state row. */
+    public enum StateWriter: Sendable {
+        /** The router's own bookkeeping, never refused. */
+        case router
+        /** A supervisor, by its `ServerSupervisor.writerID`. */
+        case supervisor(UUID)
+    }
+
+    /** A no-op for a supervisor `retireState` retired for this id, including
+        when the row is missing: a dropped supervisor's late write must not
+        recreate a row its removal settled. Every other writer, a later
+        supervisor for the same id included, goes through. */
     public func updateState(
-        serverID: String, writer: UUID? = nil, _ mutate: (inout PersistedServerState) -> Void
+        serverID: String, writer: StateWriter, _ mutate: (inout PersistedServerState) -> Void
     ) throws {
         let serverID = Self.normalizeServerID(serverID)
-        if let writer, retiredWriters[serverID]?.contains(writer) == true { return }
+        if case .supervisor(let id) = writer, retiredWriters[serverID]?.contains(id) == true { return }
         var entry = state.servers[serverID] ?? PersistedServerState()
         mutate(&entry)
         state.servers[serverID] = entry

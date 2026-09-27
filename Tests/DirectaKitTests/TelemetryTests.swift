@@ -227,7 +227,7 @@ private func decoded<T: Decodable>(_ lines: [String], as type: T.Type) throws ->
         activity.clientDisconnected()
         activity.recordPhase(.running, key: "a")
         activity.recordPhase(.running, key: "b")
-        activity.recordPhase("stopping", key: "c")
+        activity.recordPhase(.stopping, key: "c")
         activity.forgetPhase(key: "b")
         let snapshot = activity.snapshot(now: base.advanced(by: .seconds(5)))
         #expect(snapshot.connectedClients == 1)

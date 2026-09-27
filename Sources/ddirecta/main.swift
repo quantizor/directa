@@ -312,9 +312,10 @@ Task {
         }
         DirectaLog.daemon.info("watch sweep stopped")
     }
-    /** The missing-project sweep: one stat per registered project per interval,
-        pruned only on the second consecutive miss. Also after restore for the
-        same reason: pruning is destructive on the registry rows recovery
+    /** The missing-project sweep: one stat per registered project per
+        interval, forgetting a project only once its path has stayed missing
+        for a whole interval (`MissingProjectPolicy`). Also after restore for
+        the same reason: pruning is destructive on the registry rows recovery
         replays, and the two must not race. */
     Task {
         DirectaLog.daemon.info("missing-project sweep started")
@@ -324,7 +325,7 @@ Task {
                 DirectaLog.daemon.info("missing-project sweep pruned \(pruned)")
             }
             do {
-                try await Task.sleep(for: .seconds(30))
+                try await Task.sleep(for: .seconds(Router.missingProjectSweepIntervalSeconds))
             } catch {
                 break
             }

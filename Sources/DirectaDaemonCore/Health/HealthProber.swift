@@ -220,10 +220,6 @@ public enum PortGuard {
     exit and a loopback connect waits in `poll(2)`. Swift picks these over the
     synchronous forms in any async context. */
 extension PortGuard {
-    public static func commandForPid(_ pid: Int) async -> String {
-        await BlockingLane.system.run { commandForPid(pid) }
-    }
-
     public static func isListening(port: Int) async -> Bool {
         await BlockingLane.system.run { isListening(port: port) }
     }

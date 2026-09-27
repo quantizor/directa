@@ -125,7 +125,7 @@ import Testing
         defer { holder.terminate() }
         try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: 45004))
         let idA = serverID(project: env.projectA, name: "web")
-        try await registry.updateState(serverID: idA) { entry in
+        try await registry.updateState(serverID: idA, writer: .router) { entry in
             entry.phase = .running
             entry.pid = Int(holder.processIdentifier)
         }
@@ -646,7 +646,7 @@ import Testing
         /** A stale row for another project claiming that very pid, recorded an
             hour ago: the pid matches, the identity cannot. */
         try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: port))
-        try await registry.updateState(serverID: serverID(project: env.projectB, name: "web")) {
+        try await registry.updateState(serverID: serverID(project: env.projectB, name: "web"), writer: .router) {
             entry in
             entry.phase = .running
             entry.pid = Int(stranger.processIdentifier)

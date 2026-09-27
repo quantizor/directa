@@ -146,7 +146,7 @@ public actor ServerSupervisor {
             if oldValue == .stopping, phase != .stopping {
                 stoppingWaiters.settleAll()
             }
-            DaemonActivity.shared.recordPhase(phase.rawValue, key: writerID.uuidString)
+            DaemonActivity.shared.recordPhase(phase, key: writerID.uuidString)
         }
     }
     private var pid: pid_t?
@@ -263,7 +263,7 @@ public actor ServerSupervisor {
             }
         }
         /** `didSet` does not run for assignments inside init. */
-        DaemonActivity.shared.recordPhase(phase.rawValue, key: writerID.uuidString)
+        DaemonActivity.shared.recordPhase(phase, key: writerID.uuidString)
     }
 
     deinit {
@@ -645,19 +645,34 @@ public actor ServerSupervisor {
         forgetting a vanished project). Marks it removed before the stop, so
         from here on `start`, `ensure`, and `adopt` spawn or attach nothing,
         whatever stop this one joins, and a spawn still in flight is stopped
-        when its pid arrives (`recordSpawn`). Returns true when the stop gave
-        up short of a terminal phase (still `.stopping`, or still `.starting`
-        with no pid yet): state writes are then abandoned in the same actor
-        turn the stop returned in, so a `recordOutcome` landing after the
-        caller retires or deletes the state row cannot put it back. False
-        means the stop finished; a joined non-deliberate stop (a restart, a
-        watch sweep) keeps boot intent, which the caller clears. */
-    public func stopForRemoval(reason: String) async -> Bool {
+        when its pid arrives (`recordSpawn`). On `.gaveUp` state writes are
+        abandoned in the same actor turn the stop returned in, so a
+        `recordOutcome` landing after the caller retires or deletes the state
+        row cannot put it back. On `.stopped` a joined non-deliberate stop (a
+        restart, a watch sweep) may have kept boot intent, which the caller
+        clears. */
+    public func stopForRemoval(reason: String) async -> RemovalOutcome {
         removalReason = reason
+        let wasTerminal = !hasLiveRun
         _ = await stop(reason: reason)
-        guard phase.hasLiveRun(pid: pid.map(Int.init)) else { return false }
+        guard hasLiveRun else { return wasTerminal ? .alreadyTerminal : .stopped }
         stateWritesAbandoned = true
-        return true
+        return .gaveUp
+    }
+
+    private var hasLiveRun: Bool { phase.hasLiveRun(pid: pid.map(Int.init)) }
+
+    /** How a removal stop ended, read in the actor turns the stop began and
+        returned in. */
+    public enum RemovalOutcome: Equatable, Sendable {
+        /** No run was alive when the removal began, so `stop` did nothing and
+            no `recordOutcome` posts a `stopped` event. */
+        case alreadyTerminal
+        /** The stop gave up short of a terminal phase: still `.stopping`, or
+            still `.starting` with no pid yet. */
+        case gaveUp
+        /** The run was alive and its stop finished. */
+        case stopped
     }
 
     /** How long a stop with this grace waits for the phase to clear. The
@@ -1541,7 +1556,7 @@ public actor ServerSupervisor {
     private func registryUpdate(_ mutate: @escaping @Sendable (inout PersistedServerState) -> Void) async {
         guard !stateWritesAbandoned else { return }
         do {
-            try await registry.updateState(serverID: serverID, writer: writerID, mutate)
+            try await registry.updateState(serverID: serverID, writer: .supervisor(writerID), mutate)
         } catch {
             FileHandle.standardError.write(
                 Data("ddirecta: state persistence failed for \(serverID): \(error)\n".utf8))

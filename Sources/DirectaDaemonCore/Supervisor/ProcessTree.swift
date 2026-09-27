@@ -223,6 +223,18 @@ public enum ProcessTree {
         return processStart <= persistedStartedAt.addingTimeInterval(tolerance)
     }
 
+    /** The live identity of a pid read off disk, only when its kernel start
+        time is consistent with the run recorded at `startedAt`
+        (`startTimeConsistent`): nil for a missing, out-of-range, exited, or
+        recycled pid, so a caller about to signal or adopt it never reaches a
+        stranger. */
+    public static func provenIdentity(pid: Int?, startedAt: Date?) -> ProcessIdentity? {
+        guard let narrow = pid.flatMap(narrowed), let identity = identity(of: narrow),
+            startTimeConsistent(processStart: identity.wallClockStart, persistedStartedAt: startedAt)
+        else { return nil }
+        return identity
+    }
+
     /** Round a probed byte count up to whole `kinfo_proc` entries with 12.5%
         headroom, then return capacity and the exact allocated byte count to
         pass to sysctl (never advertise past the allocation). */

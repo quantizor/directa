@@ -230,15 +230,6 @@ public final class DaemonActivity: Sendable {
         state.withLock { $0.phases[key] = phase }
     }
 
-    /** For a caller holding the phase's raw value. */
-    public func recordPhase(_ rawPhase: String, key: String) {
-        guard let phase = ServerPhase(rawValue: rawPhase) else {
-            assertionFailure("DaemonActivity.recordPhase got \(rawPhase), which is not a ServerPhase")
-            return
-        }
-        recordPhase(phase, key: key)
-    }
-
     public func forgetPhase(key: String) {
         state.withLock { $0.phases[key] = nil }
     }

@@ -72,13 +72,21 @@ private func eventsList(router: Router, project: String) async throws -> [EventR
     user's own dev servers run in. */
 private final class RecordingAgentJobs: Sendable {
     private let bootedOutLabels = OSAllocatedUnfairLock(initialState: [String]())
+    private let listings = OSAllocatedUnfairLock(initialState: 0)
 
     var labels: [String] { bootedOutLabels.withLock { $0 } }
+
+    /** How many times the job list was read (each one a `launchctl` shell-out
+        in production). */
+    var listingCount: Int { listings.withLock { $0 } }
 
     func agentJobs(listing jobs: [LaunchdJobs.ChildJob]) -> AgentJobs {
         AgentJobs(
             bootOut: { [bootedOutLabels] job in bootedOutLabels.withLock { $0.append(job.label) } },
-            listChildJobs: { jobs })
+            listChildJobs: { [listings] in
+                listings.withLock { $0 += 1 }
+                return jobs
+            })
     }
 }
 
@@ -113,7 +121,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.projectPath)
         let id = serverID(project: env.projectPath, name: "web")
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .stopped
             entry.resumeOnBoot = true
             entry.pid = nil
@@ -149,7 +157,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let registry = Registry(paths: env.paths)
         /** Deliberately not trusted: no start-shaped command ever approved it. */
         let id = serverID(project: env.projectPath, name: "web")
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .stopped
             entry.resumeOnBoot = true
             entry.pid = nil
@@ -181,7 +189,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.projectPath)
         let staleID = serverID(project: env.projectPath, name: "dev")
-        try await registry.updateState(serverID: staleID) { entry in
+        try await registry.updateState(serverID: staleID, writer: .router) { entry in
             entry.phase = .stopped
             entry.resumeOnBoot = true
         }
@@ -215,7 +223,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let survivor = try spawnSurvivor()
         defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
         let staleID = serverID(project: env.projectPath, name: "dev")
-        try await registry.updateState(serverID: staleID) { entry in
+        try await registry.updateState(serverID: staleID, writer: .router) { entry in
             entry.phase = .running
             entry.pid = Int(survivor)
             entry.resumeOnBoot = true
@@ -253,7 +261,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.projectPath)
         let staleID = serverID(project: env.projectPath, name: "old")
-        try await registry.updateState(serverID: staleID) { entry in
+        try await registry.updateState(serverID: staleID, writer: .router) { entry in
             entry.phase = .stopped
             entry.resumeOnBoot = nil
         }
@@ -278,7 +286,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.projectPath)
         let id = serverID(project: env.projectPath, name: "api")
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .running
             entry.resumeOnBoot = nil
             entry.pid = nil
@@ -362,7 +370,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
         let id = serverID(project: env.projectPath, name: "web")
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .running
             entry.pid = Int(survivor)
             entry.resumeOnBoot = true
@@ -438,7 +446,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let survivor = try spawnSurvivor()
         defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
         let id = serverID(project: env.projectPath, name: "web")
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .running
             entry.pid = Int(survivor)
             entry.resumeOnBoot = true
@@ -500,7 +508,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
         let id = serverID(project: env.projectPath, name: "web")
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .running
             entry.pid = Int(survivor)
             entry.resumeOnBoot = true
@@ -563,7 +571,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let survivor = try spawnSurvivor()
         defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
         let id = serverID(project: env.projectPath, name: "web")
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .stopped
             entry.pid = Int(survivor)
             entry.resumeOnBoot = nil
@@ -621,7 +629,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let orphan = try spawnSurvivor()
         defer { if kill(orphan, 0) == 0 { kill(orphan, SIGKILL) } }
         let id = serverID(project: env.projectPath, name: "web")
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .running
             entry.pid = Int(orphan)
             entry.resumeOnBoot = true
@@ -667,7 +675,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let orphan = try spawnSurvivor()
         defer { if kill(orphan, 0) == 0 { kill(orphan, SIGKILL) } }
         let id = serverID(project: env.projectPath, name: "web")
-        try await registry.updateState(serverID: id) { entry in
+        try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .running
             entry.pid = Int(orphan)
             entry.resumeOnBoot = true
@@ -689,7 +697,8 @@ private func logTexts(router: Router, project: String, name: String) async throw
         holds its pid) out through the injected `AgentJobs` value, never by
         shelling directly to the real gui launchd domain. No project or
         supervised server is needed to observe this: the reap runs
-        unconditionally in agent mode at the end of `recoverAtStartup`. */
+        unconditionally in agent mode at the end of `recoverAtStartup`, over
+        the one job listing the adoption checks read. */
     @Test func reapsAStaleChildJobThroughTheInjectedAgentJobsValue() async throws {
         let env = try makeRecoverEnv()
         let registry = Registry(paths: env.paths)
@@ -701,5 +710,6 @@ private func logTexts(router: Router, project: String, name: String) async throw
             launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
         await router.recoverAtStartup()
         #expect(recorder.labels == ["dev.quantizor.directa.job.leftover"])
+        #expect(recorder.listingCount == 1)
     }
 }

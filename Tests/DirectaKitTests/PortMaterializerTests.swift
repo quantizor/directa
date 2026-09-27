@@ -290,6 +290,66 @@ import Testing
         #expect(CheckoutIdentity.mainCheckout(ofLinkedWorktree: layout.submodule.path) == nil)
     }
 
+    /** A worktree root answers from its admin files and a directory below it
+        through git; both name the main checkout. A main checkout, a
+        directory below it, and a submodule are not worktrees. */
+    @Test func worktreeDisplayNamesTheMainCheckoutFromARootOrASubdirectory() throws {
+        let layout = try makeGitLayout()
+        let below = layout.worktree.appending(path: "Nested Dir")
+        let mainBelow = layout.main.appending(path: "src")
+        for dir in [below, mainBelow] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        let mainSlug = ProjectConfigLoader.defaultSlug(project: layout.main.path)
+        #expect(
+            CheckoutIdentity.worktreeDisplay(project: layout.worktree.path)
+                == WorktreeDisplay(label: "review", mainProject: mainSlug))
+        #expect(
+            CheckoutIdentity.worktreeDisplay(project: below.path)
+                == WorktreeDisplay(label: "nested-dir", mainProject: mainSlug))
+        #expect(CheckoutIdentity.isLinkedWorktree(project: below.path))
+        #expect(!CheckoutIdentity.isLinkedWorktree(project: mainBelow.path))
+        for notWorktree in [layout.main, mainBelow, layout.submodule, layout.worktreeSubmodule] {
+            #expect(CheckoutIdentity.worktreeDisplay(project: notWorktree.path) == nil)
+        }
+    }
+
+    /** A worktree of a bare repository: git names the bare directory itself as
+        the main worktree, and the admin-file read agrees with git's own
+        listing. */
+    @Test func worktreeDisplayOfABareRepositorysWorktreeMatchesGitsListing() throws {
+        let base = URL(fileURLWithPath: canonicalProjectPath(try TemporaryTree.directory(named: "bare").path))
+        let seed = base.appending(path: "seed")
+        let bare = base.appending(path: "repo.git")
+        let worktree = base.appending(path: "wt")
+        try FileManager.default.createDirectory(at: seed, withIntermediateDirectories: true)
+        func git(_ args: [String], in cwd: URL) throws -> String {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = ["-c", "user.name=t", "-c", "user.email=t@example.com"] + args
+            process.currentDirectoryURL = cwd
+            let out = Pipe()
+            process.standardOutput = out
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            let data = try out.fileHandleForReading.readToEnd() ?? Data()
+            process.waitUntilExit()
+            try #require(process.terminationStatus == 0, "git \(args.joined(separator: " ")) failed")
+            return String(decoding: data, as: UTF8.self)
+        }
+        _ = try git(["init", "-q"], in: seed)
+        _ = try git(["commit", "-q", "--allow-empty", "-m", "seed"], in: seed)
+        _ = try git(["clone", "-q", "--bare", seed.path, bare.path], in: base)
+        _ = try git(["worktree", "add", "-q", worktree.path], in: bare)
+        let listing = try git(["worktree", "list", "--porcelain"], in: worktree)
+        let listedMain = try #require(
+            listing.split(separator: "\n").first { $0.hasPrefix("worktree ") }?.dropFirst("worktree ".count))
+        #expect(canonicalProjectPath(String(listedMain)) == bare.path)
+        #expect(
+            CheckoutIdentity.worktreeDisplay(project: worktree.path)
+                == WorktreeDisplay(label: "wt", mainProject: ProjectConfigLoader.defaultSlug(project: bare.path)))
+    }
+
     /** From a linked worktree that lacks devservers.json, a name its main
         checkout declares gets both fixes; any other not-found keeps the
         plain hint. */

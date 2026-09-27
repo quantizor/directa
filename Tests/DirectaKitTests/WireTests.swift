@@ -384,6 +384,20 @@ import Testing
         #expect(reencoded == json)
     }
 
+    /** Every kind this build names decodes to that case, never to `.unknown`. */
+    @Test func everyNamedEventKindDecodesToItsCase() throws {
+        let expected: [String: EventKind] = [
+            "crashed": .crashed, "failed": .failed, "healthy": .healthy, "marked": .marked,
+            "registered": .registered, "started": .started, "stopped": .stopped,
+            "unhealthy": .unhealthy, "unregistered": .unregistered,
+        ]
+        var decoded: [String: EventKind] = [:]
+        for raw in expected.keys {
+            decoded[raw] = try JSONCoding.decoder().decode(EventKind.self, from: Data("\"\(raw)\"".utf8))
+        }
+        #expect(decoded == expected)
+    }
+
     private func encoded<T: Encodable>(_ value: T) throws -> String {
         try #require(String(data: JSONCoding.encoder().encode(value), encoding: .utf8))
     }
