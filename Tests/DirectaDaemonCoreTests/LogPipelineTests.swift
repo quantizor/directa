@@ -36,6 +36,28 @@ private func tempDir() throws -> URL {
         #expect(all.last?.text.hasPrefix("line 39 ") == true)
     }
 
+    /** A store opened over a log whose last record is later than the clock
+        (a backward clock step across a daemon restart) stamps even its very
+        first append at or after that record, one line or a burst. */
+    @Test func theFirstAppendResumesTheClampFromDisk() async throws {
+        let dir = try tempDir()
+        let later = Date(timeIntervalSince1970: 4_102_444_800)
+        for burst in [false, true] {
+            let current = dir.appending(path: "current-\(burst).log")
+            try Data((LogRecord(at: later, stream: .out, text: "from the last run").formatted() + "\n").utf8)
+                .write(to: current)
+            let store = LogStore(currentURL: current)
+            if burst {
+                await store.append(stream: .out, texts: ["one", "two"])
+            } else {
+                await store.append(stream: .out, text: "one")
+            }
+            let stamps = await store.query(LogQueryOptions()).map(\.at)
+            #expect(stamps.count == (burst ? 3 : 2))
+            #expect(stamps.allSatisfy { $0 >= later }, "burst \(burst): \(stamps)")
+        }
+    }
+
     /** A burst lands in order, one timestamp for every line up to the first
         rotation, and each rotated file ends on the line that carried it past
         the cap, exactly where appending one line at a time would rotate. */

@@ -52,8 +52,10 @@ public actor LogStore {
     }
 
     /** Monotonic clamp: an NTP step or wake-time sync must never write a
-        timestamp earlier than the previous line. */
+        timestamp earlier than the previous line. Opening first resumes the
+        clamp from the file's last record before the first line is stamped. */
     private func clamped(_ date: Date) -> Date {
+        openIfNeeded()
         let clamped = JSONCoding.canonicalMs(max(date, lastTimestamp))
         lastTimestamp = clamped
         return clamped
