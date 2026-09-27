@@ -166,6 +166,13 @@ private let fastPolicy = TelemetryCadence.Policy(
         let stop = activity.begin(.stop, label: "/p::web: requested by stop")
         activity.end(stop, outcome: "stopped")
         #expect(telemetry.waitForIncident(timeoutSeconds: 10))
+        /** The sampler thread takes its first snapshot once the scheduler
+            runs it, and a stop before then leaves none, so the exit waits
+            for one. */
+        let deadline = Date().addingTimeInterval(10)
+        while try snapshots(in: paths.daemonTelemetryDir).isEmpty, Date() < deadline {
+            usleep(10_000)
+        }
         telemetry.recordExit(code: 3, reason: "test")
         /** The process-exit hook after an exit that named its code writes nothing. */
         telemetry.recordExit(code: nil, reason: "exit")
