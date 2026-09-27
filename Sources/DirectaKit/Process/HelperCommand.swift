@@ -21,6 +21,45 @@ public enum ShellOutcome: Equatable, Sendable {
     leader of a new group, so that reaches the command and anything it started
     that stayed in the group, and never the caller. */
 public enum HelperCommand {
+    /** How long `launchctl` gets when a caller names no timeout, for the verbs
+        that answer from launchd's own state (`print`, `list`, `bootstrap`,
+        `kickstart` without `-k`). They normally finish in a few milliseconds;
+        this leaves room for a launchd that is itself slow under memory
+        pressure without letting a hung one hold a lane thread for long. */
+    public static let launchctlTimeoutSeconds: Double = 10
+
+    /** How long `launchctl bootout` and `launchctl kickstart -k` get when a
+        caller names no timeout. Both wait for the job's process to exit,
+        which launchd allows up to the job's `ExitTimeOut` before it escalates
+        to SIGKILL, and launchd refuses an `ExitTimeOut` past 60 seconds. */
+    public static let launchctlJobExitTimeoutSeconds: Double = 75
+
+    /** `lsof` normally finishes in tens of milliseconds. */
+    public static let lsofTimeoutSeconds: Double = 10
+
+    /** `ps` normally finishes in a few milliseconds. */
+    public static let psTimeoutSeconds: Double = 5
+
+    /** The deadline a command gets when its caller names none: one of the
+        constants above for launchctl, lsof, and ps, and nil (wait for the
+        command to finish) for everything else, which is either directa's own
+        CLI run from the app or a command a person is waiting on (`git fetch`
+        during `switch`, `open`). */
+    public static func defaultTimeoutSeconds(executable path: String, arguments: [String]) -> Double? {
+        switch (path as NSString).lastPathComponent {
+        case "launchctl":
+            let waitsForExit =
+                arguments.first == "bootout" || (arguments.first == "kickstart" && arguments.contains("-k"))
+            return waitsForExit ? launchctlJobExitTimeoutSeconds : launchctlTimeoutSeconds
+        case "lsof":
+            return lsofTimeoutSeconds
+        case "ps":
+            return psTimeoutSeconds
+        default:
+            return nil
+        }
+    }
+
     /** Runs `path` with `arguments` to the end, reported to `DaemonActivity`
         by executable name. `environment` nil inherits this process's, and
         `currentDirectory` nil keeps this process's. `includeStderr` merges

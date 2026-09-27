@@ -80,6 +80,38 @@ import Testing
         #expect(started.duration(to: .now) < .seconds(3))
     }
 
+    /** The helpers the daemon runs on a fixed-width lane get a deadline when
+        the caller names none, so a hung one cannot hold a lane thread forever;
+        a launchctl verb that waits for a job to exit gets room for launchd's
+        60-second `ExitTimeOut` ceiling. Everything else still waits. */
+    @Test func helpersTheDaemonRunsGetADeadlineByDefault() {
+        let launchctl = "/bin/launchctl"
+        #expect(
+            HelperCommand.defaultTimeoutSeconds(executable: launchctl, arguments: ["list"])
+                == HelperCommand.launchctlTimeoutSeconds)
+        #expect(
+            HelperCommand.defaultTimeoutSeconds(executable: launchctl, arguments: ["print", "gui/501/x"])
+                == HelperCommand.launchctlTimeoutSeconds)
+        #expect(
+            HelperCommand.defaultTimeoutSeconds(executable: launchctl, arguments: ["kickstart", "gui/501/x"])
+                == HelperCommand.launchctlTimeoutSeconds)
+        #expect(
+            HelperCommand.defaultTimeoutSeconds(executable: launchctl, arguments: ["bootout", "gui/501/x"])
+                == HelperCommand.launchctlJobExitTimeoutSeconds)
+        #expect(
+            HelperCommand.defaultTimeoutSeconds(executable: launchctl, arguments: ["kickstart", "-k", "gui/501/x"])
+                == HelperCommand.launchctlJobExitTimeoutSeconds)
+        #expect(HelperCommand.launchctlJobExitTimeoutSeconds > 60)
+        #expect(
+            HelperCommand.defaultTimeoutSeconds(executable: "/usr/sbin/lsof", arguments: ["-nP"])
+                == HelperCommand.lsofTimeoutSeconds)
+        #expect(
+            HelperCommand.defaultTimeoutSeconds(executable: "/bin/ps", arguments: ["-p", "1"])
+                == HelperCommand.psTimeoutSeconds)
+        #expect(HelperCommand.defaultTimeoutSeconds(executable: "/usr/bin/git", arguments: ["fetch"]) == nil)
+        #expect(HelperCommand.defaultTimeoutSeconds(executable: "/usr/bin/open", arguments: ["x"]) == nil)
+    }
+
     /** Output parsed as a value (a `--version` string) excludes stderr, so a
         warning on stderr cannot corrupt it; the default keeps both. */
     @Test func stdoutAloneWhenStderrIsExcluded() {

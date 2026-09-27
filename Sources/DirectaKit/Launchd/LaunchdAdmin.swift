@@ -559,7 +559,8 @@ public enum LaunchdAdmin {
 
     /** `shellOutcome` in the `(status, output)` shape most callers read: a
         child that could not start is status -1 with the reason as output, and
-        one killed at its timeout is status -1 with no output. */
+        one killed at its timeout is status -1 with no output, which
+        `capturedPath` reads as "fall back to the PATH floor". */
     @discardableResult
     public static func shell(
         _ path: String, _ arguments: [String], environment: [String: String]? = nil,
@@ -595,18 +596,21 @@ public enum LaunchdAdmin {
         is what most callers want. Pass one to make the child's answer
         independent of who asked.
 
-        `timeoutSeconds` nil waits for the command, which is right for a
-        command directa controls end to end. Pass one for anything that runs a
-        file the user wrote: a shell profile can prompt, wait on the network,
-        or expect a terminal that is not there, and waiting forever for it is
-        how a menu bar app hangs at launch with nothing on screen explaining
-        why. */
+        `timeoutSeconds` nil takes `HelperCommand.defaultTimeoutSeconds`: a
+        deadline for launchctl, lsof, and ps, whose hang would otherwise hold a
+        daemon lane thread forever, and none for anything else, which is right
+        for a command directa controls end to end. Pass one for anything that
+        runs a file the user wrote: a shell profile can prompt, wait on the
+        network, or expect a terminal that is not there, and waiting forever
+        for it is how a menu bar app hangs at launch with nothing on screen
+        explaining why. */
     public static func shellOutcome(
         _ path: String, _ arguments: [String], environment: [String: String]? = nil,
         includeStderr: Bool = true, timeoutSeconds: Double? = nil
     ) -> ShellOutcome {
         HelperCommand.run(
             path, arguments, environment: environment, includeStderr: includeStderr,
-            timeoutSeconds: timeoutSeconds)
+            timeoutSeconds: timeoutSeconds
+                ?? HelperCommand.defaultTimeoutSeconds(executable: path, arguments: arguments))
     }
 }

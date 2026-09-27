@@ -705,6 +705,35 @@ import Testing
         #expect(settled.portConflict?.state == .foreign)
     }
 
+    /** A port lookup that hangs (here a helper that backgrounds a process
+        holding its output, standing in for an `lsof` stuck on a wedged
+        socket) answers "no evidence" at its deadline rather than holding a
+        lane thread until the process lets go, and the holder is killed with
+        it. The holder outlives the deadline by far, so the two are told apart
+        by a wide margin. */
+    @Test func aHungPortLookupEndsAtItsDeadline() async throws {
+        let base = try TemporaryTree.directory(named: "hung-lookup")
+        let pidFile = base.appending(path: "holder.pid").path
+        let started = ContinuousClock.now
+        let answer = await BlockingLane.system.run {
+            PortGuard.output(
+                "/bin/sh", ["-c", "echo 4242; sleep 20 & echo $! > '\(pidFile)'"], timeoutSeconds: 0.5)
+        }
+        let elapsed = started.duration(to: .now)
+        #expect(answer == nil)
+        #expect(elapsed < .seconds(10), "the port lookup waited \(elapsed) for a process holding its output")
+        let holder = try #require(
+            (try? String(contentsOfFile: pidFile, encoding: .utf8))
+                .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        var gone = kill(holder, 0) != 0
+        for _ in 0..<50 where !gone {
+            try await Task.sleep(for: .milliseconds(50))
+            gone = kill(holder, 0) != 0
+        }
+        if !gone { kill(holder, SIGKILL) }
+        #expect(gone, "the process holding the lookup's output (pid \(holder)) outlived the deadline")
+    }
+
     private func teardown(_ router: Router, _ project: String, _ name: String) async {
         _ = await handle(router, .serverStop, ServerTargetParams(name: name, project: project), ServerResult.self)
     }

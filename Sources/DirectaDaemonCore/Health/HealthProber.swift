@@ -191,27 +191,21 @@ public enum PortGuard {
     }
 
     private static func shell(_ path: String, _ arguments: [String]) -> String? {
-        let label = ([(path as NSString).lastPathComponent] + arguments).joined(separator: " ")
-        return DaemonActivity.shared.measure(ActivityKind.forExecutable(path), label: label) {
-            shellUnmeasured(path, arguments)
-        }
+        output(
+            path, arguments,
+            timeoutSeconds: HelperCommand.defaultTimeoutSeconds(executable: path, arguments: arguments)
+                ?? HelperCommand.lsofTimeoutSeconds)
     }
 
-    private static func shellUnmeasured(_ path: String, _ arguments: [String]) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = arguments
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-        } catch {
-            return nil
+    /** stdout of a command that ran to the end, or nil when it could not
+        start or outlived `timeoutSeconds`: a lookup that hung is no evidence,
+        the same as one that found nothing. A nonzero exit still answers its
+        output, since `lsof` exits 1 when nothing matches. */
+    static func output(_ path: String, _ arguments: [String], timeoutSeconds: Double) -> String? {
+        switch HelperCommand.run(path, arguments, includeStderr: false, timeoutSeconds: timeoutSeconds) {
+        case .exited(_, let output): output
+        case .failedToRun, .timedOut: nil
         }
-        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
-        process.waitUntilExit()
-        return String(data: data, encoding: .utf8)
     }
 }
 
