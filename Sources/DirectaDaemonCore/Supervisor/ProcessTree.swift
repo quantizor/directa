@@ -387,8 +387,8 @@ public enum ProcessTree {
         traps on anything past `Int32`, and a trap under launchd `KeepAlive` is a
         crash loop, because boot restore re-reads the same file and dies again on
         every relaunch. That is the failure the defensive-load rule exists to
-        prevent, and narrowing quietly reopened it after JSON parsing had already
-        let the value through.
+        prevent, and a trapping narrow would reopen it after JSON parsing has
+        already let the value through.
 
         Answering nil costs nothing: every caller already handles a pid that
         names no live process, which is the same conclusion by a different route.

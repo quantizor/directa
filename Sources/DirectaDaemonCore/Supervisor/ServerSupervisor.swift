@@ -1,13 +1,44 @@
 import DirectaKit
 import Foundation
 
-/** One registration in `ServerSupervisor.spawnWaiters` or `.stoppingWaiters`.
-    `deadlineTask` is the sleeping task that expires this one waiter if the
-    real transition never lands first; nil for an unbounded wait. */
+/** One registration in a `PhaseWaiterList`. `deadlineTask` is the sleeping
+    task that expires this one waiter if the real transition never lands
+    first; nil for an unbounded wait. */
 private struct PhaseWaiter {
     let continuation: CheckedContinuation<Void, Never>
     let deadlineTask: Task<Void, Never>?
     let id: UUID
+}
+
+/** Callers parked until a phase transition lands. Each waiter has an id so a
+    bounded one can be picked out and resumed on its own when its deadline
+    fires, leaving every other registration (an unrelated caller's unbounded
+    join, or another bounded wait with a later deadline) untouched. The
+    transition and a deadline can never both resume one continuation: both
+    run on the owning actor and never interleave, and whichever runs first
+    removes the waiter. */
+private struct PhaseWaiterList {
+    private var waiters: [PhaseWaiter] = []
+
+    mutating func add(_ waiter: PhaseWaiter) {
+        waiters.append(waiter)
+    }
+
+    /** Resumes one waiter ahead of the transition; a no-op once the
+        transition already settled it. */
+    mutating func expire(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        waiters.remove(at: index).continuation.resume()
+    }
+
+    mutating func settleAll() {
+        let settled = waiters
+        waiters = []
+        for waiter in settled {
+            waiter.deadlineTask?.cancel()
+            waiter.continuation.resume()
+        }
+    }
 }
 
 /** How long `stop()` waits on a server. `graceSeconds` is the SIGTERM-to-SIGKILL
@@ -31,31 +62,46 @@ public struct StopTiming: Sendable {
     which is what makes `ensure` single-flight (concurrent starts join the same
     in-flight attempt instead of double-spawning). */
 public actor ServerSupervisor {
-    public let projectPath: String
+    /** What the stop in flight asked for, carried from the stop into
+        `recordOutcome`. `deliberate` retires the resume-on-boot intent (a
+        launchd drain keeps it). `reason` becomes the `stopped` event's detail
+        in place of the exit code: the code says how the process ended, never
+        why directa asked it to. `waitBound` is how long that stop waits for
+        the phase to clear (its grace plus `stopTiming.overtimeSeconds`), so a
+        `start()` joining it waits no longer than the stop itself does. */
+    private struct StopRequest {
+        let deliberate: Bool
+        let reason: String
+        let waitBound: Duration
+    }
+
+    /** The log tail a terminal run's status shows, read once rather than per
+        status call: the log stops growing once the process is gone, so one
+        read at the transition is both cheaper and a truer snapshot of the
+        failure. `read(nil)` is a read that found nothing, which must not look
+        unread and send every status call back to the log family. */
+    private enum TailCache {
+        case read([String]?)
+        case unread
+    }
+
+    /** How a run came under supervision, which decides where its tailers
+        start, what the log and event say, and whether the state row's bound
+        port is written (a spawn's is left for the router). */
+    private enum Supervision {
+        case adopted(boundPort: Int?)
+        case spawned
+    }
+
+    private enum WaiterList {
+        case spawn
+        case stopping
+    }
 
     private var consecutiveFailures = 0
-    private var errTailer: SpoolTailer?
-    private let events: EventStore?
-    private let logStore: LogStore
-    private var outTailer: SpoolTailer?
     private var consecutiveSuccesses = 0
     /** Committed port before override/rebind; status.declaredPort. */
     private var declaredPort: Int?
-    /** Error-stream tally for the current process, captured when the phase turns
-        terminal or unhealthy rather than recomputed per status call. Cleared at
-        spawn so a crash loop reports this incarnation, bracketed to the run's
-        start, and persisted so it survives a daemon restart. */
-    private var errorSummary: ErrorSummary?
-    private var everHealthy = false
-    /** What this run binds after override/rebind/materialization. */
-    private var effectivePort: Int?
-    private var healthTask: Task<Void, Never>?
-    private var lastExit: LastExit?
-    private var lastHealthAt: Date?
-    private var lastDescendantSnapshot: [ProcessIdentity] = []
-    /** Invalidates an in-flight listen scan when this run dies or a new one
-        starts, so a late lsof cannot write observedPort onto the next spawn. */
-    private var listenScanGeneration: UInt64 = 0
     /** Keeps the descendant snapshot fresh across the startup window; see
         startDescendantWatch. */
     private var descendantTask: Task<Void, Never>?
@@ -63,21 +109,31 @@ public actor ServerSupervisor {
         a crash can orphan it, and long enough that the sweeps cost nothing over
         a startup window. */
     private let descendantWatchIntervalMs = 200
-    /** The run's root as it was when its pid was recorded (spawn or adopt),
-        nil when that read found the root already reaped. Every teardown pass
-        revalidates against this and never against a read taken at teardown
-        time: a launchd job's root is reaped by launchd the moment it exits,
-        so by then its pid may name a stranger. It is also the lineage walk's
-        first key (ProcessTree.liveDescendants). */
-    private var rootIdentity: ProcessIdentity?
-    /** `ProcessTree.identity(of:)` outside tests; a test injects a reader to
-        stand in for a pid recycled between spawn and teardown. */
-    private let readIdentity: @Sendable (pid_t) -> ProcessIdentity?
+    /** What this run binds after override/rebind/materialization. */
+    private var effectivePort: Int?
+    private var errTailer: SpoolTailer?
+    /** Error-stream tally for the current process, captured when the phase turns
+        terminal or unhealthy rather than recomputed per status call. Cleared at
+        spawn so a crash loop reports this incarnation, bracketed to the run's
+        start, and persisted so it survives a daemon restart. */
+    private var errorSummary: ErrorSummary?
+    private let events: EventStore?
+    private var everHealthy = false
+    private var healthTask: Task<Void, Never>?
+    private var lastDescendantSnapshot: [ProcessIdentity] = []
+    private var lastExit: LastExit?
+    private var lastHealthAt: Date?
     private let launcher: any ProcessLauncher
+    private let logStore: LogStore
+    private let mainProjectSlug: String?
     /** Resolved named secondaries for this run (status.ports). */
     private var namedPorts: [String: Int]?
     private var observedPort: Int?
+    private var outTailer: SpoolTailer?
     private let paths: DirectaPaths
+    /** Set when a stop moves the phase to `.stopping`, cleared once the
+        phase leaves it or a new run starts. */
+    private var pendingStop: StopRequest?
     /** `didSet` is the one home for leaving `.stopping`: every caller that must
         not proceed until a stop (or the drain half of a crash/exit) has fully
         landed awaits `waitForStoppingToClear` instead of polling `runTask`,
@@ -88,28 +144,20 @@ public actor ServerSupervisor {
     private var phase: ServerPhase = .stopped {
         didSet {
             if oldValue == .stopping, phase != .stopping {
-                settleStoppingWaiters()
+                stoppingWaiters.settleAll()
             }
             DaemonActivity.shared.recordPhase(phase.rawValue, key: writerID.uuidString)
         }
     }
-    /** The server id telemetry labels this supervisor's stops and waits with. */
-    private nonisolated let activityID: String
     private var pid: pid_t?
     private var portClaim: PortClaim?
     private var portConflict: PortConflict?
     private let prober: any HealthProber
-    /** Captured once the phase turns terminal, not recomputed per status call:
-        the log stops growing once the process is gone, so one read at the
-        transition is both cheaper and a truer snapshot of the failure. The
-        extra layer of Optional tells "not read since the last spawn" (outer
-        nil) apart from "read, and the log family had nothing to show" (outer
-        some, inner nil); collapsing those into one nil would make the second
-        case look uncached and reread the whole log family on every status()
-        call, which is exactly what a server rehydrated as crashed after a
-        daemon restart does today (only errorSummary and terminalEvidence are
-        persisted, so this starts uncached every time). */
-    private var recentLogTail: [String]??
+    public let projectPath: String
+    /** `ProcessTree.identity(of:)` outside tests; a test injects a reader to
+        stand in for a pid recycled between spawn and teardown. */
+    private let readIdentity: @Sendable (pid_t) -> ProcessIdentity?
+    private var recentLogTail: TailCache = .unread
     private let registry: Registry
     /** Set by `stopForRemoval` to its reason, never cleared: the router has
         dropped (or is dropping) this supervisor, so a caller still holding the
@@ -117,24 +165,41 @@ public actor ServerSupervisor {
         attach a run that nothing would supervise, and a spawn already in
         flight is stopped for this reason the moment its pid arrives. */
     private var removalReason: String?
+    /** The run's root as it was when its pid was recorded (spawn or adopt),
+        nil when that read found the root already reaped. Every teardown pass
+        revalidates against this and never against a read taken at teardown
+        time: a launchd job's root is reaped by launchd the moment it exits,
+        so by then its pid may name a stranger. It is also the lineage walk's
+        first key (ProcessTree.liveDescendants). */
+    private var rootIdentity: ProcessIdentity?
+    /** Bumped when a run starts and when it ends, so work that awaited across
+        either (a listen scan's lsof, a log read) can tell it no longer
+        belongs to the current run and must not write onto it. */
+    private var runGeneration: UInt64 = 0
     private var runningSpecHash: String?
     private var runTask: Task<Void, Never>?
+    /** `<project>::<name>`: the state row key, and the label telemetry gives
+        this supervisor's stops and waits. */
+    private let serverID: String
     private var spawnError: SpawnError?
-    /** Waiters for the spawn settling (a pid, or a terminal phase); settled by
-        `settleSpawnWaiters`. Each has an id so a bounded waiter (see
-        `waitForSpawnSettled`) can be picked out and resumed on its own. */
-    private var spawnWaiters: [PhaseWaiter] = []
+    /** Waiters for the spawn settling (a pid, or a terminal phase). */
+    private var spawnWaiters = PhaseWaiterList()
     private var spec: ServerSpec
-    /** Waiters for `phase` leaving `.stopping`; settled by `phase`'s `didSet`,
-        with an id so a timed-out waiter (see `waitForStoppingToClear`) can be
-        picked out of the array and resumed on its own, ahead of the real
-        transition. */
-    private var stoppingWaiters: [PhaseWaiter] = []
     /** Lifetime window a self-exit must land in to count toward the stall
         streak (see recordOutcome). Overridable so tests can use fast bounds. */
     private let stallBounds: (minSeconds: Int, maxSeconds: Int)
     private var stallStreak = 0
     private var startedAt: Date?
+    /** Set once the router has dropped this supervisor after a stop that never
+        finished: a late `recordOutcome` must not write a row the router has
+        already retired or deleted. Covers the moment before the router's
+        `Registry.retireState` lands; the registry refuses `writerID` after. */
+    private var stateWritesAbandoned = false
+    /** Waiters for `phase` leaving `.stopping`, settled by `phase`'s `didSet`. */
+    private var stoppingWaiters = PhaseWaiterList()
+    private let stopTiming: StopTiming
+    /** Durable why evidence across ensure truncate / daemon rehydrate. */
+    private var terminalEvidence: [String]?
     /** Taken once the run has been alive for the settle window rather than at
         spawn, so a server that writes its own watched file while booting folds
         that write into the baseline instead of bouncing itself for it. */
@@ -144,36 +209,13 @@ public actor ServerSupervisor {
         spans restarts by definition. */
     private var watchRestarts: [Date] = []
     private var watchSuspended = false
-    /** Set once the router has dropped this supervisor after a stop that never
-        finished: a late `recordOutcome` must not write a row the router has
-        already retired or deleted. Covers the moment before the router's
-        `Registry.retireState` lands; the registry refuses `writerID` after. */
-    private var stateWritesAbandoned = false
-    private var stopRequested = false
-    private let stopTiming: StopTiming
-    /** The bound the stop in flight gives its own wait for the phase to
-        clear (its grace plus `stopTiming.overtimeSeconds`), set when that stop
-        moves the phase to `.stopping`. `start()` joining that stop waits no
-        longer than the stop itself does. */
-    private var stoppingWaitBound: Duration
-    /** Carries the stop()'s intent into recordOutcome: deliberate clears the
-        resume-on-boot flag, a launchd drain keeps it. */
-    private var stopWasDeliberate = true
-    /** Carries stop()'s reason into recordOutcome, which uses it as the
-        `stopped` event's detail in place of the exit code: the code says how
-        the process ended, never why directa asked it to. Always set together
-        with stopRequested, so it is current whenever recordOutcome reads it. */
-    private var stopReason = ""
-    /** Durable why evidence across ensure truncate / daemon rehydrate. */
-    private var terminalEvidence: [String]?
     /** Linked-worktree display identity, fixed at creation from the `worktree`
         the creator resolved (`CheckoutIdentity.worktreeDisplay`, which runs
-        git, so never per status read or per spawn): status.worktree and
-        status.mainProject. A worktree project whose servers are stopped or
-        restored still reports its label. Nil for a main checkout; the pair
-        never alters the host. */
+        git, so never per status read or per spawn): status.worktree and, with
+        `mainProjectSlug`, status.mainProject. A worktree project whose
+        servers are stopped or restored still reports its label. Nil for a
+        main checkout; the pair never alters the host. */
     private let worktreeLabel: String?
-    private let mainProjectSlug: String?
     /** Identifies this supervisor's state writes to `Registry.updateState`, so
         `Registry.retireState` refuses a dropped supervisor's late write
         without blocking a later supervisor for the same server. */
@@ -192,24 +234,23 @@ public actor ServerSupervisor {
         stopTiming: StopTiming = .standard,
         worktree: WorktreeDisplay? = nil
     ) {
-        self.events = events
-        self.launcher = launcher
         /** Match Registry's normalized state keys (`/var` vs `/private/var`). */
         let project = canonicalProjectPath(projectPath)
+        let id = DirectaKit.serverID(project: project, name: spec.name)
+        self.events = events
+        self.launcher = launcher
         self.logStore = LogStore(currentURL: paths.structuredLogFile(project: project, server: spec.name))
+        self.mainProjectSlug = worktree?.mainProject
         self.paths = paths
         self.prober = prober
         self.projectPath = project
         self.readIdentity = readIdentity
         self.registry = registry
+        self.serverID = id
         self.spec = spec
         self.stallBounds = stallBounds
         self.stopTiming = stopTiming
-        self.stoppingWaitBound = .seconds(stopTiming.graceSeconds + stopTiming.overtimeSeconds)
         self.worktreeLabel = worktree?.label
-        self.mainProjectSlug = worktree?.mainProject
-        self.activityID = serverID(project: project, name: spec.name)
-        let id = serverID(project: project, name: spec.name)
         if let persisted = AtomicFile.loadDefensively(StateFile.self, from: paths.stateFile)?
             .servers[id] {
             self.errorSummary = persisted.errorSummary
@@ -328,27 +369,29 @@ public actor ServerSupervisor {
 
     /** The status and the claim resolved at spawn, read in one actor turn so a
         port check sees a phase and a claim that belong together. */
-    public func portSnapshot() -> (claim: PortClaim?, status: ServerStatus) {
-        (claim: portClaim, status: status())
+    public func portSnapshot() async -> (claim: PortClaim?, status: ServerStatus) {
+        await fillLogTailIfUnread()
+        return (claim: portClaim, status: statusSnapshot())
     }
 
     /** Starts the server if not already starting/running; otherwise joins the
         in-flight attempt. Returns once a pid exists or the spawn has failed; the
         phase stays `starting` until the healthcheck passes. */
     public func start() async -> ServerStatus {
-        guard removalReason == nil else { return status() }
+        guard removalReason == nil else { return await status() }
         switch phase {
         case .running, .unhealthy:
-            return status()
+            return await status()
         case .starting:
             await waitForSpawnSettled()
-            return status()
+            return await status()
         case .stopping:
             /** Bounded like the stop being joined: a stop that never lands
                 reports an honest `.stopping` here too, instead of holding
                 this request (and the wire call behind it) forever. */
-            guard await waitForStoppingToClear(timeout: stoppingWaitBound) else {
-                return status()
+            let bound = pendingStop?.waitBound ?? stopWaitBound(graceSeconds: stopTiming.graceSeconds)
+            guard await waitForStoppingToClear(timeout: bound) else {
+                return await status()
             }
             return await start()
         case .failed where pid != nil:
@@ -362,20 +405,7 @@ public actor ServerSupervisor {
         case .crashed, .failed, .stopped:
             break
         }
-        listenScanGeneration += 1
-        phase = .starting
-        stopRequested = false
-        spawnError = nil
-        errorSummary = nil
-        terminalEvidence = nil
-        everHealthy = false
-        observedPort = nil
-        recentLogTail = nil
-        lastDescendantSnapshot = []
-        consecutiveFailures = 0
-        consecutiveSuccesses = 0
-        runningSpecHash = Self.specHash(spec)
-        let id = serverID(project: projectPath, name: spec.name)
+        resetForNewRun()
         let argv = effectiveArgv()
         let cwd = effectiveCwd()
         let environment = spec.env ?? [:]
@@ -385,8 +415,8 @@ public actor ServerSupervisor {
             try FileManager.default.createDirectory(
                 at: outURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         } catch {
-            await recordSpawnFailure(SpawnError(errno: nil, message: "cannot create log directory: \(error)"), id: id)
-            return status()
+            await recordSpawnFailure(SpawnError(errno: nil, message: "cannot create log directory: \(error)"))
+            return await status()
         }
         let outFD = open(outURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
         let errFD = open(errURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
@@ -394,9 +424,8 @@ public actor ServerSupervisor {
             if outFD >= 0 { close(outFD) }
             if errFD >= 0 { close(errFD) }
             await recordSpawnFailure(
-                SpawnError(errno: Int(errno), message: "cannot open spool: \(String(cString: strerror(errno)))"),
-                id: id)
-            return status()
+                SpawnError(errno: Int(errno), message: "cannot open spool: \(String(cString: strerror(errno)))"))
+            return await status()
         }
         runTask = Task { [launcher] in
             let outcome = await launcher.run(
@@ -410,15 +439,15 @@ public actor ServerSupervisor {
                     await self?.recordExitedBeforeWatch(pid: childPid)
                 },
                 onSpawn: { [weak self] childPid in
-                    await self?.recordSpawn(pid: childPid, id: id)
+                    await self?.recordSpawn(pid: childPid)
                 }
             )
             close(outFD)
             close(errFD)
-            await self.recordOutcome(outcome, id: id)
+            await self.recordOutcome(outcome)
         }
         await waitForSpawnSettled()
-        return status()
+        return await status()
     }
 
     /** Attaches to a live process a prior daemon spawned, instead of spawning a
@@ -446,20 +475,7 @@ public actor ServerSupervisor {
         pid childPid: pid_t, label: String, boundPort: Int?, startedAt runStartedAt: Date?
     ) async -> Bool {
         guard removalReason == nil, launcher.prepareAdopt(pid: childPid) else { return false }
-        listenScanGeneration += 1
-        phase = .starting
-        stopRequested = false
-        spawnError = nil
-        errorSummary = nil
-        terminalEvidence = nil
-        everHealthy = false
-        observedPort = nil
-        recentLogTail = nil
-        lastDescendantSnapshot = []
-        consecutiveFailures = 0
-        consecutiveSuccesses = 0
-        runningSpecHash = Self.specHash(spec)
-        let id = serverID(project: projectPath, name: spec.name)
+        resetForNewRun()
         pid = childPid
         rootIdentity = readIdentity(childPid)
         /** Set before the first await, as `start()` does, so a stop landing
@@ -470,38 +486,12 @@ public actor ServerSupervisor {
         runTask = Task { [launcher] in
             let outcome = await launcher.adopt(pid: childPid, label: label)
             for await _ in recorded {}
-            await self.recordOutcome(outcome, id: id)
+            await self.recordOutcome(outcome)
         }
         refreshDescendantSnapshot()
-        let spawnedAt = runStartedAt ?? Date()
-        startedAt = spawnedAt
-        let out = SpoolTailer(
-            startAtEnd: true, store: logStore, stream: .out,
-            url: paths.spoolOutFile(project: projectPath, server: spec.name))
-        let err = SpoolTailer(
-            startAtEnd: true, store: logStore, stream: .err,
-            url: paths.spoolErrFile(project: projectPath, server: spec.name))
-        outTailer = out
-        errTailer = err
-        await out.start()
-        await err.start()
-        await logStore.append(stream: .sys, text: "adopted pid=\(childPid)")
-        await events?.post(
-            kind: .started, project: projectPath, server: spec.name,
-            detail: DaemonRestartDetail.adopted(pid: childPid))
-        startHealthMonitor()
-        startDescendantWatch()
-        await registryUpdate(id: id) { entry in
-            entry.boundPort = boundPort
-            entry.lastExit = nil
-            entry.phase = .starting
-            entry.pid = Int(childPid)
-            entry.resumeOnBoot = true
-            entry.spawnError = nil
-            entry.startedAt = spawnedAt
-        }
+        await beginSupervising(
+            pid: childPid, startedAt: runStartedAt ?? Date(), as: .adopted(boundPort: boundPort))
         finishRecording.finish()
-        settleSpawnWaiters()
         return true
     }
 
@@ -509,17 +499,23 @@ public actor ServerSupervisor {
         the in-flight attempt; running and unhealthy are no-ops (unhealthy is
         reported, not restarted). Blocks until healthy, terminal, or timeout. */
     public func ensure(timeoutSeconds: Double) async -> EnsureResult {
-        guard removalReason == nil else { return EnsureResult(reason: .stopped, server: status()) }
+        guard removalReason == nil else {
+            let server = await status()
+            return EnsureResult(reason: .stopped, server: server)
+        }
         switch phase {
         case .running, .unhealthy:
-            return EnsureResult(server: status())
+            let server = await status()
+            return EnsureResult(server: server)
         case .starting:
             break
         case .stopping:
             let budget = Self.boundedTimeoutSeconds(timeoutSeconds)
             let waitStart = ContinuousClock.now
-            guard await waitForStoppingToClear(timeout: .seconds(budget)) else {
-                return EnsureResult(reason: .timeout, server: status())
+            let cleared = await waitForStoppingToClear(timeout: .seconds(budget))
+            guard cleared else {
+                let server = await status()
+                return EnsureResult(reason: .timeout, server: server)
             }
             /** The caller's timeout covers the whole ensure, so the rest of
                 it (start and the health wait) gets only what the stop wait
@@ -533,7 +529,8 @@ public actor ServerSupervisor {
             }
         }
         let outcome = await wait(for: .healthy, timeoutSeconds: timeoutSeconds)
-        return EnsureResult(reason: outcome, server: status())
+        let server = await status()
+        return EnsureResult(reason: outcome, server: server)
     }
 
     /** Clamp a wire-supplied timeout to a range `Duration.seconds` can represent
@@ -584,32 +581,26 @@ public actor ServerSupervisor {
         graceSeconds requestedGrace: Double? = nil, deliberate: Bool = true, reason: String
     ) async -> ServerStatus {
         let graceSeconds = requestedGrace ?? stopTiming.graceSeconds
-        /** The overtime margin past the grace window: comfortably past the
-            SIGKILL escalation below (which fires at the grace deadline) and
-            past the crash path's own 1s escalation grace, so an ordinary
-            teardown never trips this, and only a stop that is genuinely never
-            landing (a bug elsewhere, or a child recordOutcome cannot reap)
-            does. */
-        let stopWaitTimeout = Duration.seconds(graceSeconds + stopTiming.overtimeSeconds)
+        let stopWaitTimeout = stopWaitBound(graceSeconds: graceSeconds)
         switch phase {
         case .failed where pid != nil:
             /** A port failure leaves its run alive, so it stops like a
                 running one. */
             break
         case .stopped, .crashed, .failed:
-            return status()
+            return await status()
         case .stopping:
             if await !waitForStoppingToClear(timeout: stopWaitTimeout) {
                 await recordStuckStop(after: stopWaitTimeout)
             }
-            return status()
+            return await status()
         case .starting, .running, .unhealthy:
             break
         }
         guard let target = pid else {
             guard phase == .starting else {
                 phase = .stopped
-                return status()
+                return await status()
             }
             /** The launcher has not reported a pid yet (a launchd job takes a
                 moment to publish one). Reading `.stopped` here would let that
@@ -623,24 +614,14 @@ public actor ServerSupervisor {
                     text: "stop waited \(seconds)s for the process to start and gave up; it may still come up")
                 DirectaLog.supervisor.error(
                     "\(spec.name) stop waited \(seconds)s for the process to start and gave up; it may still come up")
-                return status()
+                return await status()
             }
             return await stop(graceSeconds: requestedGrace, deliberate: deliberate, reason: reason)
         }
-        stopRequested = true
-        stopWasDeliberate = deliberate
-        stopReason = reason
-        stoppingWaitBound = stopWaitTimeout
-        phase = .stopping
-        let activity = DaemonActivity.shared.begin(.stop, label: "\(activityID): \(reason)")
+        let activity = DaemonActivity.shared.begin(.stop, label: "\(serverID): \(reason)")
         defer { DaemonActivity.shared.end(activity, outcome: phase.rawValue) }
-        /** Captured before any await: recordOutcome for this same exit can run
-            during the awaits below and clear the live fields. The log append
-            is itself an await (actor hop to logStore), so it runs after this
-            capture too, not before it. */
-        let keys = teardownKeys
-        await logStore.append(stream: .sys, text: "stopping: \(reason)")
-        let signaled = signalRun(target: target, keys: keys, signalGroup: true, signal: SIGTERM)
+        let pass = await beginStop(
+            target: target, reason: reason, deliberate: deliberate, graceSeconds: graceSeconds)
         /** The grace ends early only once the root and every SIGTERM candidate
             have exited: a descendant still shutting down after the root is
             gone keeps the rest of its grace rather than meeting SIGKILL the
@@ -649,25 +630,15 @@ public actor ServerSupervisor {
         while ContinuousClock.now < deadline {
             let rootRunning =
                 runTask != nil
-                && (keys.rootIdentity.map(ProcessTree.isRunning) ?? (kill(target, 0) == 0))
-            if !rootRunning, !signaled.contains(where: ProcessTree.isRunning) { break }
+                && (pass.keys.rootIdentity.map(ProcessTree.isRunning) ?? (kill(target, 0) == 0))
+            if !rootRunning, !pass.candidates.contains(where: ProcessTree.isRunning) { break }
             try? await Task.sleep(for: .milliseconds(100))
         }
-        /** Escalate over a freshly re-derived union (new children may have
-            appeared during the grace window) plus everything the SIGTERM pass
-            already reached: a descendant that ignored that pass and then became
-            invisible to every live source (setsid, the now-dead root's parent
-            chain, younger than the snapshot) is still re-signaled, revalidated
-            against its recorded identity. signalRun SIGKILLs the group only
-            while the root still lives, and otherwise the survivors
-            individually. */
-        signalRun(
-            target: target, keys: keys, signalGroup: true, signal: SIGKILL,
-            priorCandidates: signaled)
+        escalate(pass)
         if await !waitForStoppingToClear(timeout: stopWaitTimeout) {
             await recordStuckStop(after: stopWaitTimeout)
         }
-        return status()
+        return await status()
     }
 
     /** A deliberate stop for a caller about to drop this supervisor (unregister,
@@ -689,6 +660,16 @@ public actor ServerSupervisor {
         return true
     }
 
+    /** How long a stop with this grace waits for the phase to clear. The
+        overtime margin sits comfortably past the SIGKILL escalation (which
+        fires at the grace deadline) and past the crash path's own escalation
+        grace, so an ordinary teardown never trips it, and only a stop that is
+        genuinely never landing (a bug elsewhere, or a child recordOutcome
+        cannot reap) does. */
+    private func stopWaitBound(graceSeconds: Double) -> Duration {
+        .seconds(graceSeconds + stopTiming.overtimeSeconds)
+    }
+
     /** What a teardown pass keys on besides the root pid, read together from
         the live fields so a caller captures them in one step before any await
         (a concurrent start or recordOutcome replaces both). */
@@ -699,6 +680,51 @@ public actor ServerSupervisor {
 
     private var teardownKeys: TeardownKeys {
         TeardownKeys(rootIdentity: rootIdentity, snapshot: lastDescendantSnapshot)
+    }
+
+    /** A SIGTERM pass, carried into the SIGKILL pass that escalates it. */
+    private struct TeardownPass: Sendable {
+        /** The union the SIGTERM pass signaled over. */
+        let candidates: [ProcessIdentity]
+        let keys: TeardownKeys
+        let signalGroup: Bool
+        let target: pid_t
+    }
+
+    /** The opening of every stop of a known pid: records what the stop asked
+        for, moves the phase to `.stopping`, writes the reason into the
+        server's own log, and sends the SIGTERM pass. The teardown keys are
+        captured before any await, since `recordOutcome` for this same exit can
+        run during the log append and clear the live fields. */
+    private func beginStop(
+        target: pid_t, reason: String, deliberate: Bool, graceSeconds: Double
+    ) async -> TeardownPass {
+        pendingStop = StopRequest(
+            deliberate: deliberate, reason: reason,
+            waitBound: stopWaitBound(graceSeconds: graceSeconds))
+        phase = .stopping
+        let keys = teardownKeys
+        await logStore.append(stream: .sys, text: "stopping: \(reason)")
+        return terminate(target: target, keys: keys, signalGroup: true)
+    }
+
+    private func terminate(target: pid_t, keys: TeardownKeys, signalGroup: Bool) -> TeardownPass {
+        TeardownPass(
+            candidates: signalRun(target: target, keys: keys, signalGroup: signalGroup, signal: SIGTERM),
+            keys: keys, signalGroup: signalGroup, target: target)
+    }
+
+    /** The SIGKILL pass over a freshly re-derived union (new children may have
+        appeared during the grace window) plus everything the SIGTERM pass
+        already reached: a descendant that ignored that pass and then became
+        invisible to every live source (setsid, the now-dead root's parent
+        chain, younger than the snapshot) is still re-signaled, revalidated
+        against its recorded identity. The group is signaled only while the
+        root still lives, and otherwise the survivors individually. */
+    private func escalate(_ pass: TeardownPass) {
+        signalRun(
+            target: pass.target, keys: pass.keys, signalGroup: pass.signalGroup, signal: SIGKILL,
+            priorCandidates: pass.candidates)
     }
 
     /** One revalidated teardown pass. Descendants come from every source at once
@@ -729,27 +755,32 @@ public actor ServerSupervisor {
         return candidates
     }
 
-    public func status() -> ServerStatus {
+    public func status() async -> ServerStatus {
+        await fillLogTailIfUnread()
+        return statusSnapshot()
+    }
+
+    private var isTerminal: Bool {
+        phase == .crashed || phase == .failed
+    }
+
+    /** A server rehydrated as crashed or failed after a daemon restart has no
+        tail in memory (only errorSummary and terminalEvidence are persisted),
+        so the first status read fills it and every later one serves that
+        read; a new run clears it. */
+    private func fillLogTailIfUnread() async {
+        guard isTerminal, case .unread = recentLogTail else { return }
+        let generation = runGeneration
+        let tail = await readLogTail()
+        guard generation == runGeneration, case .unread = recentLogTail else { return }
+        recentLogTail = .read(tail)
+    }
+
+    private func statusSnapshot() -> ServerStatus {
         let check = EffectiveHealthcheck.resolve(spec: spec)
-        let terminal = phase == .crashed || phase == .failed
-        /** The tail is captured once at the transition and served from memory. A
-            server rehydrated as crashed after a daemon restart has none in memory
-            (only errorSummary and terminalEvidence are persisted), so the first
-            status() call after rehydrate reads the log family and every later
-            call serves the cached result; start()/adopt() clear the cache at the
-            next spawn. */
-        let tail: [String]?
-        if terminal {
-            if let cached = recentLogTail {
-                tail = cached
-            } else {
-                let read = spoolTail()
-                recentLogTail = read
-                tail = read
-            }
-        } else {
-            tail = nil
-        }
+        let terminal = isTerminal
+        let tail: [String]? =
+            if terminal, case .read(let cached) = recentLogTail { cached } else { nil }
         let evidence = terminal ? (terminalEvidence ?? tail) : nil
         return ServerStatus(
             blockedOn: stallStreak >= 2 && phase == .crashed ? "interactive-auth" : nil,
@@ -792,8 +823,7 @@ public actor ServerSupervisor {
         /** With a real healthcheck, wait a short beat before the first probe so a
             server that binds immediately is not marked unhealthy on a startup
             blip; with no healthcheck, the resolved stabilization window is the
-            delay instead. Unrelated to descendantWatchIntervalMs, which happens
-            to share the value but paces the process-snapshot sweep. */
+            delay instead. */
         let defaultInitialProbeDelayMs = 200
         let initialDelayMs: Int
         if case .none(let stabilizationMs) = check {
@@ -823,7 +853,7 @@ public actor ServerSupervisor {
         }
     }
 
-    private func recordProbe(success: Bool) {
+    private func recordProbe(success: Bool) async {
         /** Probes landing after the process died must not resurrect state. */
         guard phase == .starting || phase == .running || phase == .unhealthy else { return }
         if pid != nil {
@@ -863,11 +893,13 @@ public actor ServerSupervisor {
                 `starting` until the deadline callers chose, never `unhealthy`. */
             if everHealthy, phase == .running, consecutiveFailures >= unhealthyAfter {
                 phase = .unhealthy
+                postHealthEvent(.unhealthy)
                 /** The process is still writing, so snapshot the err tally at the
                     moment it degrades; a later recovery to running clears nothing,
                     so the count reflects the most recent unhealthy episode. */
-                errorSummary = captureErrorSummary(since: startedAt)
-                postHealthEvent(.unhealthy)
+                let generation = runGeneration
+                let summary = await captureErrorSummary(since: startedAt)
+                if generation == runGeneration { errorSummary = summary }
             }
         }
     }
@@ -878,7 +910,7 @@ public actor ServerSupervisor {
     private func scanObservedPort() {
         guard let rootPid = pid else { return }
         let expected = effectivePort ?? spec.port
-        let generation = listenScanGeneration
+        let generation = runGeneration
         Task { [weak self] in
             let pids = [rootPid] + ProcessTree.descendants(of: rootPid).pids
             let ports = await PortGuard.listeningPorts(pids: pids)
@@ -891,11 +923,11 @@ public actor ServerSupervisor {
     private func applyListenScan(
         expected: Int?, generation: UInt64, ours: [Int], ports: [Int]
     ) async {
-        guard generation == listenScanGeneration else { return }
-        await recordObservedPort(ports: ports)
+        guard generation == runGeneration else { return }
+        await recordObservedPort(generation: generation, ports: ports)
         guard let expected else { return }
         let owners = await PortGuard.listenerPids(port: expected)
-        await recordPortOwnership(expected: expected, owners: owners, ours: ours)
+        await recordPortOwnership(expected: expected, generation: generation, owners: owners, ours: ours)
     }
 
     /** The managed server whose recorded pid holds one of these listeners, if
@@ -904,9 +936,8 @@ public actor ServerSupervisor {
         alone. Returns the server name and its project separately: the internal
         id is `<project>::<name>`, which is not a string to show a reader. */
     private func managedOwner(among foreign: [Int]) async -> (name: String, project: String)? {
-        let myID = serverID(project: projectPath, name: spec.name)
         let candidates = Set(foreign)
-        for (id, entry) in await registry.allPersistedState() where id != myID {
+        for (id, entry) in await registry.allPersistedState() where id != serverID {
             guard let pid = entry.pid, candidates.contains(pid) else { continue }
             /** A recorded pid is not an identity: macOS recycles pid numbers, so
                 a stale row left by a killed daemon can name a pid that now
@@ -917,11 +948,11 @@ public actor ServerSupervisor {
                 after. One second of slack covers the spawn-to-record gap. */
             guard let startedAt = entry.startedAt,
                 let narrowed = ProcessTree.narrowed(pid),
-                let identity = ProcessTree.identity(of: narrowed)
+                let identity = ProcessTree.identity(of: narrowed),
+                ProcessTree.startTimeConsistent(
+                    processStart: identity.wallClockStart, persistedStartedAt: startedAt, tolerance: 1),
+                let parsed = parseServerID(id)
             else { continue }
-            let processStart = Date(timeIntervalSince1970: TimeInterval(identity.startSeconds))
-            guard processStart <= startedAt.addingTimeInterval(1) else { continue }
-            guard let parsed = parseServerID(id) else { continue }
             return parsed
         }
         return nil
@@ -945,7 +976,9 @@ public actor ServerSupervisor {
         belongs to another server this daemon supervises is theft proven, and
         only then does the phase change. Everything else is annotated so a reader
         can see the ambiguity without the server being taken down for it. */
-    private func recordPortOwnership(expected: Int, owners: [Int], ours: [Int]) async {
+    private func recordPortOwnership(
+        expected: Int, generation: UInt64, owners: [Int], ours: [Int]
+    ) async {
         guard phase == .running || phase == .starting else { return }
         guard portConflict == nil else { return }
         guard !owners.isEmpty else { return }
@@ -984,39 +1017,22 @@ public actor ServerSupervisor {
                 "port-foreign-unattributed \(spec.name)@\(projectPath) port \(expected) owned by \(described)")
             return
         }
-        portConflict = PortConflict(
-            declaredPort: declaredPort ?? expected,
-            effectivePort: expected,
-            holder: "\(thief.name)@\(thief.project)",
-            message:
-                "healthcheck passed but managed server '\(thief.name)' in \(thief.project) owns port \(expected), not this server; run: directa stop \(ShellWord.argument(thief.name)) --project \(ShellWord.argument(thief.project))",
-            state: .foreign)
-        phase = .failed
-        spawnError = SpawnError(
-            message: "port \(expected) is owned by managed server '\(thief.name)' in \(thief.project), so the healthcheck was answered by another directa server")
-        errorSummary = captureErrorSummary(since: startedAt)
-        let tail = spoolTail()
-        recentLogTail = tail
-        terminalEvidence = tail
-        healthTask?.cancel()
-        DirectaLog.supervisor.error(
-            "port-foreign \(spec.name)@\(projectPath) port \(expected) owned by \(thief.name)@\(thief.project)")
-        await events?.post(
-            kind: .failed, project: projectPath, server: spec.name,
-            detail: "port \(expected) owned by managed server '\(thief.name)' in \(thief.project)")
-        let id = serverID(project: projectPath, name: spec.name)
-        let summary = errorSummary
-        let err = spawnError
-        let evidence = terminalEvidence
-        await registryUpdate(id: id) { entry in
-            entry.errorSummary = summary
-            entry.phase = .failed
-            entry.spawnError = err
-            entry.terminalEvidence = evidence
-        }
+        await failRun(
+            conflict: PortConflict(
+                declaredPort: declaredPort ?? expected,
+                effectivePort: expected,
+                holder: "\(thief.name)@\(thief.project)",
+                message:
+                    "healthcheck passed but managed server '\(thief.name)' in \(thief.project) owns port \(expected), not this server; run: directa stop \(ShellWord.argument(thief.name)) --project \(ShellWord.argument(thief.project))",
+                state: .foreign),
+            error: SpawnError(
+                message: "port \(expected) is owned by managed server '\(thief.name)' in \(thief.project), so the healthcheck was answered by another directa server"),
+            eventDetail: "port \(expected) owned by managed server '\(thief.name)' in \(thief.project)",
+            generation: generation,
+            logLine: "port-foreign \(spec.name)@\(projectPath) port \(expected) owned by \(thief.name)@\(thief.project)")
     }
 
-    private func recordObservedPort(ports: [Int]) async {
+    private func recordObservedPort(generation: UInt64, ports: [Int]) async {
         guard !ports.isEmpty else { return }
         let expected = effectivePort ?? spec.port
         let claimPorts = Set(portClaim?.allPorts ?? expected.map { [$0] } ?? [])
@@ -1038,32 +1054,48 @@ public actor ServerSupervisor {
             if ports.contains(expected) { return }
         }
         guard observed != expected else { return }
-        portConflict = PortConflict(
-            declaredPort: declaredPort ?? expected,
-            effectivePort: expected,
-            message:
-                "server listened on \(observed) instead of \(expected); add {port} to the command, set portEnv, or use --port / directa.local.json",
-            state: .drift)
+        await failRun(
+            conflict: PortConflict(
+                declaredPort: declaredPort ?? expected,
+                effectivePort: expected,
+                message:
+                    "server listened on \(observed) instead of \(expected); add {port} to the command, set portEnv, or use --port / directa.local.json",
+                state: .drift),
+            error: SpawnError(message: "port drift: expected \(expected), observed \(observed)"),
+            eventDetail: "port drift \(expected)->\(observed)",
+            generation: generation,
+            logLine: "port-drift \(spec.name)@\(projectPath) expected \(expected) observed \(observed)")
+    }
+
+    /** Fails a live run for a port reason, leaving its process running (the
+        caller decides whether to stop it). The error tally and log tail are
+        read first, then the whole failure lands in one step, and only while
+        the run the scan was taken for is still the current one and has not
+        ended or failed already: those reads are awaits, and a run that
+        stopped or failed meanwhile has its own terminal state that must not
+        be overwritten. */
+    private func failRun(
+        conflict: PortConflict, error: SpawnError, eventDetail: String, generation: UInt64,
+        logLine: String
+    ) async {
+        let summary = await captureErrorSummary(since: startedAt)
+        let tail = await readLogTail()
+        guard generation == runGeneration,
+            phase == .running || phase == .starting || phase == .unhealthy
+        else { return }
+        portConflict = conflict
         phase = .failed
-        spawnError = SpawnError(message: "port drift: expected \(expected), observed \(observed)")
-        errorSummary = captureErrorSummary(since: startedAt)
-        let tail = spoolTail()
-        recentLogTail = tail
-        terminalEvidence = tail
+        spawnError = error
+        errorSummary = summary
+        storeTerminalTail(tail)
         healthTask?.cancel()
-        DirectaLog.supervisor.error(
-            "port-drift \(spec.name)@\(projectPath) expected \(expected) observed \(observed)")
-        await events?.post(
-            kind: .failed, project: projectPath, server: spec.name,
-            detail: "port drift \(expected)->\(observed)")
-        let id = serverID(project: projectPath, name: spec.name)
-        let summary = errorSummary
-        let err = spawnError
+        DirectaLog.supervisor.error(logLine)
+        await events?.post(kind: .failed, project: projectPath, server: spec.name, detail: eventDetail)
         let evidence = terminalEvidence
-        await registryUpdate(id: id) { entry in
+        await registryUpdate { entry in
             entry.errorSummary = summary
             entry.phase = .failed
-            entry.spawnError = err
+            entry.spawnError = error
             entry.terminalEvidence = evidence
         }
     }
@@ -1108,7 +1140,72 @@ public actor ServerSupervisor {
         return (projectPath as NSString).appendingPathComponent(cwd)
     }
 
-    private func recordSpawn(pid childPid: pid_t, id: String) async {
+    /** Clears everything the previous run left and enters `.starting`, the
+        common opening of `start()` and `adopt()`. */
+    private func resetForNewRun() {
+        runGeneration += 1
+        phase = .starting
+        pendingStop = nil
+        spawnError = nil
+        errorSummary = nil
+        terminalEvidence = nil
+        everHealthy = false
+        observedPort = nil
+        recentLogTail = .unread
+        lastDescendantSnapshot = []
+        consecutiveFailures = 0
+        consecutiveSuccesses = 0
+        runningSpecHash = Self.specHash(spec)
+    }
+
+    private func startTailers(startAtEnd: Bool) async {
+        let out = SpoolTailer(
+            startAtEnd: startAtEnd, store: logStore, stream: .out,
+            url: paths.spoolOutFile(project: projectPath, server: spec.name))
+        let err = SpoolTailer(
+            startAtEnd: startAtEnd, store: logStore, stream: .err,
+            url: paths.spoolErrFile(project: projectPath, server: spec.name))
+        outTailer = out
+        errTailer = err
+        await out.start()
+        await err.start()
+    }
+
+    /** Everything a run whose pid is known gets once it is under supervision,
+        spawned or adopted: its start time, tailers, the `started` log line and
+        event, health and descendant watches, and a state row that restores it
+        at the next boot. Settles the spawn waiters last. */
+    private func beginSupervising(pid childPid: pid_t, startedAt runStartedAt: Date, as supervision: Supervision)
+        async
+    {
+        startedAt = runStartedAt
+        switch supervision {
+        case .adopted:
+            await startTailers(startAtEnd: true)
+            await logStore.append(stream: .sys, text: "adopted pid=\(childPid)")
+            await events?.post(
+                kind: .started, project: projectPath, server: spec.name,
+                detail: DaemonRestartDetail.adopted(pid: childPid))
+        case .spawned:
+            await startTailers(startAtEnd: false)
+            await logStore.append(stream: .sys, text: "started pid=\(childPid)")
+            await events?.post(kind: .started, project: projectPath, server: spec.name, detail: "pid \(childPid)")
+        }
+        startHealthMonitor()
+        startDescendantWatch()
+        await registryUpdate { entry in
+            if case .adopted(let boundPort) = supervision { entry.boundPort = boundPort }
+            entry.lastExit = nil
+            entry.phase = .starting
+            entry.pid = Int(childPid)
+            entry.resumeOnBoot = true
+            entry.spawnError = nil
+            entry.startedAt = runStartedAt
+        }
+        spawnWaiters.settleAll()
+    }
+
+    private func recordSpawn(pid childPid: pid_t) async {
         pid = childPid
         /** Nil when a short-lived root was already reaped before this hop ran:
             teardown then never signals the group, and the lineage walk keys on
@@ -1119,66 +1216,25 @@ public actor ServerSupervisor {
             await stopRemovedSpawn(target: childPid, reason: removalReason)
             return
         }
-        let spawnedAt = Date()
-        startedAt = spawnedAt
-        let out = SpoolTailer(
-            store: logStore, stream: .out,
-            url: paths.spoolOutFile(project: projectPath, server: spec.name))
-        let err = SpoolTailer(
-            store: logStore, stream: .err,
-            url: paths.spoolErrFile(project: projectPath, server: spec.name))
-        outTailer = out
-        errTailer = err
-        await out.start()
-        await err.start()
-        await logStore.append(stream: .sys, text: "started pid=\(childPid)")
-        await events?.post(kind: .started, project: projectPath, server: spec.name, detail: "pid \(childPid)")
-        startHealthMonitor()
-        startDescendantWatch()
-        await registryUpdate(id: id) { entry in
-            entry.lastExit = nil
-            entry.phase = .starting
-            entry.pid = Int(childPid)
-            entry.resumeOnBoot = true
-            entry.spawnError = nil
-            entry.startedAt = spawnedAt
-        }
-        settleSpawnWaiters()
+        await beginSupervising(pid: childPid, startedAt: Date(), as: .spawned)
     }
 
     /** A pid that arrives after `stopForRemoval` (its stop gave up while the
         launcher had not published one yet): nothing supervises this run any
-        more, so it is torn down instead of recorded, through `signalRun` like
-        any stop. This runs inside the launcher's own spawn callback, and the
-        run cannot finish until that returns, so it signals SIGTERM and leaves
-        the SIGKILL escalation to a task after the grace rather than awaiting
-        the exit. `recordOutcome` then lands `.stopped`, its state writes
-        abandoned when the removal already gave up. */
+        more, so it is torn down instead of recorded, through the same passes
+        as any stop. This runs inside the launcher's own spawn callback, and
+        the run cannot finish until that returns, so it signals SIGTERM and
+        leaves the SIGKILL escalation to a task after the grace rather than
+        awaiting the exit. `recordOutcome` then lands `.stopped`, its state
+        writes abandoned when the removal already gave up. */
     private func stopRemovedSpawn(target: pid_t, reason: String) async {
         let grace = stopTiming.graceSeconds
-        stopRequested = true
-        stopWasDeliberate = true
-        stopReason = reason
-        stoppingWaitBound = .seconds(grace + stopTiming.overtimeSeconds)
-        phase = .stopping
-        settleSpawnWaiters()
-        let keys = teardownKeys
-        await logStore.append(stream: .sys, text: "stopping: \(reason)")
-        let signaled = signalRun(target: target, keys: keys, signalGroup: true, signal: SIGTERM)
+        let pass = await beginStop(target: target, reason: reason, deliberate: true, graceSeconds: grace)
+        spawnWaiters.settleAll()
         Task {
             try? await Task.sleep(for: .seconds(grace))
-            self.escalateRemovedSpawn(target: target, keys: keys, priorCandidates: signaled)
+            self.escalate(pass)
         }
-    }
-
-    /** The SIGKILL half of `stopRemovedSpawn`, the same revalidated pass
-        `stop()` escalates with. */
-    private func escalateRemovedSpawn(
-        target: pid_t, keys: TeardownKeys, priorCandidates: [ProcessIdentity]
-    ) {
-        signalRun(
-            target: target, keys: keys, signalGroup: true, signal: SIGKILL,
-            priorCandidates: priorCandidates)
     }
 
     /** The launcher learned of the process only after it had already exited
@@ -1193,16 +1249,7 @@ public actor ServerSupervisor {
         settles the spawn waiters. */
     private func recordExitedBeforeWatch(pid childPid: pid_t?) async {
         startedAt = Date()
-        let out = SpoolTailer(
-            store: logStore, stream: .out,
-            url: paths.spoolOutFile(project: projectPath, server: spec.name))
-        let err = SpoolTailer(
-            store: logStore, stream: .err,
-            url: paths.spoolErrFile(project: projectPath, server: spec.name))
-        outTailer = out
-        errTailer = err
-        await out.start()
-        await err.start()
+        await startTailers(startAtEnd: false)
         let subject = childPid.map { "pid=\($0)" } ?? "process"
         await logStore.append(stream: .sys, text: "\(subject) exited before directa could watch it")
     }
@@ -1210,11 +1257,11 @@ public actor ServerSupervisor {
     /** Merges rather than replaces. A refresh that runs after the root has
         exited but before `recordOutcome` walks a parent chain the root no
         longer heads, since its children reparent to launchd at exit, and
-        replacing the snapshot with that empty walk erased the only record of
-        a setsid descendant, which neither the group nor the session reaches.
-        An earlier entry stays while its pid still names the same process, so
-        exited and recycled entries drop out and the snapshot never grows past
-        the live tree. */
+        replacing the snapshot with that empty walk would erase the only record
+        of a setsid descendant, which neither the group nor the session
+        reaches. An earlier entry stays while its pid still names the same
+        process, so exited and recycled entries drop out and the snapshot never
+        grows past the live tree. */
     private func refreshDescendantSnapshot() {
         guard let pid else { return }
         let fresh: [ProcessIdentity]
@@ -1245,13 +1292,13 @@ public actor ServerSupervisor {
         either. Whatever was recorded while the root still parented them is all
         teardown has.
 
-        A single sample shortly after spawn was not enough. Servers commonly
-        fork their workers a beat after starting, and until the first health
-        probe nothing else refreshed the snapshot: with no healthcheck declared
-        that first probe is a full stabilization window away, so a worker that
-        appeared in between was in no snapshot at all and a crash orphaned it for
-        good. Health probes take over afterward, which bounds staleness to the
-        probe interval for the rest of the run.
+        Servers commonly fork their workers a beat after starting, and until the
+        first health probe nothing else refreshes the snapshot: with no
+        healthcheck declared that first probe is a full stabilization window
+        away, so one sample shortly after spawn would miss a worker that
+        appeared in between, and a crash would orphan it for good. Health
+        probes take over afterward, which bounds staleness to the probe
+        interval for the rest of the run.
 
         The sweep is a whole-process-table sysctl measured at well under a
         millisecond, and this runs only while the server is still starting, so
@@ -1278,14 +1325,32 @@ public actor ServerSupervisor {
 
     /** Snapshot the err-stream tally for the run that just started at
         `windowStart`. Reads only from that point forward, so a crash loop reports
-        the current incarnation rather than the whole log history. */
-    private func captureErrorSummary(since windowStart: Date?) -> ErrorSummary? {
-        LogQuery.summarize(
-            current: paths.structuredLogFile(project: projectPath, server: spec.name),
-            streams: [.err], since: windowStart)
+        the current incarnation rather than the whole log history. The read runs
+        on `BlockingLane.system`, off this actor, and every line it must count
+        is already written: a tailer's append reaches the file before it
+        returns. */
+    private func captureErrorSummary(since windowStart: Date?) async -> ErrorSummary? {
+        let current = paths.structuredLogFile(project: projectPath, server: spec.name)
+        return await BlockingLane.system.run {
+            LogQuery.summarize(current: current, streams: [.err], since: windowStart)
+        }
     }
 
-    private func recordSpawnFailure(_ error: SpawnError, id: String) async {
+    /** Last structured lines (out/err/sys), for crash/failure forensics, read
+        through the log store so the read is ordered against its appends. */
+    private func readLogTail(lines: Int = 40) async -> [String]? {
+        let records = await logStore.query(LogQueryOptions(streams: [.err, .out, .sys], tail: lines))
+        return records.isEmpty ? nil : records.map(\.contextLine)
+    }
+
+    /** Records `tail` as both the tail a terminal status shows and the
+        evidence `why` reads. */
+    private func storeTerminalTail(_ tail: [String]?) {
+        recentLogTail = .read(tail)
+        terminalEvidence = tail
+    }
+
+    private func recordSpawnFailure(_ error: SpawnError) async {
         spawnError = error
         await logStore.append(stream: .sys, text: "spawn failed: \(error.message)")
         await events?.post(kind: .failed, project: projectPath, server: spec.name, detail: error.message)
@@ -1294,11 +1359,10 @@ public actor ServerSupervisor {
         runTask = nil
         healthTask?.cancel()
         healthTask = nil
-        let tail = spoolTail()
-        recentLogTail = tail
-        terminalEvidence = tail
+        let tail = await readLogTail()
+        storeTerminalTail(tail)
         let evidence = terminalEvidence
-        await registryUpdate(id: id) { entry in
+        await registryUpdate { entry in
             entry.phase = .failed
             entry.pid = nil
             entry.spawnError = error
@@ -1306,10 +1370,10 @@ public actor ServerSupervisor {
             entry.terminalEvidence = evidence
         }
         phase = .failed
-        settleSpawnWaiters()
+        spawnWaiters.settleAll()
     }
 
-    private func recordOutcome(_ outcome: ProcessOutcome, id: String) async {
+    private func recordOutcome(_ outcome: ProcessOutcome) async {
         runTask = nil
         /** Capture this run's teardown inputs before the awaits below: a
             concurrent start() can replace `pid` and the teardown keys while
@@ -1317,12 +1381,12 @@ public actor ServerSupervisor {
             that just exited, never on a newly started one. */
         let capturedPid = pid
         let capturedKeys = teardownKeys
-        listenScanGeneration += 1
+        runGeneration += 1
         healthTask?.cancel()
         healthTask = nil
         switch outcome {
         case .spawnFailed(let error):
-            await recordSpawnFailure(error, id: id)
+            await recordSpawnFailure(error)
             return
         case .exited(let code):
             lastExit = LastExit(at: Date(), code: code, signal: nil)
@@ -1338,10 +1402,9 @@ public actor ServerSupervisor {
         errTailer = nil
         /** After the final drain, so the lines that explain the exit are in the
             log before the snapshots are taken. */
-        let tail = spoolTail()
-        recentLogTail = tail
-        terminalEvidence = tail
-        errorSummary = captureErrorSummary(since: windowStart)
+        let tail = await readLogTail()
+        storeTerminalTail(tail)
+        errorSummary = await captureErrorSummary(since: windowStart)
         descendantTask?.cancel()
         descendantTask = nil
         lastDescendantSnapshot = []
@@ -1349,11 +1412,12 @@ public actor ServerSupervisor {
         pid = nil
         startedAt = nil
         observedPort = nil
-        /** Read once, before the reset below: retireIntent and the descendant
-            escalation both need to know whether directa's own stop() asked for
-            THIS exit, which `finalPhase` alone can no longer tell them now that
-            an external graceful signal also lands `.stopped`. */
-        let wasStopRequested = stopRequested
+        /** Read once, before the awaits below: whether directa's own stop()
+            asked for THIS exit decides the boot intent, the event, and the
+            descendant escalation, and `finalPhase` alone cannot tell, since an
+            external graceful signal also lands `.stopped` without directa
+            having asked. */
+        let requestedStop = pendingStop
         /** SIGTERM, SIGINT, and SIGHUP are what a well-behaved external
             supervisor, an IDE stop button, or a forwarded Ctrl-C sends for a
             graceful shutdown; directa did not ask for it, but nothing else
@@ -1361,20 +1425,16 @@ public actor ServerSupervisor {
             never runs its own handler for it), and neither can any other
             signal or a nonzero self-exit, so those stay `crashed`. */
         let externalGracefulSignal: Int? = {
-            guard case .signaled(let signal) = outcome, !wasStopRequested else { return nil }
+            guard case .signaled(let signal) = outcome, requestedStop == nil else { return nil }
             return Self.externalGracefulSignals.contains(signal) ? signal : nil
         }()
         let finalPhase: ServerPhase =
-            wasStopRequested || externalGracefulSignal != nil ? .stopped : .crashed
-        stopRequested = false
+            requestedStop != nil || externalGracefulSignal != nil ? .stopped : .crashed
         let exit = lastExit
         /** A deliberate stop retires the boot intent; a drain, an external
             signal, or a crash all keep whatever was recorded at start so the
-            next boot restores it. Gated on `wasStopRequested`, not
-            `finalPhase`: an external signal now also lands `.stopped` without
-            directa having asked for it, and must not retire an intent nobody
-            expressed. */
-        let retireIntent = wasStopRequested && finalPhase == .stopped && stopWasDeliberate
+            next boot restores it. */
+        let retireIntent = requestedStop?.deliberate == true
         let cause = exit?.code.map { "code=\($0)" } ?? exit?.signal.map { "signal=\($0)" } ?? "unknown"
         await logStore.append(stream: .sys, text: "exited \(cause)")
         /** A directa-requested stop's detail says why directa asked it down
@@ -1383,8 +1443,8 @@ public actor ServerSupervisor {
             nothing else in directa's own log explains it; a crash says how the
             process died. */
         let eventDetail: String
-        if wasStopRequested {
-            eventDetail = stopReason
+        if let requestedStop {
+            eventDetail = requestedStop.reason
         } else if let externalGracefulSignal {
             eventDetail = ExternalSignalDetail.format(signal: externalGracefulSignal)
         } else {
@@ -1415,7 +1475,7 @@ public actor ServerSupervisor {
             stallStreak = 0
         }
         let streak = stallStreak
-        await registryUpdate(id: id) { entry in
+        await registryUpdate { entry in
             entry.errorSummary = errors
             entry.lastExit = exit
             entry.phase = finalPhase
@@ -1426,13 +1486,13 @@ public actor ServerSupervisor {
             entry.terminalEvidence = evidence
         }
         phase = finalPhase
-        settleSpawnWaiters()
-        /** Gated on `wasStopRequested`, not `finalPhase`: an external graceful
-            signal now also lands `.stopped`, but directa's own stop() never
-            ran its SIGTERM/SIGKILL escalation over this run's descendants, so
-            they need the same sweep an ordinary crash gets or an orphaned
-            worker can outlive it holding a listener. */
-        if !wasStopRequested {
+        pendingStop = nil
+        spawnWaiters.settleAll()
+        /** An external graceful signal lands `.stopped` too, but directa's own
+            stop() never ran its SIGTERM/SIGKILL escalation over this run's
+            descendants, so they need the same sweep an ordinary crash gets or
+            an orphaned worker can outlive it holding a listener. */
+        if requestedStop == nil {
             await escalateCrashDescendants(rootPid: capturedPid, keys: capturedKeys)
         }
     }
@@ -1452,11 +1512,9 @@ public actor ServerSupervisor {
         still re-signaled. */
     private func escalateCrashDescendants(rootPid: pid_t?, keys: TeardownKeys) async {
         guard let rootPid else { return }
-        let signaled = signalRun(target: rootPid, keys: keys, signalGroup: false, signal: SIGTERM)
+        let pass = terminate(target: rootPid, keys: keys, signalGroup: false)
         try? await Task.sleep(for: .milliseconds(Self.crashEscalationGraceMilliseconds))
-        signalRun(
-            target: rootPid, keys: keys, signalGroup: false, signal: SIGKILL,
-            priorCandidates: signaled)
+        escalate(pass)
     }
 
     /** How long a crashed run's descendants get to answer SIGTERM before the
@@ -1477,53 +1535,14 @@ public actor ServerSupervisor {
     /** State persistence failures (full disk, permissions) must not kill the
         supervisor, but they must not vanish either: crash forensics silently
         missing is the suppression the repo rules forbid. */
-    private func registryUpdate(id: String, _ mutate: @escaping @Sendable (inout PersistedServerState) -> Void) async {
+    private func registryUpdate(_ mutate: @escaping @Sendable (inout PersistedServerState) -> Void) async {
         guard !stateWritesAbandoned else { return }
         do {
-            try await registry.updateState(serverID: id, writer: writerID, mutate)
+            try await registry.updateState(serverID: serverID, writer: writerID, mutate)
         } catch {
             FileHandle.standardError.write(
-                Data("ddirecta: state persistence failed for \(id): \(error)\n".utf8))
+                Data("ddirecta: state persistence failed for \(serverID): \(error)\n".utf8))
         }
-    }
-
-    private func settleSpawnWaiters() {
-        let waiters = spawnWaiters
-        spawnWaiters = []
-        for waiter in waiters {
-            waiter.deadlineTask?.cancel()
-            waiter.continuation.resume()
-        }
-    }
-
-    private func settleStoppingWaiters() {
-        let waiters = stoppingWaiters
-        stoppingWaiters = []
-        for waiter in waiters {
-            waiter.deadlineTask?.cancel()
-            waiter.continuation.resume()
-        }
-    }
-
-    /** The bounded half of `waitForSpawnSettled`, the same shape as
-        `expireStoppingWaiter`. */
-    private func expireSpawnWaiter(id: UUID) {
-        guard let index = spawnWaiters.firstIndex(where: { $0.id == id }) else { return }
-        let waiter = spawnWaiters.remove(at: index)
-        waiter.continuation.resume()
-    }
-
-    /** The bounded half of `waitForStoppingToClear`: picks its own waiter out
-        of the array by id and resumes it alone, leaving every other
-        registration (an unrelated caller's unbounded join, or another bounded
-        wait with a later deadline) untouched. A no-op once the real
-        transition already settled and removed this id first: the two can
-        never both resume the same continuation because both run as
-        actor-isolated methods and never interleave. */
-    private func expireStoppingWaiter(id: UUID) {
-        guard let index = stoppingWaiters.firstIndex(where: { $0.id == id }) else { return }
-        let waiter = stoppingWaiters.remove(at: index)
-        waiter.continuation.resume()
     }
 
     private static func specHash(_ spec: ServerSpec) -> String {
@@ -1536,12 +1555,42 @@ public actor ServerSupervisor {
         return running == Self.specHash(spec) ? nil : true
     }
 
-    /** Last structured lines (out/err/sys), for crash/failure forensics. */
-    private func spoolTail(lines: Int = 40) -> [String]? {
-        let records = LogQuery.run(
-            current: paths.structuredLogFile(project: projectPath, server: spec.name),
-            options: LogQueryOptions(streams: [.err, .out, .sys], tail: lines))
-        return records.isEmpty ? nil : records.map(\.contextLine)
+    /** Parks the caller on `list` while `pending` holds, until the transition
+        settles the list or `timeout` expires this one waiter. `pending` is
+        checked again inside the continuation closure, which closes the
+        lost-wakeup window between the caller's own check and the
+        registration. */
+    private func park(
+        on list: WaiterList, timeout: Duration?, activity kind: ActivityKind,
+        while pending: () -> Bool
+    ) async {
+        let id = UUID()
+        let activity = DaemonActivity.shared.begin(kind, label: serverID)
+        defer { DaemonActivity.shared.end(activity, outcome: phase.rawValue) }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            guard pending() else {
+                continuation.resume()
+                return
+            }
+            let deadlineTask = timeout.map { timeout in
+                Task { [weak self] in
+                    try? await Task.sleep(for: timeout)
+                    await self?.expireWaiter(id: id, on: list)
+                }
+            }
+            let waiter = PhaseWaiter(continuation: continuation, deadlineTask: deadlineTask, id: id)
+            switch list {
+            case .spawn: spawnWaiters.add(waiter)
+            case .stopping: stoppingWaiters.add(waiter)
+            }
+        }
+    }
+
+    private func expireWaiter(id: UUID, on list: WaiterList) {
+        switch list {
+        case .spawn: spawnWaiters.expire(id: id)
+        case .stopping: stoppingWaiters.expire(id: id)
+        }
     }
 
     /** Blocks until the in-flight start has either produced a pid or gone
@@ -1551,34 +1600,19 @@ public actor ServerSupervisor {
     @discardableResult
     private func waitForSpawnSettled(timeout: Duration? = nil) async -> Bool {
         guard phase == .starting, pid == nil else { return true }
-        let id = UUID()
-        let activity = DaemonActivity.shared.begin(.spawnWait, label: activityID)
-        defer { DaemonActivity.shared.end(activity, outcome: phase.rawValue) }
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            guard phase == .starting, pid == nil else {
-                continuation.resume()
-                return
-            }
-            let deadlineTask = timeout.map { timeout in
-                Task { [weak self] in
-                    try? await Task.sleep(for: timeout)
-                    await self?.expireSpawnWaiter(id: id)
-                }
-            }
-            spawnWaiters.append(
-                PhaseWaiter(continuation: continuation, deadlineTask: deadlineTask, id: id))
+        await park(on: .spawn, timeout: timeout, activity: .spawnWait) {
+            phase == .starting && pid == nil
         }
         return phase != .starting || pid != nil
     }
 
     /** Blocks until `phase` leaves `.stopping`, settled by its `didSet`
         wherever a stop's own recordOutcome (or a concurrent one for the same
-        run) lands `.stopped`/`.crashed`. Replaces polling `runTask == nil`,
-        which flips well before recordOutcome finishes draining the tailers and
-        writing the registry, so a caller that resumed on that alone would
-        recurse against a phase that had not actually moved. Checks phase again
-        inside the continuation closure to guard the same lost-wakeup window
-        `waitForSpawnSettled` guards.
+        run) lands `.stopped`/`.crashed`. Waiting on the phase rather than on
+        `runTask == nil` matters: `runTask` goes nil well before recordOutcome
+        finishes draining the tailers and writing the registry, so a caller
+        that resumed on that alone would recurse against a phase that had not
+        actually moved.
 
         `timeout` bounds only the CALLER's wait: only recordOutcome ever
         moves `phase` off `.stopping`, so a caller whose deadline fires still
@@ -1589,21 +1623,7 @@ public actor ServerSupervisor {
         false only when the deadline fired first. */
     private func waitForStoppingToClear(timeout: Duration) async -> Bool {
         guard phase == .stopping else { return true }
-        let id = UUID()
-        let activity = DaemonActivity.shared.begin(.stopWait, label: activityID)
-        defer { DaemonActivity.shared.end(activity, outcome: phase.rawValue) }
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            guard phase == .stopping else {
-                continuation.resume()
-                return
-            }
-            let deadlineTask = Task { [weak self] in
-                try? await Task.sleep(for: timeout)
-                await self?.expireStoppingWaiter(id: id)
-            }
-            stoppingWaiters.append(
-                PhaseWaiter(continuation: continuation, deadlineTask: deadlineTask, id: id))
-        }
+        await park(on: .stopping, timeout: timeout, activity: .stopWait) { phase == .stopping }
         return phase != .stopping
     }
 

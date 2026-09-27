@@ -501,7 +501,7 @@ private func makeEnv() throws -> TestEnv {
 
     /** An external SIGTERM lands `stopped`, not `crashed`, but directa's own
         stop() never ran its SIGTERM/SIGKILL escalation over this run: the
-        descendant sweep must still fire (gated on stopRequested, not phase) or
+        descendant sweep must still fire (gated on a directa-requested stop, not phase) or
         a session-escaped grandchild like this one outlives the exit. */
     @Test func externalSIGTERMStillEscalatesOrphanedDescendants() async throws {
         let fixture = try #require(fixtureServerExecutable())
