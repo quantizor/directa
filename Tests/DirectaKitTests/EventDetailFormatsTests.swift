@@ -16,6 +16,16 @@ import Testing
         #expect(!DaemonRestartDetail.matches("requested by stop"))
         #expect(!DaemonRestartDetail.matches("code=1"))
     }
+
+    /** A watched path can end in the adopt shape's suffix or start with the
+        bounce shape's prefix; only the exact shapes with a numeric pid match. */
+    @Test func rejectsADetailThatSharesOnlyTheShapesPrefixOrSuffix() {
+        #expect(!DaemonRestartDetail.matches("watch change in /p/x across daemon-restart"))
+        #expect(!DaemonRestartDetail.matches("daemon-restart: watch change in /p/x"))
+        #expect(!DaemonRestartDetail.matches("adopted pid abc across daemon-restart"))
+        #expect(!DaemonRestartDetail.matches("daemon-restart: orphan pid 12x bounced"))
+        #expect(!DaemonRestartDetail.matches("daemon-restart: orphan pid  bounced"))
+    }
 }
 
 @Suite struct ExternalSignalDetailTests {

@@ -32,7 +32,16 @@ public enum DaemonRestartDetail {
         contains the marker text somewhere in the middle (a watched path
         component literally named "daemon-restart", for instance). */
     public static func matches(_ detail: String) -> Bool {
-        detail == crashed || detail.hasPrefix("\(marker): ") || detail.hasSuffix(" across \(marker)")
+        detail == crashed
+            || isPid(detail, between: "\(marker): orphan pid ", and: " bounced")
+            || isPid(detail, between: "adopted pid ", and: " across \(marker)")
+    }
+
+    private static func isPid(_ detail: String, between prefix: String, and suffix: String) -> Bool {
+        guard detail.hasPrefix(prefix), detail.hasSuffix(suffix),
+            detail.count > prefix.count + suffix.count
+        else { return false }
+        return pid_t(detail.dropFirst(prefix.count).dropLast(suffix.count)) != nil
     }
 }
 
