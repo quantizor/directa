@@ -101,6 +101,9 @@ actor SpoolTailer {
         the rest of that line is dropped rather than ingested as if it were
         whole, however many chunks or drains it takes to reach its newline. */
     private var framer = LineFramer(maxPartialBytes: 16 * 1024)
+    /** Every spool byte before this offset has been ingested or skipped: the
+        point the block release trails by `retainBytes`. */
+    var ingestedThrough: UInt64 { offset }
     private let intervalMs: Int
     /** Unread bytes above this are skipped to the recent tail. Replaying a
         flood into a rotating structured log (10 MB) is wasted work, and a
@@ -256,6 +259,10 @@ actor SpoolTailer {
             let skipped = size - offset - cap
             offset = size - cap
             framer.discardThroughNextNewline()
+            /** Released before the next await (the report, or the emit of the
+                chunk read after it), so the tailer never yields with a
+                skipped backlog still holding data behind its read point. */
+            await releaseIngested()
             await reportSkipped(skipReport.add(skipped, now: .now))
         }
         return true

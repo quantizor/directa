@@ -288,6 +288,39 @@ private func tempDir() throws -> URL {
         #expect(sys.contains { $0.hasPrefix("spool catch-up skipped ") })
     }
 
+    /** A catch-up skip releases the skipped backlog before the tailer reads
+        the chunk after it, so no await (the skip report, the chunk's emit)
+        leaves skipped bytes holding data behind the read point. Every size
+        is a whole number of the volume's blocks, so each release lands
+        exactly: the skipped span less the window first, then one block per
+        chunk read. */
+    @Test func aCatchUpSkipReleasesTheSkippedBacklogBeforeReadingOn() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        let block = SpoolRelease.blockBytes(path: dir.path)
+        let line = Data(repeating: 0x61, count: block - 1) + Data("\n".utf8)
+        let backlog = 64 * block
+        try Data((0..<64).flatMap { _ in line }).write(to: spool)
+        let cap = 8 * block
+        let retain = 2 * block
+        let releases = OSAllocatedUnfairLock<[Range<UInt64>]>(initialState: [])
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(
+            intervalMs: 20, maxCatchUpBytes: cap, readChunkBytes: block,
+            releaseHole: { _, range in
+                releases.withLock { $0.append(range) }
+                return 0
+            },
+            retainBytes: retain, store: store, stream: .out, url: spool)
+        await tailer.start()
+        await tailer.stop()
+        let skippedEnd = UInt64(backlog - cap - retain)
+        let perChunk = (1...(cap / block)).map { index in
+            (skippedEnd + UInt64((index - 1) * block))..<(skippedEnd + UInt64(index * block))
+        }
+        #expect(releases.withLock { $0 } == [0..<skippedEnd] + perChunk)
+    }
+
     /** Re-attach to a spool a prior run already wrote into (adoption's use
         case): the seed-to-end drain must ingest nothing that predates it, and
         only bytes appended after that point. */
@@ -326,7 +359,11 @@ private func tempDir() throws -> URL {
         controls: `st_blocks` also counts the preallocation APFS reserves
         ahead of a fast sequential writer, which no hole punch reaches and
         which the file grows into, so it swings with the volume's own
-        policy rather than with anything the tailer did. */
+        policy rather than with anything the tailer did. Mid-flood, the data
+        is the retained window plus what the tailer has not read yet, and the
+        unread part is whatever the child wrote since the tailer last ran,
+        which a starved cooperative pool stretches without limit, so that
+        bound is measured against the tailer's own read point. */
     @Test(arguments: spoolOpenFlags)
     func aFloodingChildsSpoolStaysBoundedOnDisk(openFlags: Int32) async throws {
         let fixture = try #require(fixtureServerExecutable(), "fixture-server is not built; run swift build")
@@ -343,21 +380,31 @@ private func tempDir() throws -> URL {
         }
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         let retain = 16 * 1024
+        let chunk = 64 * 1024
         let tailer = SpoolTailer(
-            intervalMs: 20, maxCatchUpBytes: 256 * 1024, retainBytes: retain, store: store, stream: .out,
-            url: spool)
+            intervalMs: 20, maxCatchUpBytes: 256 * 1024, readChunkBytes: chunk, retainBytes: retain, store: store,
+            stream: .out, url: spool)
         await tailer.start()
         let floodBytes: Int64 = 2 * 1024 * 1024
         let deadline = ContinuousClock.now + .seconds(20)
         while try spoolSizes(spool).apparent < floodBytes, ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(20))
         }
-        /** Measured mid-flood, while a drain never reaches end of file: the
-            retained window, the catch-up cap, and a chunk in flight. */
+        /** Measured mid-flood, while a drain never reaches end of file. The
+            tailer answers between chunks, so its read point can lead its last
+            release by a chunk read but not yet released, on top of the window,
+            one release step, and a block of rounding; everything past the
+            read point is unread, counted up to the file's size after the
+            walk, since the walk sees whatever the child appends during it. */
+        let ingested = await tailer.ingestedThrough
+        let floodingData = try spoolDataBytes(spool)
         let flooding = try spoolSizes(spool)
         #expect(flooding.apparent >= floodBytes)
-        let floodingData = try spoolDataBytes(spool)
-        #expect(floodingData <= 512 * 1024, "data mid-flood \(floodingData)")
+        let unread = flooding.apparent - Int64(ingested)
+        let block = SpoolRelease.blockBytes(path: spool.path)
+        #expect(
+            floodingData <= unread + Int64(retain + retain / 4 + block + chunk),
+            "data mid-flood \(floodingData) with \(unread) unread")
         kill(child, SIGSTOP)
         await tailer.stop()
         let stopped = try spoolSizes(spool)
