@@ -1258,6 +1258,91 @@ private func makeEnv() throws -> TestEnv {
         #expect(lines.isEmpty, "log after a refused adopt: \(lines.map(\.text))")
     }
 
+    /** A stop that lands while `adopt` is still recording the run (its pid is
+        already set, its tailers and state write not yet done) gets the same
+        SIGTERM grace a stop of a finished adoption does. The survivor takes
+        half a second to shut down on SIGTERM and writes a marker when it
+        does; a stop that skipped the grace would SIGKILL it first. The stop is
+        queued from inside `prepareAdopt`, so it reaches the actor at one of
+        adoption's own awaits. */
+    @Test func stopDuringAdoptionKeepsTheGrace() async throws {
+        let env = try makeEnv()
+        let gate = AdoptGate()
+        let launcher = StopOnPrepareLauncher(gate: gate)
+        let supervisor = ServerSupervisor(
+            launcher: launcher, paths: env.paths, projectPath: env.projectPath,
+            registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "web"))
+        let stopTask = OSAllocatedUnfairLock<Task<ServerStatus, Never>?>(initialState: nil)
+        launcher.onPrepare {
+            stopTask.withLock { $0 = Task { await supervisor.stop(graceSeconds: 3, reason: "test") } }
+        }
+        let marker = URL(fileURLWithPath: env.projectPath).appending(path: "cleaned")
+        /** The runner blocks SIGTERM in its own mask, which a bare spawn
+            inherits, so the survivor resets its mask and dispositions the way
+            every real launcher does, or it would never see the stop's SIGTERM. */
+        let survivor = try spawnBare(
+            [
+                "/bin/sh", "-c",
+                "trap 'sleep 0.5; echo done > \"\(marker.path)\"; exit 0' TERM; while :; do sleep 0.1; done",
+            ],
+            flags: POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF
+        ) { attributes in
+            var none = sigset_t()
+            var all = sigset_t()
+            sigemptyset(&none)
+            sigfillset(&all)
+            posix_spawnattr_setsigmask(&attributes, &none)
+            posix_spawnattr_setsigdefault(&attributes, &all)
+        }
+        let reaper = Thread {
+            var status: Int32 = 0
+            waitpid(survivor, &status, 0)
+        }
+        reaper.start()
+        defer { kill(survivor, SIGKILL) }
+
+        #expect(
+            await supervisor.adopt(
+                pid: survivor, label: "dev.quantizor.directa.job.adopt-stop", boundPort: nil,
+                startedAt: nil))
+        for _ in 0..<100 where kill(survivor, 0) == 0 {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        await gate.signal(.signaled(signal: Int(SIGTERM)))
+        let stop = try #require(stopTask.withLock { $0 })
+        #expect(await stop.value.phase == .stopped)
+        let written = try? String(contentsOf: marker, encoding: .utf8)
+        #expect(written == "done\n", "the adopted run was killed before its graceful shutdown finished")
+    }
+
+    /** An adopted run whose exit watch reports at once is recorded only after
+        its adoption finished recording it: the crash lands last, so neither
+        the phase nor the state row is left saying `.starting` for a run that
+        is gone. Whether the outcome would otherwise overtake adoption depends
+        on how long adoption's own awaits take, so this passes against an
+        unordered outcome whenever they happen to be quick. */
+    @Test func anAdoptedRunThatExitsAtOnceIsRecordedAfterItsAdoption() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        let supervisor = ServerSupervisor(
+            launcher: ExitsAtOnceAdoptLauncher(), paths: env.paths, projectPath: env.projectPath,
+            registry: registry, spec: ServerSpec(command: ["/bin/true"], name: "web"))
+        let survivor = try spawnSurvivor()
+        defer { kill(survivor, SIGKILL) }
+
+        #expect(
+            await supervisor.adopt(
+                pid: survivor, label: "dev.quantizor.directa.job.instant", boundPort: nil,
+                startedAt: nil))
+        let crashed = try await waitForPhase(supervisor, .crashed)
+        #expect(crashed.phase == .crashed)
+        #expect(crashed.pid == nil)
+        let persisted = await registry.persistedState(
+            serverID: serverID(project: env.projectPath, name: "web"))
+        #expect(persisted?.phase == .crashed)
+        #expect(persisted?.pid == nil)
+    }
+
     /** Group teardown after adoption must reach the same escaped session
         grandchild a spawned run's teardown reaches: adoption's
         `refreshDescendantSnapshot` and `startDescendantWatch` populate the same
@@ -1644,6 +1729,58 @@ private func makeEnv() throws -> TestEnv {
         #expect(settled.phase == .stopped)
         #expect(settled.pid == nil)
         #expect(await registry.persistedState(serverID: id) == nil)
+    }
+}
+
+/** Adopts through `gate` like `FakeAdoptLauncher`, and runs a test's hook from
+    inside `prepareAdopt`, the one moment a test can act while `adopt` is
+    certainly still in progress. Never spawns. */
+private final class StopOnPrepareLauncher: ProcessLauncher {
+    let gate: AdoptGate
+    private let hook = OSAllocatedUnfairLock<(@Sendable () -> Void)?>(initialState: nil)
+
+    init(gate: AdoptGate) {
+        self.gate = gate
+    }
+
+    func onPrepare(_ action: @escaping @Sendable () -> Void) {
+        hook.withLock { $0 = action }
+    }
+
+    func run(
+        argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
+        onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
+        onSpawn: @escaping @Sendable (pid_t) async -> Void
+    ) async -> ProcessOutcome {
+        .spawnFailed(SpawnError(message: "StopOnPrepareLauncher never spawns"))
+    }
+
+    func prepareAdopt(pid: pid_t) -> Bool {
+        hook.withLock { $0 }?()
+        return true
+    }
+
+    func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
+        await gate.outcome()
+    }
+}
+
+/** An adopted child whose exit watch fires the instant it is awaited, without
+    a hop through another actor, so its outcome reaches the supervisor while
+    `adopt` is still at its first await. Never spawns. */
+private struct ExitsAtOnceAdoptLauncher: ProcessLauncher {
+    func run(
+        argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
+        onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
+        onSpawn: @escaping @Sendable (pid_t) async -> Void
+    ) async -> ProcessOutcome {
+        .spawnFailed(SpawnError(message: "ExitsAtOnceAdoptLauncher never spawns"))
+    }
+
+    func prepareAdopt(pid: pid_t) -> Bool { true }
+
+    func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
+        .signaled(signal: Int(SIGKILL))
     }
 }
 

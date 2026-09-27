@@ -437,7 +437,7 @@ public actor ServerSupervisor {
         before arming, since an armed watch nobody waits on is never consumed.
         The result is a Bool rather than a status because the health monitor
         can promote a successful adopt to `.running` before this returns. The
-        exit-watch task below is what closes the adoption hole: without it, a
+        exit-watch task is what closes the adoption hole: without it, a
         process this attaches to and later loses (the common second-jetsam-wave
         case, or an ordinary crash) would become an undetected zombie, since
         nothing else calls `recordOutcome` for a pid this instance never
@@ -462,6 +462,16 @@ public actor ServerSupervisor {
         let id = serverID(project: projectPath, name: spec.name)
         pid = childPid
         rootIdentity = readIdentity(childPid)
+        /** Set before the first await, as `start()` does, so a stop landing
+            while this is still recording the run sees a live run and keeps its
+            grace. The outcome waits for that recording to finish, so an exit
+            the watch reports at once is never recorded ahead of it. */
+        let (recorded, finishRecording) = AsyncStream<Void>.makeStream()
+        runTask = Task { [launcher] in
+            let outcome = await launcher.adopt(pid: childPid, label: label)
+            for await _ in recorded {}
+            await self.recordOutcome(outcome, id: id)
+        }
         refreshDescendantSnapshot()
         let spawnedAt = runStartedAt ?? Date()
         startedAt = spawnedAt
@@ -490,10 +500,7 @@ public actor ServerSupervisor {
             entry.spawnError = nil
             entry.startedAt = spawnedAt
         }
-        runTask = Task { [launcher] in
-            let outcome = await launcher.adopt(pid: childPid, label: label)
-            await self.recordOutcome(outcome, id: id)
-        }
+        finishRecording.finish()
         settleSpawnWaiters()
         return true
     }
