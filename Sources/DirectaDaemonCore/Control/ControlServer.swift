@@ -553,6 +553,9 @@ public actor Router {
         stat succeeds again. Shared by every caller of `pruneMissingProjects`. */
     private var missingProjectFirstMissedAt: [String: Date] = [:]
 
+    /** Projects `forgetMissingProject` is tearing down right now. */
+    private var forgetting: Set<String> = []
+
     /** Forget registered projects whose checkout path has been missing for at
         least `missingProjectSweepIntervalSeconds`, continuously, across
         however many callers ask: boot restore, machine-wide status, and the
@@ -957,6 +960,12 @@ public actor Router {
         assuming success. */
     @discardableResult
     private func forgetMissingProject(_ project: String) async -> [String] {
+        /** The teardown suspends in every server's stop, so a second forget of
+            the same project (the sweep and `project.forget`, or two requests)
+            can land mid-way; it does nothing and reports nothing rather than
+            stopping, retiring, and unregistering the same servers again. */
+        guard forgetting.insert(project).inserted else { return [] }
+        defer { forgetting.remove(project) }
         let prefix = "\(project)::"
         /** Snapshot identities before teardown: a composite tree can outlive a
             no-op stop (phase already crashed after the checkout vanished),

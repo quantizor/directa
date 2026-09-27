@@ -179,6 +179,50 @@ import Testing
             !FileManager.default.fileExists(atPath: env.paths.projectLogDir(project: canonicalProject).path))
     }
 
+    /** A `project.forget` that lands while the automatic sweep is still
+        tearing the same project down (suspended in its server's stop) runs no
+        second teardown: the project's servers are stopped and unregistered
+        once, and the late request reports nothing it did. */
+    @Test func aForgetLandingDuringTheSweepsForgetTearsDownOnce() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
+        let gate = AdoptGate()
+        let router = Router(
+            launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
+            stopTiming: StopTiming(graceSeconds: 0.3, overtimeSeconds: 0.3))
+        defer { Task { await gate.signal(.signaled(signal: Int(SIGKILL))) } }
+        _ = try await handle(
+            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+            ServerResult.self)
+        let canonicalProject = canonicalProjectPath(env.project)
+        let serverLog = env.paths.structuredLogFile(project: canonicalProject, server: "web")
+        try FileManager.default.removeItem(atPath: env.project)
+        let now = Date()
+        await router.pruneMissingProjects(now: now)
+
+        async let sweep = router.pruneMissingProjects(
+            now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
+        /** The stop writes its reason into the server's log before it waits,
+            so the sweep is suspended inside the teardown from here on. */
+        var stopping = false
+        for _ in 0..<250 where !stopping {
+            let text = (try? String(contentsOf: serverLog, encoding: .utf8)) ?? ""
+            stopping = text.contains("stopping: \(RemovalReason.projectPathGone)")
+            if !stopping { try await Task.sleep(for: .milliseconds(20)) }
+        }
+        try #require(stopping, "the sweep never began stopping the server")
+        let late = try await handle(
+            router, .projectForget, ProjectOnlyParams(project: canonicalProject), ProjectForgetResult.self)
+        #expect(await sweep == 1)
+
+        #expect(late.servers.isEmpty)
+        let events = try await handle(
+            router, .eventsQuery, EventsQueryParams(project: canonicalProject), EventsQueryResult.self)
+        #expect(events.events.filter { $0.kind == .unregistered }.map(\.server) == ["web"])
+        #expect(await registry.project(canonicalProject) == nil)
+    }
+
     /** An ad hoc-only project (never trusted, no devservers.json at all) is
         forgotten the same way: trust is not a precondition for the teardown,
         only a thing it also drops when present. */
