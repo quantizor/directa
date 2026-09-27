@@ -99,7 +99,9 @@ final class LogFileReader {
         counts as a line, as a final unterminated one does going forward.
         Lines are read in fixed chunks from the end, so memory holds one
         chunk plus the longest line however far back the walk goes. Returns
-        false when `body` stopped the walk. */
+        false when `body` stopped the walk or a read came back short (the
+        file shrank under this reader, or an I/O error), since the line
+        held across that read can no longer be completed. */
     @discardableResult
     func forEachLineBackward(
         before end: Int, chunkBytes: Int = LogScan.backwardChunkBytes,
@@ -112,7 +114,7 @@ final class LogFileReader {
         while chunkStart > 0 {
             let readStart = max(0, chunkStart - max(1, chunkBytes))
             let chunk = read(at: readStart, count: chunkStart - readStart)
-            guard chunk.count == chunkStart - readStart else { return true }
+            guard chunk.count == chunkStart - readStart else { return false }
             chunkStart = readStart
             var buffer = chunk
             buffer.append(contentsOf: pending)

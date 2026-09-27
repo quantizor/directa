@@ -676,6 +676,29 @@ import os
         }
     }
 
+    /** A read that comes back short (the file shrank under an open reader,
+        or an I/O error) ends the walk as stopped, never as a walk that
+        reached the start of the file: a caller that reads "finished" moves
+        on to an older file as if nothing newer were left. */
+    @Test func aShortReadStopsTheBackwardWalk() throws {
+        let dir = try TemporaryTree.directory(named: "logq")
+        let url = dir.appending(path: "current.log")
+        try Data("first\nsecond\nthird\n".utf8).write(to: url)
+        let reader = try #require(LogFileReader(url: url, onDiskRead: nil))
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: 9)
+        try handle.close()
+        for chunk in [4, 64 * 1024] {
+            var got: [String] = []
+            let finished = reader.forEachLineBackward(before: reader.size, chunkBytes: chunk) { line, _ in
+                got.append(String(decoding: line, as: UTF8.self))
+                return true
+            }
+            #expect(!finished, "chunk \(chunk)")
+            #expect(got.isEmpty, "chunk \(chunk)")
+        }
+    }
+
     /** A tail whose stream filter thins the file out walks back past many
         chunk edges, some of them splitting a multi-byte character, and must
         answer exactly what parsing the whole file would, in reads no larger
