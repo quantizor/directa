@@ -18,14 +18,12 @@ public struct CoalitionIDs: Equatable, Hashable, Sendable {
         or failed read, never a trap: a missing flavor is the same as "we cannot
         see coalitions on this kernel." */
     public static func read(of pid: pid_t) -> CoalitionIDs? {
-        var info = ProcPIDCoalitionInfo()
-        let got = withUnsafeMutableBytes(of: &info) { buf -> Int32 in
-            guard let base = buf.baseAddress else { return 0 }
-            return proc_pidinfo(
-                pid, ProcPIDCoalitionInfo.flavor, 0, base,
-                Int32(MemoryLayout<ProcPIDCoalitionInfo>.stride))
-        }
-        guard got >= 16, info.resource != 0 || info.jetsam != 0 else { return nil }
+        guard
+            let info = readProcInfo(
+                pid: pid, flavor: ProcPIDCoalitionInfo.flavor, argument: 0,
+                into: ProcPIDCoalitionInfo()),
+            info.resource != 0 || info.jetsam != 0
+        else { return nil }
         return CoalitionIDs(jetsam: info.jetsam, resource: info.resource)
     }
 }

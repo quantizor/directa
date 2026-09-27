@@ -22,13 +22,12 @@ public struct ProcessUniqueIDs: Equatable, Hashable, Sendable {
         `kinfo_proc` answers for it. Nil on a short or failed read (the pid is
         gone), never a trap. */
     public static func read(of pid: pid_t) -> ProcessUniqueIDs? {
-        var info = ProcUniqIdentifierInfo()
-        let size = Int32(MemoryLayout<ProcUniqIdentifierInfo>.size)
-        let got = withUnsafeMutableBytes(of: &info) { buf -> Int32 in
-            guard let base = buf.baseAddress else { return 0 }
-            return proc_pidinfo(pid, ProcUniqIdentifierInfo.flavor, 1, base, size)
-        }
-        guard got == size, info.uniqueID != 0 else { return nil }
+        guard
+            let info = readProcInfo(
+                pid: pid, flavor: ProcUniqIdentifierInfo.flavor, argument: 1,
+                into: ProcUniqIdentifierInfo()),
+            info.uniqueID != 0
+        else { return nil }
         return ProcessUniqueIDs(parent: info.parentUniqueID, process: info.uniqueID)
     }
 }

@@ -6,10 +6,12 @@ import System
 /** Outcome of a completed (or never-started) child process. */
 public enum ProcessOutcome: Sendable {
     case exited(code: Int)
-    /** The process exited, but its wait(2) status could not be read: the
-        kernel refused `NOTE_EXITSTATUS` (EACCES) because the daemon may not
-        signal it, the permission `EVFILT_PROC` gates the note on. Neither a
-        code nor a signal is known. */
+    /** The process exited, but neither a code nor a signal is known: the
+        kernel withheld its status (`NOTE_EXITSTATUS` refused with EACCES for
+        a process the daemon may not signal, or the process died before its
+        watch was armed), and launchd's record of the job printed neither a
+        code nor a signal or showed no exit record within
+        `LaunchdJobLauncher.exitRecordAttempts` reads. */
     case exitedStatusUnknown
     case signaled(signal: Int)
     case spawnFailed(SpawnError)
@@ -32,10 +34,10 @@ public struct SpawnCapture: Sendable {
     }
 }
 
-/** Seam isolating swift-subprocess (pre-1.0) from the supervisor. The fallback
-    implementation, if the API churns, is ~200 lines of posix_spawn +
-    POSIX_SPAWN_SETSID + kqueue EVFILT_PROC; the protocol is shaped so that swap
-    stays invisible to callers. */
+/** Seam isolating swift-subprocess (pre-1.0) from the supervisor. The fallback,
+    if the API churns, is posix_spawn with POSIX_SPAWN_SETSID, its exit watched
+    through `ExitWatcher` exactly as `LaunchdJobLauncher`'s children are; the
+    protocol is shaped so that swap stays invisible to callers. */
 public protocol ProcessLauncher: Sendable {
     /** Spawns `argv` in a fresh session with stdout and stderr on the spool
         capture, then returns only when the process has terminated. Exactly one

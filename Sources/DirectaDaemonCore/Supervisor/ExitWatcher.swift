@@ -230,7 +230,9 @@ final class ExitWatcher: Sendable {
         granted is read straight off the event's own `fflags` rather than
         tracked separately, since the kernel only sets that bit on an event it
         is reporting real status for. Darwin does not export the `WIFEXITED`
-        macros as Swift functions, so the wait(2) layout is decoded here. */
+        macros as Swift functions, so the wait(2) layout is decoded here: a
+        zero low byte is an exit, anything else the terminating signal (an
+        exit event never carries a stopped status). */
     private static func decode(event: kevent, pid: pid_t) -> ProcessOutcome {
         guard event.fflags & UInt32(NOTE_EXITSTATUS) != 0 else {
             return .exitedStatusUnknown
@@ -240,13 +242,8 @@ final class ExitWatcher: Sendable {
                 SpawnError(
                     errno: nil, message: "exit status for pid \(pid) does not fit wait(2)"))
         }
-        if (status & 0o177) == 0 {
-            return .exited(code: Int((status >> 8) & 0xff))
-        }
         let signal = status & 0o177
-        if signal != 0, signal != 0o177 {
-            return .signaled(signal: Int(signal))
-        }
-        return .exited(code: Int((status >> 8) & 0xff))
+        guard signal != 0 else { return .exited(code: Int((status >> 8) & 0xff)) }
+        return .signaled(signal: Int(signal))
     }
 }

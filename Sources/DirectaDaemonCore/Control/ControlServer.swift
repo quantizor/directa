@@ -847,9 +847,7 @@ public actor Router {
             session and reparented, the same union stop() and the crash path
             use. */
         let descendants = ProcessTree.liveDescendants(rootPid: pid, rootIdentity: root, snapshot: [])
-        ProcessTree.signalTree(
-            descendants: descendants, revalidate: true, rootIdentity: root, rootPid: pid,
-            signal: SIGTERM)
+        ProcessTree.signalTree(descendants: descendants, rootIdentity: root, signal: SIGTERM)
         /** Poll with identity, not kill(pid,0): a recycled number must end the
             wait as "gone" rather than escalate into the new process. A shorter
             grace than an ordinary stop's 7s default: an orphan bounce runs during
@@ -866,9 +864,7 @@ public actor Router {
         if ProcessTree.shouldSignal(
             snapshotted: root, live: ProcessTree.identity(of: pid))
         {
-            ProcessTree.signalTree(
-                descendants: descendants, revalidate: true, rootIdentity: root, rootPid: pid,
-                signal: SIGKILL)
+            ProcessTree.signalTree(descendants: descendants, rootIdentity: root, signal: SIGKILL)
         }
         await events.post(
             kind: .crashed, project: project, server: name,

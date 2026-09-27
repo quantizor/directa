@@ -62,24 +62,23 @@ public enum ProcessTree {
     /** All live descendants of `pid` (children, grandchildren, ...), excluding
         `pid` itself. Best-effort: a process spawned after the snapshot is missed. */
     public static func descendants(of pid: pid_t) -> DescendantsResult {
-        switch fetchProcessTable() {
-        case .failed(let errno):
-            return .failed(errno: errno)
-        case .ok(let table):
-            var childrenByParent: [pid_t: [TableRow]] = [:]
-            for row in table {
-                childrenByParent[row.parent, default: []].append(row)
-            }
-            var found: [ProcessIdentity] = []
-            var queue: [pid_t] = [pid]
-            while let parent = queue.popLast() {
-                for child in childrenByParent[parent] ?? [] where child.pid != parent {
-                    found.append(child.identity)
-                    queue.append(child.pid)
-                }
-            }
-            return .ok(found)
+        fetchProcessTable().map { descendants(of: pid, in: $0) }
+    }
+
+    private static func descendants(of pid: pid_t, in table: [TableRow]) -> [ProcessIdentity] {
+        var childrenByParent: [pid_t: [TableRow]] = [:]
+        for row in table {
+            childrenByParent[row.parent, default: []].append(row)
         }
+        var found: [ProcessIdentity] = []
+        var queue: [pid_t] = [pid]
+        while let parent = queue.popLast() {
+            for child in childrenByParent[parent] ?? [] where child.pid != parent {
+                found.append(child.identity)
+                queue.append(child.pid)
+            }
+        }
+        return found
     }
 
     /** Live members of the session `leader` leads (a session id is its
@@ -100,20 +99,20 @@ public enum ProcessTree {
         caller's own session is refused outright rather than trusted to differ:
         sweeping it would signal the daemon and everything it owns. */
     public static func sessionMembers(of leader: pid_t) -> DescendantsResult {
-        let session = leader
-        guard session > 0, session != getsid(getpid()) else {
-            return .ok([])
-        }
-        switch fetchProcessTable() {
-        case .failed(let errno):
-            return .failed(errno: errno)
-        case .ok(let table):
-            let mine = getpid()
-            return .ok(
-                table.filter { row in
-                    row.pid != session && row.pid != mine && getsid(row.pid) == session
-                }.map(\.identity))
-        }
+        guard sweepsSession(of: leader) else { return .ok([]) }
+        return fetchProcessTable().map { sessionMembers(of: leader, in: $0) }
+    }
+
+    private static func sweepsSession(of leader: pid_t) -> Bool {
+        leader > 0 && leader != getsid(getpid())
+    }
+
+    private static func sessionMembers(of leader: pid_t, in table: [TableRow]) -> [ProcessIdentity] {
+        guard sweepsSession(of: leader) else { return [] }
+        let mine = getpid()
+        return table.filter { row in
+            row.pid != leader && row.pid != mine && getsid(row.pid) == leader
+        }.map(\.identity)
     }
 
     /** One process as the lineage walk reads it: its identity, whose
@@ -182,21 +181,20 @@ public enum ProcessTree {
         when this process's own unique id cannot be read, since the
         refusals above cannot be proven without it. */
     public static func lineageMembers(of seeds: Set<UInt64>) -> DescendantsResult {
+        guard !seeds.isEmpty else { return .ok([]) }
+        return fetchProcessTable().map { lineageMembers(of: seeds, in: $0) }
+    }
+
+    private static func lineageMembers(of seeds: Set<UInt64>, in table: [TableRow]) -> [ProcessIdentity] {
         guard !seeds.isEmpty, let daemon = ProcessUniqueIDs.read(of: getpid())?.process else {
-            return .ok([])
+            return []
         }
-        switch fetchProcessTable() {
-        case .failed(let errno):
-            return .failed(errno: errno)
-        case .ok(let table):
-            let rows = table.compactMap { row -> LineageRow? in
-                guard let ids = ProcessUniqueIDs.read(of: row.pid) else { return nil }
-                return LineageRow(parentUniqueID: ids.parent, process: row.identity(uniqueID: ids.process))
-            }
-            let daemonSession = getsid(getpid())
-            return .ok(
-                lineage(of: seeds, in: rows, daemon: daemon).filter { getsid($0.pid) != daemonSession })
+        let rows = table.compactMap { row -> LineageRow? in
+            guard let ids = ProcessUniqueIDs.read(of: row.pid) else { return nil }
+            return LineageRow(parentUniqueID: ids.parent, process: row.identity(uniqueID: ids.process))
         }
+        let daemonSession = getsid(getpid())
+        return lineage(of: seeds, in: rows, daemon: daemon).filter { getsid($0.pid) != daemonSession }
     }
 
     /** Whether a snapshotted identity still names the same process. A nil live
@@ -236,42 +234,28 @@ public enum ProcessTree {
         return (capacity, capacity * stride)
     }
 
-    /** Signals the process group and every stray descendant outside it.
-        When `revalidate` is true, skip the root group signal and any descendant
-        whose start time no longer matches (PID reuse after a grace window).
-        `rootIdentity` is required for a revalidated group kill; without it only
-        matching descendants are signaled. */
+    /** Signals the process group `rootIdentity` leads and every descendant
+        outside it, each only while its pid still names the identity recorded
+        for it (a recycled pid is never hit). A nil `rootIdentity` signals no
+        group at all, only the matching descendants. */
     public static func signalTree(
-        descendants: [ProcessIdentity],
-        revalidate: Bool = false,
-        rootIdentity: ProcessIdentity? = nil,
-        rootPid: pid_t,
-        signal: Int32
+        descendants: [ProcessIdentity], rootIdentity: ProcessIdentity?, signal: Int32
     ) {
-        let rootStillOurs: Bool
-        if revalidate {
-            if let rootIdentity {
-                rootStillOurs = shouldSignal(
-                    snapshotted: rootIdentity, live: identity(of: rootPid))
-            } else {
-                rootStillOurs = false
-            }
-        } else {
-            rootStillOurs = true
+        let groupLeader = rootIdentity.flatMap { root in
+            shouldSignal(snapshotted: root, live: identity(of: root.pid)) ? root.pid : nil
         }
-        if rootStillOurs {
-            kill(-rootPid, signal)
+        if let groupLeader {
+            kill(-groupLeader, signal)
         }
         for identity in descendants {
-            if revalidate {
-                let live = self.identity(of: identity.pid)
-                guard shouldSignal(snapshotted: identity, live: live) else { continue }
+            guard shouldSignal(snapshotted: identity, live: self.identity(of: identity.pid)) else {
+                continue
             }
             /** Skip a group member only when the group itself was signaled;
-                otherwise (the root is gone or recycled, so `kill(-rootPid)` was
+                otherwise (the root is gone or recycled, so the group signal was
                 withheld) a member still in that group would be missed, and it
                 must be signaled individually instead. */
-            if !rootStillOurs || getpgid(identity.pid) != rootPid {
+            if groupLeader == nil || getpgid(identity.pid) != groupLeader {
                 kill(identity.pid, signal)
             }
         }
@@ -285,8 +269,10 @@ public enum ProcessTree {
         reaches a setsid child that reparented after the last snapshot
         refresh. No single source is enough (see the note on
         ServerSupervisor.startDescendantWatch), so both the deliberate-stop and
-        crash paths union all four and revalidate each pid at signal time. A
-        failed sweep contributes nothing rather than throwing.
+        crash paths union all four and revalidate each pid at signal time. The
+        three live sweeps read one process table, so they agree on a single
+        moment; a failed read contributes nothing rather than throwing, and is
+        logged, since only the recorded descendants are then signaled.
 
         `rootIdentity` is the root as recorded while it was alive (nil when
         that read failed). The two sweeps keyed on `rootPid` are skipped while
@@ -309,14 +295,23 @@ public enum ProcessTree {
         var byPid: [pid_t: ProcessIdentity] = [:]
         for identity in priorCandidates { byPid[identity.pid] = identity }
         for identity in snapshot { byPid[identity.pid] = identity }
+        let table: [TableRow]
+        switch fetchProcessTable() {
+        case .failed(let errno):
+            DirectaLog.supervisor.error(
+                "teardown of pid \(rootPid) could not read the process table (errno \(errno)); signaling only the descendants recorded earlier")
+            return Array(byPid.values)
+        case .ok(let rows):
+            table = rows
+        }
         let wearer = identity(of: rootPid)
         if rootIdentity == nil || wearer == nil || wearer == rootIdentity {
-            for identity in descendants(of: rootPid).identities { byPid[identity.pid] = identity }
-            for identity in sessionMembers(of: rootPid).identities { byPid[identity.pid] = identity }
+            for identity in descendants(of: rootPid, in: table) { byPid[identity.pid] = identity }
+            for identity in sessionMembers(of: rootPid, in: table) { byPid[identity.pid] = identity }
         }
         var seeds = Set(byPid.values.compactMap(\.uniqueID))
         if let rootUniqueID = rootIdentity?.uniqueID { seeds.insert(rootUniqueID) }
-        for identity in lineageMembers(of: seeds).identities { byPid[identity.pid] = identity }
+        for identity in lineageMembers(of: seeds, in: table) { byPid[identity.pid] = identity }
         return Array(byPid.values)
     }
 
@@ -344,6 +339,13 @@ public enum ProcessTree {
     private enum TableResult {
         case failed(errno: Int32)
         case ok([TableRow])
+
+        func map(_ sweep: ([TableRow]) -> [ProcessIdentity]) -> DescendantsResult {
+            switch self {
+            case .failed(let errno): .failed(errno: errno)
+            case .ok(let table): .ok(sweep(table))
+            }
+        }
     }
 
     /** QA1123 shape: 3-level MIB, size probe, rounded allocation, retry ENOMEM. */

@@ -724,8 +724,8 @@ public actor ServerSupervisor {
             rootPid: target, rootIdentity: keys.rootIdentity, snapshot: keys.snapshot,
             priorCandidates: priorCandidates)
         ProcessTree.signalTree(
-            descendants: candidates, revalidate: true,
-            rootIdentity: signalGroup ? keys.rootIdentity : nil, rootPid: target, signal: signal)
+            descendants: candidates, rootIdentity: signalGroup ? keys.rootIdentity : nil,
+            signal: signal)
         return candidates
     }
 
@@ -1217,7 +1217,15 @@ public actor ServerSupervisor {
         the live tree. */
     private func refreshDescendantSnapshot() {
         guard let pid else { return }
-        let fresh = ProcessTree.descendants(of: pid).identities
+        let fresh: [ProcessIdentity]
+        switch ProcessTree.descendants(of: pid) {
+        case .failed(let errno):
+            DirectaLog.supervisor.error(
+                "\(spec.name)@\(projectPath) could not read the process table to record the descendants of pid \(pid) (errno \(errno)); keeping the earlier record")
+            fresh = []
+        case .ok(let found):
+            fresh = found
+        }
         let freshPids = Set(fresh.map(\.pid))
         let stillLive = lastDescendantSnapshot.filter { recorded in
             !freshPids.contains(recorded.pid)
