@@ -5,12 +5,12 @@ PREFIX ?= $(HOME)/.local
 # with SIGN_IDENTITY=... to pick a specific identity or to force ad-hoc.
 SIGN_IDENTITY ?= $(shell scripts/signing-identity.sh)
 
-.PHONY: build test sweep-test-temp app dmg release-dmg install clean icon
+.PHONY: build test sweep-test-temp sweep-swift-temp app dmg release-dmg install clean icon
 
 # The shipped products only. A bare `swift build -c release` also compiles the
 # test-only targets (DirectaTestSupport imports Testing). `--product` keeps
 # only its last value, hence one invocation per product.
-build:
+build: sweep-swift-temp
 	swift build -c release --product directa
 	swift build -c release --product ddirecta
 	swift build -c release --product DirectaApp
@@ -26,13 +26,18 @@ build:
 sweep-test-temp:
 	@find "$$(getconf DARWIN_USER_TEMP_DIR)" -mindepth 1 -maxdepth 1 \( -name 'directa-run.*' -o -name 'directa-test-*' \) -type d -mtime +0 -exec rm -rf {} + 2>/dev/null || true
 
+# The Swift compiler driver leaves a temp folder behind on every build; the
+# script's header says exactly which folders it removes.
+sweep-swift-temp:
+	@scripts/sweep-swift-temp.sh
+
 # Every test's scratch tree comes from TemporaryTree
 # (Tests/DirectaTestSupport/TemporaryTree.swift), which removes it when the
 # test ends. The run gets its own root through DIRECTA_TEST_TEMP_ROOT, and a
 # root that is not empty afterward fails the run and is kept for inspection:
 # something bypassed the helper, or a server rebuilt a tree after its test
 # returned.
-test: sweep-test-temp
+test: sweep-test-temp sweep-swift-temp
 	@root="$$(mktemp -d "$$(getconf DARWIN_USER_TEMP_DIR)directa-run.XXXXXX")" || exit 1; \
 	DIRECTA_TEST_TEMP_ROOT="$$root" swift test; status=$$?; \
 	left="$$(find "$$root" -mindepth 1 -maxdepth 1)"; \

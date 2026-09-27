@@ -2,6 +2,16 @@
 
 directa is a personal tool first; issues and patches are welcome all the same. Read `AGENTS.md` for the codebase map, invariants, and commands (`CLAUDE.md` is a one-line pointer to it), and `docs/cli-contract.md` for the JSON surface. `make test` and `scripts/smoke.sh` must pass locally; `scripts/smoke-launchd.sh` exercises the real launchd lifecycle if your change touches daemon management. GitHub Actions (`.github/workflows/ci.yml`) runs `swift build` + `swift test` on `macos-26` only: no smoke, no large runners.
 
+## Swift temp folder cleanup
+
+The Swift compiler driver leaves a small temporary folder in your user temp directory on every build and never removes it ([swiftlang/swift-driver#1720](https://github.com/swiftlang/swift-driver/issues/1720)), so thousands pile up on a busy machine. `scripts/sweep-swift-temp.sh` removes only those leftovers (its header lists exactly which folders qualify), and `make build` and `make test` run it first. To also run it on every commit, enable the versioned hooks once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The hook never blocks a commit: a failed sweep is printed and the commit goes ahead. `git config --unset core.hooksPath` turns it off again.
+
 ## Commit and changeset hygiene
 
 Commit subjects and PR titles are Conventional Commits. The type/scope list and subject grammar live in `AGENTS.md` (Engineering rules / Git). GitHub squash uses the PR title as the `main` subject, so the PR title is a conventional commit subject, not a headline sentence.
