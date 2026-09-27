@@ -318,10 +318,15 @@ private func tempDir() throws -> URL {
     static let spoolOpenFlags: [Int32] = [O_WRONLY | O_CREAT | O_TRUNC, O_RDWR | O_CREAT | O_APPEND]
 
     /** A flooding child writes through a descriptor the tailer can neither
-        reopen nor reposition. Released blocks keep the spool's disk use near
-        the retained window while its apparent size grows many times past it,
+        reopen nor reposition. Released blocks keep the spool's data near the
+        retained window while its apparent size grows many times past it,
         every line still reaches the structured log, and the child's writes
-        keep landing at the end of the file. */
+        keep landing at the end of the file. The bound is on the bytes that
+        still hold data (the SEEK_DATA walk), which is what the tailer
+        controls: `st_blocks` also counts the preallocation APFS reserves
+        ahead of a fast sequential writer, which no hole punch reaches and
+        which the file grows into, so it swings with the volume's own
+        policy rather than with anything the tailer did. */
     @Test(arguments: spoolOpenFlags)
     func aFloodingChildsSpoolStaysBoundedOnDisk(openFlags: Int32) async throws {
         let fixture = try #require(fixtureServerExecutable(), "fixture-server is not built; run swift build")
@@ -351,14 +356,16 @@ private func tempDir() throws -> URL {
             retained window, the catch-up cap, and a chunk in flight. */
         let flooding = try spoolSizes(spool)
         #expect(flooding.apparent >= floodBytes)
-        #expect(flooding.allocated <= 512 * 1024, "allocated mid-flood \(flooding.allocated)")
+        let floodingData = try spoolDataBytes(spool)
+        #expect(floodingData <= 512 * 1024, "data mid-flood \(floodingData)")
         kill(child, SIGSTOP)
         await tailer.stop()
         let stopped = try spoolSizes(spool)
         #expect(stopped.apparent >= floodBytes)
-        /** The retained window, one release step, and a block of rounding;
-            APFS adds at most a block of preallocation past that. */
-        #expect(stopped.allocated <= Int64(retain + retain / 4 + 2 * 4096), "allocated \(stopped.allocated)")
+        /** The retained window, one release step, and a block of rounding at
+            each end. */
+        let stoppedData = try spoolDataBytes(spool)
+        #expect(stoppedData <= Int64(retain + retain / 4 + 2 * 4096), "data after stop \(stoppedData)")
 
         let rawTail = try spoolTailText(spool)
         let newest = await store.query(LogQueryOptions(streams: [.out], tail: 1)).map(\.text)
@@ -458,6 +465,29 @@ private func tempDir() throws -> URL {
         var info = stat()
         guard stat(url.path, &info) == 0 else { throw POSIXError(.ENOENT) }
         return (Int64(info.st_blocks) * 512, Int64(info.st_size))
+    }
+
+    /** The bytes of `url` that still hold data: the sum of the extents a
+        SEEK_DATA / SEEK_HOLE walk reports, so a punched range counts as
+        zero whatever the volume still has allocated around it. */
+    private func spoolDataBytes(_ url: URL) throws -> Int64 {
+        let descriptor = open(url.path, O_RDONLY | O_CLOEXEC)
+        guard descriptor >= 0 else { throw POSIXError(.ENOENT) }
+        defer { close(descriptor) }
+        var total: Int64 = 0
+        var cursor: off_t = 0
+        while true {
+            let data = lseek(descriptor, cursor, SEEK_DATA)
+            /** ENXIO: no data at or past `cursor`, the walk's normal end. */
+            guard data >= 0 else {
+                guard errno == ENXIO else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                return total
+            }
+            let hole = lseek(descriptor, data, SEEK_HOLE)
+            guard hole > data else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            total += Int64(hole - data)
+            cursor = hole
+        }
     }
 
     /** The newest line in the raw spool (a trailing unterminated one
