@@ -9,8 +9,8 @@ import Testing
     }
 
     @Test func removesEveryTargetedUnicodeCategory() {
-        /** Cc (U+0001, and U+0085 NEXT LINE specifically because the plan
-            calls it out by name), Cf (U+200B ZERO WIDTH SPACE, and U+202A
+        /** Cc (U+0001, and U+0085 NEXT LINE, a line break a reader would
+            otherwise see as a new directa line), Cf (U+200B ZERO WIDTH SPACE, and U+202A
             LEFT-TO-RIGHT EMBEDDING as a bidi override), Zl (U+2028 LINE
             SEPARATOR), Zp (U+2029 PARAGRAPH SEPARATOR): every character
             besides the visible letters must disappear, none replaced by a
@@ -32,17 +32,6 @@ import Testing
         #expect(MonitorSanitizer.sanitizeLabel(hostile) == "web_evil_name")
     }
 
-    /** The limit counts the ellipsis, the same convention the daemon's
-        `maxLineCharacters` cut uses, so a line the daemon already cut to the
-        limit passes through unchanged. */
-    @Test func truncatesPastTheLimitWithEllipsis() {
-        let long = String(repeating: "x", count: 401)
-        let truncated = MonitorSanitizer.truncate(long, limit: MonitorLimits.truncationCharacterLimit)
-        #expect(truncated == String(repeating: "x", count: 399) + "…")
-        #expect(MonitorSanitizer.truncate(truncated, limit: MonitorLimits.truncationCharacterLimit) == truncated)
-        let exact = String(repeating: "x", count: 400)
-        #expect(MonitorSanitizer.truncate(exact, limit: MonitorLimits.truncationCharacterLimit) == exact)
-    }
 }
 
 @Suite struct LineNormalizerTests {
@@ -93,7 +82,9 @@ import Testing
         _ offset: TimeInterval, health: String? = nil, records: [LogRecord] = [],
         trimmed: [LogStream: Int] = [:], windowStart: Date? = nil
     ) -> MonitorTick {
-        MonitorTick(at: date(offset), health: health, records: records, trimmed: trimmed, windowStart: windowStart)
+        MonitorTick(
+            at: date(offset), health: health, records: records, trimmed: trimmed,
+            windowStart: windowStart ?? date(offset))
     }
 
     private func makeStream(
@@ -108,8 +99,7 @@ import Testing
     // MARK: - Codable
 
     @Test func eventEncodesThroughJSONCodingWithSortedKeysAndMillisecondTimestamps() throws {
-        let event = MonitorEvent(
-            at: date(1.5), count: 3, kind: .budget, label: "web", stream: .out, text: "out over budget")
+        let event = MonitorEvent.budget(at: date(1.5), count: 3, label: "web", stream: .out, text: "out over budget")
         let data = try JSONCoding.encoder().encode(event)
         #expect(
             String(data: data, encoding: .utf8)
@@ -120,7 +110,7 @@ import Testing
     }
 
     @Test func eventWithNoStreamOmitsItFromTheEncodedObject() throws {
-        let event = MonitorEvent(at: date(0), kind: .ended, label: "web", text: "ended (done)")
+        let event = MonitorEvent.ended(at: date(0), label: "web", text: "ended (done)")
         let data = try JSONCoding.encoder().encode(event)
         #expect(
             String(data: data, encoding: .utf8)
@@ -131,7 +121,7 @@ import Testing
     // MARK: - Attached / ended
 
     @Test func attachedRendersTheStartMarker() {
-        var stream = makeStream()
+        let stream = makeStream()
         let events = stream.attached(
             MonitorAttachSummary(checkoutPath: "/Users/me/app", statusDescription: "running, pid=812"))
         #expect(events.map(\MonitorEvent.humanLine) == [
@@ -172,6 +162,26 @@ import Testing
         var stream = makeStream()
         #expect(stream.ingest(tick(0)).isEmpty)
         #expect(stream.ingest(tick(500)).isEmpty)
+    }
+
+    @Test func theLabelIsSanitizedOnceAndExposed() {
+        var stream = makeStream(label: "web|x: y")
+        #expect(stream.label == "web_x__y")
+        #expect(stream.ended(reason: "done").map(\.label) == ["web_x__y"])
+    }
+
+    /** Records arrive already cut to the limit by the daemon (the ellipsis
+        counts toward it) and show unchanged; health text is composed on the
+        client, so the stream cuts that itself. */
+    @Test func aDaemonCutLineShowsUnchangedAndLongHealthIsCut() {
+        var stream = makeStream()
+        let cut = String(repeating: "x", count: MonitorLimits.truncationCharacterLimit - 1) + "…"
+        let events = stream.ingest(
+            tick(1, health: String(repeating: "h", count: 500), records: [record(0, .out, cut)]))
+        #expect(events.map(\MonitorEvent.humanLine) == [
+            "web out| \(cut)",
+            "directa web: \(String(repeating: "h", count: MonitorLimits.truncationCharacterLimit - 1))…",
+        ])
     }
 
     // MARK: - Lifecycle classification

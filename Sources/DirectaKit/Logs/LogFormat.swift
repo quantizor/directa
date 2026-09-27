@@ -9,6 +9,13 @@ public enum LogStream: String, CaseIterable, Codable, Sendable {
     case sys
 }
 
+/** Fixed `sys` payloads a reader matches exactly, shared by the writer and
+    every reader so the two can never drift apart. */
+public enum SysLineText {
+    /** The first line of a fresh file after the log store rotates. */
+    public static let rotated = "rotated"
+}
+
 /** One structured log line: `ISO8601\t<stream>\t<payload>`. The payload may
     contain tabs (parsers split on the first two only); it never contains raw
     newlines (line-split upstream). */

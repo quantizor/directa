@@ -401,7 +401,7 @@ private actor FakeMonitorClock: MonitorClock {
         let attachCursor = LogCursor(at: Self.epoch, count: 0)
         var session = await attachedSession(requester, clock: clock, cursor: attachCursor)
 
-        await clock.advance(by: MonitorRunTuning.hardCapSeconds)
+        await clock.advance(by: MonitorLimits.hardCapSeconds)
         let lineAt = Self.epoch.addingTimeInterval(1_739.5)
         await requester.enqueueLogs(
             .success(
@@ -427,7 +427,7 @@ private actor FakeMonitorClock: MonitorClock {
         let attachCursor = LogCursor(at: Self.epoch.addingTimeInterval(0.25), count: 3)
         var session = await attachedSession(requester, clock: clock, cursor: attachCursor)
 
-        await clock.advance(by: MonitorRunTuning.hardCapSeconds)
+        await clock.advance(by: MonitorLimits.hardCapSeconds)
         await requester.enqueueLogs(.failure(WireError(code: .daemonUnreachable, message: "cannot connect")))
         guard case .ended(let events) = await session.step() else {
             Issue.record("expected the hard cap to end the run")
@@ -564,31 +564,41 @@ private actor FakeMonitorClock: MonitorClock {
         `TimeoutOptionTests` tests `TimeoutOption.parse` itself: a value
         `Monitor.parse` hands one of these throws the raw `ValidationError`,
         with a message naming the offending value and the accepted range. */
+    private static let lineRanges = [
+        MonitorLimits.errorsPerArmRange, MonitorLimits.errorsPerMinuteRange, MonitorLimits.linesPerArmRange,
+        MonitorLimits.linesPerMinuteRange,
+    ]
+
     @Test func everyFlagRejectsBelowItsRange() {
-        let low = #expect(throws: ValidationError.self) { try MonitorFlagOption.linesPerMinute("0") }
-        #expect(low?.message.contains("between 1 and 1200") == true)
-        #expect(throws: ValidationError.self) { try MonitorFlagOption.linesPerArm("0") }
-        #expect(throws: ValidationError.self) { try MonitorFlagOption.errorsPerMinute("0") }
-        #expect(throws: ValidationError.self) { try MonitorFlagOption.errorsPerArm("0") }
+        let low = #expect(throws: ValidationError.self) {
+            try MonitorFlagOption.lines(in: MonitorLimits.linesPerMinuteRange)("0")
+        }
+        #expect(low?.message == "must be between 1 and 1200, got 0")
+        for range in Self.lineRanges {
+            #expect(throws: ValidationError.self) { try MonitorFlagOption.lines(in: range)(String(range.lowerBound - 1)) }
+        }
         let tickLow = #expect(throws: ValidationError.self) { try MonitorFlagOption.tick("0.1") }
-        #expect(tickLow?.message.contains("between 0.5 and 60") == true)
+        #expect(tickLow?.message == "must be between 0.5 and 60 seconds, got 0.1")
     }
 
     @Test func everyFlagRejectsAboveItsRange() {
-        #expect(throws: ValidationError.self) { try MonitorFlagOption.linesPerMinute("1201") }
-        #expect(throws: ValidationError.self) { try MonitorFlagOption.linesPerArm("20001") }
-        #expect(throws: ValidationError.self) { try MonitorFlagOption.errorsPerMinute("601") }
-        #expect(throws: ValidationError.self) { try MonitorFlagOption.errorsPerArm("5001") }
+        for range in Self.lineRanges {
+            #expect(throws: ValidationError.self) { try MonitorFlagOption.lines(in: range)(String(range.upperBound + 1)) }
+        }
         #expect(throws: ValidationError.self) { try MonitorFlagOption.tick("61") }
     }
 
     @Test func garbageTextIsRejectedForEveryFlag() {
-        #expect(throws: ValidationError.self) { try MonitorFlagOption.linesPerMinute("soon") }
-        #expect(throws: ValidationError.self) { try MonitorFlagOption.linesPerArm("soon") }
-        #expect(throws: ValidationError.self) { try MonitorFlagOption.errorsPerMinute("soon") }
-        #expect(throws: ValidationError.self) { try MonitorFlagOption.errorsPerArm("soon") }
+        for range in Self.lineRanges {
+            #expect(throws: ValidationError.self) { try MonitorFlagOption.lines(in: range)("soon") }
+        }
         #expect(throws: ValidationError.self) { try MonitorFlagOption.tick("soon") }
         #expect(throws: ValidationError.self) { try MonitorFlagOption.tick("nan") }
+    }
+
+    @Test func rangeTextReadsLikeTheHelp() {
+        #expect(MonitorFlagOption.rangeText(MonitorLimits.linesPerArmRange) == "1-20000")
+        #expect(MonitorFlagOption.rangeText(MonitorLimits.tickRange) == "0.5-60")
     }
 
     /** Every flag actually routes through its validator at the CLI's own

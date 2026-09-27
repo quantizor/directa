@@ -34,12 +34,20 @@ public enum MonitorLimits {
         of the 30 s window. */
     public static let quietTrigger: TimeInterval = 5
 
-    /** The daemon's own `tailByStream` cap on out and err per query (the
-        command layer's per-tick fetch uses the same number): past this many
-        lines in one tick, the daemon trims before the client ever sees them,
-        so a tick can under-report volume even while the client's own budget
-        has room left. */
+    /** The per-stream line count the client asks for on out and err in each
+        tick's query (`tailByStream`): past this many lines in one tick, the
+        daemon keeps the newest and drops the rest before the client sees
+        them, so a tick can under-report volume even while the client's own
+        budget has room left. */
     public static let perTickFetchCap = 300
+
+    /** Claude Code's Monitor tool kills its command after this long; the
+        session context's Monitor call asks for exactly this `timeout_ms`. */
+    public static let harnessKillSeconds: TimeInterval = 30 * 60
+
+    /** A minute under the harness kill, so the run's own end marker, with
+        its re-arm command, is delivered before the tool drops the process. */
+    public static let hardCapSeconds: TimeInterval = harnessKillSeconds - 60
 
     /** stdout: 120/min covers a chatty dev server's request logging without
         the monitor itself becoming the flood; 1200 is a hard ceiling past
@@ -147,17 +155,17 @@ public struct MonitorAttachSummary: Sendable {
     state change, so MonitorStream never needs to deduplicate it itself.
     `windowStart` is the time of the cursor the query read past: the daemon
     trims the oldest lines of a window, so that is where the lines it did not
-    return begin. Nil falls back to the first returned record, then `at`. */
+    return begin. */
 public struct MonitorTick: Sendable {
     public var at: Date
     public var health: String?
     public var records: [LogRecord]
     public var trimmed: [LogStream: Int]
-    public var windowStart: Date?
+    public var windowStart: Date
 
     public init(
         at: Date, health: String? = nil, records: [LogRecord] = [], trimmed: [LogStream: Int] = [:],
-        windowStart: Date? = nil
+        windowStart: Date
     ) {
         self.at = at
         self.health = health
@@ -189,7 +197,9 @@ public enum MonitorEventKind: String, Codable, Sendable {
     substring: the repeat count for `repeated`, the crossed cap for a
     `budget` overflow marker, the suppressed total for its resume marker or
     for `suppressed`. Encode only through `JSONCoding`; a raw `JSONEncoder`
-    loses the millisecond ISO-8601 date format this type's golden depends on. */
+    loses the millisecond ISO-8601 date format this type's golden depends on.
+    Built only through the per-kind factories below, so a kind that carries a
+    count always has one. */
 public struct MonitorEvent: Codable, Equatable, Sendable {
     public var at: Date
     public var count: Int?
@@ -198,7 +208,7 @@ public struct MonitorEvent: Codable, Equatable, Sendable {
     public var stream: LogStream?
     public var text: String
 
-    public init(
+    private init(
         at: Date, count: Int? = nil, kind: MonitorEventKind, label: String, stream: LogStream? = nil,
         text: String
     ) {
@@ -208,6 +218,50 @@ public struct MonitorEvent: Codable, Equatable, Sendable {
         self.label = label
         self.stream = stream
         self.text = text
+    }
+
+    public static func attached(at: Date, label: String, text: String) -> MonitorEvent {
+        MonitorEvent(at: at, kind: .attached, label: label, text: text)
+    }
+
+    /** `count` is the crossed cap for an over-budget marker, or the
+        suppressed total for a resume marker. */
+    public static func budget(at: Date, count: Int, label: String, stream: LogStream, text: String) -> MonitorEvent {
+        MonitorEvent(at: at, count: count, kind: .budget, label: label, stream: stream, text: text)
+    }
+
+    public static func ended(at: Date, label: String, text: String) -> MonitorEvent {
+        MonitorEvent(at: at, kind: .ended, label: label, text: text)
+    }
+
+    public static func health(at: Date, label: String, text: String) -> MonitorEvent {
+        MonitorEvent(at: at, kind: .health, label: label, text: text)
+    }
+
+    public static func lifecycle(at: Date, label: String, stream: LogStream, text: String) -> MonitorEvent {
+        MonitorEvent(at: at, kind: .lifecycle, label: label, stream: stream, text: text)
+    }
+
+    public static func line(at: Date, label: String, stream: LogStream, text: String) -> MonitorEvent {
+        MonitorEvent(at: at, kind: .line, label: label, stream: stream, text: text)
+    }
+
+    /** `count` is how many more times `text` arrived after the one shown. */
+    public static func repeated(at: Date, count: Int, label: String, stream: LogStream, text: String) -> MonitorEvent {
+        MonitorEvent(at: at, count: count, kind: .repeated, label: label, stream: stream, text: text)
+    }
+
+    /** `count` is how many lines went unshown: skipped by the daemon on
+        `stream`, or collapsed as repeats across every stream when `stream`
+        is nil. */
+    public static func suppressed(
+        at: Date, count: Int, label: String, stream: LogStream? = nil, text: String
+    ) -> MonitorEvent {
+        MonitorEvent(at: at, count: count, kind: .suppressed, label: label, stream: stream, text: text)
+    }
+
+    public static func transient(at: Date, label: String, text: String) -> MonitorEvent {
+        MonitorEvent(at: at, kind: .transient, label: label, text: text)
     }
 
     /** The exact line a terminal or an agent's Monitor tool sees. */
@@ -237,9 +291,10 @@ public struct MonitorEvent: Codable, Equatable, Sendable {
 
 /** Sanitizes text and labels before either reaches a terminal or an agent's
     context: child output is attacker-influenceable. Public: the CLI's monitor
-    loop constructs a `.transient` `MonitorEvent` directly (there is no
-    `MonitorStream` method for a connection-level failure), and needs the same
-    guarantees on the label it renders that as `directa <label>:`. */
+    loop builds a `.transient` event itself (there is no `MonitorStream`
+    method for a connection-level failure), before attaching as well as
+    after, and needs the same guarantees on the label and reason it renders
+    under `directa <label>:`. */
 public enum MonitorSanitizer {
     /** ANSI/OSC escapes (a terminal-injection surface, stripped by the same
         routine `LogSanitizer` already uses for spool output), the Unicode
@@ -272,10 +327,6 @@ public enum MonitorSanitizer {
             sanitize(raw).map { character in
                 character == "|" || character == ":" || character.isWhitespace ? "_" : character
             })
-    }
-
-    public static func truncate(_ text: String, limit: Int) -> String {
-        LogSanitizer.truncated(text, toCharacters: limit)
     }
 }
 
@@ -320,14 +371,29 @@ public struct MonitorStream: Sendable {
         var totalShownCount: Int
     }
 
-    private struct RepeatKey: Hashable {
-        var normalized: String
-        var stream: LogStream
+    /** The two streams a child writes, the only ones with repeat suppression
+        and budgets; sys and mark never reach either. */
+    private enum ChildStream {
+        case err
+        case out
+
+        var logStream: LogStream {
+            switch self {
+            case .err: .err
+            case .out: .out
+            }
+        }
     }
 
-    /** A fixed-capacity, insertion/access-ordered cache: the LRU the plan
-        calls for. 512 entries is small enough that a linear position update
-        on write is not worth a doubly-linked structure. */
+    private struct RepeatKey: Hashable {
+        var normalized: String
+        var stream: ChildStream
+    }
+
+    /** A fixed-capacity cache ordered by last sighting, bounding client
+        memory for the life of the run. At `MonitorLimits.lruCapacity`
+        entries a linear position update on write costs less than a
+        doubly-linked structure would. */
     private struct RepeatLRU {
         private let capacity: Int
         private var order: [RepeatKey] = []
@@ -383,28 +449,54 @@ public struct MonitorStream: Sendable {
     /** One stream's token bucket (rate, refills) plus its independent, non-
         refilling arm ceiling and the accounting a resume marker needs. */
     private struct TokenBudget {
+        let armCap: Int
         var armCount = 0
         var armMarkerShown = false
         var daemonTrimmedSinceMarker = 0
         var lastRefillAt: Date
         var minuteOverBudget = false
+        let perMinute: Int
         var tokens: Double
         var withheldSinceMarker = 0
 
-        init(capacity: Double, at: Date) {
-            tokens = capacity
+        init(armCap: Int, perMinute: Int, at: Date) {
+            self.armCap = armCap
             lastRefillAt = at
+            self.perMinute = perMinute
+            tokens = Double(MonitorLimits.burstCapacity(perMinute: perMinute))
         }
+
+        var burstCapacity: Int { MonitorLimits.burstCapacity(perMinute: perMinute) }
 
         /** Moves forward only: a flushed `(repeated xN)` carries the time
             its run was last seen, which can be earlier than a line already
             charged this tick, and stepping `lastRefillAt` back to it would
             credit the same interval twice. */
-        mutating func refill(at date: Date, ratePerMinute: Int, capacity: Int) {
+        mutating func refill(at date: Date) {
             guard date > lastRefillAt else { return }
             let elapsed = date.timeIntervalSince(lastRefillAt)
-            tokens = min(Double(capacity), tokens + elapsed * Double(ratePerMinute) / 60)
+            tokens = min(Double(burstCapacity), tokens + elapsed * Double(perMinute) / 60)
             lastRefillAt = date
+        }
+    }
+
+    private struct StreamBudgets {
+        var err: TokenBudget
+        var out: TokenBudget
+
+        subscript(stream: ChildStream) -> TokenBudget {
+            get {
+                switch stream {
+                case .err: err
+                case .out: out
+                }
+            }
+            set {
+                switch stream {
+                case .err: err = newValue
+                case .out: out = newValue
+                }
+            }
         }
     }
 
@@ -413,18 +505,18 @@ public struct MonitorStream: Sendable {
         case minute
     }
 
-    private var blockContinuation: [LogStream: Bool] = [:]
+    private var blockContinuation: [ChildStream: Bool] = [:]
+    private var budgets: StreamBudgets
     private let config: MonitorConfig
-    private var errBudget: TokenBudget
     private let hintName: String
+    /** The sanitized label every event of this run renders under. */
+    public let label: String
     private var lastKnownAt: Date
     private var lastOutErrActivityAt: Date?
-    private var lastRecordAt: [LogStream: Date] = [:]
+    private var lastRecordAt: [ChildStream: Date] = [:]
     private var lastSummaryAt: Date
     private var lifecyclePending: [LogStream: PendingRun] = [:]
-    private var outBudget: TokenBudget
     private var repeatLRU: RepeatLRU
-    private var sanitizedLabel: String
     private var summaryDistinct: Set<RepeatKey> = []
     /** The oldest suppressed repeat still counted in `summaryTotal`: where
         the summary's read-what-was-skipped command has to start. */
@@ -432,30 +524,29 @@ public struct MonitorStream: Sendable {
     private var summaryTotal = 0
 
     public init(config: MonitorConfig) {
+        budgets = StreamBudgets(
+            err: TokenBudget(
+                armCap: config.budgets.errorsPerArm, perMinute: config.budgets.errorsPerMinute, at: config.clockStart),
+            out: TokenBudget(
+                armCap: config.budgets.linesPerArm, perMinute: config.budgets.linesPerMinute, at: config.clockStart))
         self.config = config
-        errBudget = TokenBudget(
-            capacity: Double(MonitorLimits.burstCapacity(perMinute: config.budgets.errorsPerMinute)),
-            at: config.clockStart)
         hintName = ShellWord.inertOr(config.serverName)
+        label = MonitorSanitizer.sanitizeLabel(config.label)
         lastKnownAt = config.clockStart
         lastSummaryAt = config.clockStart
-        outBudget = TokenBudget(
-            capacity: Double(MonitorLimits.burstCapacity(perMinute: config.budgets.linesPerMinute)),
-            at: config.clockStart)
         repeatLRU = RepeatLRU(capacity: MonitorLimits.lruCapacity)
-        sanitizedLabel = MonitorSanitizer.sanitizeLabel(config.label)
     }
 
     // MARK: - Public surface
 
-    public mutating func attached(_ summary: MonitorAttachSummary) -> [MonitorEvent] {
+    public func attached(_ summary: MonitorAttachSummary) -> [MonitorEvent] {
         let budgets = config.budgets
         let text =
             "monitoring \(summary.checkoutPath) (\(summary.statusDescription); "
             + "budget \(budgets.linesPerMinute)/min and \(budgets.linesPerArm)/arm, "
             + "errors \(budgets.errorsPerMinute)/min and \(budgets.errorsPerArm)/arm); "
             + "earlier output: directa logs \(hintName) --tail 200"
-        return [MonitorEvent(at: lastKnownAt, kind: .attached, label: sanitizedLabel, text: text)]
+        return [.attached(at: lastKnownAt, label: label, text: text)]
     }
 
     public mutating func ingest(_ tick: MonitorTick) -> [MonitorEvent] {
@@ -464,8 +555,7 @@ public struct MonitorStream: Sendable {
         /** Stamped at the window's start so it sorts ahead of this tick's
             returned lines: the daemon kept the newest lines, so the skipped
             ones came first. */
-        let windowStart = tick.windowStart ?? tick.records.first?.at ?? tick.at
-        events += applyDaemonTrimmed(tick.trimmed, at: windowStart)
+        events += applyDaemonTrimmed(tick.trimmed, at: tick.windowStart)
         for record in tick.records {
             events += process(record)
         }
@@ -476,9 +566,9 @@ public struct MonitorStream: Sendable {
             it had a chance to report its own suppressed count. */
         events += flushPendingBurstRuns(at: tick.at, onlyStale: true)
         if let health = tick.health {
-            let text = MonitorSanitizer.truncate(
-                MonitorSanitizer.sanitize(health), limit: MonitorLimits.truncationCharacterLimit)
-            events.append(MonitorEvent(at: tick.at, kind: .health, label: sanitizedLabel, text: text))
+            let text = LogSanitizer.truncated(
+                MonitorSanitizer.sanitize(health), toCharacters: MonitorLimits.truncationCharacterLimit)
+            events.append(.health(at: tick.at, label: label, text: text))
         }
         events += evaluatePeriodicSummary(now: tick.at)
         /** A stale-run flush can carry an `at` from well before this tick (the
@@ -491,24 +581,23 @@ public struct MonitorStream: Sendable {
 
     public mutating func ended(reason: String) -> [MonitorEvent] {
         var events = flushForEnd()
-        events.append(MonitorEvent(at: lastKnownAt, kind: .ended, label: sanitizedLabel, text: "ended (\(reason))"))
+        events.append(.ended(at: lastKnownAt, label: label, text: "ended (\(reason))"))
         return events
     }
 
-    /** The 29-minute hard cap (below Claude Code's 30-minute Monitor kill, so
-        this line is delivered before the tool would drop the process
-        itself): worded as a next step rather than `ended(reason:)`'s
-        parenthetical, since re-arming is the whole point of this ending.
-        `resumeFrom` is the final cursor's time: a re-armed monitor starts at
-        the end of the log, so the command reads whatever lands between this
-        line and that attach. */
+    /** The `MonitorLimits.hardCapSeconds` ending: worded as a next step
+        rather than `ended(reason:)`'s parenthetical, since re-arming is the
+        whole point of this ending. `resumeFrom` is the final cursor's time:
+        a re-armed monitor starts at the end of the log, so the command reads
+        whatever lands between this line and that attach. */
     public mutating func endedAtHardCap(resumeFrom: Date) -> [MonitorEvent] {
         var events = flushForEnd()
         let since = JSONCoding.formatISO8601(resumeFrom)
+        let minutes = Int(MonitorLimits.hardCapSeconds / 60)
         events.append(
-            MonitorEvent(
-                at: lastKnownAt, kind: .ended, label: sanitizedLabel,
-                text: "ended after 29 minutes; run the same command again to keep watching; "
+            .ended(
+                at: lastKnownAt, label: label,
+                text: "ended after \(minutes) minutes; run the same command again to keep watching; "
                     + "anything after this: directa logs \(hintName) --since \(since) --head 200"))
         return events
     }
@@ -523,9 +612,7 @@ public struct MonitorStream: Sendable {
         for stream in [LogStream.sys, .mark] {
             if let pending = lifecyclePending[stream], pending.count > 1 {
                 events.append(
-                    MonitorEvent(
-                        at: pending.at, count: pending.count - 1, kind: .repeated, label: sanitizedLabel,
-                        stream: stream, text: pending.text))
+                    .repeated(at: pending.at, count: pending.count - 1, label: label, stream: stream, text: pending.text))
             }
             lifecyclePending[stream] = nil
         }
@@ -542,28 +629,26 @@ public struct MonitorStream: Sendable {
         case .sys:
             return processSys(record)
         case .mark:
-            return processMark(record)
-        case .out, .err:
-            return processChildLine(record)
+            return collapseLifecycle(
+                stream: .mark, text: "mark \(MonitorSanitizer.sanitize(record.text))", at: record.at)
+        case .out:
+            return processChildLine(record, stream: .out)
+        case .err:
+            return processChildLine(record, stream: .err)
         }
     }
 
-    /** `rotated` is the one sys line that never reaches the transcript at
-        all; every other producer (started/exited/stopping/spawn failed/
-        adopted/watch suspended/spool catch-up/stuck stop, or anything a
-        future producer adds) renders identically, so there is nothing else
-        to branch on here. */
+    /** `SysLineText.rotated` is the one sys line that never reaches the
+        transcript at all; every other producer (started/exited/stopping/
+        spawn failed/adopted/watch suspended/spool catch-up/stuck stop, or
+        anything a future producer adds) renders identically, so there is
+        nothing else to branch on here. Record text needs no truncation here
+        or on any other stream: the query asks the daemon to cut each line to
+        `MonitorLimits.truncationCharacterLimit`, and sanitizing only removes
+        characters. */
     private mutating func processSys(_ record: LogRecord) -> [MonitorEvent] {
-        guard record.text != "rotated" else { return [] }
-        let text = MonitorSanitizer.truncate(
-            MonitorSanitizer.sanitize(record.text), limit: MonitorLimits.truncationCharacterLimit)
-        return collapseLifecycle(stream: .sys, text: text, at: record.at)
-    }
-
-    private mutating func processMark(_ record: LogRecord) -> [MonitorEvent] {
-        let inner = MonitorSanitizer.truncate(
-            MonitorSanitizer.sanitize(record.text), limit: MonitorLimits.truncationCharacterLimit)
-        return collapseLifecycle(stream: .mark, text: "mark \(inner)", at: record.at)
+        guard record.text != SysLineText.rotated else { return [] }
+        return collapseLifecycle(stream: .sys, text: MonitorSanitizer.sanitize(record.text), at: record.at)
     }
 
     /** Lifecycle/mark bypass the LRU and the budgets entirely; the only
@@ -578,21 +663,17 @@ public struct MonitorStream: Sendable {
         var events: [MonitorEvent] = []
         if let pending = lifecyclePending[stream], pending.count > 1 {
             events.append(
-                MonitorEvent(
-                    at: pending.at, count: pending.count - 1, kind: .repeated, label: sanitizedLabel,
-                    stream: stream, text: pending.text))
+                .repeated(at: pending.at, count: pending.count - 1, label: label, stream: stream, text: pending.text))
         }
-        events.append(MonitorEvent(at: at, kind: .lifecycle, label: sanitizedLabel, stream: stream, text: text))
+        events.append(.lifecycle(at: at, label: label, stream: stream, text: text))
         lifecyclePending[stream] = PendingRun(at: at, count: 1, text: text)
         return events
     }
 
     // MARK: - Out/err repeat suppression and budgets
 
-    private mutating func processChildLine(_ record: LogRecord) -> [MonitorEvent] {
-        let stream = record.stream
-        let displayText = MonitorSanitizer.truncate(
-            MonitorSanitizer.sanitize(record.text), limit: MonitorLimits.truncationCharacterLimit)
+    private mutating func processChildLine(_ record: LogRecord, stream: ChildStream) -> [MonitorEvent] {
+        let displayText = MonitorSanitizer.sanitize(record.text)
         let key = RepeatKey(normalized: LineNormalizer.normalize(displayText), stream: stream)
 
         /** A reprinted multi-line block (a stack trace) opens on its first
@@ -623,8 +704,7 @@ public struct MonitorStream: Sendable {
                 firstShownAt: record.at, lastDisplayText: displayText, lastSeenAt: record.at,
                 pendingSuppressed: 0, totalShownCount: 1)
             return applyBudget(
-                MonitorEvent(at: record.at, kind: .line, label: sanitizedLabel, stream: stream, text: displayText),
-                stream: stream)
+                .line(at: record.at, label: label, stream: stream.logStream, text: displayText), stream: stream)
         }
 
         let elapsedSinceSeen = record.at.timeIntervalSince(entry.lastSeenAt)
@@ -647,8 +727,7 @@ public struct MonitorStream: Sendable {
             firstShownAt: entry.firstShownAt, lastDisplayText: displayText, lastSeenAt: record.at,
             pendingSuppressed: 0, totalShownCount: ordinal)
         blockContinuation[stream] = true
-        return applyBudget(
-            MonitorEvent(at: record.at, kind: .line, label: sanitizedLabel, stream: stream, text: text), stream: stream)
+        return applyBudget(.line(at: record.at, label: label, stream: stream.logStream, text: text), stream: stream)
     }
 
     private mutating func recordBurstRepeat(key: RepeatKey, displayText: String, at: Date) {
@@ -686,9 +765,9 @@ public struct MonitorStream: Sendable {
                 continue
             }
             events += applyBudget(
-                MonitorEvent(
-                    at: entry.lastSeenAt, count: entry.pendingSuppressed, kind: .repeated,
-                    label: sanitizedLabel, stream: key.stream, text: entry.lastDisplayText),
+                .repeated(
+                    at: entry.lastSeenAt, count: entry.pendingSuppressed, label: label, stream: key.stream.logStream,
+                    text: entry.lastDisplayText),
                 stream: key.stream)
             releaseFromSummary(entry.pendingSuppressed, key: key)
             var updated = entry
@@ -706,15 +785,13 @@ public struct MonitorStream: Sendable {
         suppress lines the daemon itself never sent. */
     private mutating func applyDaemonTrimmed(_ trimmed: [LogStream: Int], at: Date) -> [MonitorEvent] {
         var events: [MonitorEvent] = []
-        for stream in [LogStream.out, .err] {
-            guard let count = trimmed[stream], count > 0 else { continue }
-            var budget = budget(for: stream)
-            if budget.minuteOverBudget {
-                budget.daemonTrimmedSinceMarker += count
+        for stream in [ChildStream.out, .err] {
+            guard let count = trimmed[stream.logStream], count > 0 else { continue }
+            if budgets[stream].minuteOverBudget {
+                budgets[stream].daemonTrimmedSinceMarker += count
             } else {
-                events.append(trimmedSkippedEvent(stream: stream, at: at, count: count))
+                events.append(trimmedSkippedEvent(stream: stream.logStream, at: at, count: count))
             }
-            setBudget(budget, for: stream)
         }
         return events
     }
@@ -722,9 +799,9 @@ public struct MonitorStream: Sendable {
     private func trimmedSkippedEvent(stream: LogStream, at: Date, count: Int) -> MonitorEvent {
         let since = JSONCoding.formatISO8601(at)
         let text =
-            "\(Self.lines(count, of: stream)) skipped (more than \(MonitorLimits.perTickFetchCap) in one tick); "
+            "\(Self.lines(count, of: stream.rawValue)) skipped (more than \(MonitorLimits.perTickFetchCap) in one tick); "
             + "read them: directa logs \(hintName) --since \(since) --stream \(stream.rawValue) --head 200"
-        return MonitorEvent(at: at, count: count, kind: .suppressed, label: sanitizedLabel, stream: stream, text: text)
+        return .suppressed(at: at, count: count, label: label, stream: stream, text: text)
     }
 
     /** Every rendered out/err event passes here, a flushed `(repeated xN)`
@@ -732,40 +809,38 @@ public struct MonitorStream: Sendable {
         counts toward the resume marker exactly like a line. Otherwise a
         stream of distinct-but-repeating lines would reach the reader
         through its collapse markers with no budget at all. */
-    private mutating func applyBudget(_ event: MonitorEvent, stream: LogStream) -> [MonitorEvent] {
+    private mutating func applyBudget(_ event: MonitorEvent, stream: ChildStream) -> [MonitorEvent] {
         let at = event.at
-        var budget = budget(for: stream)
-        defer { setBudget(budget, for: stream) }
+        var budget = budgets[stream]
+        defer { budgets[stream] = budget }
         var events: [MonitorEvent] = []
 
-        let armCeiling = armCap(for: stream)
-        if budget.armCount >= armCeiling {
+        if budget.armCount >= budget.armCap {
             if !budget.armMarkerShown {
                 budget.armMarkerShown = true
-                events.append(overBudgetEvent(stream: stream, at: at, cap: armCeiling, scope: .arm))
+                events.append(overBudgetEvent(stream: stream.logStream, at: at, cap: budget.armCap, scope: .arm))
             }
             return events
         }
 
-        budget.refill(at: at, ratePerMinute: perMinuteCap(for: stream), capacity: burstCapacity(for: stream))
+        budget.refill(at: at)
         /** Hysteresis: once over, a stream stays withheld until its bucket
             refills to the full burst. Resuming on the first refilled token
             would alternate an over-budget and a resume marker on every tick
             of a steadily chatty server, more noise than the lines withheld. */
-        let resumeAt = budget.minuteOverBudget ? Double(burstCapacity(for: stream)) : 1
+        let resumeAt = budget.minuteOverBudget ? Double(budget.burstCapacity) : 1
         if budget.tokens < resumeAt {
             budget.withheldSinceMarker += 1
             if !budget.minuteOverBudget {
                 budget.minuteOverBudget = true
-                events.append(
-                    overBudgetEvent(stream: stream, at: at, cap: perMinuteCap(for: stream), scope: .minute))
+                events.append(overBudgetEvent(stream: stream.logStream, at: at, cap: budget.perMinute, scope: .minute))
             }
             return events
         }
 
         if budget.minuteOverBudget {
             let suppressed = budget.withheldSinceMarker + budget.daemonTrimmedSinceMarker
-            events.append(resumeEvent(stream: stream, at: at, suppressed: suppressed))
+            events.append(resumeEvent(stream: stream.logStream, at: at, suppressed: suppressed))
             budget.minuteOverBudget = false
             budget.withheldSinceMarker = 0
             budget.daemonTrimmedSinceMarker = 0
@@ -777,30 +852,6 @@ public struct MonitorStream: Sendable {
         return events
     }
 
-    private func budget(for stream: LogStream) -> TokenBudget {
-        stream == .out ? outBudget : errBudget
-    }
-
-    private mutating func setBudget(_ value: TokenBudget, for stream: LogStream) {
-        if stream == .out {
-            outBudget = value
-        } else {
-            errBudget = value
-        }
-    }
-
-    private func armCap(for stream: LogStream) -> Int {
-        stream == .out ? config.budgets.linesPerArm : config.budgets.errorsPerArm
-    }
-
-    private func perMinuteCap(for stream: LogStream) -> Int {
-        stream == .out ? config.budgets.linesPerMinute : config.budgets.errorsPerMinute
-    }
-
-    private func burstCapacity(for stream: LogStream) -> Int {
-        MonitorLimits.burstCapacity(perMinute: perMinuteCap(for: stream))
-    }
-
     private func overBudgetEvent(stream: LogStream, at: Date, cap: Int, scope: BudgetScope) -> MonitorEvent {
         let scopeText =
             scope == .minute
@@ -810,7 +861,7 @@ public struct MonitorStream: Sendable {
         let text =
             "\(stream.rawValue) over budget (\(scopeText)); read what was skipped: "
             + "directa logs \(hintName) --since \(since) --stream \(stream.rawValue) --head 200"
-        return MonitorEvent(at: at, count: cap, kind: .budget, label: sanitizedLabel, stream: stream, text: text)
+        return .budget(at: at, count: cap, label: label, stream: stream, text: text)
     }
 
     /** "1 line", "3 lines", "1 out line", "3 repeated lines". */
@@ -819,14 +870,9 @@ public struct MonitorStream: Sendable {
         return [String(count), qualifier, noun].compactMap { $0 }.joined(separator: " ")
     }
 
-    private static func lines(_ count: Int, of stream: LogStream) -> String {
-        lines(count, of: stream.rawValue)
-    }
-
     private func resumeEvent(stream: LogStream, at: Date, suppressed: Int) -> MonitorEvent {
         let text = "\(stream.rawValue) resumed (\(Self.lines(suppressed)) suppressed while over budget)"
-        return MonitorEvent(
-            at: at, count: suppressed, kind: .budget, label: sanitizedLabel, stream: stream, text: text)
+        return .budget(at: at, count: suppressed, label: label, stream: stream, text: text)
     }
 
     // MARK: - Periodic summary
@@ -851,7 +897,7 @@ public struct MonitorStream: Sendable {
         let text =
             "\(Self.lines(summaryTotal, of: "repeated")) suppressed (\(summaryDistinct.count) distinct); "
             + "directa logs \(hintName) --since \(since) --head 200"
-        let event = MonitorEvent(at: at, count: summaryTotal, kind: .suppressed, label: sanitizedLabel, text: text)
+        let event = MonitorEvent.suppressed(at: at, count: summaryTotal, label: label, text: text)
         summaryDistinct.removeAll()
         summaryEarliestAt = nil
         summaryTotal = 0

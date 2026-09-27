@@ -441,6 +441,7 @@ import Testing
         #expect(ShellWord.argument("web; rm -rf ~") == "'web; rm -rf ~'")
         #expect(ShellWord.argument("it's") == "'it'\\''s'")
         #expect(ShellWord.argument("") == "''")
+        #expect(ShellWord.argument(String(repeating: "a", count: 65)) == String(repeating: "a", count: 65))
     }
 
     @Test(arguments: ["web", "api-v2", "my_app.dev", String(repeating: "a", count: 64)])
@@ -450,7 +451,7 @@ import Testing
     }
 
     @Test(arguments: [
-        "", "web; rm -rf ~", "web\"x", "my server", "$(id)", "web`id`", "wéb", "a|b", "it's",
+        "", "web; rm -rf ~", "web\"x", "my server", "$(id)", "web`id`", "wéb", "a|b", "it's", "a/b",
         String(repeating: "a", count: 65),
     ])
     func anythingElseBecomesThePlaceholder(word: String) {
@@ -462,5 +463,29 @@ import Testing
         #expect(ShellWord.singleQuoted("/Users/me/app") == "'/Users/me/app'")
         #expect(ShellWord.singleQuoted("/tmp/it's here") == #"'/tmp/it'\''s here'"#)
         #expect(ShellWord.singleQuoted("$(id) `x`") == "'$(id) `x`'")
+    }
+}
+
+/** The one phrasing of a server's most recent exit that status, the
+    session context, and monitor share. */
+@Suite struct LastExitDescriptionTests {
+    private let at = Date(timeIntervalSince1970: 1_752_868_000)
+
+    @Test func aCodeWinsOverASignal() {
+        let exit = LastExit(at: at, code: 1, signal: 15)
+        #expect(exit.causeDescription == "exit 1")
+        #expect(exit.summary == "last exit exit 1 at 2025-07-18T19:46:40.000Z")
+    }
+
+    @Test func aSignalAloneNamesTheSignal() {
+        let exit = LastExit(at: at, signal: 9)
+        #expect(exit.causeDescription == "signal 9")
+        #expect(exit.summary == "last exit signal 9 at 2025-07-18T19:46:40.000Z")
+    }
+
+    @Test func anUnobservedStatusHasNoCauseAndReadsUnknown() {
+        let exit = LastExit(at: at)
+        #expect(exit.causeDescription == nil)
+        #expect(exit.summary == "last exit unknown at 2025-07-18T19:46:40.000Z")
     }
 }

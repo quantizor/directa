@@ -2,6 +2,7 @@ import ArgumentParser
 import Darwin
 import DirectaKit
 import Foundation
+import os
 
 /** `directa monitor <name>`: a client-side polling loop over `logs.query` and
     `server.status` that shapes daemon output for an agent's own streaming
@@ -17,36 +18,33 @@ struct Monitor: AsyncParsableCommand {
 
     @Option(
         help:
-            "Total stderr lines for this run (\(MonitorLimits.errorsPerArmRange.lowerBound)-\(MonitorLimits.errorsPerArmRange.upperBound)); re-arm (run the command again) to reset.",
-        transform: MonitorFlagOption.errorsPerArm)
+            "Total stderr lines for this run (\(MonitorFlagOption.rangeText(MonitorLimits.errorsPerArmRange))); re-arm (run the command again) to reset.",
+        transform: MonitorFlagOption.lines(in: MonitorLimits.errorsPerArmRange))
     var errorsPerArm = MonitorLimits.errorsPerArmDefault
 
     @Option(
-        help:
-            "Stderr lines allowed per minute (\(MonitorLimits.errorsPerMinuteRange.lowerBound)-\(MonitorLimits.errorsPerMinuteRange.upperBound)).",
-        transform: MonitorFlagOption.errorsPerMinute)
+        help: "Stderr lines allowed per minute (\(MonitorFlagOption.rangeText(MonitorLimits.errorsPerMinuteRange))).",
+        transform: MonitorFlagOption.lines(in: MonitorLimits.errorsPerMinuteRange))
     var errorsPerMinute = MonitorLimits.errorsPerMinuteDefault
 
     @OptionGroup var global: GlobalOptions
 
     @Option(
         help:
-            "Total stdout lines for this run (\(MonitorLimits.linesPerArmRange.lowerBound)-\(MonitorLimits.linesPerArmRange.upperBound)); re-arm (run the command again) to reset.",
-        transform: MonitorFlagOption.linesPerArm)
+            "Total stdout lines for this run (\(MonitorFlagOption.rangeText(MonitorLimits.linesPerArmRange))); re-arm (run the command again) to reset.",
+        transform: MonitorFlagOption.lines(in: MonitorLimits.linesPerArmRange))
     var linesPerArm = MonitorLimits.linesPerArmDefault
 
     @Option(
-        help:
-            "Stdout lines allowed per minute (\(MonitorLimits.linesPerMinuteRange.lowerBound)-\(MonitorLimits.linesPerMinuteRange.upperBound)).",
-        transform: MonitorFlagOption.linesPerMinute)
+        help: "Stdout lines allowed per minute (\(MonitorFlagOption.rangeText(MonitorLimits.linesPerMinuteRange))).",
+        transform: MonitorFlagOption.lines(in: MonitorLimits.linesPerMinuteRange))
     var linesPerMinute = MonitorLimits.linesPerMinuteDefault
 
     @Argument(help: "Server name.")
     var name: String
 
     @Option(
-        help:
-            "Seconds between polls (\(MonitorFlagOption.formatSeconds(MonitorLimits.tickRange.lowerBound))-\(MonitorFlagOption.formatSeconds(MonitorLimits.tickRange.upperBound))).",
+        help: "Seconds between polls (\(MonitorFlagOption.rangeText(MonitorLimits.tickRange))).",
         transform: MonitorFlagOption.tick)
     var tick = MonitorLimits.tickDefault
 
@@ -100,9 +98,8 @@ struct Monitor: AsyncParsableCommand {
                     do {
                         try await Task.sleep(for: .seconds(delaySeconds))
                     } catch {
-                        /** Cancelled mid-sleep: the reader is gone. Per the
-                            design, an end marker prints only on self-exit, so
-                            nothing more is written here. */
+                        /** Cancelled mid-sleep: the reader is gone, so there
+                            is no one to print an end marker to. */
                         return .success
                     }
                 }
@@ -127,8 +124,9 @@ struct Monitor: AsyncParsableCommand {
     private static func emit(_ events: [MonitorEvent], json: Bool) -> Bool {
         guard !events.isEmpty else { return true }
         if json {
+            let encoder = JSONCoding.encoder()
             for event in events {
-                if let data = try? JSONCoding.encoder().encode(event) {
+                if let data = try? encoder.encode(event) {
                     print(String(decoding: data, as: UTF8.self))
                 }
             }
@@ -150,22 +148,19 @@ struct Monitor: AsyncParsableCommand {
     boundary `TimeoutOption` screens `--timeout` at: a value outside
     `MonitorLimits`' range is refused with a message naming the range,
     rather than reaching `MonitorStream` and silently behaving as an
-    unlimited or a zero budget. */
+    unlimited or a zero budget. ArgumentParser prefixes each message with the
+    flag it came from. */
 enum MonitorFlagOption {
-    static func errorsPerArm(_ raw: String) throws -> Int {
-        try parseInt(raw, range: MonitorLimits.errorsPerArmRange, flag: "--errors-per-arm")
-    }
-
-    static func errorsPerMinute(_ raw: String) throws -> Int {
-        try parseInt(raw, range: MonitorLimits.errorsPerMinuteRange, flag: "--errors-per-minute")
-    }
-
-    static func linesPerArm(_ raw: String) throws -> Int {
-        try parseInt(raw, range: MonitorLimits.linesPerArmRange, flag: "--lines-per-arm")
-    }
-
-    static func linesPerMinute(_ raw: String) throws -> Int {
-        try parseInt(raw, range: MonitorLimits.linesPerMinuteRange, flag: "--lines-per-minute")
+    static func lines(in range: ClosedRange<Int>) -> @Sendable (String) throws -> Int {
+        { raw in
+            guard let value = Int(raw) else {
+                throw ValidationError("'\(raw)' is not a whole number of lines")
+            }
+            guard range.contains(value) else {
+                throw ValidationError("must be between \(range.lowerBound) and \(range.upperBound), got \(raw)")
+            }
+            return value
+        }
     }
 
     static func tick(_ raw: String) throws -> Double {
@@ -175,28 +170,24 @@ enum MonitorFlagOption {
         let range = MonitorLimits.tickRange
         guard range.contains(value) else {
             throw ValidationError(
-                "--tick must be between \(formatSeconds(range.lowerBound)) and "
-                    + "\(formatSeconds(range.upperBound)) seconds, got \(raw)")
+                "must be between \(formatSeconds(range.lowerBound)) and \(formatSeconds(range.upperBound)) seconds, got \(raw)")
         }
         return value
     }
 
-    /** `MonitorLimits.tickRange`'s bounds are `TimeInterval`; printing a
-        whole one (60) as "60" rather than "60.0" keeps the message and the
-        help text reading like something a person wrote. */
-    static func formatSeconds(_ value: Double) -> String {
+    /** "1-1200": the range as the help text shows it. */
+    static func rangeText(_ range: ClosedRange<Int>) -> String {
+        "\(range.lowerBound)-\(range.upperBound)"
+    }
+
+    static func rangeText(_ range: ClosedRange<Double>) -> String {
+        "\(formatSeconds(range.lowerBound))-\(formatSeconds(range.upperBound))"
+    }
+
+    /** A whole number of seconds (60) prints as "60" rather than "60.0", so
+        the message and the help text read like something a person wrote. */
+    private static func formatSeconds(_ value: Double) -> String {
         value == value.rounded() ? String(Int(value)) : String(value)
-    }
-
-    private static func parseInt(_ raw: String, range: ClosedRange<Int>, flag: String) throws -> Int {
-        guard let value = Int(raw) else {
-            throw ValidationError("'\(raw)' is not a whole number of lines")
-        }
-        guard range.contains(value) else {
-            throw ValidationError(
-                "\(flag) must be between \(range.lowerBound) and \(range.upperBound), got \(raw)")
-        }
-        return value
     }
 }
 
@@ -222,8 +213,10 @@ extension DaemonClient: MonitorRequesting {
     }
 }
 
-/** Wall time and sleep behind a protocol so a test drives every backoff,
-    poll-interval, and hard-cap decision without a real clock. */
+/** Wall time behind a protocol so a test drives every backoff, status-poll,
+    and hard-cap decision without a real clock. The sleep between steps is
+    the caller's (`Monitor.run`), outside `MonitorSession`, so it needs no
+    seam: a step only returns the delay. */
 protocol MonitorClock: Sendable {
     func now() async -> Date
 }
@@ -276,9 +269,6 @@ enum MonitorTransient: Equatable {
 enum MonitorRunTuning {
     /** The exponential backoff ceiling while a transient failure persists. */
     static let backoffCeilingSeconds: Double = 10
-    /** Below Claude Code's 30-minute Monitor-tool kill, so the end marker is
-        delivered before the tool would drop the process itself. */
-    static let hardCapSeconds: TimeInterval = 29 * 60
     /** Per tick, sys and mark are fetched with their own small cap,
         independent of `MonitorLimits.perTickFetchCap` (out/err's, much
         larger): lifecycle can never be crowded out by a stdout flood, and
@@ -294,13 +284,13 @@ enum MonitorRunTuning {
 /** One `directa monitor` invocation's state machine: attaches (confirms the
     server exists, feature-gates the daemon, prints the start marker), then
     ticks (one `logs.query` past the last cursor, an occasional
-    `server.status` for health, transient/backoff handling, and the 29-minute
-    hard cap). Free of stdout and process lifetime, so a fake client and
-    clock exercise every decision. */
+    `server.status` for health, transient/backoff handling, and the
+    `MonitorLimits.hardCapSeconds` cap). Free of stdout and process lifetime,
+    so a fake client and clock exercise every decision. */
 struct MonitorSession: Sendable {
     enum StepOutcome: Sendable {
         /** The run is over on its own initiative (not-found, 60 s
-            unreachable, or the 29-minute cap); `events` include the
+            unreachable, or the hard cap); `events` include the
             `MonitorStream.ended`/`endedAtHardCap` marker. */
         case ended([MonitorEvent])
         /** The run is over because the daemon refused it after attaching
@@ -314,35 +304,55 @@ struct MonitorSession: Sendable {
         case exit(WireError)
     }
 
-    private enum State {
-        case attaching
-        case streaming(cursor: LogCursor, stream: MonitorStream, lastHealthDescription: String, startedAt: Date)
+    /** Everything a run carries once attached. */
+    private struct Streaming: Sendable {
+        var cursor: LogCursor
+        var lastHealth: String
+        var lastStatusPollAt: Date
+        let startedAt: Date
+        var stream: MonitorStream
     }
 
+    private enum State: Sendable {
+        case attaching
+        case streaming(Streaming)
+    }
+
+    /** What a transient failure does next: retry after `delay` (with the
+        transition's report, if any), or give up because the daemon has
+        failed to answer for `MonitorRunTuning.unreachableGiveUpSeconds`. */
+    private enum TransientStep {
+        case giveUp
+        case retry([MonitorEvent], delay: Double)
+    }
+
+    /** The label transient lines render under before attaching, when there
+        is no `MonitorStream` yet: the bare server name, sanitized. */
+    private let attachingLabel: String
     private let client: any MonitorRequesting
     private let clock: any MonitorClock
     private let config: MonitorRunConfig
     private var currentBackoff: Double
-    private var label: String
-    private var lastStatusPollAt: Date?
     private var state: State = .attaching
     private var transientKind: MonitorTransient?
     private var unreachableSince: Date?
 
     init(client: any MonitorRequesting, clock: any MonitorClock, config: MonitorRunConfig) {
+        attachingLabel = MonitorSanitizer.sanitizeLabel(config.name)
         self.client = client
         self.clock = clock
         self.config = config
         currentBackoff = config.tickSeconds
-        label = MonitorSanitizer.sanitizeLabel(config.name)
     }
 
     mutating func step() async -> StepOutcome {
         switch state {
         case .attaching:
             return await attachStep()
-        case .streaming:
-            return await tickStep()
+        case .streaming(var streaming):
+            let outcome = await tickStep(&streaming)
+            state = .streaming(streaming)
+            return outcome
         }
     }
 
@@ -367,18 +377,18 @@ struct MonitorSession: Sendable {
             guard let server = statusResult.servers.first(where: { $0.server == config.name }) else {
                 return .exit(ProjectConfigLoader.serverNotFound(name: config.name, project: config.project))
             }
-            label = MonitorSanitizer.sanitizeLabel(Self.rawLabel(name: config.name, server: server))
-            var stream = MonitorStream(
+            let stream = MonitorStream(
                 config: MonitorConfig(
-                    budgets: config.budgets, clockStart: now, label: label, serverName: config.name))
+                    budgets: config.budgets, clockStart: now, label: Self.rawLabel(name: config.name, server: server),
+                    serverName: config.name))
             let description = Self.statusDescription(for: server)
             let events = stream.attached(
                 MonitorAttachSummary(checkoutPath: config.project, statusDescription: description))
             transientKind = nil
             unreachableSince = nil
             currentBackoff = config.tickSeconds
-            lastStatusPollAt = now
-            state = .streaming(cursor: cursor, stream: stream, lastHealthDescription: description, startedAt: now)
+            state = .streaming(
+                Streaming(cursor: cursor, lastHealth: description, lastStatusPollAt: now, startedAt: now, stream: stream))
             return .events(events, delaySeconds: config.tickSeconds)
         } catch let error as WireError {
             if error.code == .notFound {
@@ -392,19 +402,22 @@ struct MonitorSession: Sendable {
     }
 
     private mutating func attachTransient(_ kind: MonitorTransient, detail: String, at now: Date) -> StepOutcome {
-        let outcome = handleTransient(kind, detail: detail, at: now)
-        guard outcome.giveUp else { return .events(outcome.events, delaySeconds: outcome.delaySeconds) }
-        let seconds = Int(MonitorRunTuning.unreachableGiveUpSeconds)
-        if kind == .unreadable {
+        switch handleTransient(kind, detail: detail, at: now, label: attachingLabel) {
+        case .retry(let events, let delay):
+            return .events(events, delaySeconds: delay)
+        case .giveUp:
+            let seconds = Int(MonitorRunTuning.unreachableGiveUpSeconds)
+            if kind == .unreadable {
+                return .exit(
+                    WireError(
+                        code: .internalError, hint: "run: directa daemon restart",
+                        message: "the daemon's answers could not be read for \(seconds)s: \(detail)"))
+            }
             return .exit(
                 WireError(
-                    code: .internalError, hint: "run: directa daemon restart",
-                    message: "the daemon's answers could not be read for \(seconds)s: \(detail)"))
+                    code: .daemonUnreachable, hint: "run: directa daemon status",
+                    message: "the daemon has been unreachable for \(seconds)s"))
         }
-        return .exit(
-            WireError(
-                code: .daemonUnreachable, hint: "run: directa daemon status",
-                message: "the daemon has been unreachable for \(seconds)s"))
     }
 
     private func tickParams(after cursor: LogCursor) -> LogsQueryParams {
@@ -436,7 +449,8 @@ struct MonitorSession: Sendable {
         command then starts where this read stopped. A failed read is an
         accepted loss here (the run is ending either way): the marker names
         the cursor already held, so its command still covers those lines. */
-    private func finalDrain(cursor: LogCursor, stream: inout MonitorStream, at now: Date) async -> [MonitorEvent] {
+    private func finalDrain(cursor: LogCursor, stream: MonitorStream, at now: Date) async -> [MonitorEvent] {
+        var stream = stream
         var events: [MonitorEvent] = []
         var resumeFrom = cursor
         let drained = try? await client.queryLogs(tickParams(after: cursor))
@@ -447,31 +461,25 @@ struct MonitorSession: Sendable {
         return events + stream.endedAtHardCap(resumeFrom: resumeFrom.at)
     }
 
-    private mutating func tickStep() async -> StepOutcome {
-        guard case .streaming(let cursor, var stream, let lastHealth, let startedAt) = state else {
-            return .events([], delaySeconds: config.tickSeconds)
-        }
+    private mutating func tickStep(_ streaming: inout Streaming) async -> StepOutcome {
         let now = await clock.now()
-        if now.timeIntervalSince(startedAt) >= MonitorRunTuning.hardCapSeconds {
-            let events = await finalDrain(cursor: cursor, stream: &stream, at: now)
-            return .ended(events)
+        if now.timeIntervalSince(streaming.startedAt) >= MonitorLimits.hardCapSeconds {
+            return .ended(await finalDrain(cursor: streaming.cursor, stream: streaming.stream, at: now))
         }
 
         let logsResult: LogsQueryResult
         do {
-            logsResult = try await client.queryLogs(tickParams(after: cursor))
+            logsResult = try await client.queryLogs(tickParams(after: streaming.cursor))
         } catch let error as WireError {
-            state = .streaming(cursor: cursor, stream: stream, lastHealthDescription: lastHealth, startedAt: startedAt)
             if error.code == .notFound {
-                return .ended(stream.ended(reason: "server unregistered"))
+                return .ended(streaming.stream.ended(reason: "server unregistered"))
             }
             guard let kind = MonitorTransient(error.code) else {
-                return .endedWithError(stream.ended(reason: Self.reason(error)), error)
+                return .endedWithError(streaming.stream.ended(reason: Self.reason(error)), error)
             }
-            return tickTransient(kind, detail: error.message, stream: &stream, at: now)
+            return tickTransient(kind, detail: error.message, stream: streaming.stream, at: now)
         } catch {
-            state = .streaming(cursor: cursor, stream: stream, lastHealthDescription: lastHealth, startedAt: startedAt)
-            return tickTransient(.unreadable, detail: String(describing: error), stream: &stream, at: now)
+            return tickTransient(.unreadable, detail: String(describing: error), stream: streaming.stream, at: now)
         }
 
         transientKind = nil
@@ -483,46 +491,42 @@ struct MonitorSession: Sendable {
                 for an older one mid-run: either way the per-tick accounting
                 cannot be trusted, so the run ends the way attach refuses. */
             return .endedWithError(
-                stream.ended(reason: Self.reason(Logs.olderDaemon)), Logs.olderDaemon)
+                streaming.stream.ended(reason: Self.reason(Logs.olderDaemon)), Logs.olderDaemon)
         }
 
         var health: String?
-        var updatedLastHealth = lastHealth
-        var polledAt = lastStatusPollAt ?? startedAt
         var endedFromStatus: [MonitorEvent]?
-        if now.timeIntervalSince(polledAt) >= MonitorRunTuning.statusPollInterval {
+        if now.timeIntervalSince(streaming.lastStatusPollAt) >= MonitorRunTuning.statusPollInterval {
             do {
                 let statusResult = try await client.fetchStatus(
                     ProjectParams(name: config.name, project: config.project))
                 if let server = statusResult.servers.first(where: { $0.server == config.name }) {
                     let description = Self.statusDescription(for: server)
-                    if description != updatedLastHealth {
+                    if description != streaming.lastHealth {
                         health = description
-                        updatedLastHealth = description
+                        streaming.lastHealth = description
                     }
-                    polledAt = now
+                    streaming.lastStatusPollAt = now
                 } else {
-                    endedFromStatus = stream.ended(reason: "server unregistered")
+                    endedFromStatus = streaming.stream.ended(reason: "server unregistered")
                 }
             } catch let error as WireError {
                 if error.code == .notFound {
-                    endedFromStatus = stream.ended(reason: "server unregistered")
+                    endedFromStatus = streaming.stream.ended(reason: "server unregistered")
                 }
                 /** Any other failure here retries on the next tick (the poll
-                    interval has not been advanced); the logs.query call
-                    above already reported a transient this tick when there
-                    was a new one to report, and a second marker for the
-                    same underlying failure would be noise. */
+                    time has not been advanced); the logs.query call above
+                    already reported a transient this tick when there was a
+                    new one to report, and a second marker for the same
+                    underlying failure would be noise. */
             } catch {
-                // Ignored; the next scheduled poll retries.
+                /** Retried on the next tick, as above. */
             }
         }
 
-        let tickEvents = stream.ingest(
-            Self.tick(logsResult, totals: totals, after: cursor, at: now, health: health))
-        lastStatusPollAt = polledAt
-        state = .streaming(
-            cursor: nextCursor, stream: stream, lastHealthDescription: updatedLastHealth, startedAt: startedAt)
+        let tickEvents = streaming.stream.ingest(
+            Self.tick(logsResult, totals: totals, after: streaming.cursor, at: now, health: health))
+        streaming.cursor = nextCursor
 
         if let endedFromStatus {
             return .ended(tickEvents + endedFromStatus)
@@ -531,43 +535,46 @@ struct MonitorSession: Sendable {
     }
 
     private mutating func tickTransient(
-        _ kind: MonitorTransient, detail: String, stream: inout MonitorStream, at now: Date
+        _ kind: MonitorTransient, detail: String, stream: MonitorStream, at now: Date
     ) -> StepOutcome {
-        let outcome = handleTransient(kind, detail: detail, at: now)
-        guard outcome.giveUp else { return .events(outcome.events, delaySeconds: outcome.delaySeconds) }
-        let seconds = Int(MonitorRunTuning.unreachableGiveUpSeconds)
-        let reason = kind == .unreadable ? "daemon answers unreadable for \(seconds)s" : "daemon unreachable for \(seconds)s"
-        return .ended(stream.ended(reason: reason))
+        switch handleTransient(kind, detail: detail, at: now, label: stream.label) {
+        case .retry(let events, let delay):
+            return .events(events, delaySeconds: delay)
+        case .giveUp:
+            var stream = stream
+            let seconds = Int(MonitorRunTuning.unreachableGiveUpSeconds)
+            let reason =
+                kind == .unreadable ? "daemon answers unreadable for \(seconds)s" : "daemon unreachable for \(seconds)s"
+            return .ended(stream.ended(reason: reason))
+        }
     }
 
     /** Shared by attach and every tick: reports a transient state once per
         transition, tracks how long the daemon has continuously failed to
         answer (unreachable or unreadable), and computes the next backoff
-        delay. `giveUp` means that failure has lasted
+        delay. Gives up once that failure has lasted
         `MonitorRunTuning.unreachableGiveUpSeconds`: the caller ends the run
         (a tick) or exits (still attaching) instead of retrying again. */
     private mutating func handleTransient(
-        _ kind: MonitorTransient, detail: String, at now: Date
-    ) -> (events: [MonitorEvent], delaySeconds: Double, giveUp: Bool) {
+        _ kind: MonitorTransient, detail: String, at now: Date, label: String
+    ) -> TransientStep {
         if kind.countsTowardGiveUp {
             let since = unreachableSince ?? now
             unreachableSince = since
             if now.timeIntervalSince(since) >= MonitorRunTuning.unreachableGiveUpSeconds {
-                return ([], 0, true)
+                return .giveUp
             }
         } else {
             unreachableSince = nil
         }
         var events: [MonitorEvent] = []
         if transientKind != kind {
-            events = [
-                MonitorEvent(at: now, kind: .transient, label: label, text: Self.transientText(kind, detail: detail))
-            ]
+            events = [.transient(at: now, label: label, text: Self.transientText(kind, detail: detail))]
             transientKind = kind
         }
         let delay = currentBackoff
         currentBackoff = min(currentBackoff * 2, MonitorRunTuning.backoffCeilingSeconds)
-        return (events, delay, false)
+        return .retry(events, delay: delay)
     }
 
     private static func transientText(_ kind: MonitorTransient, detail: String) -> String {
@@ -582,7 +589,7 @@ struct MonitorSession: Sendable {
     /** A daemon message or a decoding error's description, made safe to
         print in the `directa <label>:` namespace. */
     private static func reason(_ text: String) -> String {
-        MonitorSanitizer.truncate(MonitorSanitizer.sanitize(text), limit: MonitorLimits.truncationCharacterLimit)
+        LogSanitizer.truncated(MonitorSanitizer.sanitize(text), toCharacters: MonitorLimits.truncationCharacterLimit)
     }
 
     /** The ended line for a refusal carries its fix: the message, then the
@@ -595,16 +602,14 @@ struct MonitorSession: Sendable {
         server.worktree.map { "\(name)@\($0)" } ?? name
     }
 
-    /** `phase, pid=N, last exit …`: the fields the plan names for the start
-        marker, reused as the health baseline so a later `server.status` poll
-        can tell "changed" from "same" by comparing this same string. */
+    /** `phase, pid=N, last exit …`: the start marker's view of the server
+        (docs/cli-contract.md, monitor), reused as the health baseline so a
+        later `server.status` poll can tell "changed" from "same" by
+        comparing this same string. */
     private static func statusDescription(for server: ServerStatus) -> String {
         var parts = [server.phase.rawValue]
         if let pid = server.pid { parts.append("pid=\(pid)") }
-        if let exit = server.lastExit {
-            let cause = exit.code.map { "exit \($0)" } ?? exit.signal.map { "signal \($0)" } ?? "unknown"
-            parts.append("last exit \(cause) at \(JSONCoding.formatISO8601(exit.at))")
-        }
+        if let exit = server.lastExit { parts.append(exit.summary) }
         return parts.joined(separator: ", ")
     }
 }
@@ -631,7 +636,7 @@ private enum MonitorRunOutcome: Sendable {
     it. A regular file or a TTY has no such edge, so that case instead
     watches `CLAUDE_PID` (`EVFILT_PROC`/`NOTE_EXIT`) when the harness set it,
     or falls back to polling `getppid()` for a change. */
-final class MonitorLifetime: @unchecked Sendable {
+final class MonitorLifetime: Sendable {
     /** The signal that ends the run; a kqueue signal carries its descriptor,
         already registered. */
     enum Watch: Equatable {
@@ -640,21 +645,18 @@ final class MonitorLifetime: @unchecked Sendable {
         case stdoutEOF(kqueue: Int32)
     }
 
-    private let lock = NSLock()
-    private var onGone: (() -> Void)?
+    private let onGone = OSAllocatedUnfairLock<(@Sendable () -> Void)?>(initialState: nil)
 
     func attach<Success, Failure: Error>(to task: Task<Success, Failure>) {
-        lock.lock()
-        onGone = { task.cancel() }
-        lock.unlock()
+        onGone.withLock { $0 = { task.cancel() } }
         arm()
     }
 
     private func fire() {
-        lock.lock()
-        let handler = onGone
-        onGone = nil
-        lock.unlock()
+        let handler = onGone.withLock { handler in
+            defer { handler = nil }
+            return handler
+        }
         handler?()
     }
 
@@ -670,9 +672,9 @@ final class MonitorLifetime: @unchecked Sendable {
         case .parentChange:
             watchParentChange()
         case .processExit(let kq):
-            watchProcessExit(kqueue: kq)
+            runWatcher(kqueue: kq, name: "claude") { _ in true }
         case .stdoutEOF(let kq):
-            watchStdoutEOF(kqueue: kq)
+            runWatcher(kqueue: kq, name: "stdout") { $0.flags & UInt16(EV_EOF) != 0 }
         }
     }
 
@@ -717,48 +719,36 @@ final class MonitorLifetime: @unchecked Sendable {
         return kq
     }
 
-    private func watchStdoutEOF(kqueue kq: Int32) {
+    /** Blocks a dedicated thread on `kq` until an event `firesOn` accepts,
+        then ends the run; a kqueue error other than EINTR ends the watch
+        without ending the run. */
+    private func runWatcher(kqueue kq: Int32, name: String, firesOn: @escaping @Sendable (kevent) -> Bool) {
         let thread = Thread { [self] in
             defer { close(kq) }
-            var events: [kevent] = Array(repeating: kevent(), count: 1)
+            var event = kevent()
             while true {
-                let n = kevent(kq, nil, 0, &events, 1, nil)
+                let n = kevent(kq, nil, 0, &event, 1, nil)
                 if n < 0 {
                     if errno == EINTR { continue }
                     return
                 }
-                if n > 0, events[0].flags & UInt16(EV_EOF) != 0 {
+                if n > 0, firesOn(event) {
                     fire()
                     return
                 }
             }
         }
-        thread.name = "dev.quantizor.directa.monitor-lifetime"
-        thread.start()
-    }
-
-    private func watchProcessExit(kqueue kq: Int32) {
-        let thread = Thread { [self] in
-            defer { close(kq) }
-            var events: [kevent] = Array(repeating: kevent(), count: 1)
-            while true {
-                let n = kevent(kq, nil, 0, &events, 1, nil)
-                if n < 0, errno == EINTR { continue }
-                if n > 0 { fire() }
-                return
-            }
-        }
-        thread.name = "dev.quantizor.directa.monitor-lifetime-claude"
+        thread.name = "dev.quantizor.directa.monitor-lifetime-\(name)"
         thread.start()
     }
 
     private func watchParentChange() {
-        let startPpid = getppid()
-        let thread = Thread {
-            while getppid() == startPpid {
+        let parent = getppid()
+        let thread = Thread { [self] in
+            while getppid() == parent {
                 usleep(500_000)
             }
-            self.fire()
+            fire()
         }
         thread.name = "dev.quantizor.directa.monitor-lifetime-ppid"
         thread.start()

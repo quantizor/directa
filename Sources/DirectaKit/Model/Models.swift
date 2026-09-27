@@ -320,6 +320,17 @@ public struct LastExit: Codable, Equatable, Sendable {
         self.code = code
         self.signal = signal
     }
+
+    /** "exit N" or "signal N"; nil when the exit status was never observed. */
+    public var causeDescription: String? {
+        code.map { "exit \($0)" } ?? signal.map { "signal \($0)" }
+    }
+
+    /** "last exit <cause> at <time>": how status, the session context, and
+        monitor's start marker name the most recent exit. */
+    public var summary: String {
+        "last exit \(causeDescription ?? "unknown") at \(JSONCoding.formatISO8601(at))"
+    }
 }
 
 /** Forensics for a spawn that never produced a process. */

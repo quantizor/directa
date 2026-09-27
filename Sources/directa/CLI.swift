@@ -234,8 +234,7 @@ enum CLIRunner {
         if let port = status.declaredPort { parts.append("port \(port)") }
         if let worktree = status.worktree { parts.append("worktree \(worktree)") }
         if let exit = status.lastExit {
-            let cause = exit.code.map { "exit \($0)" } ?? exit.signal.map { "signal \($0)" } ?? "unknown"
-            parts.append("last exit \(cause) at \(JSONCoding.formatISO8601(exit.at))")
+            parts.append(exit.summary)
         }
         if status.blockedOn != nil {
             parts.append(

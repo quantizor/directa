@@ -117,7 +117,7 @@ public actor LogStore {
         try? fm.moveItem(at: currentURL, to: currentURL.appendingPathExtension("1"))
         openIfNeeded()
         writtenBytes = 0
-        append(stream: .sys, text: "rotated")
+        append(stream: .sys, text: SysLineText.rotated)
     }
 
     private func write(_ data: Data) {

@@ -62,8 +62,7 @@ enum WhyEngine {
             summary = "spawn never succeeded: \(status.spawnError?.message ?? "unknown spawn error")"
             evidence.append("log: \(status.logPath)")
         case .crashed:
-            let cause = status.lastExit?.code.map { "exit \($0)" }
-                ?? status.lastExit?.signal.map { "signal \($0)" } ?? "unknown cause"
+            let cause = status.lastExit?.causeDescription ?? "unknown cause"
             let when = status.lastExit.map { JSONCoding.formatISO8601($0.at) } ?? "unknown time"
             summary = "crashed (\(cause)) at \(when)"
             if status.blockedOn != nil {
