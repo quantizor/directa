@@ -179,6 +179,27 @@ import Testing
             !FileManager.default.fileExists(atPath: env.paths.projectLogDir(project: canonicalProject).path))
     }
 
+    /** A vanished checkout asked for through the `/var` link finds the key
+        recorded under `/private/var` while the checkout existed, so its row
+        and trust go rather than the request being refused as unknown. */
+    @Test func forgetsAVanishedProjectGivenItsVarSpelling() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
+        try await registry.setTrusted(project: env.project)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let recorded = canonicalProjectPath(env.project)
+        try #require(recorded.hasPrefix("/private/var/"), "the temporary tree is not under /private/var: \(recorded)")
+        try FileManager.default.removeItem(atPath: env.project)
+
+        let outcome = try await send(
+            router, .projectForget, ProjectOnlyParams(project: String(recorded.dropFirst("/private".count))),
+            ProjectForgetResult.self)
+
+        #expect((try? outcome.get()) != nil, "project.forget refused the /var spelling: \(outcome)")
+        #expect(await registry.project(recorded) == nil)
+    }
+
     /** A `project.forget` that lands while the automatic sweep is still
         tearing the same project down (suspended in its server's stop) runs no
         second teardown: the project's servers are stopped and unregistered

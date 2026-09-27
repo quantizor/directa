@@ -1,3 +1,4 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -81,5 +82,56 @@ import Testing
         #expect(
             paths.projectLogDir(project: "/code/app").deletingLastPathComponent().path == "/tmp/w/logs")
         #expect(paths.socketPath == "/tmp/w/d.sock")
+    }
+}
+
+/** A project path that no longer exists still canonicalizes to the spelling
+    it was recorded under while it did: the nearest ancestor that still exists
+    is resolved and the vanished rest re-appended. Without that, a discarded
+    checkout asked for through a symlinked ancestor (`/var` for `/private/var`,
+    or a link of the user's own) misses the key the registry stored. */
+@Suite(.temporaryTree) struct CanonicalProjectPathTests {
+    @Test func aVanishedPathKeepsItsRecordedSpellingThroughASymlinkedAncestor() throws {
+        let base = try TemporaryTree.directory(named: "canonical")
+        let real = base.appending(path: "real")
+        let project = real.appending(path: "proj")
+        try FileManager.default.createDirectory(
+            at: project.appending(path: "app"), withIntermediateDirectories: true)
+        let link = base.appending(path: "link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+        let recorded = canonicalProjectPath(project.path)
+        let recordedBelow = canonicalProjectPath(project.appending(path: "app").path)
+        #expect(canonicalProjectPath(link.appending(path: "proj").path) == recorded)
+
+        try FileManager.default.removeItem(at: project)
+
+        #expect(canonicalProjectPath(link.appending(path: "proj").path) == recorded)
+        #expect(canonicalProjectPath(project.path) == recorded)
+        #expect(canonicalProjectPath(link.appending(path: "proj/app").path) == recordedBelow)
+        #expect(canonicalProjectPath(recorded) == recorded)
+    }
+
+    /** The case seen in practice: macOS's temporary directory lives under
+        `/private/var`, reached through the `/var` link, and a recorded key
+        keeps `/private`. */
+    @Test func aVanishedPathSpelledThroughVarFindsThePrivateVarKey() throws {
+        let base = try TemporaryTree.directory(named: "canonical-var")
+        let project = base.appending(path: "proj")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let recorded = canonicalProjectPath(project.path)
+        try #require(recorded.hasPrefix("/private/var/"), "the temporary tree is not under /private/var: \(recorded)")
+        let varSpelling = String(recorded.dropFirst("/private".count))
+        #expect(canonicalProjectPath(varSpelling) == recorded)
+
+        try FileManager.default.removeItem(at: project)
+
+        #expect(canonicalProjectPath(varSpelling) == recorded)
+        #expect(canonicalProjectPath(recorded) == recorded)
+    }
+
+    @Test func aPathWithNoExistingAncestorBelowTheRootStaysAsWritten() {
+        let path = "/directa-nonexistent-\(UUID().uuidString)/a/b"
+        #expect(canonicalProjectPath(path) == path)
+        #expect(canonicalProjectPath(path + "/../b/./") == path)
     }
 }

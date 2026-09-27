@@ -259,16 +259,31 @@ public func projectSlug(_ path: String) -> String {
 
 /** Canonicalizes a project path: absolute, symlinks resolved, on-disk case.
     CLI and daemon both use this so `~/code` symlinks or `/tmp` vs `/private/tmp`
-    cannot mint two identities for one project. */
+    cannot mint two identities for one project. A path that no longer exists
+    (a discarded checkout) resolves its nearest existing ancestor and keeps the
+    vanished rest as written, so it still names the key recorded while it
+    existed: Foundation resolves no link in a missing path, and even strips a
+    leading `/private`, so resolving it whole would turn a recorded
+    `/private/var/...` into `/var/...`. */
 public func canonicalProjectPath(_ path: String) -> String {
-    let expanded = (path as NSString).expandingTildeInPath
-    let url = URL(fileURLWithPath: expanded)
-    let resolved = url.resolvingSymlinksInPath().standardizedFileURL
-    // On-disk case: FileManager gives the true spelling for existing paths.
-    if let canonical = try? resolved.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath {
-        return canonical
+    let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+    if let canonical = existingCanonicalPath(url) { return canonical }
+    var ancestor = url.standardizedFileURL
+    var vanished: [String] = []
+    while ancestor.path != "/" {
+        vanished.insert(ancestor.lastPathComponent, at: 0)
+        ancestor = ancestor.deletingLastPathComponent()
+        if let canonical = existingCanonicalPath(ancestor) {
+            return vanished.reduce(URL(fileURLWithPath: canonical)) { $0.appending(path: $1) }.path
+        }
     }
-    return resolved.path
+    return url.resolvingSymlinksInPath().standardizedFileURL.path
+}
+
+/** The on-disk spelling of a path that exists, nil for one that does not. */
+private func existingCanonicalPath(_ url: URL) -> String? {
+    try? url.resolvingSymlinksInPath().standardizedFileURL
+        .resourceValues(forKeys: [.canonicalPathKey]).canonicalPath
 }
 
 /** Server identity used in the registry and state store. */
