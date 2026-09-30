@@ -283,6 +283,16 @@ enum CLIRunner {
         parts.append("log \(status.logPath)")
         return parts.joined(separator: "  ·  ")
     }
+
+    /** One line per server of a group result (`up`, `restart`, `switch`): the
+        server's line, with a `FELL SHORT` suffix naming the reason when the
+        server did not reach the asked state. */
+    static func describeGroup(_ results: [EnsureResult]) -> String {
+        results.map { entry in
+            entry.reason.map { "\(describe(entry.server))  ·  FELL SHORT (\($0.rawValue))" }
+                ?? describe(entry.server)
+        }.joined(separator: "\n")
+    }
 }
 
 /** User-facing strings the CLI itself prints or fails with (never a message
@@ -629,9 +639,7 @@ struct Restart: AsyncParsableCommand {
         } catch {
             CLIRunner.fail(WireError(code: .internalError, message: String(describing: error)), json: global.json)
         }
-        CLIRunner.emit(result, json: global.json) { r in
-            r.results.map { CLIRunner.describe($0.server) }.joined(separator: "\n")
-        }
+        CLIRunner.emit(result, json: global.json) { CLIRunner.describeGroup($0.results) }
         if result.results.contains(where: { $0.reason != nil }) {
             Foundation.exit(1)
         }
@@ -1459,12 +1467,7 @@ struct Up: AsyncParsableCommand {
                 .groupUp, params: params, expecting: GroupResult.self,
                 operationTimeoutSeconds: timeout)
         }
-        CLIRunner.emit(result, json: global.json) { r in
-            r.results.map { entry in
-                entry.reason.map { "\(CLIRunner.describe(entry.server))  ·  FELL SHORT (\($0.rawValue))" }
-                    ?? CLIRunner.describe(entry.server)
-            }.joined(separator: "\n")
-        }
+        CLIRunner.emit(result, json: global.json) { CLIRunner.describeGroup($0.results) }
         if result.results.contains(where: { $0.reason != nil }) {
             Foundation.exit(1)
         }
@@ -2702,10 +2705,7 @@ struct Switch: AsyncParsableCommand {
         CLIRunner.emit(result, json: global.json) { r in
             r.results.isEmpty
                 ? "switched to \(branch) (no servers registered)"
-                : r.results.map { entry in
-                    entry.reason.map { "\(CLIRunner.describe(entry.server))  ·  FELL SHORT (\($0.rawValue))" }
-                        ?? CLIRunner.describe(entry.server)
-                }.joined(separator: "\n")
+                : CLIRunner.describeGroup(r.results)
         }
         if result.results.contains(where: { $0.reason != nil }) {
             Foundation.exit(1)
