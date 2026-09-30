@@ -422,15 +422,21 @@ struct Wait: AsyncParsableCommand {
                 .serverWait, params: params, expecting: EnsureResult.self,
                 operationTimeoutSeconds: timeout)
         }
-        CLIRunner.emit(result, json: global.json) { r in
-            if let reason = r.reason {
-                return "wait fell short (\(reason.rawValue))\n" + CLIRunner.describe(r.server)
-            }
-            return CLIRunner.describe(r.server)
-        }
+        CLIRunner.emit(result, json: global.json) { Self.humanText($0, condition: condition, name: name) }
         if result.reason != nil {
             Foundation.exit(1)
         }
+    }
+
+    /** The falls-short line, the server, and, when a `--healthy` wait ended
+        on a crash or a stop, the command that brings the server back. */
+    static func humanText(_ result: EnsureResult, condition: WaitCondition, name: String) -> String {
+        guard let reason = result.reason else { return CLIRunner.describe(result.server) }
+        var text = "wait fell short (\(reason.rawValue))\n" + CLIRunner.describe(result.server)
+        if condition == .healthy, reason == .crashed || reason == .stopped {
+            text += "\nhint: directa ensure \(ShellWord.argument(name))"
+        }
+        return text
     }
 }
 
