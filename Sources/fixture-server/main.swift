@@ -130,12 +130,21 @@ func launchOrphanGrandchild(ignoreTerm: Bool) {
 
 /** posix_spawn rather than Foundation's `Process`, which cannot set
     POSIX_SPAWN_SETSID. The child inherits this process's stdout and stderr, so
-    its own lines land in the same spool. */
+    its own lines land in the same spool. The child's signal mask is emptied and
+    every disposition reset to default: a Dispatch worker thread can have
+    SIGTERM blocked, and a child inheriting that mask would never notice a stop. */
 func launchSetsidListener(port: UInt16) {
     var attr: posix_spawnattr_t?
     posix_spawnattr_init(&attr)
     defer { posix_spawnattr_destroy(&attr) }
-    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
+    var noSignals = sigset_t()
+    var allSignals = sigset_t()
+    sigemptyset(&noSignals)
+    sigfillset(&allSignals)
+    posix_spawnattr_setflags(
+        &attr, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF))
+    posix_spawnattr_setsigmask(&attr, &noSignals)
+    posix_spawnattr_setsigdefault(&attr, &allSignals)
     let argv = [CommandLine.arguments[0], "--listen-tcp", String(port)]
     let cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
     defer { for arg in cArgs { free(arg) } }

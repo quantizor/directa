@@ -149,6 +149,28 @@ import os
         #expect(codes.withLock { $0 } == [4, 4])
     }
 
+    /** The fixture's setsid listener is spawned from a Dispatch worker thread
+        (the delay), which can have SIGTERM blocked; the listener must not
+        inherit that. Its parent exits at once so launchd reaps it, which lets
+        the exit show as a pid that stops answering. */
+    @Test func aFixtureSetsidListenerTakesSIGTERMFromADispatchThread() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let (readEnd, writeEnd) = try makeOutputPipe()
+        defer { close(readEnd) }
+        let root = try spawnReapedSessionLeader(
+            [
+                fixture, "--setsid-listener", "\(TestPorts.port(60))", "--grandchild-after", "0.1",
+                "--exit-after-spawn",
+            ], stdoutFD: writeEnd)
+        close(writeEnd)
+        defer { kill(root, SIGKILL) }
+        let listener = try #require(await readSetsidListenerPid(from: readEnd))
+        defer { kill(listener, SIGKILL) }
+
+        kill(listener, SIGTERM)
+        #expect(try await awaitExit(listener, within: .seconds(5)), "the listener kept the spawning thread's mask")
+    }
+
     private static func exitCode(_ outcome: ProcessOutcome) -> Int? {
         guard case .exited(let code) = outcome else { return nil }
         return code
