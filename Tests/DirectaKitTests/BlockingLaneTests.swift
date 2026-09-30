@@ -84,7 +84,10 @@ import os
         #expect(pressure.queued == 2)
         #expect(pressure.oldestQueuedSeconds >= 0.2)
         #expect(results.sorted() == [0, 1, 2])
-        #expect(lane.pressure() == LanePressure(name: "pressure", oldestQueuedSeconds: 0, queued: 0, running: 0, width: 1))
+        /** A job resumes its caller before the drainer counts it finished, so
+            the lane reads idle a moment after the last result, not at once. */
+        let idle = LanePressure(name: "pressure", oldestQueuedSeconds: 0, queued: 0, running: 0, width: 1)
+        #expect(try await eventually(within: .seconds(2)) { lane.pressure() == idle })
         #expect(heard.withLock { $0 } == ["pressure true", "pressure true"])
         activity.setObserver(nil)
     }
