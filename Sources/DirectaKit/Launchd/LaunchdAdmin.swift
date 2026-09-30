@@ -468,14 +468,14 @@ public enum LaunchdAdmin {
                 environment: environment, timeoutSeconds: pathCaptureTimeoutSeconds))
     }
 
-    /** A shell killed at its deadline has no answer: whatever it printed
-        before then is not a PATH, so the floor applies. */
+    /** Only a shell that ran to its exit answers: one that could not start
+        carries an error reason, and one killed at its deadline printed at most
+        part of a line, neither of them a PATH, so the floor applies. */
     static func capturedPath(from outcome: ShellOutcome) -> String {
         let output =
             switch outcome {
             case .exited(_, let output): output
-            case .failedToRun(let reason): reason
-            case .timedOut: ""
+            case .failedToRun, .timedOut: ""
             }
         let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
         return path.isEmpty ? pathFloor : path

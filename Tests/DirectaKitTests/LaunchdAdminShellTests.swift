@@ -105,11 +105,15 @@ import Testing
                 == "timed out after 10 seconds")
     }
 
-    /** `capturedPath` reads a timed-out shell as no answer, never as the
-        timeout message or the partial output, so the PATH floor applies. */
-    @Test func aTimedOutPathCaptureFallsBackToTheFloor() {
+    /** `capturedPath` reads a timed-out shell, or one that never started, as
+        no answer, never as the partial output or the error reason, so the
+        PATH floor applies. */
+    @Test func aPathCaptureWithoutAnExitFallsBackToTheFloor() {
         #expect(
             LaunchdAdmin.capturedPath(from: .timedOut(partialOutput: "/partial/bin:")) == LaunchdAdmin.pathFloor)
+        #expect(
+            LaunchdAdmin.capturedPath(from: .failedToRun("The file “zsh” doesn’t exist."))
+                == LaunchdAdmin.pathFloor)
         #expect(
             LaunchdAdmin.capturedPath(from: .exited(status: 0, output: "/usr/bin:/opt/bin\n")) == "/usr/bin:/opt/bin")
         #expect(LaunchdAdmin.capturedPath(from: .exited(status: 0, output: "\n")) == LaunchdAdmin.pathFloor)
