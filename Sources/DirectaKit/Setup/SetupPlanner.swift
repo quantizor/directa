@@ -308,13 +308,7 @@ public enum SetupPlanner {
 
     /** Drop the DMG/Downloads quarantine so Gatekeeper trusts the Applications copy. */
     private static func clearQuarantine(at url: URL) {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
-        proc.arguments = ["-dr", "com.apple.quarantine", url.path]
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
-        try? proc.run()
-        proc.waitUntilExit()
+        LaunchdAdmin.shell("/usr/bin/xattr", ["-dr", "com.apple.quarantine", url.path])
     }
 
     private static func parseVersion(_ raw: String) -> [Int] {

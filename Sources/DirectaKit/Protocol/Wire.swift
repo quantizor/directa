@@ -90,6 +90,14 @@ public enum WireErrorCode: String, Codable, Sendable {
     case notTrusted = "not-trusted"
     case portDrift = "port-drift"
     case portHeld = "port-held"
+    /** `project.forget` refuses a project whose checkout still exists: acting
+        on it would drop trust and delete logs for a project that is still
+        live, not merely stale. */
+    case projectStillExists = "project-still-exists"
+    /** A request line grew past the daemon's pending-request cap with no
+        newline yet seen, so the connection was closed before any frame on it
+        could be decoded. */
+    case requestTooLarge = "request-too-large"
     case resourceLocked = "resource-locked"
     case resourceMutated = "resource-mutated"
     case spawnFailed = "spawn-failed"
@@ -107,6 +115,23 @@ public struct WireError: Codable, Equatable, Error, Sendable {
         self.code = code
         self.hint = hint
         self.message = message
+    }
+
+    /** The exact `usage` message `Router.handle` writes when `head.method`
+        names no case this build's `WireMethod` recognizes: a CLI talking to a
+        daemon built before a method existed, or the reverse. Shared by the
+        writer and any reader that wants to tell that specific refusal apart
+        from every other `usage` failure (a daemon needing a restart to learn
+        a new method, rather than a malformed request) without guessing at a
+        substring. */
+    public static func unknownMethodMessage(_ rawMethod: String) -> String {
+        "unknown method \(rawMethod)"
+    }
+
+    /** True when this is a daemon's refusal of `method` as a method it does
+        not know: a daemon older than this client, which a restart updates. */
+    public func isUnknownMethod(_ method: WireMethod) -> Bool {
+        code == .usage && message == Self.unknownMethodMessage(method.rawValue)
     }
 }
 
@@ -205,7 +230,9 @@ public enum WireMethod: String, CaseIterable, Sendable {
     case lockStatus = "lock.status"
     case logsMark = "logs.mark"
     case logsQuery = "logs.query"
+    case logsRemoveOrphan = "logs.removeOrphan"
     case projectCheck = "project.check"
+    case projectForget = "project.forget"
     case projectInitConfig = "project.initConfig"
     case projectTrust = "project.trust"
     case projectWriteConfig = "project.writeConfig"
@@ -461,6 +488,107 @@ public struct ProjectOnlyParams: Codable, Equatable, Sendable {
     }
 }
 
+/** `project.forget`'s result: the ad hoc and persisted server names the daemon
+    dropped along with the project row, trust, and log directory. Empty for a
+    trusted project that carried no ad hoc or previously-run server. */
+public struct ProjectForgetResult: Codable, Equatable, Sendable {
+    public var servers: [String]
+
+    public init(servers: [String]) {
+        self.servers = servers
+    }
+}
+
+/** `logs.removeOrphan`'s params: the name of one directory directly inside
+    the daemon's own logs dir, never a path, so a client cannot aim the
+    removal anywhere else. */
+public struct LogsRemoveOrphanParams: Codable, Equatable, Sendable {
+    public var directory: String
+
+    public init(directory: String) {
+        self.directory = directory
+    }
+}
+
+/** `logs.removeOrphan`'s result. On the wire, `{outcome, path, reason?,
+    remedy?}`: `reason` is present when the directory was left in place
+    (`refused`) or the removal failed (`failed`), `remedy` only for a refusal a
+    person can act on, and never a deletion command. In memory each outcome
+    carries exactly the fields it has, so a refusal or failure always has a
+    reason; one decoded without a reason gets a generic one at this seam. */
+public struct LogsRemoveOrphanResult: Codable, Equatable, Sendable {
+    public enum Outcome: Equatable, Sendable {
+        case failed(reason: String)
+        case refused(reason: String, remedy: String?)
+        case removed
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case outcome
+        case path
+        case reason
+        case remedy
+    }
+
+    private enum OutcomeName: String, Codable {
+        case failed
+        case refused
+        case removed
+    }
+
+    public var outcome: Outcome
+    /** The full path the daemon checked, inside its own logs dir. */
+    public var path: String
+
+    public init(outcome: Outcome, path: String) {
+        self.outcome = outcome
+        self.path = path
+    }
+
+    public init(path: URL, removal: OrphanProjectLogs.Removal) {
+        switch removal {
+        case .removed:
+            self.init(outcome: .removed, path: path.path)
+        case .refused(let refusal):
+            self.init(outcome: .refused(reason: refusal.reason, remedy: refusal.remedy), path: path.path)
+        case .failed(let message):
+            self.init(outcome: .failed(reason: message), path: path.path)
+        }
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        path = try container.decode(String.self, forKey: .path)
+        let reason = try container.decodeIfPresent(String.self, forKey: .reason)
+        switch try container.decode(OutcomeName.self, forKey: .outcome) {
+        case .failed:
+            outcome = .failed(reason: reason ?? "the removal failed")
+        case .refused:
+            outcome = .refused(
+                reason: reason ?? "the daemon refused",
+                remedy: try container.decodeIfPresent(String.self, forKey: .remedy))
+        case .removed:
+            outcome = .removed
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(path, forKey: .path)
+        switch outcome {
+        case .failed(let reason):
+            try container.encode(OutcomeName.failed, forKey: .outcome)
+            try container.encode(reason, forKey: .reason)
+        case .refused(let reason, let remedy):
+            try container.encode(OutcomeName.refused, forKey: .outcome)
+            try container.encode(reason, forKey: .reason)
+            try container.encodeIfPresent(remedy, forKey: .remedy)
+        case .removed:
+            try container.encode(OutcomeName.removed, forKey: .outcome)
+        }
+    }
+}
+
 public struct WriteConfigParams: Codable, Equatable, Sendable {
     /** hash8 of the bytes the editor loaded; the daemon rejects on mismatch so
         an IDE's concurrent save is never silently clobbered. Empty = file must
@@ -574,39 +702,223 @@ public struct InitConfigResult: Codable, Equatable, Sendable {
     }
 }
 
+/** A position in a server's log family: every record before `at`, plus the
+    first `count` records stamped exactly `at` (all streams, file order), lie
+    behind it. Many records share one millisecond (a spool chunk is appended
+    under one timestamp), so a timestamp alone cannot say where a reader
+    stopped. */
+public struct LogCursor: Codable, Equatable, Sendable {
+    public var at: Date
+    public var count: Int
+    /** Where the newest record behind the cursor ends, carried once `count`
+        is large enough that skipping that many records costs a real read:
+        the daemon resumes there instead of counting through the
+        millisecond again. Ignored, with `count` applying, when it no longer
+        names such a record in the family. */
+    public var position: LogFilePosition?
+
+    public init(at: Date, count: Int, position: LogFilePosition? = nil) {
+        self.at = at
+        self.count = count
+        self.position = position
+    }
+
+    /** The cursor of a family with no records yet: nothing lies behind it. */
+    public static let origin = LogCursor(at: Date(timeIntervalSince1970: 0), count: 0)
+}
+
+/** A byte position in one file of a log family. `file` is the file's inode
+    number, which a rotation's rename keeps, so the position survives the
+    file moving from current.log to current.log.1. */
+public struct LogFilePosition: Codable, Equatable, Sendable {
+    public var file: UInt64
+    public var offset: Int
+
+    public init(file: UInt64, offset: Int) {
+        self.file = file
+        self.offset = offset
+    }
+}
+
+/** A per-stream trim (`tailByStream`): nil leaves that stream untrimmed and
+    0 excludes it. */
+public struct LogStreamCounts: Codable, Equatable, Sendable {
+    public var err: Int?
+    public var mark: Int?
+    public var out: Int?
+    public var sys: Int?
+
+    public init(err: Int? = nil, mark: Int? = nil, out: Int? = nil, sys: Int? = nil) {
+        self.err = err
+        self.mark = mark
+        self.out = out
+        self.sys = sys
+    }
+
+    public subscript(stream: LogStream) -> Int? {
+        get {
+            switch stream {
+            case .err: err
+            case .mark: mark
+            case .out: out
+            case .sys: sys
+            }
+        }
+        set {
+            switch stream {
+            case .err: err = newValue
+            case .mark: mark = newValue
+            case .out: out = newValue
+            case .sys: sys = newValue
+            }
+        }
+    }
+}
+
+/** Records matched per stream, every stream counted. Encodes exactly as a
+    `LogStreamCounts` with every field set. */
+public struct LogStreamTotals: Codable, Equatable, Sendable {
+    public var err: Int
+    public var mark: Int
+    public var out: Int
+    public var sys: Int
+
+    public init(err: Int = 0, mark: Int = 0, out: Int = 0, sys: Int = 0) {
+        self.err = err
+        self.mark = mark
+        self.out = out
+        self.sys = sys
+    }
+
+    public var sum: Int { err + mark + out + sys }
+
+    public subscript(stream: LogStream) -> Int {
+        get {
+            switch stream {
+            case .err: err
+            case .mark: mark
+            case .out: out
+            case .sys: sys
+            }
+        }
+        set {
+            switch stream {
+            case .err: err = newValue
+            case .mark: mark = newValue
+            case .out: out = newValue
+            case .sys: sys = newValue
+            }
+        }
+    }
+}
+
 public struct LogsQueryParams: Codable, Equatable, Sendable {
+    /** Exclusive lower bound: only records past this cursor. */
+    public var after: LogCursor?
     public var grep: String?
+    /** The oldest N matching records. */
+    public var head: Int?
+    /** Each returned text is cut to this many characters, ending in `…`. */
+    public var maxLineCharacters: Int?
     public var name: String
     public var project: String
     public var since: Date?
     public var sinceMark: String?
     public var streams: [LogStream]?
     public var tail: Int?
+    /** The newest N matching records per stream, so one stream's burst never
+        crowds another out of the answer. */
+    public var tailByStream: LogStreamCounts?
 
     public init(
+        after: LogCursor? = nil,
         grep: String? = nil,
+        head: Int? = nil,
+        maxLineCharacters: Int? = nil,
         name: String,
         project: String,
         since: Date? = nil,
         sinceMark: String? = nil,
         streams: [LogStream]? = nil,
-        tail: Int? = nil
+        tail: Int? = nil,
+        tailByStream: LogStreamCounts? = nil
     ) {
+        self.after = after
         self.grep = grep
+        self.head = head
+        self.maxLineCharacters = maxLineCharacters
         self.name = name
         self.project = project
         self.since = since
         self.sinceMark = sinceMark
         self.streams = streams
         self.tail = tail
+        self.tailByStream = tailByStream
+    }
+
+    /** Why the daemon must refuse these parameters, or nil when they are
+        coherent. The wire is untrusted: a negative count is refused rather
+        than trimmed, since a trim of a negative size has no meaning. Every
+        count is otherwise safe at any size, because nothing is allocated
+        ahead of the records that fill it. A grep pattern must pass
+        `LogQuery.grepRejection`. */
+    public func refusal() -> WireError? {
+        if after != nil, since != nil || sinceMark != nil {
+            return WireError(
+                code: .usage, hint: "send after, or since/sinceMark, not both",
+                message: "a logs query takes one lower bound: after, or since/sinceMark")
+        }
+        if tail != nil, tailByStream != nil {
+            return WireError(
+                code: .usage, hint: "send tail or tailByStream, not both",
+                message: "a logs query takes one tail: tail, or tailByStream")
+        }
+        if head != nil, tail != nil || tailByStream != nil {
+            return WireError(
+                code: .usage, hint: "send head, or tail/tailByStream, not both",
+                message: "a logs query keeps the oldest lines (head) or the newest (tail), not both")
+        }
+        var counts: [(String, Int?)] = [
+            ("after.count", after?.count), ("head", head), ("tail", tail),
+        ]
+        for stream in LogStream.allCases {
+            counts.append(("tailByStream.\(stream.rawValue)", tailByStream?[stream]))
+        }
+        for case let (field, value?) in counts where value < 0 {
+            return WireError(
+                code: .usage, hint: "send \(field) as 0 or more",
+                message: "\(field) is \(value), but a line count cannot be negative")
+        }
+        if let maxLineCharacters, maxLineCharacters < 1 {
+            return WireError(
+                code: .usage, hint: "send maxLineCharacters as 1 or more, or omit it",
+                message: "maxLineCharacters is \(maxLineCharacters), but a line needs room for at least one character")
+        }
+        if let grep, let why = LogQuery.grepRejection(grep) {
+            return WireError(
+                code: .usage,
+                hint: "fix the pattern, or drop --grep to see every line",
+                message: "--grep is not a valid regular expression: \(why)")
+        }
+        return nil
     }
 }
 
 public struct LogsQueryResult: Codable, Equatable, Sendable {
+    /** The position after the newest record in the family when the query
+        ran, present even when no line matched: the next query's `after`. A
+        daemon older than this field omits it. */
+    public var cursor: LogCursor?
     public var lines: [LogRecord]
+    /** Records matched per stream before trimming, present when the query
+        carried `after` or `tailByStream`. A `head` without `after` omits it,
+        so the daemon can stop reading at the Nth line. */
+    public var totals: LogStreamTotals?
 
-    public init(lines: [LogRecord]) {
+    public init(cursor: LogCursor? = nil, lines: [LogRecord], totals: LogStreamTotals? = nil) {
+        self.cursor = cursor
         self.lines = lines
+        self.totals = totals
     }
 }
 
@@ -659,6 +971,16 @@ public struct EventsQueryParams: Codable, Equatable, Sendable {
         self.sinceMark = sinceMark
         self.tail = tail
     }
+
+    /** Why the daemon must refuse these parameters, or nil when they are
+        coherent. A negative tail is refused, as `LogsQueryParams` refuses
+        one, rather than trimmed. */
+    public func refusal() -> WireError? {
+        guard let tail, tail < 0 else { return nil }
+        return WireError(
+            code: .usage, hint: "send tail as 0 or more",
+            message: "tail is \(tail), but an event count cannot be negative")
+    }
 }
 
 public struct EventsQueryResult: Codable, Equatable, Sendable {
@@ -671,26 +993,12 @@ public struct EventsQueryResult: Codable, Equatable, Sendable {
 
 // MARK: - NDJSON framing
 
-/** Incremental NDJSON line assembler: feed raw bytes, get complete frames.
-    JSONEncoder never emits interior newlines (no prettyPrinted), so framing on
-    0x0A is safe. */
-public struct NDJSONBuffer: Sendable {
-    private var buffer = Data()
-
-    public init() {}
-
-    /** Appends bytes and returns any newly completed lines (without the newline). */
-    public mutating func feed(_ data: Data) -> [Data] {
-        buffer.append(data)
-        var lines: [Data] = []
-        while let newline = buffer.firstIndex(of: 0x0A) {
-            let line = buffer.subdata(in: buffer.startIndex..<newline)
-            buffer.removeSubrange(buffer.startIndex...newline)
-            if !line.isEmpty { lines.append(line) }
-        }
-        return lines
-    }
-}
+/** NDJSON frame assembly. JSONCoding never emits an interior newline, so a
+    frame is exactly one line. The control server caps `pendingByteCount` on
+    its untrusted-client side to bound memory; a client reading the daemon's
+    own responses, which can legitimately run tens of megabytes, never
+    consults it. */
+public typealias NDJSONBuffer = LineFramer
 
 public enum NDJSON {
     /** Encodes one frame with its trailing newline. */

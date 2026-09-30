@@ -17,8 +17,8 @@ import Testing
             "d1", "--acquire-timeout", "5", "--timeout", "300", "--", "somecmd",
         ])
         #expect(lock.resource == "d1")
-        #expect(lock.acquireTimeout == 5)
-        #expect(lock.timeout == 300)
+        #expect(lock.acquireTimeout == TimeoutOption(seconds: 5))
+        #expect(lock.timeout == TimeoutOption(seconds: 300))
         #expect(lock.command == ["somecmd"])
     }
 
@@ -71,8 +71,15 @@ import Testing
         #expect(lock.command.isEmpty)
         let error = try #require(Lock.usageError(command: lock.command, resource: lock.resource))
         #expect(error.code == .usage)
-        #expect(error.hint == "directa lock d1 -- <command>")
+        #expect(error.hint == "run: directa lock d1 -- <command>")
         #expect(error.message.contains("needs a command after `--`"))
+    }
+
+    /** The hint is pasted into a shell, so a resource name that is not plain
+        arrives as one quoted argument. */
+    @Test func theUsageHintQuotesAResourceNameThatIsNotPlain() throws {
+        let error = try #require(Lock.usageError(command: [], resource: "my db"))
+        #expect(error.hint == "run: directa lock 'my db' -- <command>")
     }
 
     @Test func aPresentCommandProducesNoUsageError() {

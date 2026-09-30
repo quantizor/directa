@@ -13,7 +13,10 @@ enum WhyEngine {
         specs: [String: ServerSpec],
         /** Fallback evidence when status has no recentLogTail / terminalEvidence
             (structured-log window since last exit or start). */
-        evidenceLines: (String) -> [String]
+        evidenceLines: (String) -> [String],
+        /** The most recent `stopped` event's detail for a server, or nil when
+            there is none; recognized only through `ExternalSignalDetail`. */
+        lastStopDetail: (String) -> String? = { _ in nil }
     ) -> WhyResult {
         var findings: [WhyFinding] = []
         var visited = Set<String>()
@@ -21,7 +24,8 @@ enum WhyEngine {
         var frontier = [target]
         while let name = frontier.popLast() {
             guard visited.insert(name).inserted, let status = statuses[name] else { continue }
-            let finding = describe(status: status, evidenceLines: evidenceLines)
+            let finding = describe(
+                status: status, evidenceLines: evidenceLines, lastStopDetail: lastStopDetail)
             findings.append(finding)
             let broken = status.phase != .running && status.phase != .stopped
             if broken || status.phase == .stopped {
@@ -41,7 +45,8 @@ enum WhyEngine {
     }
 
     private static func describe(
-        status: ServerStatus, evidenceLines: (String) -> [String]
+        status: ServerStatus, evidenceLines: (String) -> [String],
+        lastStopDetail: (String) -> String?
     ) -> WhyFinding {
         var evidence: [String] = []
         var summary: String
@@ -50,8 +55,7 @@ enum WhyEngine {
             summary = "spawn never succeeded: \(status.spawnError?.message ?? "unknown spawn error")"
             evidence.append("log: \(status.logPath)")
         case .crashed:
-            let cause = status.lastExit?.code.map { "exit \($0)" }
-                ?? status.lastExit?.signal.map { "signal \($0)" } ?? "unknown cause"
+            let cause = status.lastExit?.causeDescription ?? "unknown cause"
             let when = status.lastExit.map { JSONCoding.formatISO8601($0.at) } ?? "unknown time"
             summary = "crashed (\(cause)) at \(when)"
             if status.blockedOn != nil {
@@ -67,7 +71,19 @@ enum WhyEngine {
         case .starting:
             summary = "still starting; healthcheck (\(status.healthcheck.rawValue)) has not passed yet"
         case .stopped:
-            summary = "not running (stopped)"
+            /** A directa-requested stop and a graceful external signal
+                (SIGTERM/SIGINT/SIGHUP forwarded by an IDE, a Ctrl-C, another
+                process manager) both land here; only the external one has
+                nothing else in directa's own log explaining the exit, so it
+                is the one worth naming instead of leaving `why` to read like
+                nothing happened. */
+            if let signal = status.lastExit?.signal,
+                let detail = lastStopDetail(status.server), ExternalSignalDetail.matches(detail)
+            {
+                summary = "not running (stopped by signal \(signal) sent from outside directa)"
+            } else {
+                summary = "not running (stopped)"
+            }
         case .stopping:
             summary = "shutting down"
         case .running:

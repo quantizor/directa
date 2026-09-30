@@ -1,33 +1,85 @@
 import Foundation
 
-/** Query parameters for reading structured logs. `sinceMark` resolves to the
-    timestamp of the mark whose payload begins with that id. */
+/** Query parameters for reading structured logs, with the meanings
+    `LogsQueryParams` gives them on the wire. Callers screen them with
+    `LogsQueryParams.refusal` first; past that screen `after` wins over
+    `since`, a conflicting trim resolves as `head`, then `tailByStream`, then
+    `tail`, and a negative count reads as zero. */
 public struct LogQueryOptions: Sendable {
+    public let after: LogCursor?
     /** Swift Regex pattern (compiled once per run; Regex itself is not Sendable). */
-    public var grep: String?
-    public var since: Date?
-    public var streams: Set<LogStream>?
-    public var tail: Int?
+    public let grep: String?
+    public let head: Int?
+    public let maxLineCharacters: Int?
+    public let since: Date?
+    public let streams: Set<LogStream>?
+    public let tail: Int?
+    public let tailByStream: LogStreamCounts?
 
+    /** Every count is stored at zero or more, so nothing past this point
+        guards against a negative one. */
     public init(
+        after: LogCursor? = nil,
         grep: String? = nil,
+        head: Int? = nil,
+        maxLineCharacters: Int? = nil,
         since: Date? = nil,
         streams: Set<LogStream>? = nil,
-        tail: Int? = nil
+        tail: Int? = nil,
+        tailByStream: LogStreamCounts? = nil
     ) {
+        func count(_ value: Int?) -> Int? { value.map { max(0, $0) } }
+        self.after = after.map { LogCursor(at: $0.at, count: max(0, $0.count), position: $0.position) }
         self.grep = grep
+        self.head = count(head)
+        self.maxLineCharacters = maxLineCharacters
         self.since = since
         self.streams = streams
-        self.tail = tail
+        self.tail = count(tail)
+        self.tailByStream = tailByStream.map {
+            LogStreamCounts(err: count($0.err), mark: count($0.mark), out: count($0.out), sys: count($0.sys))
+        }
+    }
+
+    /** The options a wire query asks for, with `since` already resolved
+        from its `since` or `sinceMark`. */
+    public init(_ params: LogsQueryParams, since: Date?) {
+        self.init(
+            after: params.after, grep: params.grep, head: params.head,
+            maxLineCharacters: params.maxLineCharacters, since: since, streams: params.streams.map(Set.init),
+            tail: params.tail, tailByStream: params.tailByStream)
+    }
+
+    /** The shapes that carry per-stream totals in their answer: the ones a
+        poller reads past a cursor or trims per stream. A `head` alone does
+        not, so it can stop reading once it holds its lines. */
+    var reportsTotals: Bool { after != nil || tailByStream != nil }
+}
+
+/** A query's answer: the lines, the family's end position when it ran, and
+    (for the shapes that report them) the matched count per stream before any
+    trim, so a caller knows exactly how many lines it was not shown. */
+public struct LogWindow: Equatable, Sendable {
+    public var cursor: LogCursor
+    public var lines: [LogRecord]
+    public var totals: LogStreamTotals?
+
+    public init(cursor: LogCursor, lines: [LogRecord], totals: LogStreamTotals? = nil) {
+        self.cursor = cursor
+        self.lines = lines
+        self.totals = totals
     }
 }
 
 /** File-level query engine over a structured log family (current.log plus
-    rotated .1-.5). Timestamps are per-file monotonic (the store clamps on
-    append), which is what makes the binary search sound. */
+    its numbered rotations). Timestamps are per-file monotonic (the store
+    clamps on append), which is what makes the binary search sound. */
 public enum LogQuery {
+    /** How many rotated files a family keeps behind current.log. */
+    public static let rotations = 5
+
     /** Oldest-first file list for a log family: highest rotation number first. */
-    public static func familyFiles(current: URL, rotations: Int = 5) -> [URL] {
+    public static func familyFiles(current: URL) -> [URL] {
         var files: [URL] = []
         for index in stride(from: rotations, through: 1, by: -1) {
             let rotated = current.appendingPathExtension("\(index)")
@@ -41,16 +93,17 @@ public enum LogQuery {
         return files
     }
 
-    /** Why a caller-supplied grep pattern must be refused, or nil when it is safe
-        to run. Callers validate before querying: a pattern the engine cannot
-        compile must not silently degrade into "no filter", because returning
-        every line reads exactly like a query that matched everything. A pattern
+    /** Why a caller-supplied grep pattern must be refused, or nil when it is
+        safe to run. `LogsQueryParams.refusal` runs it before a query: a
+        pattern the engine cannot compile must not silently degrade into "no
+        filter", because returning every line reads exactly like a query that
+        matched everything. A pattern
         that compiles but nests an unbounded quantifier inside another is refused
         too: Swift's `Regex` backtracks, so `^(a+)+$` against a handful of
         characters runs for seconds and against a longer line never returns,
         wedging the log actor while it churns. The match runs per line, so this
         screen is the only place to stop it before it starts. */
-    public static func grepRejection(_ pattern: String) -> String? {
+    static func grepRejection(_ pattern: String) -> String? {
         do {
             _ = try Regex(pattern)
         } catch {
@@ -139,56 +192,144 @@ public enum LogQuery {
         (current.log is append-only across spawns), and drives the same file-skip
         and binary search `run` uses, so it does not scan a long history. */
     public static func summarize(current: URL, streams: Set<LogStream>, since: Date?) -> ErrorSummary? {
-        var count = 0
-        var first: Date?
-        var last: Date?
-        for record in run(current: current, options: LogQueryOptions(since: since, streams: streams)) {
-            count += 1
-            if first == nil { first = record.at }
-            last = record.at
-        }
-        guard count > 0, let first, let last else { return nil }
-        return ErrorSummary(count: count, firstAt: first, lastAt: last)
+        summarizeMeasured(current: current, streams: streams, since: since, onDiskRead: nil)
+    }
+
+    /** Keeps only the first and last match, so memory stays flat however
+        many records match. */
+    static func summarizeMeasured(
+        current: URL, streams: Set<LogStream>, since: Date?, onDiskRead: (@Sendable (Int) -> Void)?
+    ) -> ErrorSummary? {
+        let scanned = LogScan.scan(
+            files: familyFiles(current: current), options: LogQueryOptions(since: since, streams: streams),
+            grep: nil, retention: .firstAndLast, onDiskRead: onDiskRead)
+        let count = scanned.totals.sum
+        guard count > 0, let first = scanned.lines.first, let last = scanned.lines.last else { return nil }
+        return ErrorSummary(count: count, firstAt: first.at, lastAt: last.at)
     }
 
     public static func run(current: URL, options: LogQueryOptions) -> [LogRecord] {
+        runMeasured(current: current, options: options, onDiskRead: nil)
+    }
+
+    /** `run` plus the family's end cursor and, for the shapes that report
+        them, per-stream totals. */
+    public static func window(current: URL, options: LogQueryOptions) -> LogWindow {
+        windowMeasured(current: current, options: options, onDiskRead: nil)
+    }
+
+    /** A cursor carries a position once its millisecond holds this many
+        records. Below it, counting through them again on the next poll
+        costs one small read, and a count-only cursor keeps the wire
+        answer in its older shape. */
+    static let positionThreshold = 1024
+
+    static func windowMeasured(
+        current: URL, options: LogQueryOptions, positionThreshold: Int = positionThreshold,
+        onDiskRead: (@Sendable (Int) -> Void)?
+    ) -> LogWindow {
+        let files = familyFiles(current: current)
+        let collected = collect(files: files, options: options, onDiskRead: onDiskRead)
+        let readers = collected.readers ?? LogFileReader.readers(for: files, onDiskRead: onDiskRead)
+        let newest = LogScan.newestGroup(readers: readers, resume: collected.resume)
+        let cursor = newest.map { newest in
+            LogCursor(
+                at: LogScan.date(milliseconds: newest.ms), count: newest.count,
+                position: newest.count >= positionThreshold
+                    ? LogFilePosition(file: readers[newest.file].inode, offset: newest.end) : nil)
+        }
+        return LogWindow(cursor: cursor ?? .origin, lines: collected.lines, totals: collected.totals)
+    }
+
+    /** `run`, reporting the byte count of every disk read to `onDiskRead`
+        in call order: every read a query makes goes through
+        `LogFileReader`, so a sum of these bounds what the query read. */
+    static func runMeasured(
+        current: URL, options: LogQueryOptions, onDiskRead: (@Sendable (Int) -> Void)?
+    ) -> [LogRecord] {
+        collect(files: familyFiles(current: current), options: options, onDiskRead: onDiskRead).lines
+    }
+
+    /** The answer, plus, when a forward scan ran, the readers it opened and
+        where a cursor's position let it resume. */
+    private static func collect(
+        files: [URL], options: LogQueryOptions, onDiskRead: (@Sendable (Int) -> Void)?
+    ) -> (lines: [LogRecord], readers: [LogFileReader]?, resume: LogScan.GroupEnd?, totals: LogStreamTotals?) {
+        /** A tail with no grep and no lower bound is answerable from the end
+            of the family backward, without reading older files a caller never
+            asked to see: `directa logs <name> --tail 50` must not read a whole
+            10 MB rotation to hand back 50 lines. Every other shape scans
+            forward from its lower bound, so this fast path is scoped to the
+            one shape that has no reason to touch bytes it will discard. */
+        if let tail = options.tail, options.since == nil, options.after == nil,
+            options.grep == nil, options.head == nil, options.tailByStream == nil
+        {
+            let lines = tailOnly(files: files, tail: tail, streams: options.streams, onDiskRead: onDiskRead)
+            return (truncated(lines, to: options.maxLineCharacters), nil, nil, nil)
+        }
         /** A pattern that will not compile filters nothing out, so it would
-            answer with the whole log. Fail closed and say so instead: callers
-            screen user input with grepRejection first. */
+            answer with the whole log. Fail closed and say so instead: a wire
+            query is screened by `LogsQueryParams.refusal` first. */
         var grep: Regex<AnyRegexOutput>?
         if let pattern = options.grep {
             guard let compiled = try? Regex(pattern) else {
                 DirectaLog.daemon.error("log query grep pattern does not compile: \(pattern)")
-                return []
+                return ([], nil, nil, options.reportsTotals ? LogStreamTotals() : nil)
             }
             grep = compiled
         }
-        var records: [LogRecord] = []
-        for file in familyFiles(current: current) {
-            /** Whole-file skip: a file whose last line predates `since` cannot
-                contribute. */
-            if let since = options.since,
-                let last = lastLineTimestamp(of: file), last < since {
-                continue
-            }
-            guard let data = try? Data(contentsOf: file), !data.isEmpty else { continue }
-            let text = String(decoding: data, as: UTF8.self)
-            var startIndex = text.startIndex
-            if let since = options.since {
-                startIndex = firstLineIndex(atOrAfter: since, in: text)
-            }
-            for line in text[startIndex...].split(separator: "\n", omittingEmptySubsequences: true) {
-                guard let record = LogRecord.parse(line) else { continue }
-                if let since = options.since, record.at < since { continue }
-                if let streams = options.streams, !streams.contains(record.stream) { continue }
-                if let grep, (try? grep.firstMatch(in: record.text)) == nil { continue }
-                records.append(record)
-            }
+        let scanned = LogScan.scan(files: files, options: options, grep: grep, onDiskRead: onDiskRead)
+        return (
+            truncated(scanned.lines, to: options.maxLineCharacters), scanned.readers, scanned.resume,
+            options.reportsTotals ? scanned.totals : nil
+        )
+    }
+
+    private static func truncated(_ records: [LogRecord], to limit: Int?) -> [LogRecord] {
+        guard let limit else { return records }
+        return records.map { record in
+            LogRecord(
+                at: record.at, stream: record.stream,
+                text: LogSanitizer.truncated(record.text, toCharacters: limit))
         }
-        if let tail = options.tail, records.count > tail {
-            records.removeFirst(records.count - tail)
+    }
+
+    /** Newest-file-first tail: pulls just enough lines off the end of the
+        family to answer `tail`, oldest file only once a newer one runs dry.
+        Reproduces the forward scan's trim-to-tail result exactly (same
+        records, same order) without reading a file whose contribution to the
+        tail is zero. */
+    private static func tailOnly(
+        files: [URL], tail: Int, streams: Set<LogStream>?,
+        onDiskRead: (@Sendable (Int) -> Void)?
+    ) -> [LogRecord] {
+        var collected: [LogRecord] = []
+        for file in files.reversed() {
+            guard collected.count < tail else { break }
+            let fromThisFile = tailRecords(
+                of: file, needed: tail - collected.count, streams: streams, onDiskRead: onDiskRead)
+            collected = fromThisFile + collected
         }
-        return records
+        return collected
+    }
+
+    /** Up to `needed` records off the end of one file, oldest-first, read
+        backward in fixed chunks: a file far larger than the requested tail
+        is never read past the bytes that satisfy it, and a `streams` filter
+        that thins the tail out walks further back without holding more than
+        a chunk. */
+    private static func tailRecords(
+        of url: URL, needed: Int, streams: Set<LogStream>?,
+        onDiskRead: (@Sendable (Int) -> Void)?
+    ) -> [LogRecord] {
+        guard let reader = LogFileReader(url: url, onDiskRead: onDiskRead) else { return [] }
+        var matched: [LogRecord] = []
+        reader.forEachLineBackward(before: reader.size) { line, _ in
+            guard let record = LogScan.record(from: line, streams: streams) else { return true }
+            matched.append(record)
+            return matched.count < needed
+        }
+        return matched.reversed()
     }
 
     /** Timestamp of a mark record whose payload starts with `<id>\t`. */
@@ -197,80 +338,9 @@ public enum LogQuery {
         return marks.first { $0.text.hasPrefix("\(markID)\t") || $0.text == markID }?.at
     }
 
-    /** Binary search over byte-offset midpoints: seek, scan to the next line
-        start, read that line's timestamp prefix. Returns the string index of the
-        first line whose timestamp is at or after `since`. */
-    static func firstLineIndex(atOrAfter since: Date, in text: String) -> String.Index {
-        let utf8 = text.utf8
-        var low = 0
-        var high = utf8.count
-        while low < high {
-            let mid = (low + high) / 2
-            let lineStart = lineStartOffset(atOrBefore: mid, utf8: utf8)
-            guard let stamp = timestamp(atOffset: lineStart, in: text) else {
-                /** Unparseable midpoint line: fall back to linear from here. */
-                high = lineStart
-                if high <= low { break }
-                continue
-            }
-            if stamp < since {
-                let next = nextLineOffset(after: lineStart, utf8: utf8)
-                if next == lineStart { break }
-                low = next
-            } else {
-                high = lineStart
-            }
-        }
-        let offset = lineStartOffset(atOrBefore: min(low, utf8.count), utf8: utf8)
-        return text.utf8.index(text.utf8.startIndex, offsetBy: offset)
-    }
-
-    public static func lastLineTimestamp(of url: URL) -> Date? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        guard size > 0 else { return nil }
-        let window: UInt64 = 64 * 1024
-        let offset = size > window ? size - window : 0
-        try? handle.seek(toOffset: offset)
-        guard let data = try? handle.readToEnd() else { return nil }
-        let text = String(decoding: data, as: UTF8.self)
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
-            if let stamp = LogRecord.timestampPrefix(of: line) { return stamp }
-        }
-        return nil
-    }
-
-    private static func lineStartOffset(atOrBefore offset: Int, utf8: String.UTF8View) -> Int {
-        guard offset > 0 else { return 0 }
-        var index = utf8.index(utf8.startIndex, offsetBy: min(offset, utf8.count))
-        while index > utf8.startIndex {
-            let previous = utf8.index(before: index)
-            if utf8[previous] == 0x0A {
-                return utf8.distance(from: utf8.startIndex, to: index)
-            }
-            index = previous
-        }
-        return 0
-    }
-
-    private static func nextLineOffset(after offset: Int, utf8: String.UTF8View) -> Int {
-        var index = utf8.index(utf8.startIndex, offsetBy: min(offset, utf8.count))
-        while index < utf8.endIndex {
-            let current = utf8[index]
-            index = utf8.index(after: index)
-            if current == 0x0A {
-                return utf8.distance(from: utf8.startIndex, to: index)
-            }
-        }
-        return utf8.distance(from: utf8.startIndex, to: utf8.endIndex)
-    }
-
-    private static func timestamp(atOffset offset: Int, in text: String) -> Date? {
-        let start = text.utf8.index(text.utf8.startIndex, offsetBy: offset)
-        guard let lineEnd = text[start...].firstIndex(of: "\n") else {
-            return LogRecord.timestampPrefix(of: text[start...])
-        }
-        return LogRecord.timestampPrefix(of: text[start..<lineEnd])
+    /** The timestamp of the last record in one log file, or nil when it
+        holds none or cannot be opened. */
+    public static func lastRecordDate(of url: URL) -> Date? {
+        LogFileReader(url: url, onDiskRead: nil)?.lastRecordMilliseconds().map(LogScan.date(milliseconds:))
     }
 }

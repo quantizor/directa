@@ -5,23 +5,68 @@ PREFIX ?= $(HOME)/.local
 # with SIGN_IDENTITY=... to pick a specific identity or to force ad-hoc.
 SIGN_IDENTITY ?= $(shell scripts/signing-identity.sh)
 
-.PHONY: build test sweep-test-temp app dmg release-dmg install clean icon
+.PHONY: build test test-parallel-width dead-code sweep-test-temp sweep-swift-temp app dmg release-dmg install clean icon
 
-build:
-	swift build -c release
+# The shipped products only. A bare `swift build -c release` also compiles the
+# test-only targets (DirectaTestSupport imports Testing). `--product` keeps
+# only its last value, hence one invocation per product.
+build: sweep-swift-temp
+	swift build -c release --product directa
+	swift build -c release --product ddirecta
+	swift build -c release --product DirectaApp
 
-# The unit suites create their fixture project trees under the user temp dir
-# (directa-sup-*, directa-wt-*, directa-cfg-*, …) and never delete them: a run
-# killed part way has no one to clean up after it. This sweeps anything older
-# than a day, so a second `make test` running concurrently is untouched and a
-# just-finished run's own dirs are not yanked from under a still-attached
-# debugger. Best-effort by design (macOS system dirs are unreadable and make
-# find exit 1), so a failed sweep never fails a test run.
+# Unused-code scan; the script's header covers the index location, the version
+# pin, and the vendor call it blocks.
+dead-code: sweep-swift-temp
+	scripts/dead-code.sh
+
+# A run killed part way leaves its scratch trees under the user temp dir
+# (directa-run.* from `make test`, directa-test-* from TemporaryTree when no
+# run root is set) with no one to clean up after it. This sweeps exactly those
+# two shapes, never another directa-* entry there (the grok hook's turn state
+# lives in directa-grok-hook), and only when older than a day, so a second `make test` running concurrently is
+# untouched and a just-finished run's own dirs are not yanked from under a
+# still-attached debugger. Best-effort by design (macOS system dirs are
+# unreadable and make find exit 1), so a failed sweep never fails a test run.
 sweep-test-temp:
-	@find "$$(getconf DARWIN_USER_TEMP_DIR)" -depth 1 -name 'directa-*' -type d -mtime +0 -exec rm -rf {} + 2>/dev/null || true
+	@find "$$(getconf DARWIN_USER_TEMP_DIR)" -mindepth 1 -maxdepth 1 \( -name 'directa-run.*' -o -name 'directa-test-*' \) -type d -mtime +0 -exec rm -rf {} + 2>/dev/null || true
 
-test: sweep-test-temp
-	swift test
+# The Swift compiler driver leaves a temp folder behind on every build; the
+# script's header says exactly which folders it removes.
+sweep-swift-temp:
+	@scripts/sweep-swift-temp.sh
+
+# How many test cases Swift Testing runs at once. Unset, it starts every test
+# at the same moment (Swift 6.3+ reads this variable; older toolchains ignore
+# it), and on a three-core CI runner that opening burst leaves ready work
+# waiting seconds for a cooperative-pool thread, so every wall-clock bound in
+# the suites (a deadline, a "fails fast" check) misses. The cap keeps that wait
+# short without lengthening the run. make test (and so CI) and
+# scripts/test-narrow-pool.sh read this one value.
+TEST_PARALLEL_WIDTH := 16
+
+# Every test's scratch tree comes from TemporaryTree
+# (Tests/DirectaTestSupport/TemporaryTree.swift), which removes it when the
+# test ends. The run gets its own root through DIRECTA_TEST_TEMP_ROOT, and a
+# root that is not empty afterward fails the run and is kept for inspection:
+# something bypassed the helper, or a server rebuilt a tree after its test
+# returned.
+test: sweep-test-temp sweep-swift-temp
+	@root="$$(mktemp -d "$$(getconf DARWIN_USER_TEMP_DIR)directa-run.XXXXXX")" || exit 1; \
+	SWT_EXPERIMENTAL_MAXIMUM_PARALLELIZATION_WIDTH=$(TEST_PARALLEL_WIDTH) \
+	DIRECTA_TEST_TEMP_ROOT="$$root" swift test --disable-xctest; status=$$?; \
+	left="$$(find "$$root" -mindepth 1 -maxdepth 1)"; \
+	if [ -n "$$left" ]; then \
+		echo "error: the test run left temporary trees in $$root:" >&2; \
+		echo "$$left" >&2; \
+		echo "fix: each test's tree must be gone when it returns; see Tests/DirectaTestSupport/TemporaryTree.swift" >&2; \
+		exit 1; \
+	fi; \
+	rm -rf "$$root"; \
+	exit $$status
+
+test-parallel-width:
+	@echo $(TEST_PARALLEL_WIDTH)
 
 app: build
 	scripts/make-app-bundle.sh "$(SIGN_IDENTITY)"

@@ -18,27 +18,30 @@ public struct CoalitionIDs: Equatable, Hashable, Sendable {
         or failed read, never a trap: a missing flavor is the same as "we cannot
         see coalitions on this kernel." */
     public static func read(of pid: pid_t) -> CoalitionIDs? {
-        var info = ProcPIDCoalitionInfo()
-        let got = withUnsafeMutableBytes(of: &info) { buf -> Int32 in
-            guard let base = buf.baseAddress else { return 0 }
-            return proc_pidinfo(
-                pid, ProcPIDCoalitionInfo.flavor, 0, base,
-                Int32(MemoryLayout<ProcPIDCoalitionInfo>.stride))
-        }
-        guard got >= 16, info.resource != 0 || info.jetsam != 0 else { return nil }
+        guard
+            let info = readProcInfo(
+                pid: pid, flavor: ProcPIDCoalitionInfo.flavor, argument: 0,
+                into: ProcPIDCoalitionInfo()),
+            info.resource != 0 || info.jetsam != 0
+        else { return nil }
         return CoalitionIDs(jetsam: info.jetsam, resource: info.resource)
     }
 }
 
-/** xnu `struct proc_pidcoalitioninfo` for flavor 20. Not in the public SDK.
-    Field order is the kernel's `coalition_id[COALITION_NUM_TYPES]` (resource
-    then jetsam) plus reserved words, not alphabetical. `proc_pidinfo` itself
-    comes from Darwin (`libproc.h`); only this layout is private. */
+/** xnu `struct proc_pidcoalitioninfo` for flavor 20, 40 bytes. Not in the
+    public SDK. Field order is the kernel's `coalition_id[COALITION_NUM_TYPES]`
+    (resource then jetsam) plus reserved words, not alphabetical. `proc_pidinfo`
+    itself comes from Darwin (`libproc.h`); only this layout is private. The
+    reserved words stay: `proc_pidinfo` refuses a buffer smaller than the
+    kernel's. */
 private struct ProcPIDCoalitionInfo {
     static let flavor: Int32 = 20
     var resource: UInt64 = 0
     var jetsam: UInt64 = 0
+    /* periphery:ignore - kernel layout */
     var reserved1: UInt64 = 0
+    /* periphery:ignore - kernel layout */
     var reserved2: UInt64 = 0
+    /* periphery:ignore - kernel layout */
     var reserved3: UInt64 = 0
 }

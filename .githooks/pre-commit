@@ -1,0 +1,8 @@
+#!/bin/sh
+# Opt-in (enable once per clone: git config core.hooksPath .githooks).
+# Clears the Swift compiler driver's leftover temp folders on every commit; see
+# scripts/sweep-swift-temp.sh for exactly what it removes. A sweep failure is
+# printed but never blocks the commit, since it says nothing about the change.
+root="$(git rev-parse --show-toplevel)" || exit 0
+"$root/scripts/sweep-swift-temp.sh" || echo "pre-commit: the Swift temp sweep failed (above); the commit goes ahead" >&2
+exit 0

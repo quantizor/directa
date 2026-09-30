@@ -8,7 +8,6 @@ public enum DirectaLogCategory: String, Sendable, Equatable, CaseIterable {
     case app
     case daemon
     case deeplink
-    case health
     case supervisor
 }
 
@@ -77,9 +76,8 @@ public final class RecordingBackend: DirectaLogBackend {
     }
 }
 
-/** The logging front door. Call the ergonomic per-category members
-    (`DirectaLog.deeplink.info("…")`) or the category-parameterized statics; both
-    reach the swappable `backend`. */
+/** The logging front door. Call the per-category members
+    (`DirectaLog.deeplink.info("…")`); each reaches the swappable `backend`. */
 public enum DirectaLog {
     public static let subsystem = "dev.quantizor.directa"
 
@@ -103,7 +101,6 @@ public enum DirectaLog {
     public static let app = CategoryLogger(category: .app)
     public static let daemon = CategoryLogger(category: .daemon)
     public static let deeplink = CategoryLogger(category: .deeplink)
-    public static let health = CategoryLogger(category: .health)
     public static let supervisor = CategoryLogger(category: .supervisor)
 
     /** The active backend, guarded by a lock so a test's swap and a concurrent
@@ -113,20 +110,21 @@ public enum DirectaLog {
         set { backendLock.withLock { $0 = newValue } }
     }
 
-    public static func debug(_ category: DirectaLogCategory, _ message: String) {
-        emit(category: category, level: .debug, message: message)
-    }
-
-    public static func error(_ category: DirectaLogCategory, _ message: String) {
-        emit(category: category, level: .error, message: message)
-    }
-
-    public static func info(_ category: DirectaLogCategory, _ message: String) {
-        emit(category: category, level: .info, message: message)
+    /** `swiftpm-testing-helper` is the process `swift test` runs every suite
+        under, and Swift Testing suites run in parallel by default, so a
+        per-test swap of this shared backend would race across suites. Deciding
+        the default backend once here, at first access, instead keeps every
+        error/info call a test's negative path exercises out of the real
+        `dev.quantizor.directa` unified log, which persists error-level entries
+        indefinitely: without this, a full test run left permanent, unqueryable
+        noise (including temp-directory paths from throwaway fixtures) in the
+        developer's own system log. */
+    static func defaultBackend(processName: String) -> any DirectaLogBackend {
+        processName == "swiftpm-testing-helper" ? RecordingBackend() : OSLogBackend()
     }
 
     private static let backendLock = OSAllocatedUnfairLock<any DirectaLogBackend>(
-        initialState: OSLogBackend())
+        initialState: defaultBackend(processName: ProcessInfo.processInfo.processName))
 
     private static func emit(category: DirectaLogCategory, level: DirectaLogLevel, message: String) {
         backend.log(category: category, level: level, message: message)

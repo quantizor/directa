@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -9,29 +10,32 @@ import Testing
     host: every `*.localhost` name resolves to loopback, so the host never
     disambiguated a bind, and a third-level subdomain breaks apps whose auth
     config pins one origin. The worktree name surfaces as a display value. */
-@Suite(.serialized) struct WorktreeCoexistenceTests {
+@Suite(.serialized, .temporaryTree) struct WorktreeCoexistenceTests {
+    /** The port the coexistence fixtures declare, and the first of the three
+        the span fixture declares (`portSpan: 3`). */
+    private static let declaredPort = TestPorts.port(111)
+    private static let spanPort = TestPorts.port(200)
+
     private struct Env {
-        let fixture: String
         let main: String
         let paths: DirectaPaths
         let worktree: String
     }
 
-    private func makeEnv() throws -> Env {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-wt-\(UUID().uuidString)")
+    private func makeEnv() async throws -> Env {
+        let base = try TemporaryTree.directory(named: "wt")
         let main = base.appending(path: "main")
         let worktree = base.appending(path: "worktrees/review")
         try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
-        try run(in: main.path, "/usr/bin/git", "init", "-b", "main")
-        try run(in: main.path, "/usr/bin/git", "config", "user.email", "directa@test")
-        try run(in: main.path, "/usr/bin/git", "config", "user.name", "directa")
+        try await run(in: main.path, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: main.path, "/usr/bin/git", "config", "user.email", "directa@test")
+        try await run(in: main.path, "/usr/bin/git", "config", "user.name", "directa")
         try Data("ok\n".utf8).write(to: main.appending(path: "README"))
-        try run(in: main.path, "/usr/bin/git", "add", "README")
-        try run(in: main.path, "/usr/bin/git", "commit", "-m", "init")
+        try await run(in: main.path, "/usr/bin/git", "add", "README")
+        try await run(in: main.path, "/usr/bin/git", "commit", "-m", "init")
         try FileManager.default.createDirectory(
             at: worktree.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try run(
+        try await run(
             in: main.path, "/usr/bin/git", "worktree", "add", "-b", "review", worktree.path)
         let fixture = try #require(Self.fixtureServerPath())
         let body = """
@@ -40,9 +44,9 @@ import Testing
               "servers": {
                 "web": {
                   "command": ["\(fixture)", "--listen-tcp", "{port}"],
-                  "healthcheck": { "type": "tcp", "port": 45111 },
-                  "port": 45111,
-                  "url": "http://app.localhost:45111/"
+                  "healthcheck": { "type": "tcp", "port": \(Self.declaredPort) },
+                  "port": \(Self.declaredPort),
+                  "url": "http://app.localhost:\(Self.declaredPort)/"
                 }
               },
               "version": 1
@@ -51,45 +55,28 @@ import Testing
         for root in [main, worktree] {
             try Data(body.utf8).write(to: root.appending(path: "devservers.json"))
         }
-        return Env(
-            fixture: fixture,
-            main: main.path,
-            paths: DirectaPaths(
-                dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
-            worktree: worktree.path)
-    }
-
-    private func handle<P: Codable & Sendable, R: Codable & Sendable>(
-        _ router: Router, _ method: WireMethod, _ params: P, _ expecting: R.Type
-    ) async throws -> R {
-        let line = try NDJSON.encodeLine(WireRequest(id: "t", method: method.rawValue, params: params))
-        let data = await router.handle(line: line)
-        let response = try JSONCoding.decoder().decode(WireResponse<R>.self, from: data)
-        if response.ok, let result = response.result { return result }
-        throw response.error ?? WireError(code: .internalError, message: "no result")
+        return Env(main: main.path, paths: .scratch(in: base), worktree: worktree.path)
     }
 
     @Test func siblingWorktreeEnsureRebindsAndKeepsTheDeclaredHost() async throws {
-        let env = try makeEnv()
+        let env = try await makeEnv()
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.main)
         try await registry.setTrusted(project: env.worktree)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        let mainResult = try await handle(
-            router, .serverEnsure,
-            EnsureParams(name: "web", project: env.main, timeoutSeconds: 10), EnsureResult.self)
+        let mainResult = try await router.call(
+            .serverEnsure, EnsureParams(name: "web", project: env.main, timeoutSeconds: 10), EnsureResult.self)
         #expect(mainResult.server.phase == .running)
-        #expect(mainResult.server.effectivePort == 45111)
-        #expect(mainResult.server.url == "http://app.localhost:45111/")
+        #expect(mainResult.server.effectivePort == Self.declaredPort)
+        #expect(mainResult.server.url == "http://app.localhost:\(Self.declaredPort)/")
         #expect(mainResult.server.portConflict == nil)
         #expect(mainResult.server.worktree == nil)
 
-        let wtResult = try await handle(
-            router, .serverEnsure,
-            EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
+        let wtResult = try await router.call(
+            .serverEnsure, EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
         #expect(wtResult.server.phase == .running)
-        #expect(wtResult.server.effectivePort != 45111)
+        #expect(wtResult.server.effectivePort != Self.declaredPort)
         #expect(wtResult.server.portConflict?.state == .rebound)
         #expect(wtResult.server.worktree == "review")
         #expect(wtResult.server.mainProject == "main")
@@ -97,12 +84,10 @@ import Testing
         /** The declared host is used unchanged; only the port moves. */
         #expect(url == "http://app.localhost:\(wtResult.server.effectivePort ?? -1)/")
 
-        _ = try await handle(
-            router, .serverStop, ServerTargetParams(name: "web", project: env.worktree),
-            ServerResult.self)
-        _ = try await handle(
-            router, .serverStop, ServerTargetParams(name: "web", project: env.main),
-            ServerResult.self)
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "web", project: env.worktree), ServerResult.self)
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "web", project: env.main), ServerResult.self)
     }
 
     /** The label is computed at supervisor creation, not at spawn: a worktree
@@ -111,37 +96,34 @@ import Testing
         reports which checkout it is, and the session-context banner is
         therefore never silently missing. */
     @Test func statusNamesTheWorktreeBeforeAnythingStarts() async throws {
-        let env = try makeEnv()
+        let env = try await makeEnv()
         let registry = Registry(paths: env.paths)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        let listed = try await handle(
-            router, .serverStatus, ProjectParams(project: env.worktree), ServerListResult.self)
+        let listed = try await router.call(.serverStatus, ProjectParams(project: env.worktree), ServerListResult.self)
         let web = try #require(listed.servers.first { $0.server == "web" })
         #expect(web.phase == .stopped)
         #expect(web.worktree == "review")
         #expect(web.mainProject == "main")
-        #expect(web.url == "http://app.localhost:45111/")
+        #expect(web.url == "http://app.localhost:\(Self.declaredPort)/")
     }
 
     /** The worktree checkout is answerable before anything starts, so a reader
         can tell which checkout a config describes. The host question is now
         boring on purpose: the declared host is the spawn host everywhere. */
     @Test func configCheckNamesTheWorktreeAndKeepsTheDeclaredHost() async throws {
-        let env = try makeEnv()
+        let env = try await makeEnv()
         let registry = Registry(paths: env.paths)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        let mainCheck = try await handle(
-            router, .projectCheck, ProjectOnlyParams(project: env.main), CheckResult.self)
+        let mainCheck = try await router.call(.projectCheck, ProjectOnlyParams(project: env.main), CheckResult.self)
         #expect(mainCheck.errors.isEmpty)
         #expect(mainCheck.host == "app.localhost")
         #expect(mainCheck.effectiveHost == nil)
         #expect(mainCheck.effectiveHostReason == nil)
         #expect(mainCheck.worktree == nil)
 
-        let wtCheck = try await handle(
-            router, .projectCheck, ProjectOnlyParams(project: env.worktree), CheckResult.self)
+        let wtCheck = try await router.call(.projectCheck, ProjectOnlyParams(project: env.worktree), CheckResult.self)
         #expect(wtCheck.errors.isEmpty)
         #expect(wtCheck.host == "app.localhost")
         #expect(wtCheck.effectiveHost == nil)
@@ -151,14 +133,12 @@ import Testing
         /** The reported host must be the one a start actually uses, which is
             the whole point of answering before the start. */
         try await registry.setTrusted(project: env.worktree)
-        let started = try await handle(
-            router, .serverEnsure,
-            EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
+        let started = try await router.call(
+            .serverEnsure, EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
         let url = try #require(started.server.url)
         #expect(url.contains(try #require(wtCheck.host)))
-        _ = try await handle(
-            router, .serverStop, ServerTargetParams(name: "web", project: env.worktree),
-            ServerResult.self)
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "web", project: env.worktree), ServerResult.self)
     }
 
     /** `up` prepares the spawn and then runs its waves. Re-resolving the
@@ -167,57 +147,60 @@ import Testing
         the child bound the committed port while status reported the rebind.
         Group and single-server starts must agree. */
     @Test func siblingWorktreeGroupUpKeepsTheMaterializedSpawnSpec() async throws {
-        let env = try makeEnv()
+        let env = try await makeEnv()
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.main)
         try await registry.setTrusted(project: env.worktree)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        let mainResult = try await handle(
-            router, .groupUp, GroupParams(project: env.main, timeoutSeconds: 10),
-            GroupResult.self)
+        let mainResult = try await router.call(
+            .groupUp, GroupParams(project: env.main, timeoutSeconds: 10), GroupResult.self)
         #expect(mainResult.results.first?.server.phase == .running)
-        #expect(mainResult.results.first?.server.effectivePort == 45111)
+        #expect(mainResult.results.first?.server.effectivePort == Self.declaredPort)
 
-        let wtResult = try await handle(
-            router, .groupUp, GroupParams(project: env.worktree, timeoutSeconds: 10),
-            GroupResult.self)
+        let wtResult = try await router.call(
+            .groupUp, GroupParams(project: env.worktree, timeoutSeconds: 10), GroupResult.self)
         let web = try #require(wtResult.results.first?.server)
         #expect(web.phase == .running)
         let effective = try #require(web.effectivePort)
-        #expect(effective != 45111)
+        #expect(effective != Self.declaredPort)
         #expect(web.portConflict?.state == .rebound)
         #expect(web.worktree == "review")
         /** The url is the tell: it is built from the materialized spec, so the
             committed port here means the spawn spec was clobbered. */
         let url = try #require(web.url)
         #expect(url == "http://app.localhost:\(effective)/")
-        /** The child was told `{port}`, so a clobbered spec listens on 45111. */
+        /** The child was told `{port}`, so a clobbered spec listens on the declared port. */
         #expect(web.observedPort == nil || web.observedPort == effective)
 
-        _ = try await handle(
-            router, .groupDown, GroupParams(project: env.worktree, timeoutSeconds: 10),
-            GroupResult.self)
-        _ = try await handle(
-            router, .groupDown, GroupParams(project: env.main, timeoutSeconds: 10),
-            GroupResult.self)
+        _ = try await router.call(
+            .groupDown, GroupParams(project: env.worktree, timeoutSeconds: 10), GroupResult.self)
+        _ = try await router.call(
+            .groupDown, GroupParams(project: env.main, timeoutSeconds: 10), GroupResult.self)
     }
 
     @Test func siblingWorktreePortSpanRebindsAsBlock() async throws {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-span-\(UUID().uuidString)")
+        let base = try TemporaryTree.directory(named: "span")
         let main = base.appending(path: "main")
-        let worktree = base.appending(path: "worktrees/review")
         try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
-        try run(in: main.path, "/usr/bin/git", "init", "-b", "main")
-        try run(in: main.path, "/usr/bin/git", "config", "user.email", "directa@test")
-        try run(in: main.path, "/usr/bin/git", "config", "user.name", "directa")
+        /** Named so the sibling search starts one past main's base port, inside
+            main's span: only a search that reserves the whole span clears it. */
+        let parent = canonicalProjectPath(base.path)
+        let label = try #require(
+            (0..<100_000).lazy.map { "review-\($0)" }.first {
+                CheckoutIdentity.siblingPortCandidate(
+                    declared: Self.spanPort, project: "\(parent)/worktrees/\($0)") == Self.spanPort + 1
+            })
+        let worktree = base.appending(path: "worktrees/\(label)")
+        try await run(in: main.path, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: main.path, "/usr/bin/git", "config", "user.email", "directa@test")
+        try await run(in: main.path, "/usr/bin/git", "config", "user.name", "directa")
         try Data("ok\n".utf8).write(to: main.appending(path: "README"))
-        try run(in: main.path, "/usr/bin/git", "add", "README")
-        try run(in: main.path, "/usr/bin/git", "commit", "-m", "init")
+        try await run(in: main.path, "/usr/bin/git", "add", "README")
+        try await run(in: main.path, "/usr/bin/git", "commit", "-m", "init")
         try FileManager.default.createDirectory(
             at: worktree.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try run(
+        try await run(
             in: main.path, "/usr/bin/git", "worktree", "add", "-b", "review", worktree.path)
         let fixture = try #require(Self.fixtureServerPath())
         let body = """
@@ -226,11 +209,11 @@ import Testing
               "servers": {
                 "web": {
                   "command": ["\(fixture)", "--listen-tcp", "{port}"],
-                  "healthcheck": { "type": "tcp", "port": 45200 },
-                  "port": 45200,
+                  "healthcheck": { "type": "tcp", "port": \(Self.spanPort) },
+                  "port": \(Self.spanPort),
                   "portEnv": "PUBLIC_PORT",
                   "portSpan": 3,
-                  "url": "http://app.localhost:45200/"
+                  "url": "http://app.localhost:\(Self.spanPort)/"
                 }
               },
               "version": 1
@@ -239,83 +222,83 @@ import Testing
         for root in [main, worktree] {
             try Data(body.utf8).write(to: root.appending(path: "devservers.json"))
         }
-        let paths = DirectaPaths(
-            dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs"))
+        let paths = DirectaPaths.scratch(in: base)
         let registry = Registry(paths: paths)
         try await registry.setTrusted(project: main.path)
         try await registry.setTrusted(project: worktree.path)
         let router = Router(launcher: SubprocessLauncher(), paths: paths, registry: registry)
-        let mainResult = try await handle(
-            router, .serverEnsure,
-            EnsureParams(name: "web", project: main.path, timeoutSeconds: 10), EnsureResult.self)
-        #expect(mainResult.server.effectivePort == 45200)
-        let wtResult = try await handle(
-            router, .serverEnsure,
-            EnsureParams(name: "web", project: worktree.path, timeoutSeconds: 10), EnsureResult.self)
+        let mainResult = try await router.call(
+            .serverEnsure, EnsureParams(name: "web", project: main.path, timeoutSeconds: 10), EnsureResult.self)
+        #expect(mainResult.server.effectivePort == Self.spanPort)
+        let wtResult = try await router.call(
+            .serverEnsure, EnsureParams(name: "web", project: worktree.path, timeoutSeconds: 10), EnsureResult.self)
         let rebound = try #require(wtResult.server.effectivePort)
-        #expect(rebound != 45200)
-        /** Rebound base must clear the whole span away from main's 45200..45202. */
-        #expect(Set(rebound..<(rebound + 3)).isDisjoint(with: Set(45200..<45203)))
-        #expect(PortGuard.isListening(port: rebound))
-        #expect(PortGuard.isListening(port: 45200))
-        _ = try await handle(
-            router, .serverStop, ServerTargetParams(name: "web", project: worktree.path),
-            ServerResult.self)
-        _ = try await handle(
-            router, .serverStop, ServerTargetParams(name: "web", project: main.path),
-            ServerResult.self)
+        /** The first block clear of main's three ports. */
+        #expect(rebound == Self.spanPort + 3)
+        #expect(await PortGuard.isListening(port: rebound))
+        #expect(await PortGuard.isListening(port: Self.spanPort))
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "web", project: worktree.path), ServerResult.self)
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "web", project: main.path), ServerResult.self)
     }
 
     /** Discarding a worktree path stops its children and forgets registry/state
         without touching the main checkout. */
-    /** The timer sweep needs the path missing on two consecutive passes before
-        it tears a project down (one flaky stat must never be irreversible), and
-        on the second pass the children are stopped and the registration is
-        forgotten exactly like the machine-wide prune. */
-    @Test func missingProjectSweepPrunesAfterTwoConsecutiveMisses() async throws {
-        let env = try makeEnv()
+    /** The timer sweep needs the path missing continuously for a full sweep
+        interval before it tears a project down (one flaky stat must never be
+        irreversible), and once that interval elapses the children are stopped
+        and the registration is forgotten exactly like the machine-wide prune.
+        A clock passed explicitly, never a sleep, moves time forward. */
+    @Test func missingProjectSweepPrunesAfterTheDebounceInterval() async throws {
+        let env = try await makeEnv()
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.worktree)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        let started = try await handle(
-            router, .serverEnsure,
-            EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
+        let started = try await router.call(
+            .serverEnsure, EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
         #expect(started.server.phase == .running)
         let pid = try #require(started.server.pid)
         let projectKey = started.server.project
 
         try FileManager.default.removeItem(atPath: env.worktree)
 
+        let firstMiss = Date()
         /** First miss: held. Nothing is torn down on one flaky stat. */
-        #expect(await router.sweepMissingProjects() == 0)
+        #expect(await router.pruneMissingProjects(now: firstMiss) == 0)
         #expect(await registry.project(projectKey) != nil)
         #expect(kill(pid_t(pid), 0) == 0)
 
-        /** Second miss: torn down, children stopped, state forgotten. */
-        #expect(await router.sweepMissingProjects() == 1)
+        /** Still inside the sweep interval: still held. */
+        #expect(await router.pruneMissingProjects(now: firstMiss.addingTimeInterval(1)) == 0)
+        #expect(await registry.project(projectKey) != nil)
+
+        /** Missing continuously for the full sweep interval: torn down,
+            children stopped, state forgotten. */
+        let afterInterval = firstMiss.addingTimeInterval(Router.missingProjectSweepIntervalSeconds)
+        #expect(await router.pruneMissingProjects(now: afterInterval) == 1)
         #expect(await registry.project(projectKey) == nil)
         #expect(kill(pid_t(pid), 0) != 0)
-        #expect(!PortGuard.isListening(port: try #require(started.server.effectivePort)))
+        let port = try #require(started.server.effectivePort)
+        #expect(await !PortGuard.isListening(port: port))
     }
 
     @Test func discardedWorktreeIsPrunedOnMachineWideStatus() async throws {
-        let env = try makeEnv()
+        let env = try await makeEnv()
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.main)
         try await registry.setTrusted(project: env.worktree)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        let mainResult = try await handle(
-            router, .serverEnsure,
-            EnsureParams(name: "web", project: env.main, timeoutSeconds: 10), EnsureResult.self)
+        let mainResult = try await router.call(
+            .serverEnsure, EnsureParams(name: "web", project: env.main, timeoutSeconds: 10), EnsureResult.self)
         #expect(mainResult.server.phase == .running)
         let mainPid = try #require(mainResult.server.pid)
         let mainProject = mainResult.server.project
 
-        let wtResult = try await handle(
-            router, .serverEnsure,
-            EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
+        let wtResult = try await router.call(
+            .serverEnsure, EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
         #expect(wtResult.server.phase == .running)
         let wtPid = try #require(wtResult.server.pid)
         let wtPort = try #require(wtResult.server.effectivePort)
@@ -324,8 +307,14 @@ import Testing
         try FileManager.default.removeItem(atPath: env.worktree)
         #expect(!FileManager.default.fileExists(atPath: env.worktree))
 
-        let after = try await handle(
-            router, .serverStatus, ProjectParams(project: ""), ServerListResult.self)
+        /** Primes the debounce with a first-miss timestamp already past the
+            sweep interval, so the next real check below (the ordinary
+            machine-wide status path, timed by the wall clock) forgets on this
+            one call instead of needing a real 30-second wait. */
+        _ = await router.pruneMissingProjects(
+            now: Date().addingTimeInterval(-Router.missingProjectSweepIntervalSeconds - 1))
+
+        let after = try await router.call(.serverStatus, ProjectParams(project: ""), ServerListResult.self)
         #expect(!after.servers.contains { $0.project == wtProject })
         #expect(after.servers.contains { $0.project == mainProject && $0.phase == .running })
         #expect(await registry.project(wtProject) == nil)
@@ -335,32 +324,34 @@ import Testing
         #expect(!LoopbackProbe.isListening(port: wtPort))
 
         /** Second prune is a no-op: machine-wide status still lists main only. */
-        let again = try await handle(
-            router, .serverStatus, ProjectParams(project: ""), ServerListResult.self)
+        let again = try await router.call(.serverStatus, ProjectParams(project: ""), ServerListResult.self)
         #expect(again.servers.allSatisfy { $0.project == mainProject })
         #expect(await registry.project(mainProject) != nil)
 
-        _ = try await handle(
-            router, .serverStop, ServerTargetParams(name: "web", project: mainProject),
-            ServerResult.self)
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "web", project: mainProject), ServerResult.self)
     }
 
     @Test func discardedWorktreeIsPrunedOnRecoverAtStartup() async throws {
-        let env = try makeEnv()
+        let env = try await makeEnv()
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.main)
         try await registry.setTrusted(project: env.worktree)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        let wtResult = try await handle(
-            router, .serverEnsure,
-            EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
+        let wtResult = try await router.call(
+            .serverEnsure, EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
         #expect(wtResult.server.phase == .running)
         let wtPid = try #require(wtResult.server.pid)
         let wtProject = wtResult.server.project
         let mainProject = canonicalProjectPath(env.main)
 
         try FileManager.default.removeItem(atPath: env.worktree)
+        /** Same priming as the machine-wide status test above: recoverAtStartup
+            calls `pruneMissingProjects()` with the real wall clock, so the
+            first-miss record is seeded already past the interval. */
+        _ = await router.pruneMissingProjects(
+            now: Date().addingTimeInterval(-Router.missingProjectSweepIntervalSeconds - 1))
         await router.recoverAtStartup()
         #expect(await registry.project(wtProject) == nil)
         #expect(kill(pid_t(wtPid), 0) != 0)
@@ -371,86 +362,74 @@ import Testing
         that used the checkout path without a `::` terminator would treat the
         worktree as the same project and `restart` would take both down. */
     @Test func nestedWorktreeRestartLeavesTheSiblingRunning() async throws {
-        let env = try makeNestedEnv(port: 45310)
+        let env = try await makeNestedEnv(port: TestPorts.port(310))
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.main)
         try await registry.setTrusted(project: env.worktree)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        let mainFirst = try await handle(
-            router, .serverEnsure,
-            EnsureParams(name: "web", project: env.main, timeoutSeconds: 10), EnsureResult.self)
+        let mainFirst = try await router.call(
+            .serverEnsure, EnsureParams(name: "web", project: env.main, timeoutSeconds: 10), EnsureResult.self)
         #expect(mainFirst.server.phase == .running)
-        let wtFirst = try await handle(
-            router, .serverEnsure,
-            EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
+        let wtFirst = try await router.call(
+            .serverEnsure, EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
         #expect(wtFirst.server.phase == .running)
         let wtPid = try #require(wtFirst.server.pid)
         let mainPid = try #require(mainFirst.server.pid)
         #expect(wtPid != mainPid)
 
-        let restartedMain = try await handle(
-            router, .serverRestart,
-            RestartParams(names: ["web"], project: env.main, timeoutSeconds: 10), GroupResult.self)
+        let restartedMain = try await router.call(
+            .serverRestart, RestartParams(names: ["web"], project: env.main, timeoutSeconds: 10), GroupResult.self)
         #expect(restartedMain.results.count == 1)
         #expect(try #require(restartedMain.results.first?.server.pid) != mainPid)
-        let wtAfterMain = try await handle(
-            router, .serverStatus, ProjectParams(name: "web", project: env.worktree),
-            ServerListResult.self)
+        let wtAfterMain = try await router.call(
+            .serverStatus, ProjectParams(name: "web", project: env.worktree), ServerListResult.self)
         let wtStill = try #require(wtAfterMain.servers.first)
         #expect(wtStill.phase == .running)
         #expect(wtStill.pid == wtPid)
 
-        let mainAfter = try await handle(
-            router, .serverStatus, ProjectParams(name: "web", project: env.main),
-            ServerListResult.self)
+        let mainAfter = try await router.call(
+            .serverStatus, ProjectParams(name: "web", project: env.main), ServerListResult.self)
         let mainNowPid = try #require(mainAfter.servers.first?.pid)
 
-        let restartedWt = try await handle(
-            router, .serverRestart,
-            RestartParams(names: ["web"], project: env.worktree, timeoutSeconds: 10),
+        let restartedWt = try await router.call(
+            .serverRestart, RestartParams(names: ["web"], project: env.worktree, timeoutSeconds: 10),
             GroupResult.self)
         let wtNowPid = try #require(restartedWt.results.first?.server.pid)
         #expect(wtNowPid != wtPid)
-        let mainAfterWt = try await handle(
-            router, .serverStatus, ProjectParams(name: "web", project: env.main),
-            ServerListResult.self)
+        let mainAfterWt = try await router.call(
+            .serverStatus, ProjectParams(name: "web", project: env.main), ServerListResult.self)
         #expect(mainAfterWt.servers.first?.phase == .running)
         #expect(mainAfterWt.servers.first?.pid == mainNowPid)
 
-        let restartedAll = try await handle(
-            router, .serverRestart,
-            RestartParams(names: nil, project: env.main, timeoutSeconds: 10), GroupResult.self)
+        let restartedAll = try await router.call(
+            .serverRestart, RestartParams(names: nil, project: env.main, timeoutSeconds: 10), GroupResult.self)
         #expect(restartedAll.results.count == 1)
-        let wtAfterAll = try await handle(
-            router, .serverStatus, ProjectParams(name: "web", project: env.worktree),
-            ServerListResult.self)
+        let wtAfterAll = try await router.call(
+            .serverStatus, ProjectParams(name: "web", project: env.worktree), ServerListResult.self)
         #expect(wtAfterAll.servers.first?.phase == .running)
         #expect(wtAfterAll.servers.first?.pid == wtNowPid)
 
-        _ = try await handle(
-            router, .serverStop, ServerTargetParams(name: "web", project: env.worktree),
-            ServerResult.self)
-        _ = try await handle(
-            router, .serverStop, ServerTargetParams(name: "web", project: env.main),
-            ServerResult.self)
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "web", project: env.worktree), ServerResult.self)
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "web", project: env.main), ServerResult.self)
     }
 
-    private func makeNestedEnv(port: Int) throws -> Env {
-        let base = FileManager.default.temporaryDirectory
-            .appending(path: "directa-wt-nested-\(UUID().uuidString)")
+    private func makeNestedEnv(port: Int) async throws -> Env {
+        let base = try TemporaryTree.directory(named: "wt-nested")
         let main = base.appending(path: "main")
         let worktree = main.appending(path: ".claude/worktrees/review")
         try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
-        try run(in: main.path, "/usr/bin/git", "init", "-b", "main")
-        try run(in: main.path, "/usr/bin/git", "config", "user.email", "directa@test")
-        try run(in: main.path, "/usr/bin/git", "config", "user.name", "directa")
+        try await run(in: main.path, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: main.path, "/usr/bin/git", "config", "user.email", "directa@test")
+        try await run(in: main.path, "/usr/bin/git", "config", "user.name", "directa")
         try Data("ok\n".utf8).write(to: main.appending(path: "README"))
-        try run(in: main.path, "/usr/bin/git", "add", "README")
-        try run(in: main.path, "/usr/bin/git", "commit", "-m", "init")
+        try await run(in: main.path, "/usr/bin/git", "add", "README")
+        try await run(in: main.path, "/usr/bin/git", "commit", "-m", "init")
         try FileManager.default.createDirectory(
             at: worktree.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try run(
+        try await run(
             in: main.path, "/usr/bin/git", "worktree", "add", "-b", "review", worktree.path)
         let fixture = try #require(Self.fixtureServerPath())
         let body = """
@@ -470,28 +449,11 @@ import Testing
         for root in [main, worktree] {
             try Data(body.utf8).write(to: root.appending(path: "devservers.json"))
         }
-        return Env(
-            fixture: fixture,
-            main: main.path,
-            paths: DirectaPaths(
-                dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
-            worktree: worktree.path)
+        return Env(main: main.path, paths: .scratch(in: base), worktree: worktree.path)
     }
 
-    private func run(in cwd: String, _ exe: String, _ args: String...) throws {
-        let proc = Process()
-        proc.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        proc.executableURL = URL(fileURLWithPath: exe)
-        proc.arguments = args
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        try proc.run()
-        proc.waitUntilExit()
-        guard proc.terminationStatus == 0 else {
-            throw WireError(
-                code: .internalError,
-                message: "\(exe) \(args.joined(separator: " ")) failed (\(proc.terminationStatus))")
-        }
+    private func run(in cwd: String, _ exe: String, _ args: String...) async throws {
+        try await TestProcess.succeed(exe, args, in: URL(fileURLWithPath: cwd))
     }
 
     private static func fixtureServerPath() -> String? {

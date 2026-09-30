@@ -1,3 +1,4 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -7,11 +8,9 @@ private struct Box: Codable, Equatable {
     var value: Int
 }
 
-@Suite struct AtomicFileTests {
-    private func tempURL() -> URL {
-        FileManager.default.temporaryDirectory
-            .appending(path: "atomicfile-\(UUID().uuidString)")
-            .appending(path: "store.json")
+@Suite(.temporaryTree) struct AtomicFileTests {
+    private func tempURL() throws -> URL {
+        try TemporaryTree.path(named: "atomicfile").appending(path: "store.json")
     }
 
     @Test func loadReturnsNilForAMissingFile() throws {
@@ -19,13 +18,13 @@ private struct Box: Codable, Equatable {
     }
 
     @Test func loadDecodesAValidFile() throws {
-        let url = tempURL()
+        let url = try tempURL()
         try AtomicFile.write(Data(#"{"value":7}"#.utf8), to: url)
         #expect(try AtomicFile.load(Box.self, from: url) == Box(value: 7))
     }
 
     @Test func loadQuarantinesCorruptBytesAndReturnsNil() throws {
-        let url = tempURL()
+        let url = try tempURL()
         try AtomicFile.write(Data("not json at all".utf8), to: url)
         #expect(try AtomicFile.load(Box.self, from: url) == nil)
         #expect(!FileManager.default.fileExists(atPath: url.path))
@@ -38,7 +37,7 @@ private struct Box: Codable, Equatable {
         store path) must throw, so the daemon refuses to start rather than
         treating real data as absent and erasing it on the next write. */
     @Test func loadThrowsWhenTheStoreExistsButCannotBeRead() throws {
-        let url = tempURL()
+        let url = try tempURL()
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         #expect(throws: (any Error).self) {
             _ = try AtomicFile.load(Box.self, from: url)
@@ -49,7 +48,7 @@ private struct Box: Codable, Equatable {
         failure above, collapses to nil. It is only safe where losing the value
         does no harm. */
     @Test func loadDefensivelySwallowsAReadFailure() throws {
-        let url = tempURL()
+        let url = try tempURL()
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         #expect(AtomicFile.loadDefensively(Box.self, from: url) == nil)
     }

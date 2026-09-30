@@ -1,0 +1,249 @@
+import Darwin
+import DirectaTestSupport
+import Foundation
+import Testing
+import os
+
+@testable import DirectaKit
+
+@Suite(.temporaryTree) struct BlockingLaneTests {
+    /** A lane never runs more than `width` jobs at once: with every running
+        job held on a gate, one more never starts, and all of them finish in
+        full once the gate opens. */
+    @Test func aLaneRunsAtMostWidthJobsAtOnce() async {
+        let lane = BlockingLane(name: "test-width", width: 2)
+        let entered = DispatchSemaphore(value: 0)
+        let gate = DispatchSemaphore(value: 0)
+        let jobs = 6
+        let calls = (0..<jobs).map { index in
+            Task.detached {
+                await lane.run {
+                    entered.signal()
+                    gate.wait()
+                    return index
+                }
+            }
+        }
+        let startedPastWidth = await offPool {
+            defer { for _ in 0..<jobs { gate.signal() } }
+            entered.wait()
+            entered.wait()
+            return entered.wait(timeout: .now() + 0.2) == .success
+        }
+        var results: [Int] = []
+        for call in calls {
+            results.append(await call.value)
+        }
+        #expect(!startedPastWidth, "a third job started while two held the lane's full width")
+        #expect(results == Array(0..<jobs))
+    }
+
+    /** Pressure counts running and queued jobs exactly, the oldest queued
+        wait grows while the lane is full, and only a job that waited past the
+        lane's slow-wait bound is reported, once, with its lane name. The jobs
+        reach the lane from tasks, which a busy cooperative pool can start
+        late, so the wait for them is only a guard against hanging, and the
+        gate opens however the wait ends: a job left on a closed gate would
+        hold the test forever. */
+    @Test func pressureAndSlowWaitsAreReported() async throws {
+        let activity = DaemonActivity()
+        let heard = OSAllocatedUnfairLock<[String]>(initialState: [])
+        activity.setObserver { event in
+            if case .laneWaited(let lane, let seconds) = event {
+                heard.withLock { $0.append("\(lane) \(seconds >= 0.15)") }
+            }
+        }
+        let lane = BlockingLane(
+            name: "pressure", width: 1, activity: activity, slowWaitSeconds: 0.15)
+        #expect(lane.pressure() == LanePressure(name: "pressure", oldestQueuedSeconds: 0, queued: 0, running: 0, width: 1))
+        let entered = DispatchSemaphore(value: 0)
+        let gate = DispatchSemaphore(value: 0)
+        let calls = (0..<3).map { index in
+            Task.detached {
+                await lane.run {
+                    entered.signal()
+                    gate.wait()
+                    return index
+                }
+            }
+        }
+        let observed = await offPool { () -> LanePressure? in
+            defer { for _ in 0..<3 { gate.signal() } }
+            let deadline = Date().addingTimeInterval(60)
+            guard entered.wait(timeout: .now() + 60) == .success else { return nil }
+            while lane.pressure().queued < 2, Date() < deadline { usleep(2_000) }
+            usleep(200_000)
+            return lane.pressure()
+        }
+        var results: [Int] = []
+        for call in calls {
+            results.append(await call.value)
+        }
+        let pressure = try #require(observed)
+        #expect(pressure.running == 1)
+        #expect(pressure.queued == 2)
+        #expect(pressure.oldestQueuedSeconds >= 0.2)
+        #expect(results.sorted() == [0, 1, 2])
+        /** A job resumes its caller before the drainer counts it finished, so
+            the lane reads idle a moment after the last result, not at once. */
+        let idle = LanePressure(name: "pressure", oldestQueuedSeconds: 0, queued: 0, running: 0, width: 1)
+        #expect(try await eventually(within: .seconds(2)) { lane.pressure() == idle })
+        #expect(heard.withLock { $0 } == ["pressure true", "pressure true"])
+        activity.setObserver(nil)
+    }
+
+    /** Git calls against a repository whose `HEAD` is a FIFO hang in `open(2)`
+        until something opens the other end, the shape of a git stuck on a
+        network filesystem. Twice as many callers as the cooperative pool has
+        threads must leave that pool free to run other work: a trivial task
+        submitted after every caller still completes while all of them hang.
+        Measured from a dedicated thread, since the test body itself runs on
+        the pool it is measuring. Nothing releases the repository until the
+        trivial task has run, so the callers can only finish on their own at
+        git's timeout: the task counts how many had finished when it ran, and
+        any nonzero count means it waited for the pool to drain rather than
+        running beside the hung calls, however loaded the machine is. The
+        wait outlasts git's timeout so a blocked pool fails rather than hangs. */
+    @Test func hungGitCallsLeaveTheCooperativePoolFree() async throws {
+        let repo = try HungRepository()
+        let callers = ProcessInfo.processInfo.activeProcessorCount * 2
+        let finished = OSAllocatedUnfairLock(initialState: 0)
+        let finishedWhenTaskRan = OSAllocatedUnfairLock<Int?>(initialState: nil)
+        let path = repo.path
+        let calls = (0..<callers).map { _ in
+            Task.detached {
+                let answer = await CheckoutIdentity.gitCommonDir(project: path)
+                finished.withLock { $0 += 1 }
+                return answer
+            }
+        }
+        await offPool {
+            let ran = DispatchSemaphore(value: 0)
+            Task.detached {
+                finishedWhenTaskRan.withLock { $0 = finished.withLock { $0 } }
+                ran.signal()
+            }
+            _ = ran.wait(timeout: .now() + CheckoutIdentity.gitTimeoutSeconds * 2)
+            repo.release(until: { finished.withLock { $0 } == callers })
+        }
+        for call in calls {
+            #expect(await call.value == nil)
+        }
+        let seen = finishedWhenTaskRan.withLock { $0 }
+        #expect(
+            seen == 0,
+            "a trivial task ran only after \(seen.map(String.init) ?? "none") of \(callers) hung git calls had finished")
+    }
+
+    /** A git that never returns is terminated at its timeout and answers nil,
+        so it cannot hold a lane thread forever. The release pump starts only
+        far past the timeout, and whether the answer needed it is the
+        assertion: elapsed time is not, since a loaded machine can delay the
+        spawn itself. The call runs on a lane of its own: the shared
+        repository lane may be queued behind another test's hung calls, and a
+        wait there would be counted as this git's. */
+    @Test func aHungGitIsTerminatedAtItsTimeout() async throws {
+        let repo = try HungRepository()
+        let path = repo.path
+        let lane = BlockingLane(name: "hung-git", width: 1)
+        let answered = OSAllocatedUnfairLock(initialState: false)
+        let call = Task.detached {
+            let answer = await lane.run {
+                CheckoutIdentity.git(
+                    project: path, args: ["rev-parse", "--git-common-dir"], timeoutSeconds: 0.3)
+            }
+            answered.withLock { $0 = true }
+            return answer
+        }
+        let neededRelease = await offPool {
+            let pumpFrom = Date().addingTimeInterval(8)
+            while !answered.withLock({ $0 }), Date() < pumpFrom { usleep(10_000) }
+            let pumped = !answered.withLock { $0 }
+            repo.release(until: { answered.withLock { $0 } })
+            return pumped
+        }
+        #expect(await call.value == nil)
+        #expect(!neededRelease, "a hung git answered only once its repository was released")
+    }
+
+    /** A git that exits at once while a process it started keeps its output
+        open (here an alias that backgrounds a `sleep`) answers nil at its
+        timeout rather than when that process lets go, and the holder, which
+        shares git's process group, is killed with it. The holder outlives the
+        longest timeout by far, so waiting on it and not waiting on it are
+        told apart by a wide margin.
+
+        An attempt whose deadline passed before git and the alias's shell got
+        far enough to start the holder proves nothing (there is no pid file,
+        and nothing held the output), and a busy machine can take longer than
+        a short deadline to spawn both, so such an attempt is repeated with a
+        longer one. The call runs on a lane of its own for the reason
+        `aHungGitIsTerminatedAtItsTimeout` gives. */
+    @Test func aGitWhoseOutputOutlivesItEndsAtItsTimeout() async throws {
+        let project = try TemporaryTree.directory(named: "held-output")
+        let pidFile = project.appending(path: "holder.pid").path
+        let lane = BlockingLane(name: "held-output", width: 1)
+        let holderLifetime = Duration.seconds(60)
+        for timeoutSeconds in [0.5, 2, 8] {
+            try? FileManager.default.removeItem(atPath: pidFile)
+            let started = ContinuousClock.now
+            let answer = await lane.run {
+                CheckoutIdentity.git(
+                    project: project.path,
+                    args: [
+                        "-c", "alias.hold=!sleep \(Int(holderLifetime / .seconds(1))) & echo $! > '\(pidFile)'", "hold",
+                    ],
+                    timeoutSeconds: timeoutSeconds)
+            }
+            let elapsed = started.duration(to: .now)
+            guard
+                let holder = (try? String(contentsOfFile: pidFile, encoding: .utf8))
+                    .flatMap({ pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+            else { continue }
+            #expect(answer == nil)
+            #expect(elapsed < holderLifetime / 2, "the git read waited \(elapsed) for a process holding its output")
+            let gone = try await awaitExit(holder, within: .seconds(5))
+            if !gone { kill(holder, SIGKILL) }
+            #expect(gone, "the process holding git's output (pid \(holder)) outlived the timeout")
+            return
+        }
+        Issue.record("git never ran its alias far enough to start the holder, even with an 8 s deadline")
+    }
+}
+
+/** A directory git treats as a repository candidate whose `HEAD` is a FIFO:
+    every git that validates it blocks in `open(2)` until `release` opens the
+    write end. `path` is a directory below the repository root, because a
+    checkout root answers its common directory from files without running
+    git. */
+private struct HungRepository: Sendable {
+    let path: String
+    private let root: String
+
+    init() throws {
+        let root = try TemporaryTree.directory(named: "hung-repo")
+        let gitDir = root.appending(path: ".git")
+        try FileManager.default.createDirectory(
+            at: gitDir.appending(path: "objects"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: gitDir.appending(path: "refs"), withIntermediateDirectories: true)
+        try #require(mkfifo(gitDir.appending(path: "HEAD").path, 0o644) == 0)
+        let below = root.appending(path: "app")
+        try FileManager.default.createDirectory(at: below, withIntermediateDirectories: true)
+        path = below.path
+        self.root = root.path
+    }
+
+    /** Opens and closes the FIFO's write end until `done` holds, so every git
+        blocked in `open` sees end of file and exits. A write-only open without
+        a reader fails with ENXIO, which only means no git is waiting yet. */
+    func release(until done: () -> Bool) {
+        let fifo = root + "/.git/HEAD"
+        let deadline = Date().addingTimeInterval(20)
+        while !done(), Date() < deadline {
+            let fd = open(fifo, O_WRONLY | O_NONBLOCK)
+            if fd >= 0 { close(fd) }
+            usleep(2_000)
+        }
+    }
+}

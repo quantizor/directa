@@ -9,6 +9,13 @@ public enum LogStream: String, CaseIterable, Codable, Sendable {
     case sys
 }
 
+/** Fixed `sys` payloads a reader matches exactly, shared by the writer and
+    every reader so the two can never drift apart. */
+public enum SysLineText {
+    /** The first line of a fresh file after the log store rotates. */
+    public static let rotated = "rotated"
+}
+
 /** One structured log line: `ISO8601\t<stream>\t<payload>`. The payload may
     contain tabs (parsers split on the first two only); it never contains raw
     newlines (line-split upstream). */
@@ -27,29 +34,10 @@ public struct LogRecord: Codable, Equatable, Sendable {
         "\(JSONCoding.formatISO8601(at))\t\(stream.rawValue)\t\(text)"
     }
 
-    /** Stream-tagged payload for a human or an agent reading a tail: the shared
-        spelling behind `directa why` evidence and `recentLogTail`, which used to
-        prefix it two different ways. */
+    /** Stream-tagged payload for a human or an agent reading a tail: the one
+        spelling behind `directa why` evidence and `recentLogTail`. */
     public var contextLine: String {
         "\(stream.rawValue): \(text)"
-    }
-
-    public static func parse(_ line: Substring) -> LogRecord? {
-        let firstTab = line.firstIndex(of: "\t")
-        guard let firstTab else { return nil }
-        let afterFirst = line.index(after: firstTab)
-        guard let secondTab = line[afterFirst...].firstIndex(of: "\t") else { return nil }
-        guard let at = JSONCoding.parseISO8601(String(line[line.startIndex..<firstTab])),
-            let stream = LogStream(rawValue: String(line[afterFirst..<secondTab]))
-        else { return nil }
-        return LogRecord(at: at, stream: stream, text: String(line[line.index(after: secondTab)...]))
-    }
-
-    /** The 24-char timestamp prefix, parsed without splitting the whole line;
-        the since-query binary search reads only this. */
-    public static func timestampPrefix(of line: Substring) -> Date? {
-        guard let tab = line.firstIndex(of: "\t") else { return nil }
-        return JSONCoding.parseISO8601(String(line[line.startIndex..<tab]))
     }
 }
 
@@ -59,6 +47,9 @@ public struct LogRecord: Codable, Equatable, Sendable {
     and carriage-return spinner rewrites (keep only the final rewrite). */
 public enum LogSanitizer {
     public static func sanitize(_ raw: String) -> String {
+        /** Nearly every line carries none of the three bytes the passes below
+            act on, and one scan for them is far cheaper than the passes. */
+        guard raw.utf8.contains(where: { $0 == 0x00 || $0 == 0x0D || $0 == 0x1B }) else { return raw }
         var text = raw
         /** Spinner rewrites: everything before the last CR is overdrawn output. */
         if let lastCR = text.lastIndex(of: "\r") {
@@ -108,5 +99,14 @@ public enum LogSanitizer {
             }
         }
         return String(result)
+    }
+
+    /** `text` cut to at most `limit` characters, the last being `…` when
+        anything was cut; unchanged when it fits or `limit` is below 1. */
+    public static func truncated(_ text: String, toCharacters limit: Int) -> String {
+        guard limit >= 1, let cut = text.index(text.startIndex, offsetBy: limit, limitedBy: text.endIndex),
+            cut < text.endIndex
+        else { return text }
+        return String(text[..<text.index(before: cut)]) + "…"
     }
 }

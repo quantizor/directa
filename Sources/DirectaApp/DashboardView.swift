@@ -355,8 +355,7 @@ struct TimelinePane: View {
         case .crashed, .failed: .red
         case .healthy, .started: .green
         case .marked: .blue
-        case .registered, .unregistered: .secondary
-        case .stopped: .secondary
+        case .registered, .stopped, .unknown, .unregistered: .secondary
         case .unhealthy: .orange
         }
     }
@@ -398,7 +397,7 @@ struct LaneView: View {
                 case .marked:
                     let pin = CGRect(x: x(event.at) - 0.75, y: 0, width: 1.5, height: size.height)
                     context.fill(Path(pin), with: .color(.blue.opacity(0.9)))
-                case .registered, .unregistered:
+                case .registered, .unregistered, .unknown:
                     break
                 }
             }

@@ -32,8 +32,11 @@ public actor EventStore {
         }
     }
 
+    /** Reads need no flush first: `post` hands each line to write(2) with no
+        user-space buffer, so a read on another descriptor already sees it.
+        A negative `tail` reads as zero; the router refuses one from the wire
+        before it gets here. */
     public func query(project: String? = nil, since: Date? = nil, tail: Int? = nil) -> [EventRecord] {
-        try? handle?.synchronize()
         var events: [EventRecord] = []
         let decoder = JSONCoding.decoder()
         for file in [url.appendingPathExtension("1"), url] {
@@ -45,10 +48,8 @@ public actor EventStore {
                 events.append(record)
             }
         }
-        if let tail, events.count > tail {
-            events.removeFirst(events.count - tail)
-        }
-        return events
+        guard let tail else { return events }
+        return Array(events.suffix(max(tail, 0)))
     }
 
     private func openIfNeeded() {

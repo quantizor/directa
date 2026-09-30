@@ -35,11 +35,7 @@ cd your-project
 directa register --name myproj --cmd bun --cmd run --cmd dev --port 3000
 directa ensure myproj  # idempotent: healthy is a no-op
 directa why myproj     # root cause when something breaks
-directa hook install --harness antigravity # Antigravity sessions rediscover servers automatically
-directa hook install --harness claude      # same for Claude Code (default harness)
-directa hook install --harness cursor      # same for Cursor
-directa hook install --harness grok        # Grok Build: live snapshot after the first tool, plus a home rule
-directa hook install --harness opencode    # OpenCode: standing instruction wired into its global config
+directa hook install   # wires every agent harness this machine has (Antigravity, Claude Code, Cursor, Grok Build, OpenCode) to rediscover servers automatically; pass --harness to install just one
 ```
 
 Name each server after the project (`myproj`, not a generic `web`) so it is easy to spot in Spotlight and search, and give it a `<project>.localhost` host rather than bare `localhost`: the per-project subdomain keeps browser cookies, storage, and service workers isolated between projects.
@@ -51,8 +47,17 @@ Commit that file where the whole team runs the same servers. Keep it gitignored 
 ## The parts
 
 - `ddirecta`: the daemon. Spool-file output capture (children survive daemon restarts without SIGPIPE), process-group plus descendant-sweep teardown, health-gated phases, crash forensics, structured logs with correlation marks, a unified event feed.
-- `directa`: the CLI. `ensure`, `wait`, `up`/`down`, `logs --since-mark`, `mark`, `events`, `restart`, `why`, `open`, `switch`, `lock` (take exclusive access to a resource a server holds while a harness runs, leaving the server up by default or stopping it with `--pause`, and report when a command changed that resource while a server still held it open), `config init`, `doctor`, and launchd management. A server can list the config files it reads at boot and directa restarts it when one changes. Agents are the first-class consumer.
+- `directa`: the CLI. `ensure`, `wait`, `up`/`down`, `logs --since-mark`, `mark`, `events`, `restart`, `why`, `open`, `switch`, `monitor` (stream a server's output into an agent's own streaming tool, Claude Code's Monitor or Grok Build's monitor, with a budget so a flooding or looping server can't fill the agent's context), `lock` (take exclusive access to a resource a server holds while a harness runs, leaving the server up by default or stopping it with `--pause`, and report when a command changed that resource while a server still held it open), `config init`, `doctor`, and launchd management. A server can list the config files it reads at boot and directa restarts it when one changes. Agents are the first-class consumer.
 - `directa.app`: the menu bar. Presence dots with counts, per-project rows with click-to-open heads (pinnable), crash notifications, a dashboard with live logs, an event timeline, and a validating config editor. Every server and head is Spotlight-searchable.
+
+## Environment variables
+
+None are needed for everyday use. They point the CLI at a daemon other than the background one, such as a throwaway daemon in a test script started with `ddirecta --foreground --socket … --data-dir … --logs-dir …`:
+
+- `DIRECTA_SOCKET`: the daemon socket to talk to.
+- `DIRECTA_DATA_DIR` and `DIRECTA_LOGS_DIR`: the CLI's own data and logs folders, matching the daemon's `--data-dir` and `--logs-dir`. Without `DIRECTA_SOCKET`, the socket is `daemon.sock` inside `DIRECTA_DATA_DIR`.
+
+With any of them set, the CLI never installs or starts the background daemon on its own, and the commands that manage the background daemon (`directa daemon install`, `start`, `restart`, `uninstall`, and `directa uninstall`) refuse to run, so a test script can never remove or purge your real setup. `directa daemon stop` stops the daemon those variables point at. Details: [docs/cli-contract.md](./docs/cli-contract.md#environment).
 
 ## Building
 

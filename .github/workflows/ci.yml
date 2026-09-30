@@ -45,5 +45,19 @@ jobs:
       - name: Build
         run: swift build
 
+      # make test caps how many tests run at once (Makefile, TEST_PARALLEL_WIDTH),
+      # and a toolchain before Swift 6.3 ignores that cap without a word, so a
+      # runner image that drops below it fails here instead of as timing flakes.
+      - name: Toolchain
+        run: |
+          swift --version
+          version=$(swift --version 2>&1 | sed -nE 's/.*Swift version ([0-9]+)\.([0-9]+).*/\1 \2/p' | head -1)
+          read -r major minor <<< "$version"
+          if [ -z "$major" ] || [ "$major" -lt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -lt 3 ]; }; then
+            echo "error: the tests need Swift 6.3 or later for the parallel-width cap; this runner has '${major:-unreadable}${minor:+.$minor}'" >&2
+            echo "fix: select a newer Xcode in this workflow, e.g. sudo xcode-select -s /Applications/Xcode_26.6.app" >&2
+            exit 1
+          fi
+
       - name: Test
-        run: swift test
+        run: make test

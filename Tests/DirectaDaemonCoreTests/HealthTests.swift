@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -32,7 +33,7 @@ private func makeSupervisor(
     prober: any HealthProber,
     port: Int? = nil
 ) throws -> (ServerSupervisor, DirectaPaths, String) {
-    let base = FileManager.default.temporaryDirectory.appending(path: "directa-health-\(UUID().uuidString)")
+    let base = try TemporaryTree.directory(named: "health")
     let project = base.appending(path: "proj")
     try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
     let paths = DirectaPaths(dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs"))
@@ -43,18 +44,7 @@ private func makeSupervisor(
     return (supervisor, paths, project.path)
 }
 
-private func pollPhase(
-    _ supervisor: ServerSupervisor, until target: ServerPhase, withinMs: Int = 5000
-) async -> ServerPhase {
-    var latest = await supervisor.status().phase
-    for _ in 0..<(withinMs / 50) where latest != target {
-        try? await Task.sleep(for: .milliseconds(50))
-        latest = await supervisor.status().phase
-    }
-    return latest
-}
-
-@Suite struct HealthStateMachineTests {
+@Suite(.temporaryTree) struct HealthStateMachineTests {
     private let fastTCP = HealthCheckSpec(
         healthyAfter: 1, intervalMs: 30, port: 1, timeoutMs: 100, type: .tcp, unhealthyAfter: 3)
 
@@ -66,13 +56,13 @@ private func pollPhase(
         let started = await supervisor.start()
         /** Failures before first-healthy never mark unhealthy: still starting. */
         #expect(started.phase == .starting)
-        #expect(await pollPhase(supervisor, until: .running) == .running)
-        _ = await supervisor.stop(graceSeconds: 1)
+        #expect(try await awaitPhase(supervisor, .running).phase == .running)
+        _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
     }
 
     @Test func unhealthyAfterThresholdAndRecovery() async throws {
         /** Pad failures past unhealthyAfter so the unhealthy phase lasts longer
-            than pollPhase's 50ms sample: a tight [true,F,F,F,true] script can
+            than a few polling intervals: a tight [true,F,F,F,true] script can
             recover before the assertion sees .unhealthy (flake on CI). */
         let (supervisor, _, _) = try makeSupervisor(
             command: ["/bin/sh", "-c", "sleep 30"],
@@ -80,11 +70,11 @@ private func pollPhase(
             prober: ScriptedProber(
                 script: ProbeScript([true] + Array(repeating: false, count: 12) + [true])))
         _ = await supervisor.start()
-        #expect(await pollPhase(supervisor, until: .running) == .running)
-        #expect(await pollPhase(supervisor, until: .unhealthy) == .unhealthy)
+        #expect(try await awaitPhase(supervisor, .running).phase == .running)
+        #expect(try await awaitPhase(supervisor, .unhealthy).phase == .unhealthy)
         /** A healthy probe recovers the phase without a restart. */
-        #expect(await pollPhase(supervisor, until: .running) == .running)
-        _ = await supervisor.stop(graceSeconds: 1)
+        #expect(try await awaitPhase(supervisor, .running).phase == .running)
+        _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
     }
 
     @Test func ensureFailsFastOnCrash() async throws {
@@ -112,7 +102,7 @@ private func pollPhase(
         let second = await supervisor.ensure(timeoutSeconds: 10)
         #expect(second.reason == nil)
         #expect(second.server.pid == first.server.pid)
-        _ = await supervisor.stop(graceSeconds: 1)
+        _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
     }
 
     @Test func ensureSpawnFailureReportsFailed() async throws {
@@ -132,7 +122,7 @@ private func pollPhase(
             prober: ScriptedProber(script: ProbeScript([true])))
         _ = await supervisor.start()
         async let waiter = supervisor.wait(for: .stopped, timeoutSeconds: 10)
-        _ = await supervisor.stop(graceSeconds: 1)
+        _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
         #expect(await waiter == nil)
     }
 }

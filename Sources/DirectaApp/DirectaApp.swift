@@ -59,12 +59,7 @@ final class KeyNavModel {
         for project in projects {
             for server in project.servers {
                 var actions: [KeyNavRow.Action] = [.open]
-                switch server.phase {
-                case .running, .unhealthy, .starting:
-                    actions += [.restart, .stop]
-                case .stopped, .crashed, .failed, .stopping:
-                    actions += [.start]
-                }
+                actions += server.offersStop ? [.restart, .stop] : [.start]
                 next.append(KeyNavRow(kind: .server(project: project.path, server: server.server), actions: actions))
                 if let heads = server.heads {
                     for name in heads.keys.sorted() {
@@ -199,18 +194,26 @@ final class AppActivationDelegate: NSObject, NSApplicationDelegate, UNUserNotifi
         }
         /** MenuBarExtra is not a window TAL counts as "in use", so AppKit's
             automatic termination will quit an LSUIElement extra that looks idle,
-            especially after a memory-pressure pass. Start at Login does not
-            relaunch mid-session. The matching Info.plist keys refuse TAL at
-            Launch Services; these calls refuse it in-process. */
+            especially after a memory-pressure pass. The matching Info.plist
+            keys refuse TAL at Launch Services; these calls refuse it
+            in-process. With Start at login off, nothing relaunches the app
+            after such a quit. */
         ProcessInfo.processInfo.disableAutomaticTermination("menu bar extra")
         ProcessInfo.processInfo.disableSuddenTermination()
+        /** Start at login's agent relaunches the app after the kills the
+            opt-out above cannot refuse (a jetsam SIGKILL). Service Management
+            calls are synchronous XPC round-trips, so they run on a blocking
+            lane, not the cooperative pool. */
+        Task {
+            await BlockingLane.system.run { AppAgentService.ensureRegisteredAtLaunch() }
+        }
         AppFocus.installObservers()
         AppDeepLinkDispatch.registerNotificationCategories()
         UNUserNotificationCenter.current().delegate = self
     }
 
     @objc private func handleGetURLEvent(
-        _ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor
+        _ event: NSAppleEventDescriptor, withReplyEvent _: NSAppleEventDescriptor
     ) {
         guard let raw = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
             let url = URL(string: raw)
@@ -585,6 +588,10 @@ struct MenuContent: View {
             .padding(.vertical, 8)
         }
         .frame(width: 340)
+        /** Opaque, not the panel's default glass: whatever sits behind the
+            popover bled through and washed out the server rows. */
+        .background(Color(nsColor: .windowBackgroundColor), ignoresSafeAreaEdges: .all)
+        .background(SystemAppearancePin())
         .onAppear {
             keyNav.daemon = model
             keyNav.installIfNeeded()
@@ -615,11 +622,11 @@ struct DaemonDownRow: View {
     var model: DaemonModel
 
     private var message: String {
-        if model.daemonRecovering { return "Starting ddirecta…" }
+        if model.daemonRecovering { return "Starting the daemon…" }
         if model.daemonNeedsApproval { return "directa needs your approval" }
-        if model.daemonStoppedOnPurpose { return "ddirecta is stopped" }
-        if model.daemonRecoveryError != nil { return "ddirecta is not running" }
-        return "ddirecta is not running; restarting"
+        if model.daemonStoppedOnPurpose { return "The daemon is stopped" }
+        if model.daemonRecoveryError != nil { return "The daemon is not running" }
+        return "The daemon is not running; restarting"
     }
 
     private var glyph: String {
@@ -654,7 +661,7 @@ struct DaemonDownRow: View {
                 }
                 .buttonStyle(.borderless)
                 .disabled(model.daemonRecovering)
-                .help("Start ddirecta now")
+                .help("Start the daemon now")
             }
         }
     }
@@ -784,6 +791,12 @@ struct KeyNavCell: ViewModifier {
     }
 }
 
+extension ServerStatus {
+    /** A live run a person can stop or restart, a port-failed one included.
+        A stopping run is left to finish, so it offers a disabled Start. */
+    var offersStop: Bool { hasLiveRun && phase != .stopping }
+}
+
 /** Start / stop / restart icon strip shared by the popover rows and the
     dashboard detail header. `reserveSlot` keeps popover rows from jumping
     when the phase swaps play for restart+stop. */
@@ -798,15 +811,14 @@ struct ServerLifecycleControls: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            switch server.phase {
-            case .running, .unhealthy, .starting:
+            if server.offersStop {
                 iconButton("arrow.clockwise", help: "Restart", action: .restart) {
                     model.restartServer(server)
                 }
                 iconButton("stop.fill", help: "Stop", action: .stop) {
                     model.stopServer(server)
                 }
-            case .stopped, .crashed, .failed, .stopping:
+            } else {
                 if reserveSlot {
                     Color.clear.frame(width: size, height: size)
                 }
@@ -1129,22 +1141,18 @@ struct HeadRow: View {
 
 /** The tally light: state as color, `starting` breathes. Never shouts. */
 struct TallyDot: View {
-    @State private var breathing = false
     let phase: ServerPhase
 
     var body: some View {
-        Circle()
-            .fill(color)
-            .frame(width: 8, height: 8)
-            .opacity(phase == .starting ? (breathing ? 1.0 : 0.35) : 1.0)
-            .animation(
-                phase == .starting
-                    ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true)
-                    : .default,
-                value: breathing
-            )
-            .onAppear { breathing = true }
-            .accessibilityLabel(Text(phase.rawValue))
+        Group {
+            if phase == .starting {
+                BreathingDot(color: color)
+            } else {
+                Circle().fill(color)
+            }
+        }
+        .frame(width: 8, height: 8)
+        .accessibilityLabel(Text(phase.rawValue))
     }
 
     private var color: Color {
@@ -1155,6 +1163,23 @@ struct TallyDot: View {
         case .crashed, .failed: .red
         case .stopped: Color(nsColor: .tertiaryLabelColor)
         }
+    }
+}
+
+/** The starting dot's breath. Its own view so the repeating animation ends
+    with it: SwiftUI never cancels a `repeatForever` in flight when the
+    animation modifier changes, and the menu bar window keeps its content alive
+    while closed, so a breath left running redraws the window forever. */
+private struct BreathingDot: View {
+    @State private var inhaled = false
+    let color: Color
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .opacity(inhaled ? 1.0 : 0.35)
+            .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: inhaled)
+            .onAppear { inhaled = true }
     }
 }
 
@@ -1240,7 +1265,7 @@ struct SortOrderMenu: View {
                 .background {
                     let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
                     shape
-                        .fill(.ultraThinMaterial)
+                        .fill(Color(nsColor: .controlBackgroundColor))
                         .overlay(
                             shape.strokeBorder(
                                 Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.5))
@@ -1294,7 +1319,7 @@ struct FilterBox: View {
         .background {
             let shape = RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
             shape
-                .fill(.ultraThinMaterial)
+                .fill(Color(nsColor: .controlBackgroundColor))
                 .overlay(
                     shape.strokeBorder(
                         Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.5))
@@ -1347,3 +1372,31 @@ enum FuzzyMatcher {
 }
 
 
+
+/** Pins the hosting window to the system Light/Dark setting. A MenuBarExtra
+    panel otherwise takes the menu bar's appearance, which follows the wallpaper
+    behind the bar, so a dark-mode user on a bright wallpaper got a light popover.
+    NSApp.effectiveAppearance tracks the system setting because the app never
+    sets NSApp.appearance. */
+struct SystemAppearancePin: NSViewRepresentable {
+    func makeNSView(context: Context) -> PinView { PinView() }
+
+    func updateNSView(_ nsView: PinView, context: Context) {}
+
+    final class PinView: NSView {
+        private var observation: NSKeyValueObservation?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil else {
+                observation = nil
+                return
+            }
+            observation = NSApp.observe(\.effectiveAppearance, options: [.initial]) { [weak self] app, _ in
+                MainActor.assumeIsolated {
+                    self?.window?.appearance = app.effectiveAppearance
+                }
+            }
+        }
+    }
+}

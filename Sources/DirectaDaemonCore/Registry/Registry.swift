@@ -87,6 +87,10 @@ public struct PersistedServerState: Codable, Sendable {
 public actor Registry {
     private let paths: DirectaPaths
     private var registry: RegistryFile
+    /** Per normalized server id, the writers `retireState` retired. In memory
+        only: a restart starts empty, and every supervisor it creates has a new
+        writer. */
+    private(set) var retiredWriters: [String: Set<UUID>] = [:]
     private var state: StateFile
 
     public init(paths: DirectaPaths) {
@@ -133,10 +137,21 @@ public actor Registry {
         try persistRegistry()
     }
 
+    /** Drops one ad hoc server. A project row also carries recorded trust for
+        its committed devservers.json, independent of whether any ad hoc server
+        is registered there, so the row is only ever dropped once both the ad
+        hoc servers and trust are gone: a project trusted through a committed
+        server (`setTrusted`) must survive losing its last, or only, ad hoc
+        entry. Removing a name this project never registered ad hoc (including
+        one that exists solely in committed config) is a no-op; the caller is
+        expected to check `spec(project:name:)` first and surface its own
+        not-found error, since an ad hoc registry miss is not this type's to
+        report. */
     public func unregister(project: String, name: String) throws {
         let project = Self.normalize(project)
+        guard registry.projects[project]?.servers[name] != nil else { return }
         registry.projects[project]?.servers[name] = nil
-        if let entry = registry.projects[project], entry.servers.isEmpty {
+        if let entry = registry.projects[project], entry.servers.isEmpty, !entry.trusted {
             registry.projects[project] = nil
         }
         try persistRegistry()
@@ -159,11 +174,39 @@ public actor Registry {
         state.servers
     }
 
-    public func updateState(serverID: String, _ mutate: (inout PersistedServerState) -> Void) throws {
+    /** Who is writing a state row. */
+    public enum StateWriter: Sendable {
+        /** The router's own bookkeeping, never refused. */
+        case router
+        /** A supervisor, by its `ServerSupervisor.writerID`. */
+        case supervisor(UUID)
+    }
+
+    /** A no-op for a supervisor `retireState` retired for this id, including
+        when the row is missing: a dropped supervisor's late write must not
+        recreate a row its removal settled. Every other writer, a later
+        supervisor for the same id included, goes through. */
+    public func updateState(
+        serverID: String, writer: StateWriter, _ mutate: (inout PersistedServerState) -> Void
+    ) throws {
         let serverID = Self.normalizeServerID(serverID)
+        if case .supervisor(let id) = writer, retiredWriters[serverID]?.contains(id) == true { return }
         var entry = state.servers[serverID] ?? PersistedServerState()
         mutate(&entry)
         state.servers[serverID] = entry
+        try persistState()
+    }
+
+    /** Settles a removed server's row as `final` and retires `writer` for that
+        id, in one turn on this actor. For a server whose stop never finished
+        before its supervisor was dropped: that supervisor's `recordOutcome`
+        can still land afterward. Both take effect in memory before the save,
+        so a save that throws still refuses the late write. `removeState`
+        still deletes a retired row. */
+    public func retireState(serverID: String, final: PersistedServerState, writer: UUID) throws {
+        let serverID = Self.normalizeServerID(serverID)
+        retiredWriters[serverID, default: []].insert(writer)
+        state.servers[serverID] = final
         try persistState()
     }
 

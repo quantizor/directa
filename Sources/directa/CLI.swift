@@ -14,7 +14,7 @@ struct Directa: AsyncParsableCommand {
         version: DirectaVersion.version,
         subcommands: [
             ConfigCommand.self, Context.self, Doctor.self, Down.self, Ensure.self, Events.self,
-            HookCommand.self, Link.self, Logs.self, Mark.self, Open.self, Register.self,
+            HookCommand.self, Link.self, Logs.self, Mark.self, Monitor.self, Open.self, Register.self,
             Restart.self, Start.self,
             Lock.self, Statusline.self, Status.self, Stop.self, Switch.self, Trust.self,
             Uninstall.self, Unregister.self, Up.self,
@@ -30,13 +30,20 @@ struct GlobalOptions: ParsableArguments {
     @Flag(help: "Never auto-install or auto-start the daemon on connection failure.")
     var noBootstrap = false
 
-    @Option(help: "Project root; defaults to the nearest devservers.json ancestor, then git root, then cwd.")
+    @Option(
+        help: "Project root; defaults to the nearest devservers.json ancestor (the search stops at a linked git worktree's root), then git root, then cwd."
+    )
     var project: String?
 
     /** Resolution order: nearest ancestor with devservers.json → git root → cwd,
-        then canonicalized (symlinks and on-disk case). A git worktree is a real
-        distinct path and keeps its own project identity; canonicalization does
-        not collapse sibling checkouts into one. */
+        then canonicalized (symlinks and on-disk case). The ancestor search
+        stops at a linked worktree's root, so a worktree nested inside its main
+        checkout (Claude Code's `.claude/worktrees/`) never picks up the main
+        checkout's config and resolves to itself when it has none; `.git`
+        directories and submodule `.git` files are crossed, so a devservers.json
+        above several repositories, or in a superproject, still applies. A git
+        worktree is a real distinct path and keeps its own project identity;
+        canonicalization does not collapse sibling checkouts into one. */
     func resolvedProject() -> String {
         if let project {
             /** An explicit `--project myproj` (a name, not a path) lands on a
@@ -61,27 +68,37 @@ struct GlobalOptions: ParsableArguments {
         return Self.resolveProject(from: FileManager.default.currentDirectoryPath)
     }
 
+    /** A timeout option's seconds, or the usage failure for a bad value. */
+    func seconds(_ option: TimeoutOption, flag: String = "--timeout") -> Double {
+        switch option.seconds(flag: flag) {
+        case .success(let seconds):
+            return seconds
+        case .failure(let error):
+            CLIRunner.fail(error, json: json)
+        }
+    }
+
+    /** One walk up from `cwd`: it answers the first directory holding a
+        devservers.json or rooting a linked worktree, and remembers the nearest
+        `.git` on the way for when neither turns up. */
     static func resolveProject(from cwd: String) -> String {
         let fm = FileManager.default
+        var nearestGitRoot: URL?
         var probe = URL(fileURLWithPath: cwd)
         while true {
-            if fm.fileExists(atPath: probe.appending(path: "devservers.json").path) {
+            if fm.fileExists(atPath: probe.appending(path: "devservers.json").path)
+                || CheckoutIdentity.linkedWorktreeGitDir(of: probe.path) != nil
+            {
                 return canonicalProjectPath(probe.path)
+            }
+            if nearestGitRoot == nil, fm.fileExists(atPath: probe.appending(path: ".git").path) {
+                nearestGitRoot = probe
             }
             let parent = probe.deletingLastPathComponent()
             if parent.path == probe.path { break }
             probe = parent
         }
-        var gitProbe = URL(fileURLWithPath: cwd)
-        while true {
-            if fm.fileExists(atPath: gitProbe.appending(path: ".git").path) {
-                return canonicalProjectPath(gitProbe.path)
-            }
-            let parent = gitProbe.deletingLastPathComponent()
-            if parent.path == gitProbe.path { break }
-            gitProbe = parent
-        }
-        return canonicalProjectPath(cwd)
+        return canonicalProjectPath(nearestGitRoot?.path ?? cwd)
     }
 }
 
@@ -89,7 +106,7 @@ struct GlobalOptions: ParsableArguments {
     failed, 2 usage, 3 daemon unreachable, 4 named server not found. */
 enum CLIRunner {
     static func client() -> DaemonClient {
-        DaemonClient(socketPath: DirectaPaths().socketPath)
+        DaemonClient(socketPath: DirectaPaths.fromEnvironment().socketPath)
     }
 
     static func stdinData() -> Data {
@@ -117,24 +134,60 @@ enum CLIRunner {
                 .flatMap { String(data: $0, encoding: .utf8) }
             print(payload ?? #"{"ok":false}"#)
         } else {
-            var text = "directa: \(error.message)"
+            var text = noticeLine(error.message)
             if let hint = error.hint { text += "\n  \(hint)" }
-            FileHandle.standardError.write(Data((text + "\n").utf8))
+            note(text)
         }
     }
 
+    /** Writes `text` as one line on stderr, the channel for everything that
+        is not the command's result: stdout belongs to the result (`--json`)
+        or, under `lock`, to the guarded command. */
+    static func note(_ text: String) {
+        FileHandle.standardError.write(Data((text + "\n").utf8))
+    }
+
+    /** Writes a `CLINotice` body on stderr under directa's own prefix. */
+    static func notice(_ body: String) {
+        note(noticeLine(body))
+    }
+
+    static func noticeLine(_ body: String) -> String {
+        "directa: \(body)"
+    }
+
+    /** The response budget for a request that stops servers, which drains
+        each one through its own stop grace. */
+    static let stopOperationTimeoutSeconds: Double = 120
+
     static func fail(_ error: WireError, json: Bool) -> Never {
         emitFailure(error, json: json)
-        switch error.code {
+        Foundation.exit(exitStatus(for: error.code))
+    }
+
+    /** A negative count for `flag` is nonsense to send to the daemon: refused
+        here, before the request is built, through the same usage envelope
+        every other bad flag takes, rather than reaching the daemon and
+        coming back as a wire refusal. */
+    static func negativeCountError(_ value: Int?, flag: String, noun: String) -> WireError? {
+        guard let value, value < 0 else { return nil }
+        return WireError(code: .usage, message: "\(flag) takes 0 or more \(noun), got \(value)")
+    }
+
+    /** The one mapping from an error code to the process exit status, for
+        `fail` and for a command that reports its failure some other way
+        (`monitor`'s ended line) but must still exit the same. */
+    static func exitStatus(for code: WireErrorCode) -> Int32 {
+        switch code {
         case .daemonStarting, .daemonUnreachable, .versionMismatch:
-            Foundation.exit(3)
+            3
         case .notFound:
-            Foundation.exit(4)
+            4
         case .usage:
-            Foundation.exit(2)
+            2
         case .alreadyExists, .configInvalid, .internalError, .notTrusted, .portDrift, .portHeld,
-            .resourceLocked, .resourceMutated, .spawnFailed:
-            Foundation.exit(1)
+            .projectStillExists, .requestTooLarge, .resourceLocked, .resourceMutated, .spawnFailed:
+            1
         }
     }
 
@@ -155,12 +208,12 @@ enum CLIRunner {
                     fail(WireError(code: .internalError, message: String(describing: error)), json: json)
                 }
             }
-            if FileManager.default.fileExists(atPath: DirectaPaths().stoppedIntentFile.path) {
+            if FileManager.default.fileExists(atPath: DirectaPaths.fromEnvironment().stoppedIntentFile.path) {
                 fail(
                     WireError(
                         code: .daemonUnreachable,
                         hint: "run: directa daemon start",
-                        message: "ddirecta was deliberately stopped"),
+                        message: CLINotice.daemonDeliberatelyStopped),
                     json: json)
             }
             fail(error, json: json)
@@ -195,8 +248,7 @@ enum CLIRunner {
                 guard ContinuousClock.now < deadline else { throw error }
                 if !announced {
                     announced = true
-                    FileHandle.standardError.write(
-                        Data("directa: ddirecta is restoring supervised servers; waiting…\n".utf8))
+                    notice(CLINotice.daemonRestoring)
                 }
                 /** A cancelled sleep just re-checks the deadline on the next
                     pass, so the loop still terminates and nothing is lost. */
@@ -205,7 +257,8 @@ enum CLIRunner {
         }
     }
 
-    /** Auto-bootstrap: only against the default socket (never a test override),
+    /** Auto-bootstrap: only against the default layout (never under a
+        `DIRECTA_SOCKET`, `DIRECTA_DATA_DIR`, or `DIRECTA_LOGS_DIR` override),
         never past a deliberate-stop marker, install-if-missing when the ddirecta
         binary ships alongside this CLI. */
     static func attemptBootstrap() async -> Bool {
@@ -218,8 +271,7 @@ enum CLIRunner {
         if let port = status.declaredPort { parts.append("port \(port)") }
         if let worktree = status.worktree { parts.append("worktree \(worktree)") }
         if let exit = status.lastExit {
-            let cause = exit.code.map { "exit \($0)" } ?? exit.signal.map { "signal \($0)" } ?? "unknown"
-            parts.append("last exit \(cause) at \(JSONCoding.formatISO8601(exit.at))")
+            parts.append(exit.summary)
         }
         if status.blockedOn != nil {
             parts.append(
@@ -230,6 +282,90 @@ enum CLIRunner {
         }
         parts.append("log \(status.logPath)")
         return parts.joined(separator: "  ·  ")
+    }
+
+    /** One line per server of a group result (`up`, `restart`, `switch`): the
+        server's line, with a `FELL SHORT` suffix naming the reason when the
+        server did not reach the asked state. */
+    static func describeGroup(_ results: [EnsureResult]) -> String {
+        results.map { entry in
+            entry.reason.map { "\(describe(entry.server))  ·  FELL SHORT (\($0.rawValue))" }
+                ?? describe(entry.server)
+        }.joined(separator: "\n")
+    }
+}
+
+/** User-facing strings the CLI itself prints or fails with (never a message
+    the daemon composed), named so the exact wording is pinned by a test. Each
+    is a body without a prefix: `CLIRunner.notice` and `CLIRunner.emitFailure`
+    print it after "directa: ", so a body names the daemon in plain English
+    rather than as "ddirecta", which would read "directa: ddirecta …". */
+enum CLINotice {
+    /** What `directa daemon start` points at when auto-bootstrap declines to
+        restart a daemon a person stopped on purpose. */
+    static let daemonDeliberatelyStopped = "the daemon was deliberately stopped"
+    /** A command that needs a result field only a newer daemon sends (the
+        logs cursor) refuses rather than falling back to an unbounded read. */
+    static let daemonOlderThanCLI = "the daemon is older than this CLI and cannot answer this command"
+    /** Printed once per invocation when a request is retried against a daemon
+        still finishing boot restore, so a silent wait does not read as a hang. */
+    static let daemonRestoring = "the daemon is restoring supervised servers; waiting…"
+    /** Printed by `daemon uninstall`, on stderr so `--json` stdout stays clean. */
+    static let daemonUninstallDeprecated =
+        "`directa daemon uninstall` is deprecated; use `directa uninstall` (or `directa uninstall --agent-only` to remove just the agent)"
+    /** Printed once by `logs --follow` inside a Claude Code session whose
+        stdout is not a terminal (`Logs.monitorHint`). */
+    static let followUseMonitor =
+        "to stream a server's output into this session, run directa monitor <name> with the Monitor tool"
+    /** Printed once when `restart` loses the daemon mid-restart and starts
+        recovering (`RestartSession`). */
+    static let restartConnectionLost =
+        "the daemon connection closed during the restart; waiting for it to come back and checking the server instead of restarting it again"
+}
+
+/** A `--timeout`/`--acquire-timeout` value as typed. The parser accepts any
+    text (each option parses `.unconditional`, so `-1` is a value rather than
+    an unknown flag) so a bad value reaches the command, which screens it with `seconds`
+    before it ever reaches the wire and fails through the usage path every
+    other bad flag takes (under `--json`, the error envelope on stdout, exit
+    2). A non-finite seconds value (`inf`, `nan`) fatally traps
+    `Duration.seconds` downstream (`ServerSupervisor.boundedTimeoutSeconds`,
+    the client's own SO_RCVTIMEO deadline), and the daemon clamps those cases
+    silently rather than telling the caller their input was nonsense, so a
+    message naming the bad value and the accepted range is more useful. */
+struct TimeoutOption: ExpressibleByArgument, Equatable {
+    static let validRange: ClosedRange<Double> = 0...86400
+
+    let raw: String
+
+    init(argument: String) {
+        raw = argument
+    }
+
+    /** A default, written the way `--help` shows it. */
+    init(seconds: Int) {
+        raw = String(seconds)
+    }
+
+    var defaultValueDescription: String { raw }
+
+    /** The value in seconds, or the usage error naming `flag`. */
+    func seconds(flag: String) -> Result<Double, WireError> {
+        func refusal(_ message: String) -> Result<Double, WireError> {
+            .failure(WireError(code: .usage, message: "\(flag) \(message)"))
+        }
+        guard let value = Double(raw) else {
+            return refusal("takes a number of seconds, got '\(raw)'")
+        }
+        guard value.isFinite else {
+            return refusal("must be a finite number of seconds, got '\(raw)'")
+        }
+        guard Self.validRange.contains(value) else {
+            return refusal(
+                "must be between \(Int(Self.validRange.lowerBound)) and \(Int(Self.validRange.upperBound)) seconds, got \(raw)"
+            )
+        }
+        return .success(value)
     }
 }
 
@@ -245,10 +381,11 @@ struct Ensure: AsyncParsableCommand {
     @Option(help: "Override the declared port for this run.")
     var port: Int?
 
-    @Option(help: "Seconds to wait for health before giving up.")
-    var timeout: Double = 60
+    @Option(parsing: .unconditional, help: "Seconds to wait for health before giving up.")
+    var timeout = TimeoutOption(seconds: 60)
 
     func run() async throws {
+        let timeout = global.seconds(timeout)
         let params = EnsureParams(
             name: name, port: port, project: global.resolvedProject(), timeoutSeconds: timeout)
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
@@ -282,10 +419,11 @@ struct Wait: AsyncParsableCommand {
     @Flag(help: "Wait for the server to be fully stopped instead.")
     var stopped = false
 
-    @Option(help: "Seconds to wait before giving up.")
-    var timeout: Double = 60
+    @Option(parsing: .unconditional, help: "Seconds to wait before giving up.")
+    var timeout = TimeoutOption(seconds: 60)
 
     func run() async throws {
+        let timeout = global.seconds(timeout)
         let condition: WaitCondition = stopped ? .stopped : .healthy
         let params = WaitParams(
             condition: condition, name: name, project: global.resolvedProject(), timeoutSeconds: timeout)
@@ -294,15 +432,21 @@ struct Wait: AsyncParsableCommand {
                 .serverWait, params: params, expecting: EnsureResult.self,
                 operationTimeoutSeconds: timeout)
         }
-        CLIRunner.emit(result, json: global.json) { r in
-            if let reason = r.reason {
-                return "wait fell short (\(reason.rawValue))\n" + CLIRunner.describe(r.server)
-            }
-            return CLIRunner.describe(r.server)
-        }
+        CLIRunner.emit(result, json: global.json) { Self.humanText($0, condition: condition, name: name) }
         if result.reason != nil {
             Foundation.exit(1)
         }
+    }
+
+    /** The falls-short line, the server, and, when a `--healthy` wait ended
+        on a crash or a stop, the command that brings the server back. */
+    static func humanText(_ result: EnsureResult, condition: WaitCondition, name: String) -> String {
+        guard let reason = result.reason else { return CLIRunner.describe(result.server) }
+        var text = "wait fell short (\(reason.rawValue))\n" + CLIRunner.describe(result.server)
+        if condition == .healthy, reason == .crashed || reason == .stopped {
+            text += "\nhint: directa ensure \(ShellWord.argument(name))"
+        }
+        return text
     }
 }
 
@@ -381,7 +525,7 @@ struct Start: AsyncParsableCommand {
             CLIRunner.fail(
                 WireError(
                     code: .spawnFailed,
-                    hint: "run: directa status \(name) --json",
+                    hint: "run: directa status \(ShellWord.argument(name)) --json",
                     message: result.server.spawnError?.message ?? "spawn failed"),
                 json: global.json)
         }
@@ -408,18 +552,35 @@ struct Status: AsyncParsableCommand {
         }
         if let name, result.servers.isEmpty {
             CLIRunner.fail(
-                WireError(
-                    code: .notFound,
-                    hint: "run: directa status --json",
-                    message: "no server named '\(name)' is registered for this project"),
+                all
+                    ? WireError(
+                        code: .notFound, hint: "run: directa status --all --json",
+                        message: "no server named '\(name)' is registered on this machine")
+                    : ProjectConfigLoader.serverNotFound(name: name, project: project),
                 json: global.json)
         }
-        CLIRunner.emit(result, json: global.json) { list in
-            if list.servers.isEmpty {
-                return "no servers registered for this project (hint: directa register --name myproj --cmd …)"
-            }
+        /** Human mode on the empty scoped path only: one machine-wide read tells
+            an empty project from an empty machine. The lookup is a hint, so a
+            failed one falls back to the register text rather than failing a
+            status that already answered. */
+        var machineHasServers = false
+        if !global.json, name == nil, !all, result.servers.isEmpty {
+            let everything = try? await CLIRunner.client().request(
+                .serverStatus, params: ProjectParams(name: nil, project: ""), expecting: ServerListResult.self)
+            machineHasServers = everything?.servers.isEmpty == false
+        }
+        CLIRunner.emit(result, json: global.json) {
+            Self.humanText($0, machineHasServers: machineHasServers)
+        }
+    }
+
+    static func humanText(_ list: ServerListResult, machineHasServers: Bool) -> String {
+        if !list.servers.isEmpty {
             return list.servers.map(CLIRunner.describe).joined(separator: "\n")
         }
+        return machineHasServers
+            ? "no servers registered for this project, but other projects on this machine have some (hint: directa status --all)"
+            : "no servers registered for this project (hint: directa register --name myproj --cmd …)"
     }
 }
 
@@ -441,8 +602,8 @@ struct Restart: AsyncParsableCommand {
     @Option(help: "Override the declared port for this run.")
     var port: Int?
 
-    @Option(help: "Per-server seconds to wait for health.")
-    var timeout: Double = 60
+    @Option(parsing: .unconditional, help: "Per-server seconds to wait for health.")
+    var timeout = TimeoutOption(seconds: 60)
 
     func run() async throws {
         /** A bare `restart` is far likelier to be typed by reflex than `down`
@@ -459,15 +620,26 @@ struct Restart: AsyncParsableCommand {
         }
         let params = RestartParams(
             names: name.map { [$0] }, port: port, project: global.resolvedProject(),
-            timeoutSeconds: timeout)
-        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-            try await client.request(
-                .serverRestart, params: params, expecting: GroupResult.self,
-                operationTimeoutSeconds: timeout)
+            timeoutSeconds: global.seconds(timeout))
+        let session = RestartSession(
+            clock: SystemRestartClock(),
+            notice: { CLIRunner.notice($0) },
+            params: params,
+            requester: DaemonClientRestartRequester(client: CLIRunner.client()))
+        let before = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { _ in
+            try await session.readBefore()
         }
-        CLIRunner.emit(result, json: global.json) { r in
-            r.results.map { CLIRunner.describe($0.server) }.joined(separator: "\n")
+        /** Not through `CLIRunner.run`: once the restart is sent, its retry
+            would send it again and bounce a server whose restart landed. */
+        let result: GroupResult
+        do {
+            result = try await session.run(before: before)
+        } catch let error as WireError {
+            CLIRunner.fail(error, json: global.json)
+        } catch {
+            CLIRunner.fail(WireError(code: .internalError, message: String(describing: error)), json: global.json)
         }
+        CLIRunner.emit(result, json: global.json) { CLIRunner.describeGroup($0.results) }
         if result.results.contains(where: { $0.reason != nil }) {
             Foundation.exit(1)
         }
@@ -492,10 +664,9 @@ struct Stop: AsyncParsableCommand {
             something it holds is the heavy way there, and `lock` does it without
             a bounce. `--json` carries `locks` instead, so stdout keeps its schema. */
         if !global.json, let resource = result.server.locks?.sorted().first {
-            FileHandle.standardError.write(
-                Data(
-                    "hint: \(name) holds '\(resource)'; directa lock \(resource) -- <command> gets exclusive access without stopping it\n"
-                        .utf8))
+            CLIRunner.note(
+                "hint: \(name) holds '\(resource)'; directa lock \(ShellWord.argument(resource)) -- <command> gets exclusive access without stopping it"
+            )
         }
     }
 }
@@ -521,6 +692,18 @@ struct Logs: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Query a server's structured logs (out/err/sys/mark streams).")
 
+    /** With none of `--tail`/`--since`/`--since-mark`/`--follow`/`--all`, `logs`
+        bounds itself to this many lines from the end instead of answering the
+        whole history a long-running server has accumulated. */
+    static let defaultTailLines = 200
+
+    /** `--follow`'s own initial backlog, smaller than `defaultTailLines`:
+        follow is about watching new lines arrive, not backfilling history. */
+    static let followDefaultTailLines = 50
+
+    @Flag(help: "Full history instead of the last \(defaultTailLines) lines.")
+    var all = false
+
     @Flag(help: "Keep polling for new lines (Ctrl-C to stop).")
     var follow = false
 
@@ -528,6 +711,12 @@ struct Logs: AsyncParsableCommand {
 
     @Option(help: "Regex filter (Swift Regex dialect) applied to line text.")
     var grep: String?
+
+    @Option(
+        parsing: .unconditional,
+        help: "Only the first N lines of the window (oldest first); pairs with --since to read what came after a moment."
+    )
+    var head: Int?
 
     @Argument(help: "Server name.")
     var name: String
@@ -541,10 +730,82 @@ struct Logs: AsyncParsableCommand {
     @Option(help: "Filter to one stream: out, err, sys, or mark.")
     var stream: [String] = []
 
-    @Option(help: "Only the last N lines.")
+    @Option(
+        parsing: .unconditional,
+        help: "Only the last N lines (default: \(defaultTailLines), unless --since/--since-mark/--follow/--all is given)."
+    )
     var tail: Int?
 
+    /** `--all` asks for the whole history outright, which is meaningless
+        alongside a bounded `--tail`: the two name incompatible amounts of
+        output. A negative `--tail` is refused here too, before it ever
+        reaches the wire. */
+    static func usageError(all: Bool, tail: Int?) -> WireError? {
+        if all, tail != nil { return WireError(code: .usage, message: "pass --tail or --all, not both") }
+        return CLIRunner.negativeCountError(tail, flag: "--tail", noun: "lines")
+    }
+
+    /** `--head` asks for a bounded slice from the start of the window, which
+        conflicts with any other amount (`--tail`, `--all`) and with
+        `--follow`, whose answer has no start. */
+    static func usageError(all: Bool, follow: Bool, head: Int?, tail: Int?) -> WireError? {
+        if let error = usageError(all: all, tail: tail) { return error }
+        guard let head else { return nil }
+        if let error = CLIRunner.negativeCountError(head, flag: "--head", noun: "lines") { return error }
+        if tail != nil { return WireError(code: .usage, message: "pass --head or --tail, not both") }
+        if all { return WireError(code: .usage, message: "pass --head or --all, not both") }
+        if follow { return WireError(code: .usage, message: "pass --head or --follow, not both") }
+        return nil
+    }
+
+    /** The notice `--follow` prints once on stderr inside a Claude Code
+        session whose stdout is not a terminal: a polling command there is
+        usually a harness waiting on it, and the monitor command is the
+        streaming shape built for that. Nil everywhere else. */
+    static func monitorHint(environment: [String: String], stdoutIsTerminal: Bool) -> String? {
+        guard environment["CLAUDECODE"] == "1", !stdoutIsTerminal else { return nil }
+        return CLINotice.followUseMonitor
+    }
+
+    /** `--head` and `--follow` need the result's cursor; a daemon older than
+        that field omits it (and would ignore `head` and `after`, answering
+        unbounded), so the command stops with this instead. */
+    static let olderDaemon = WireError(
+        code: .versionMismatch, hint: "run: directa daemon restart", message: CLINotice.daemonOlderThanCLI)
+
+    /** Every poll after the first reads exactly what lies past the cursor the
+        daemon issued last, whatever lower bound and tail seeded the first
+        query; the cursor is exclusive and counts same-millisecond records,
+        so nothing repeats and nothing is skipped. */
+    static func followParams(_ first: LogsQueryParams, after cursor: LogCursor) -> LogsQueryParams {
+        var params = first
+        params.after = cursor
+        params.since = nil
+        params.sinceMark = nil
+        params.tail = nil
+        return params
+    }
+
+    /** The tail bound actually sent to the daemon. `--all` and `--head` send
+        none (full history, even under `--follow`; `--head` bounds from the
+        start instead). An explicit `--tail` wins next. Otherwise `--follow`
+        keeps its own smaller backlog default, a bare `--since`/`--since-mark`
+        is left unbounded (already scoped by time), and no bound at all falls
+        back to `defaultTailLines`. */
+    static func effectiveTail(
+        all: Bool, follow: Bool, head: Int?, since: Date?, sinceMark: String?, tail: Int?
+    ) -> Int? {
+        if all || head != nil { return nil }
+        if let tail { return tail }
+        if follow { return followDefaultTailLines }
+        if since != nil || sinceMark != nil { return nil }
+        return defaultTailLines
+    }
+
     func run() async throws {
+        if let usage = Self.usageError(all: all, follow: follow, head: head, tail: tail) {
+            CLIRunner.fail(usage, json: global.json)
+        }
         var sinceDate: Date?
         if let since {
             sinceDate = Self.parseSince(since)
@@ -559,43 +820,44 @@ struct Logs: AsyncParsableCommand {
             CLIRunner.fail(
                 WireError(code: .usage, message: "--stream takes out, err, sys, or mark"), json: global.json)
         }
-        var params = LogsQueryParams(
-            grep: grep, name: name, project: global.resolvedProject(), since: sinceDate,
-            sinceMark: sinceMark, streams: streams, tail: follow ? (tail ?? 50) : tail)
-        let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-            try await client.request(.logsQuery, params: params, expecting: LogsQueryResult.self)
+        let first = LogsQueryParams(
+            grep: grep, head: head, name: name, project: global.resolvedProject(), since: sinceDate,
+            sinceMark: sinceMark, streams: streams,
+            tail: Self.effectiveTail(
+                all: all, follow: follow, head: head, since: sinceDate, sinceMark: sinceMark, tail: tail))
+        let result = await query(first)
+        var followCursor: LogCursor?
+        if follow || head != nil {
+            guard let cursor = result.cursor else { failOlderDaemon() }
+            followCursor = cursor
         }
         emit(result.lines)
-        guard follow else { return }
-        /** Follow = incremental polling since the last seen line: restart-safe
-            and no push machinery. Duplicate timestamps are deduped by count. */
-        var lastAt = result.lines.last?.at
-        var seenAtLast = result.lines.filter { $0.at == lastAt }.count
-        params.sinceMark = nil
-        params.tail = nil
+        /** Incremental polling past the daemon's cursor: restart-safe, no
+            push machinery, and seeded by the first answer even when it
+            matched nothing, so an empty start never re-reads history. */
+        guard follow, var cursor = followCursor else { return }
+        if let hint = Self.monitorHint(
+            environment: ProcessInfo.processInfo.environment, stdoutIsTerminal: isatty(STDOUT_FILENO) == 1)
+        {
+            CLIRunner.notice(hint)
+        }
         while true {
             try await Task.sleep(for: .milliseconds(300))
-            params.since = lastAt
-            let more = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-                try await client.request(.logsQuery, params: params, expecting: LogsQueryResult.self)
-            }
-            var fresh = more.lines
-            if let lastAt {
-                var skip = seenAtLast
-                fresh = fresh.drop { record in
-                    if record.at == lastAt, skip > 0 {
-                        skip -= 1
-                        return true
-                    }
-                    return false
-                }.filter { $0.at >= lastAt }
-            }
-            if !fresh.isEmpty {
-                emit(fresh)
-                lastAt = fresh.last?.at
-                seenAtLast = more.lines.filter { $0.at == lastAt }.count
-            }
+            let more = await query(Self.followParams(first, after: cursor))
+            guard let next = more.cursor else { failOlderDaemon() }
+            emit(more.lines)
+            cursor = next
         }
+    }
+
+    private func query(_ params: LogsQueryParams) async -> LogsQueryResult {
+        await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
+            try await client.request(.logsQuery, params: params, expecting: LogsQueryResult.self)
+        }
+    }
+
+    private func failOlderDaemon() -> Never {
+        CLIRunner.fail(Self.olderDaemon, json: global.json)
     }
 
     private func emit(_ lines: [LogRecord]) {
@@ -610,6 +872,11 @@ struct Logs: AsyncParsableCommand {
                 print("\(JSONCoding.formatISO8601(line.at)) [\(line.stream.rawValue)] \(line.text)")
             }
         }
+        /** `print` block-buffers into a pipe, so a follow reader would see
+            nothing until kilobytes pile up; nil flushes every output stream
+            without touching the `stdout` global, which strict concurrency
+            rejects. */
+        fflush(nil)
     }
 
     /** 5m / 2h / 1d / 30s relative forms, else ISO-8601. */
@@ -693,10 +960,20 @@ struct Events: AsyncParsableCommand {
     @Option(help: "Only events after the mark with this id.")
     var sinceMark: String?
 
-    @Option(help: "Only the last N events.")
+    @Option(parsing: .unconditional, help: "Only the last N events.")
     var tail: Int?
 
+    /** A negative `--tail` names an impossible event count; refused here
+        rather than reaching the daemon, which refuses the same value as a
+        wire-level `EventsQueryParams.refusal()`. */
+    static func usageError(tail: Int?) -> WireError? {
+        CLIRunner.negativeCountError(tail, flag: "--tail", noun: "events")
+    }
+
     func run() async throws {
+        if let usage = Self.usageError(tail: tail) {
+            CLIRunner.fail(usage, json: global.json)
+        }
         var sinceDate: Date?
         if let since {
             sinceDate = Logs.parseSince(since)
@@ -763,7 +1040,7 @@ struct Context: AsyncParsableCommand {
     @OptionGroup var global: GlobalOptions
 
     func run() async throws {
-        if let text = await HookContext.render(project: global.resolvedProject()) {
+        if let text = await HookContext.render(project: global.resolvedProject(), harness: .neutral) {
             print(text)
         }
     }
@@ -794,20 +1071,61 @@ struct HookInstall: AsyncParsableCommand {
 
     @OptionGroup var global: GlobalOptions
 
-    @Option(help: "Harness to install for: \(harnessAdapters.map(\.name).joined(separator: ", ")) (default: claude).")
-    var harness: String = "claude"
+    @Option(
+        help:
+            "Harness to install for: \(harnessAdapters.map(\.name).joined(separator: ", ")) (default: every harness detected on this machine)."
+    )
+    var harness: String?
 
     @Flag(help: "Also print the statusline wiring suggestion.")
     var statusline = false
 
-    func run() async throws {
-        guard let adapter = harnessAdapters.first(where: { $0.name == harness }) else {
-            CLIRunner.fail(
+    /** The adapters `hook install` acts on, and the ones it leaves alone. */
+    struct Targets {
+        var install: [any HarnessAdapter]
+        var skipped: [any HarnessAdapter]
+    }
+
+    /** Which adapters `hook install` acts on. An explicit `--harness` is
+        unconditional: it installs that one adapter regardless of detection.
+        Omitted, it installs every harness whose `hookState()` reads as present
+        (installed or `notInstalled`, never `harnessAbsent`), so a harness this
+        machine has never run stays untouched rather than gaining a settings
+        file for a tool that was never there. Pure so the exact decision is
+        asserted with stub adapters, without touching a harness's real
+        settings file. */
+    static func resolveTargets(harness: String?, adapters: [any HarnessAdapter]) -> Result<Targets, WireError> {
+        if let harness {
+            return HarnessBatch.adapter(named: harness, in: adapters, verb: .install)
+                .map { Targets(install: [$0], skipped: []) }
+        }
+        var targets = Targets(install: [], skipped: [])
+        for adapter in adapters {
+            if adapter.hookState() == .harnessAbsent {
+                targets.skipped.append(adapter)
+            } else {
+                targets.install.append(adapter)
+            }
+        }
+        guard !targets.install.isEmpty else {
+            return .failure(
                 WireError(
                     code: .usage,
-                    hint: "supported: \(harnessAdapters.map(\.name).joined(separator: ", ")) (adding one: CONTRIBUTING.md)",
-                    message: "unknown harness '\(harness)'"),
-                json: global.json)
+                    hint: "run: directa hook install --harness <name>",
+                    message:
+                        "no supported harness detected on this machine (checked: \(adapters.map(\.name).joined(separator: ", ")))"
+                ))
+        }
+        return .success(targets)
+    }
+
+    func run() async throws {
+        let targets: Targets
+        switch Self.resolveTargets(harness: harness, adapters: harnessAdapters) {
+        case .failure(let error):
+            CLIRunner.fail(error, json: global.json)
+        case .success(let resolved):
+            targets = resolved
         }
         if let override = cliPath, !override.hasPrefix("/") {
             CLIRunner.fail(
@@ -818,28 +1136,28 @@ struct HookInstall: AsyncParsableCommand {
                 json: global.json)
         }
         let cliPath = cliPath ?? CLISelf.path
-        do {
-            let summary = try adapter.install(cliPath: cliPath)
-            var output = summary
-            if statusline {
-                output += "\n\nStatusline: pipe your statusline script through `directa statusline` to append server presence, e.g.\n  directa statusline <<< \"$STDIN_JSON\"  ->  myproj:3000 ok · api crashed"
-            }
-            /** The discovery tip is printed, never appended to CLAUDE.md/AGENTS.md:
-                directa does not edit a project's files. Server names come from the
-                nearest devservers.json (empty when there is none yet). */
-            let serverNames: [String]
-            if let view = try? ProjectConfigLoader.load(project: global.resolvedProject()) {
-                serverNames = view.specs.map(\.name)
-            } else {
-                serverNames = []
-            }
-            output += "\n\nDiscovery tip: paste this bullet into the project's CLAUDE.md/AGENTS.md so agents find directa on their own (directa never edits those files):\n\(DiscoveryStanza.render(serverNames: serverNames))"
-            CLIRunner.emit(WireEmpty(), json: global.json) { _ in output }
-        } catch {
-            CLIRunner.fail(
-                WireError(code: .internalError, message: "hook install failed: \(error)"),
-                json: global.json)
+        let result = HarnessBatch.run(targets.install) { try $0.install(cliPath: cliPath) }
+        if let failure = result.failure(verb: .install) {
+            CLIRunner.fail(failure, json: global.json)
         }
+        var lines = result.summaries
+        lines.append(
+            contentsOf: targets.skipped.map { "\($0.name): not detected on this machine, skipped" })
+        var output = lines.joined(separator: "\n")
+        if statusline {
+            output += "\n\nStatusline: pipe your statusline script through `directa statusline` to append server presence, e.g.\n  directa statusline <<< \"$STDIN_JSON\"  ->  myproj:3000 ok · api crashed"
+        }
+        /** The discovery tip is printed, never appended to CLAUDE.md/AGENTS.md:
+            directa does not edit a project's files. Server names come from the
+            nearest devservers.json (empty when there is none yet). */
+        let serverNames: [String]
+        if let view = try? ProjectConfigLoader.load(project: global.resolvedProject()) {
+            serverNames = view.specs.map(\.name)
+        } else {
+            serverNames = []
+        }
+        output += "\n\nDiscovery tip: paste this bullet into the project's CLAUDE.md/AGENTS.md so agents find directa on their own (directa never edits those files):\n\(DiscoveryStanza.render(serverNames: serverNames))"
+        CLIRunner.emit(WireEmpty(), json: global.json) { _ in output }
     }
 }
 
@@ -858,116 +1176,147 @@ struct HookUninstall: AsyncParsableCommand {
     func run() async throws {
         let adapters: [any HarnessAdapter]
         if let harness {
-            guard let adapter = harnessAdapters.first(where: { $0.name == harness }) else {
-                CLIRunner.fail(
-                    WireError(
-                        code: .usage,
-                        hint: "supported: \(harnessAdapters.map(\.name).joined(separator: ", "))",
-                        message: "unknown harness '\(harness)'"),
-                    json: global.json)
+            switch HarnessBatch.adapter(named: harness, in: harnessAdapters, verb: .uninstall) {
+            case .failure(let error):
+                CLIRunner.fail(error, json: global.json)
+            case .success(let adapter):
+                adapters = [adapter]
             }
-            adapters = [adapter]
         } else {
             adapters = harnessAdapters
         }
-        let result = Self.uninstallAll(adapters)
-        if !result.failures.isEmpty {
-            /** Every adapter before the first failure has already rewritten its
-                file, so the report names what succeeded rather than discarding
-                that work. */
-            let succeeded = adapters.map(\.name).filter { name in
-                !result.failures.contains { $0.name == name }
-            }
-            var message = "hook uninstall finished with errors"
-            if !succeeded.isEmpty {
-                message += "; removed from \(succeeded.joined(separator: ", "))"
-            }
-            message +=
-                ". Failed: "
-                + result.failures.map { "\($0.name) (\($0.message))" }.joined(separator: "; ")
-            message += " Fix each cause and rerun directa hook uninstall."
-            CLIRunner.fail(
-                WireError(code: .internalError, hint: "directa hook uninstall", message: message),
-                json: global.json)
+        let result = HarnessBatch.run(adapters) { try $0.uninstall() }
+        if let failure = result.failure(verb: .uninstall) {
+            CLIRunner.fail(failure, json: global.json)
         }
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in result.summaries.joined(separator: "\n") }
     }
+}
 
-    /** One uninstall pass over the adapters, collecting rather than aborting: a
-        refusal from one harness must not discard the others' summaries, because
-        their files are already rewritten by the time the throw lands. */
-    static func uninstallAll(_ adapters: [any HarnessAdapter]) -> (
-        summaries: [String], failures: [(name: String, message: String)]
-    ) {
-        var summaries: [String] = []
-        var failures: [(name: String, message: String)] = []
-        for adapter in adapters {
-            do {
-                summaries.append(try adapter.uninstall())
-            } catch let error as WireError {
-                failures.append((adapter.name, error.message))
-            } catch {
-                failures.append((adapter.name, String(describing: error)))
+/** What one `hook install` or `hook uninstall` pass over several harnesses
+    did. The pass collects rather than aborts: a refusal from one harness must
+    not discard the others' work, since their files are already rewritten by
+    the time it lands, so every adapter runs and the report names both what
+    succeeded and what failed. */
+struct HarnessBatchResult {
+    struct Failure: Equatable {
+        var message: String
+        var name: String
+    }
+
+    var failures: [Failure] = []
+    /** Names of the adapters whose action returned, in order. */
+    var succeeded: [String] = []
+    var summaries: [String] = []
+
+    /** The failure the command exits with when any adapter failed, or nil. */
+    func failure(verb: HarnessBatch.Verb) -> WireError? {
+        guard !failures.isEmpty else { return nil }
+        var message = "hook \(verb.rawValue) finished with errors"
+        if !succeeded.isEmpty {
+            message += "; \(verb.pastTense) \(succeeded.joined(separator: ", "))"
+        }
+        message +=
+            ". Failed: " + failures.map { "\($0.name) (\($0.message))" }.joined(separator: "; ")
+        message += " Fix each cause and rerun directa hook \(verb.rawValue)."
+        return WireError(code: .internalError, hint: "run: directa hook \(verb.rawValue)", message: message)
+    }
+}
+
+/** The pieces `hook install` and `hook uninstall` share. */
+enum HarnessBatch {
+    enum Verb: String {
+        case install
+        case uninstall
+
+        /** How the failure report names what succeeded ("installed claude"). */
+        var pastTense: String {
+            switch self {
+            case .install: "installed"
+            case .uninstall: "removed from"
             }
         }
-        return (summaries, failures)
+    }
+
+    /** The adapter an explicit `--harness` names, or the usage error listing
+        the supported names. */
+    static func adapter(
+        named name: String, in adapters: [any HarnessAdapter], verb: Verb
+    ) -> Result<any HarnessAdapter, WireError> {
+        if let adapter = adapters.first(where: { $0.name == name }) { return .success(adapter) }
+        let supported = adapters.map(\.name).joined(separator: ", ")
+        let guide = verb == .install ? "; adding one: CONTRIBUTING.md" : ""
+        return .failure(
+            WireError(
+                code: .usage,
+                hint: "run: directa hook \(verb.rawValue) --harness <name>",
+                message: "unknown harness '\(name)' (supported: \(supported)\(guide))"))
+    }
+
+    /** Runs `action` on every adapter, collecting each summary or failure. */
+    static func run(
+        _ adapters: [any HarnessAdapter], _ action: (any HarnessAdapter) throws -> String
+    ) -> HarnessBatchResult {
+        var result = HarnessBatchResult()
+        for adapter in adapters {
+            do {
+                result.summaries.append(try action(adapter))
+                result.succeeded.append(adapter.name)
+            } catch let error as WireError {
+                result.failures.append(HarnessBatchResult.Failure(message: error.message, name: adapter.name))
+            } catch {
+                result.failures.append(
+                    HarnessBatchResult.Failure(message: String(describing: error), name: adapter.name))
+            }
+        }
+        return result
     }
 }
 
 /** Invoked by Antigravity's PreInvocation hook. Reads the hook's stdin JSON for
-    the workspace directory, emits {"injectSteps": [{"ephemeralMessage": ...}]},
-    and always exits 0 quickly. */
+    the workspace directory, emits {"injectSteps": [{"ephemeralMessage": ...}]}
+    on the first model call only (HookPayloadGate), and always exits 0 quickly. */
 struct HookAntigravitySessionStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "antigravity-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let stdin = CLIRunner.stdinData()
-        let cwd = HookSessionCwd.resolve(stdin: stdin)
-        FileManager.default.changeCurrentDirectoryPath(cwd)
-        let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await HookContext.render(project: project) else {
-            let empty: [String: Any] = ["injectSteps": []]
-            if let data = try? JSONSerialization.data(withJSONObject: empty) {
-                FileHandle.standardOutput.write(data)
-            }
+        let payload = HookPayload.parse(CLIRunner.stdinData())
+        /** Decided before any project lookup: every model call after the
+            first answers empty, so it costs one stdin parse and nothing more. */
+        guard HookPayloadGate.antigravityHookShouldEmit(payload),
+            let text = await HookContext.render(
+                project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
+                harness: .antigravity)
+        else {
+            HookOutput.write(HookOutput.Antigravity(injectSteps: []))
             return
         }
-        let output: [String: Any] = [
-            "injectSteps": [
-                ["ephemeralMessage": text]
-            ]
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: output) {
-            FileHandle.standardOutput.write(data)
-        }
+        HookOutput.write(HookOutput.Antigravity(injectSteps: [.init(ephemeralMessage: text)]))
     }
 }
 
 /** Invoked by Claude Code's SessionStart hook. Reads the hook's stdin JSON for
     the session cwd, emits hookSpecificOutput.additionalContext, and always exits
-    0 quickly: a session start must never stall or fail on directa's account. */
+    0 quickly: a session start must never stall or fail on directa's account.
+    Silent when Cursor runs it (HookPayloadGate), since Cursor's own hook
+    already carries the block. */
 struct HookClaudeSessionStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "claude-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let stdin = CLIRunner.stdinData()
-        let cwd = HookSessionCwd.resolve(stdin: stdin)
-        /** Project resolution without --project: reuse the CLI's walk from the
-            hook cwd by chdir-ing there first. */
-        FileManager.default.changeCurrentDirectoryPath(cwd)
-        let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await HookContext.render(project: project) else { return }
-        let output: [String: Any] = [
-            "hookSpecificOutput": [
-                "additionalContext": text,
-                "hookEventName": "SessionStart",
-            ]
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: output) {
-            FileHandle.standardOutput.write(data)
-        }
+        let payload = HookPayload.parse(CLIRunner.stdinData())
+        guard
+            HookPayloadGate.claudeHookShouldEmit(
+                payload, cursorHookInstalled: { CursorAdapter().hookState().isLive }),
+            let text = await HookContext.render(
+                project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
+                harness: .claude)
+        else { return }
+        HookOutput.write(
+            HookOutput.AdditionalContext(
+                hookSpecificOutput: .init(additionalContext: text, hookEventName: "SessionStart")))
     }
 }
 
@@ -978,15 +1327,13 @@ struct HookCursorSessionStart: AsyncParsableCommand {
         commandName: "cursor-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let stdin = CLIRunner.stdinData()
-        let cwd = HookSessionCwd.resolve(stdin: stdin)
-        FileManager.default.changeCurrentDirectoryPath(cwd)
-        let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await HookContext.render(project: project) else { return }
-        let output: [String: Any] = ["additional_context": text]
-        if let data = try? JSONSerialization.data(withJSONObject: output) {
-            FileHandle.standardOutput.write(data)
-        }
+        let payload = HookPayload.parse(CLIRunner.stdinData())
+        guard
+            let text = await HookContext.render(
+                project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
+                harness: .cursor)
+        else { return }
+        HookOutput.write(HookOutput.Cursor(additionalContext: text))
     }
 }
 
@@ -1034,19 +1381,15 @@ struct HookGrokSessionStart: AsyncParsableCommand {
 
     /** Returns false when there is nothing to say, so the caller can skip the mark. */
     private func emit(stdin: Data) async -> Bool {
-        let cwd = HookSessionCwd.resolve(stdin: stdin)
-        FileManager.default.changeCurrentDirectoryPath(cwd)
-        let project = GlobalOptions.resolveProject(from: cwd)
-        guard let text = await HookContext.render(project: project) else { return false }
-        let output: [String: Any] = [
-            "hookSpecificOutput": [
-                "additionalContext": text,
-                "hookEventName": "PreToolUse",
-            ]
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: output) {
-            FileHandle.standardOutput.write(data)
-        }
+        guard
+            let text = await HookContext.render(
+                project: GlobalOptions.resolveProject(
+                    from: HookSessionCwd.resolve(HookPayload.parse(stdin))),
+                harness: .grok)
+        else { return false }
+        HookOutput.write(
+            HookOutput.AdditionalContext(
+                hookSpecificOutput: .init(additionalContext: text, hookEventName: "PreToolUse")))
         return true
     }
 }
@@ -1058,18 +1401,10 @@ struct Statusline: AsyncParsableCommand {
         abstract: "Compact server presence for a statusline; reads harness stdin JSON.")
 
     func run() async throws {
-        let stdin = CLIRunner.stdinData()
-        var cwd = FileManager.default.currentDirectoryPath
-        if let payload = try? JSONSerialization.jsonObject(with: stdin) as? [String: Any] {
-            if let workspace = payload["workspace"] as? [String: Any],
-                let dir = workspace["current_dir"] as? String {
-                cwd = dir
-            } else if let dir = payload["cwd"] as? String {
-                cwd = dir
-            }
-        }
+        let payload = HookPayload.parse(CLIRunner.stdinData())
+        let cwd = payload?.workspaceCurrentDir ?? payload?.cwd ?? FileManager.default.currentDirectoryPath
         let project = GlobalOptions.resolveProject(from: cwd)
-        let client = DaemonClient(socketPath: DirectaPaths().socketPath)
+        let client = CLIRunner.client()
         guard
             let list = try? await client.request(
                 .serverStatus, params: ProjectParams(project: project), expecting: ServerListResult.self),
@@ -1094,18 +1429,36 @@ struct Up: AsyncParsableCommand {
 
     @OptionGroup var global: GlobalOptions
 
+    @Argument(help: "Server name (shorthand for --only; omit for the whole project).")
+    var name: String?
+
     @Option(help: "Comma-separated server names (their dependencies come along).")
     var only: String?
 
     @Option(help: "Override the declared port for each server this up starts.")
     var port: Int?
 
-    @Option(help: "Per-server seconds to wait for health.")
-    var timeout: Double = 60
+    @Option(parsing: .unconditional, help: "Per-server seconds to wait for health.")
+    var timeout = TimeoutOption(seconds: 60)
+
+    /** Pure so the exact message is asserted without spawning the CLI: the
+        positional name is shorthand for `--only <name>`, so both at once names
+        two conflicting subsets rather than one. */
+    static func usageError(name: String?, only: String?) -> WireError? {
+        guard let name, only != nil else { return nil }
+        return WireError(
+            code: .usage,
+            hint: "run: directa up \(ShellWord.argument(name))",
+            message: "pass a server name or --only, not both")
+    }
 
     func run() async throws {
+        if let usage = Self.usageError(name: name, only: only) {
+            CLIRunner.fail(usage, json: global.json)
+        }
+        let timeout = global.seconds(timeout)
         let params = GroupParams(
-            only: only.map { $0.split(separator: ",").map(String.init) },
+            only: name.map { [$0] } ?? only.map { $0.split(separator: ",").map(String.init) },
             port: port,
             project: global.resolvedProject(),
             timeoutSeconds: timeout)
@@ -1114,12 +1467,7 @@ struct Up: AsyncParsableCommand {
                 .groupUp, params: params, expecting: GroupResult.self,
                 operationTimeoutSeconds: timeout)
         }
-        CLIRunner.emit(result, json: global.json) { r in
-            r.results.map { entry in
-                entry.reason.map { "\(CLIRunner.describe(entry.server))  ·  FELL SHORT (\($0.rawValue))" }
-                    ?? CLIRunner.describe(entry.server)
-            }.joined(separator: "\n")
-        }
+        CLIRunner.emit(result, json: global.json) { CLIRunner.describeGroup($0.results) }
         if result.results.contains(where: { $0.reason != nil }) {
             Foundation.exit(1)
         }
@@ -1128,18 +1476,47 @@ struct Up: AsyncParsableCommand {
 
 struct Down: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Stop the whole project in reverse dependency order.")
+        abstract: "Stop the whole project (or one server) in reverse dependency order.")
 
     @OptionGroup var global: GlobalOptions
 
+    @Argument(help: "Server name (stops only this one; omit to stop the whole project).")
+    var name: String?
+
+    /** Which wire request `down` makes. A named server never pulls in
+        dependents (the opposite of `up`'s `--only`, which does), so it goes
+        straight to `server.stop`: every daemon build understands that
+        method, unlike `group.down`'s `only`, a proto addition an older
+        daemon silently ignores, stopping the whole project instead of just
+        the named server. */
+    enum DownRequest: Equatable {
+        case group(GroupParams)
+        case server(ServerTargetParams)
+    }
+
+    /** Pure so the choice of wire request is asserted without a live daemon. */
+    static func request(name: String?, project: String) -> DownRequest {
+        guard let name else { return .group(GroupParams(project: project)) }
+        return .server(ServerTargetParams(name: name, project: project))
+    }
+
     func run() async throws {
-        let params = GroupParams(project: global.resolvedProject())
+        let request = Self.request(name: name, project: global.resolvedProject())
         let result = await CLIRunner.run(json: global.json, bootstrap: !global.noBootstrap) { client in
-            /** A deep dependency chain drains one wave at a time, each with its own
-                stop grace, so the client waits well past a single stop. */
-            try await client.request(
-                .groupDown, params: params, expecting: GroupResult.self,
-                operationTimeoutSeconds: 120)
+            switch request {
+            case .server(let target):
+                let stopped = try await client.request(
+                    .serverStop, params: target, expecting: ServerResult.self,
+                    operationTimeoutSeconds: CLIRunner.stopOperationTimeoutSeconds)
+                return GroupResult(results: [EnsureResult(server: stopped.server)])
+            case .group(let params):
+                /** A deep dependency chain drains one wave at a time, each with
+                    its own stop grace, so the client waits well past a single
+                    stop. */
+                return try await client.request(
+                    .groupDown, params: params, expecting: GroupResult.self,
+                    operationTimeoutSeconds: CLIRunner.stopOperationTimeoutSeconds)
+            }
         }
         CLIRunner.emit(result, json: global.json) { r in
             r.results.isEmpty
@@ -1185,10 +1562,7 @@ struct Open: AsyncParsableCommand {
         }
         guard let server = result.servers.first else {
             CLIRunner.fail(
-                WireError(
-                    code: .notFound, hint: "run: directa status --json",
-                    message: "no server named '\(name)' is registered for this project"),
-                json: global.json)
+                ProjectConfigLoader.serverNotFound(name: name, project: params.project), json: global.json)
         }
         var target = server.url
         if let head {
@@ -1211,7 +1585,7 @@ struct Open: AsyncParsableCommand {
                     message: "\(name) has no URL (no port declared and no url configured)"),
                 json: global.json)
         }
-        LaunchdAdmin.shell("/usr/bin/open", [url])
+        await LaunchdAdmin.shell("/usr/bin/open", [url])
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in "opened \(url)" }
     }
 }
@@ -1304,11 +1678,11 @@ struct CLIDeepLinkEffects: DeepLinkEffects {
     }
 
     func notify(title: String, body: String) async {
-        FileHandle.standardError.write(Data("directa: \(title): \(body)\n".utf8))
+        CLIRunner.notice("\(title): \(body)")
     }
 
     func openBrowser(_ url: URL) async {
-        _ = LaunchdAdmin.shell("/usr/bin/open", [url.absoluteString])
+        _ = await LaunchdAdmin.shell("/usr/bin/open", [url.absoluteString])
     }
 }
 
@@ -1363,7 +1737,7 @@ struct ConfigInit: AsyncParsableCommand {
             guard !cmd.isEmpty else {
                 CLIRunner.fail(
                     WireError(
-                        code: .usage, hint: "run: directa config init --name \(name) --cmd <word>",
+                        code: .usage, hint: "run: directa config init --name \(ShellWord.argument(name)) --cmd <word>",
                         message: "--name needs a --cmd to run"),
                     json: global.json)
             }
@@ -1449,72 +1823,232 @@ struct Doctor: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Health report: daemon, launchd, PATH staleness, signatures, stale registrations.")
 
-    @Flag(help: "Prune registry entries whose project directories no longer exist.")
+    /** Lookback for the jetsam finding's restart-burst count. */
+    private static let restartBurstWindowSeconds: TimeInterval = 24 * 60 * 60
+
+    @Flag(
+        help:
+            "Prune registry entries whose project directories no longer exist, then remove leftover log directories no project claims."
+    )
     var fix = false
 
     @OptionGroup var global: GlobalOptions
 
-    struct Finding: Codable {
+    /** One line of the report. `kind` and `severity` encode as their raw
+        values, which are the `--json` contract. */
+    struct Finding: Codable, Equatable {
+        enum Kind: String, Codable {
+            case daemon
+            case harnessHook = "harness-hook"
+            case installShadow = "install-shadow"
+            case jetsam
+            case jetsamCoalition = "jetsam-coalition"
+            case launchd
+            case leftoverJob = "leftover-job"
+            case orphanLogDir = "orphan-log-dir"
+            case pathStaleness = "path-staleness"
+            case portCollision = "port-collision"
+            case portSquatter = "port-squatter"
+            case signature
+            case signatureConflict = "signature-conflict"
+            case staleProject = "stale-project"
+            case update
+        }
+
+        enum Severity: String, Codable {
+            case error
+            case fixed
+            case info
+            case ok
+            case warning
+        }
+
         var detail: String
-        var kind: String
-        var severity: String
+        var kind: Kind
+        var severity: Severity
+    }
+
+    /** A failure's text for a finding: a daemon error's own message, anything
+        else as the system describes it. */
+    static func describe(_ error: any Error) -> String {
+        (error as? WireError)?.message ?? error.localizedDescription
+    }
+
+    /** Turns one `project.forget` outcome into the `stale-project` finding
+        `doctor --fix` reports. Pure so the plural grammar and the old-daemon
+        rewrite are asserted without a live socket. A daemon built before
+        `project.forget` existed refuses it as an unknown method
+        (`WireError.isUnknownMethod`); that refusal is rewritten into a restart
+        hint instead of the raw wire error, since "unknown method" means
+        nothing to whoever reads the report. */
+    static func staleProjectFixFinding(
+        project: String, outcome: Result<ProjectForgetResult, any Error>
+    ) -> Finding {
+        switch outcome {
+        case .success(let result):
+            let count = result.servers.count
+            return Finding(
+                detail: "forgot \(project) (\(count) server\(count == 1 ? "" : "s"))",
+                kind: .staleProject, severity: .fixed)
+        case .failure(let error as WireError) where error.isUnknownMethod(.projectForget):
+            return Finding(
+                detail:
+                    "could not forget \(project): the running daemon predates project.forget; run: directa daemon restart",
+                kind: .staleProject, severity: .error)
+        case .failure(let error):
+            return Finding(
+                detail: "could not forget \(project): \(describe(error))",
+                kind: .staleProject, severity: .error)
+        }
+    }
+
+    /** Turns one `logs.removeOrphan` answer into the `orphan-log-dir` finding
+        `doctor --fix` reports. Pure so each wording is asserted without
+        touching disk. */
+    static func orphanLogDirFixFinding(_ result: LogsRemoveOrphanResult) -> Finding {
+        switch result.outcome {
+        case .removed:
+            return Finding(
+                detail: "removed \(result.path), which matched no registered project",
+                kind: .orphanLogDir, severity: .fixed)
+        case .refused(let reason, let remedy):
+            return Finding(
+                detail: "left \(result.path) in place: \(reason)\(remedy.map { "; \($0)" } ?? "")",
+                kind: .orphanLogDir, severity: .error)
+        case .failed(let reason):
+            return orphanLogDirFailureFinding(path: result.path, reason: reason)
+        }
+    }
+
+    private static func orphanLogDirFailureFinding(path: String, reason: String) -> Finding {
+        Finding(detail: "could not remove \(path): \(reason)", kind: .orphanLogDir, severity: .error)
+    }
+
+    /** The `orphan-log-dir` findings for one doctor run, against `info`, the
+        `daemon.info` fetched when doctor began. Report-only sizes each
+        unclaimed directory. `fix` lists them and asks the daemon to remove
+        each by name (`removeOrphan`, which sends `logs.removeOrphan`); the
+        daemon decides against the claim set it holds at that moment, so a
+        project started while doctor ran keeps its directory, and this client
+        never deletes anything itself. A daemon that predates the method gets
+        the report-only findings plus one `error` finding naming the restart. */
+    static func orphanLogDirFindings(
+        fix: Bool, info: DaemonInfo,
+        removeOrphan: (String) async throws -> LogsRemoveOrphanResult
+    ) async -> [Finding] {
+        let paths = DirectaPaths(daemon: info)
+        let claimedSlugDirs = DirectaPaths.projectLogDirNames(projects: info.claimedProjects ?? [])
+        func reportOnly() -> [Finding] {
+            OrphanProjectLogs.scan(paths: paths, claimedSlugDirs: claimedSlugDirs).map { orphan in
+                Finding(
+                    detail: "\(orphan.detail) (run: \(OrphanProjectLogs.remedy))",
+                    kind: .orphanLogDir, severity: .warning)
+            }
+        }
+        guard fix else { return reportOnly() }
+        var findings: [Finding] = []
+        for directory in OrphanProjectLogs.unclaimedDirectories(
+            paths: paths, claimedSlugDirs: claimedSlugDirs)
+        {
+            do {
+                findings.append(orphanLogDirFixFinding(try await removeOrphan(directory.lastPathComponent)))
+            } catch let error as WireError where error.isUnknownMethod(.logsRemoveOrphan) {
+                return findings + reportOnly() + [
+                    Finding(
+                        detail:
+                            "removed no leftover log directories: the running daemon is too old to remove them safely; run: directa daemon restart, then directa doctor --fix",
+                        kind: .orphanLogDir, severity: .error)
+                ]
+            } catch {
+                findings.append(orphanLogDirFailureFinding(path: directory.path, reason: describe(error)))
+            }
+        }
+        return findings
+    }
+
+    /** `port-squatter` findings: a server that is down while something listens
+        on its declared port. Only a listener no managed server accounts for is
+        a squatter: when another supervised server holds that port (a live
+        port-failed run included), calling it unmanaged is wrong, and the
+        port-collision finding already names both sides. Status carries no
+        claim, so a held span member no status field names is not seen here.
+        `isListening` is the loopback probe, injected so the decision is tested
+        without binding ports. A server whose checkout is gone is never a
+        candidate (the stale-project finding covers it), though a live run of
+        one still counts as a managed owner. */
+    static func portSquatterFindings(
+        servers: [ServerStatus], isListening: (Int) -> Bool, projectExists: (String) -> Bool
+    ) -> [Finding] {
+        servers.compactMap { server in
+            guard let port = server.declaredPort, !server.hasLiveRun, projectExists(server.project)
+            else { return nil }
+            let managedOwner = servers.first { other in
+                !(other.project == server.project && other.server == server.server)
+                    && other.heldPorts(claim: nil).contains(port)
+            }
+            guard managedOwner == nil, isListening(port) else { return nil }
+            return Finding(
+                detail: "port \(port) has an unmanaged listener while \(server.server) is down",
+                kind: .portSquatter, severity: .warning)
+        }
     }
 
     func run() async throws {
         var findings: [Finding] = []
         let client = CLIRunner.client()
         let info = try? await client.request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
+        let paths = info.map(DirectaPaths.init(daemon:)) ?? DirectaPaths.fromEnvironment()
         if let info {
             findings.append(
-                Finding(detail: "v\(info.daemonVersion) pid \(info.pid) on \(info.socketPath)", kind: "daemon", severity: "ok"))
+                Finding(detail: "v\(info.daemonVersion) pid \(info.pid) on \(info.socketPath)", kind: .daemon, severity: .ok))
             let livePath = LaunchdAdmin.capturedPath()
-            let storedPath = LaunchdAdmin.readAgentPath()
+            let storedPath = LaunchdAdmin.readAgentPath(paths: paths)
             if let daemonPath = info.searchPath, daemonPath != livePath {
                 findings.append(
                     Finding(
                         detail: "daemon PATH differs from the current login shell (captured at install; run: directa daemon install)",
-                        kind: "path-staleness", severity: "warning"))
+                        kind: .pathStaleness, severity: .warning))
             }
             if let storedPath, storedPath != livePath {
                 findings.append(
                     Finding(
                         detail: "agent.path differs from the current login shell (run: directa daemon install)",
-                        kind: "path-staleness", severity: "warning"))
+                        kind: .pathStaleness, severity: .warning))
             }
         } else {
             findings.append(
-                Finding(detail: "daemon not responding (run: directa daemon status)", kind: "daemon", severity: "error"))
+                Finding(detail: "daemon not responding (run: directa daemon status)", kind: .daemon, severity: .error))
         }
-        let printed = LaunchdAdmin.shell(
+        let printed = await LaunchdAdmin.shell(
             "/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)"])
         findings.append(
-            Finding(
-                detail: LaunchdAdmin.launchdState(from: printed), kind: "launchd",
-                severity: "info"))
+            Finding(detail: LaunchdAdmin.launchdState(from: printed), kind: .launchd, severity: .info))
         if printed.status == 0 {
-            let agent = LaunchdJobs.parseAgentPrint(printed.output)
+            let agent = LaunchdJobs.parseJobPrint(printed.output)
             if agent.jetsammed {
                 let runs = agent.runs.map { " (\($0) runs)" } ?? ""
+                let burstDetail = await Self.recentRestartBurstCount(client: client).map {
+                    ", \($0) daemon restart\($0 == 1 ? "" : "s") in the last 24h"
+                } ?? ""
                 findings.append(
                     Finding(
                         detail:
-                            "ddirecta last exited \(agent.lastExitReason ?? "OS_REASON_JETSAM")\(runs); memory pressure killed the daemon, not a crash dump. Check: launchctl print \(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)",
-                        kind: "jetsam", severity: "warning"))
+                            "the daemon last exited \(agent.lastExitReason ?? "OS_REASON_JETSAM")\(runs)\(burstDetail); memory pressure killed it, not a crash dump. Check: launchctl print \(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)",
+                        kind: .jetsam, severity: .warning))
             }
         }
         if let all = try? await client.request(
             .serverStatus, params: ProjectParams(project: ""), expecting: ServerListResult.self) {
             var signatureHolders: [String: String] = [:]
-            var staleProjects: Set<String> = []
+            let staleProjects = Set(all.servers.map(\.project)).filter {
+                !FileManager.default.fileExists(atPath: $0)
+            }
             /** Host-keyed signatures miss a real collision: two projects on one
                 port under different *.localhost names are different signatures
                 and the same bind. Reported from declared ports, so it lands
                 before anyone tries to start either one. */
-            for collision in PortCollision.detect(
-                all.servers.filter { FileManager.default.fileExists(atPath: $0.project) })
-            {
-                findings.append(
-                    Finding(detail: collision.detail, kind: "port-collision", severity: "warning"))
+            for collision in PortCollision.detect(all.servers.filter { !staleProjects.contains($0.project) }) {
+                findings.append(Finding(detail: collision.detail, kind: .portCollision, severity: .warning))
             }
             let livePids = Set(
                 all.servers.compactMap { server -> pid_t? in
@@ -1531,7 +2065,7 @@ struct Doctor: AsyncParsableCommand {
                     Finding(
                         detail:
                             "\(leftover.count) leftover directa child job\(leftover.count == 1 ? "" : "s") with no live server (a jetsammed daemon never boots them out). Daemon recovery reaps them; to clear one now: launchctl bootout \(LaunchdJobs.guiDomain)/\(example)",
-                        kind: "leftover-job", severity: "warning"))
+                        kind: .leftoverJob, severity: .warning))
             }
             if let daemonPid = info.flatMap({ pid_t(exactly: $0.pid) }),
                 let daemonJetsam = CoalitionIDs.read(of: daemonPid)?.jetsam
@@ -1545,14 +2079,10 @@ struct Doctor: AsyncParsableCommand {
                         Finding(
                             detail:
                                 "\(server.server) in \(server.project) shares the daemon's jetsam coalition (pid \(childPid)); under memory pressure macOS may kill the daemon instead of this server",
-                            kind: "jetsam-coalition", severity: "warning"))
+                            kind: .jetsamCoalition, severity: .warning))
                 }
             }
-            for server in all.servers {
-                if !FileManager.default.fileExists(atPath: server.project) {
-                    staleProjects.insert(server.project)
-                    continue
-                }
+            for server in all.servers where !staleProjects.contains(server.project) {
                 if let port = server.declaredPort {
                     let host = server.url.flatMap { URL(string: $0)?.host } ?? "localhost"
                     let signature = "\(host):\(port)"
@@ -1561,63 +2091,57 @@ struct Doctor: AsyncParsableCommand {
                         findings.append(
                             Finding(
                                 detail: "signature \(signature) claimed by both \(existing) and \(holder)",
-                                kind: "signature-conflict", severity: "warning"))
+                                kind: .signatureConflict, severity: .warning))
                     } else {
                         signatureHolders[signature] = holder
                         findings.append(
                             Finding(
                                 detail: "\(signature) -> \(holder) [\(server.phase.rawValue)]",
-                                kind: "signature", severity: "info"))
-                    }
-                    /** Only a listener no managed server accounts for is a
-                        squatter. When another supervised server is up on this
-                        port, calling it unmanaged is simply wrong, and the
-                        port-collision finding above already names both sides. */
-                    let managedOwner = all.servers.first { other in
-                        (other.effectivePort ?? other.declaredPort) == port
-                            && !(other.project == server.project && other.server == server.server)
-                            && (other.phase == .running || other.phase == .starting
-                                || other.phase == .unhealthy)
-                    }
-                    if server.phase == .stopped || server.phase == .crashed,
-                        managedOwner == nil,
-                        LoopbackProbe.isListening(port: port) {
-                        findings.append(
-                            Finding(
-                                detail: "port \(port) has an unmanaged listener while \(server.server) is down",
-                                kind: "port-squatter", severity: "warning"))
+                                kind: .signature, severity: .info))
                     }
                 }
             }
+            findings += Self.portSquatterFindings(
+                servers: all.servers, isListening: { LoopbackProbe.isListening(port: $0) },
+                projectExists: { !staleProjects.contains($0) })
             for project in staleProjects.sorted() {
                 if fix {
-                    let names = all.servers.filter { $0.project == project }.map(\.server)
-                    for name in names {
-                        _ = try? await client.request(
-                            .serverUnregister,
-                            params: ServerTargetParams(name: name, project: project),
-                            expecting: WireEmpty.self)
+                    /** `project.forget` runs the same daemon-side teardown the
+                        automatic missing-project sweep uses (stop supervisors,
+                        drop locks/state/registry row/trust, remove the log
+                        directory), bypassing that sweep's elapsed-interval
+                        debounce since the caller asked explicitly for this one
+                        project. No `try?`: a failure here (the project still
+                        exists, or the daemon refused for another reason) is a
+                        real finding, not a silent no-op. */
+                    let outcome: Result<ProjectForgetResult, any Error>
+                    do {
+                        outcome = .success(
+                            try await client.request(
+                                .projectForget, params: ProjectOnlyParams(project: project),
+                                expecting: ProjectForgetResult.self))
+                    } catch {
+                        outcome = .failure(error)
                     }
-                    findings.append(
-                        Finding(detail: "pruned \(project) (\(names.count) servers)", kind: "stale-project", severity: "fixed"))
+                    findings.append(Self.staleProjectFixFinding(project: project, outcome: outcome))
                 } else {
                     findings.append(
                         Finding(
                             detail:
                                 "\(project) no longer exists on disk (daemon auto-prunes missing projects; doctor --fix forces leftovers)",
-                            kind: "stale-project", severity: "warning"))
+                            kind: .staleProject, severity: .warning))
                 }
             }
         }
         /** Update check: read the shared cache, refreshing only when stale, so a
             machine where the menu bar app never runs still learns about a release
             without doctor hitting the network every time. Silent on failure. */
-        if let update = await UpdateCheck.refreshIfStale(), update.updateAvailable {
+        if let update = await UpdateCheck.refreshIfStale(paths: paths), update.updateAvailable {
             findings.append(
                 Finding(
                     detail:
                         "directa \(update.latestVersion) is available (you have \(update.currentVersion)); upgrade with `brew upgrade --cask \(DirectaDistribution.homebrewCaskToken)` or download from \(DirectaDistribution.releasesLatestURL)",
-                    kind: "update", severity: "info"))
+                    kind: .update, severity: .info))
         }
 
         /** Harness hooks: report only, never repair. directa does not edit a file
@@ -1627,25 +2151,23 @@ struct Doctor: AsyncParsableCommand {
             switch adapter.hookState() {
             case .harnessAbsent:
                 break
-            case .installed(let path, let pathExists):
-                if pathExists {
-                    findings.append(
-                        Finding(
-                            detail: "\(adapter.name) session hook installed (\(path))",
-                            kind: "harness-hook", severity: "ok"))
-                } else {
-                    findings.append(
-                        Finding(
-                            detail:
-                                "\(adapter.name) session hook points at \(path), which no longer exists (run: directa hook install --harness \(adapter.name), or directa hook uninstall --harness \(adapter.name))",
-                            kind: "harness-hook", severity: "warning"))
-                }
+            case .installed(let path, pathExists: true):
+                findings.append(
+                    Finding(
+                        detail: "\(adapter.name) session hook installed (\(path))",
+                        kind: .harnessHook, severity: .ok))
+            case .installed(let path, pathExists: false):
+                findings.append(
+                    Finding(
+                        detail:
+                            "\(adapter.name) session hook points at \(path), which no longer exists (run: directa hook install --harness \(adapter.name), or directa hook uninstall --harness \(adapter.name))",
+                        kind: .harnessHook, severity: .warning))
             case .notInstalled:
                 findings.append(
                     Finding(
                         detail:
                             "\(adapter.name) detected without a directa session hook (run: directa hook install --harness \(adapter.name))",
-                        kind: "harness-hook", severity: "info"))
+                        kind: .harnessHook, severity: .info))
             }
         }
         /** Shadowed install: a second directa copy (a `make install` in
@@ -1657,7 +2179,28 @@ struct Doctor: AsyncParsableCommand {
             findings.append(
                 Finding(
                     detail: "\(shadow.detail) (run: \(shadow.remedy))",
-                    kind: "install-shadow", severity: "warning"))
+                    kind: .installShadow, severity: .warning))
+        }
+        /** Log directories a project no longer claims: `ControlServer` removes
+            one when it forgets the project (unregister down to zero servers,
+            the missing-project sweep), and a directory orphaned any other way
+            sits under the logs root until `--fix` or `directa uninstall
+            --purge` removes it. The claimed set comes from the daemon's
+            own `daemon.info` (every registry project plus every project with a
+            resident supervisor), not machine-wide server status: a trusted
+            project mid-edit on an invalid devservers.json, or one whose file
+            was deleted, still claims its log directory even though it has no
+            servers to list. Skipped entirely (never guessed) when talking to a
+            daemon whose `daemon.info` predates `claimedProjects`, for `--fix`
+            too, since an empty claimed set would call every directory a
+            leftover. Runs after the stale-project pass so the scan sees the
+            log directories `project.forget` already removed. */
+        if let info, info.claimedProjects != nil {
+            findings += await Self.orphanLogDirFindings(fix: fix, info: info) { name in
+                try await client.request(
+                    .logsRemoveOrphan, params: LogsRemoveOrphanParams(directory: name),
+                    expecting: LogsRemoveOrphanResult.self)
+            }
         }
         if global.json {
             struct Report: Codable {
@@ -1666,12 +2209,29 @@ struct Doctor: AsyncParsableCommand {
             CLIRunner.emit(Report(findings: findings), json: true) { _ in "" }
         } else {
             for finding in findings {
-                print("[\(finding.severity)] \(finding.kind): \(finding.detail)")
+                print("[\(finding.severity.rawValue)] \(finding.kind.rawValue): \(finding.detail)")
             }
         }
-        if findings.contains(where: { $0.severity == "error" }) {
+        if findings.contains(where: { $0.severity == .error }) {
             Foundation.exit(1)
         }
+    }
+
+    /** Nil when events.query itself fails (daemon unreachable, though `launchctl
+        print` on the agent registration can still succeed then); the caller
+        renders the jetsam finding's original text unchanged in that case. An
+        empty or missing events.log still answers 0, which is a real count, not
+        a failure. */
+    private static func recentRestartBurstCount(client: DaemonClient) async -> Int? {
+        let now = Date()
+        guard
+            let result = try? await client.request(
+                .eventsQuery,
+                params: EventsQueryParams(since: now.addingTimeInterval(-restartBurstWindowSeconds)),
+                expecting: EventsQueryResult.self)
+        else { return nil }
+        return DaemonRestartBurstCounter.count(
+            events: result.events, window: restartBurstWindowSeconds, now: now)
     }
 }
 
@@ -1701,7 +2261,8 @@ struct Uninstall: AsyncParsableCommand {
     }
 
     func run() async throws {
-        let paths = DirectaPaths()
+        AgentLifecycle.requireDefaultLayout(command: "uninstall", json: global.json)
+        let paths = DirectaPaths.fromEnvironment()
         var actions: [String] = []
 
         /** Agent + launchd job (and any legacy home plist) first. Full uninstall
@@ -1737,16 +2298,68 @@ struct Uninstall: AsyncParsableCommand {
         }
 
         if purge && !agentOnly {
-            try? FileManager.default.removeItem(at: paths.dataDir)
-            try? FileManager.default.removeItem(at: paths.logsDir)
-            for url in DirectaPaths.userLibraryResidue() {
-                try? FileManager.default.removeItem(at: url)
+            if let refusal = Self.purgeData(
+                environment: ProcessInfo.processInfo.environment, paths: paths,
+                home: FileManager.default.homeDirectoryForCurrentUser)
+            {
+                CLIRunner.fail(refusal, json: global.json)
             }
             actions.append("removed data, logs, preferences, and caches")
         }
 
         let result = UninstallResult(actions: actions, agentOnly: agentOnly, purged: purge && !agentOnly)
         CLIRunner.emit(result, json: global.json) { r in r.actions.joined(separator: "\n") }
+    }
+
+    /** Deletes the default layout's data and logs folders (`paths`) and the
+        residue under `home`, or deletes nothing and answers the refusal when
+        `environment` overrides the layout. Checked here as well as at the top
+        of `run`, since this is the one step that cannot be undone. */
+    static func purgeData(environment: [String: String], paths: DirectaPaths, home: URL) -> WireError? {
+        if let refusal = AgentLifecycle.overrideRefusal(command: "uninstall", environment: environment) {
+            return refusal
+        }
+        for url in [paths.dataDir, paths.logsDir] + DirectaPaths.userLibraryResidue(home: home) {
+            try? FileManager.default.removeItem(at: url)
+        }
+        return nil
+    }
+}
+
+/** The commands that manage the background agent (`daemon
+    install|start|restart|uninstall` and `uninstall`). The agent runs only the
+    default data, logs, and socket locations, so under a layout override
+    (`DirectaPaths.hasEnvironmentOverride`) these refuse rather than act on
+    the real agent and its folders for a CLI pointed somewhere else. */
+enum AgentLifecycle {
+    static let overrideKeys = [
+        DirectaPaths.dataDirEnvironmentKey, DirectaPaths.logsDirEnvironmentKey, DirectaPaths.socketEnvironmentKey,
+    ]
+
+    static func overrideRefusal(command: String, environment: [String: String]) -> WireError? {
+        guard DirectaPaths.hasEnvironmentOverride(environment) else { return nil }
+        let set = overrideKeys.filter { environment[$0]?.isEmpty == false }
+        let listed =
+            set.count <= 2
+            ? set.joined(separator: " and ")
+            : set.dropLast().joined(separator: ", ") + ", and " + (set.last ?? "")
+        let named =
+            set.count == 1
+            ? "\(listed) points this CLI at another layout; unset it"
+            : "\(listed) point this CLI at another layout; unset them"
+        return WireError(
+            code: .usage,
+            hint: "run: env \(overrideKeys.map { "-u \($0)" }.joined(separator: " ")) directa \(command)",
+            message:
+                "\(command) manages the background agent, which runs only the default data, logs, and socket locations, but \(named) to manage the agent (a daemon started by hand with --socket, --data-dir, or --logs-dir stops with directa daemon stop)"
+        )
+    }
+
+    /** Ends the command with the refusal when the layout is overridden. */
+    static func requireDefaultLayout(command: String, json: Bool) {
+        if let refusal = overrideRefusal(command: command, environment: ProcessInfo.processInfo.environment) {
+            CLIRunner.fail(refusal, json: json)
+        }
     }
 }
 
@@ -1777,6 +2390,7 @@ struct DaemonInstall: AsyncParsableCommand {
     @OptionGroup var global: GlobalOptions
 
     func run() async throws {
+        AgentLifecycle.requireDefaultLayout(command: "daemon install", json: global.json)
         let binary = ddirecta.map { URL(fileURLWithPath: $0) }
             ?? LaunchdAdmin.resolveDaemonBinary(extraCandidates: [CLISelf.daemonSibling])
         guard let binary else {
@@ -1790,7 +2404,7 @@ struct DaemonInstall: AsyncParsableCommand {
         let restored: [(project: String, name: String)]
         do {
             restored = try await LaunchdAdmin.install(
-                daemonBinary: binary, paths: DirectaPaths(), forceLegacy: legacy)
+                daemonBinary: binary, paths: DirectaPaths.fromEnvironment(), forceLegacy: legacy)
         } catch let error as WireError {
             CLIRunner.fail(error, json: global.json)
         }
@@ -1798,10 +2412,10 @@ struct DaemonInstall: AsyncParsableCommand {
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
             if restored.isEmpty {
                 viaApp
-                    ? "ddirecta ensured via \(SetupPlanner.applicationsAppPath) (Login Items)"
-                    : "ddirecta installed and running (\(LaunchdAdmin.label))"
+                    ? "the daemon is ensured via \(SetupPlanner.applicationsAppPath) (Login Items)"
+                    : "the daemon is installed and running (\(LaunchdAdmin.label))"
             } else {
-                "ddirecta installed; re-ensured \(restored.map(\.name).joined(separator: ", "))"
+                "the daemon is installed; re-ensured \(restored.map(\.name).joined(separator: ", "))"
             }
         }
     }
@@ -1820,13 +2434,11 @@ struct DaemonUninstall: AsyncParsableCommand {
     var purge = false
 
     func run() async throws {
-        FileHandle.standardError.write(
-            Data(
-                "directa: `directa daemon uninstall` is deprecated; use `directa uninstall` (or `directa uninstall --agent-only` to remove just the agent)\n"
-                    .utf8))
-        await LaunchdAdmin.uninstall(paths: DirectaPaths(), purge: purge)
+        CLIRunner.notice(CLINotice.daemonUninstallDeprecated)
+        AgentLifecycle.requireDefaultLayout(command: "daemon uninstall", json: global.json)
+        await LaunchdAdmin.uninstall(paths: DirectaPaths.fromEnvironment(), purge: purge)
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
-            purge ? "ddirecta uninstalled; data and logs removed" : "ddirecta uninstalled"
+            purge ? "the daemon is uninstalled; data and logs removed" : "the daemon is uninstalled"
         }
     }
 }
@@ -1844,15 +2456,16 @@ struct DaemonStart: AsyncParsableCommand {
     @OptionGroup var global: GlobalOptions
 
     func run() async throws {
+        AgentLifecycle.requireDefaultLayout(command: "daemon start", json: global.json)
         do {
             try await LaunchdAdmin.startOrInstall(
-                paths: DirectaPaths(),
+                paths: DirectaPaths.fromEnvironment(),
                 extraDaemonCandidates: [CLISelf.daemonSibling],
                 forceLegacy: legacy)
         } catch let error as WireError {
             CLIRunner.fail(error, json: global.json)
         }
-        CLIRunner.emit(WireEmpty(), json: global.json) { _ in "ddirecta running" }
+        CLIRunner.emit(WireEmpty(), json: global.json) { _ in "the daemon is running" }
     }
 }
 
@@ -1866,7 +2479,7 @@ struct DaemonStop: AsyncParsableCommand {
         let client = CLIRunner.client()
         _ = try? await client.request(.daemonShutdown, params: WireEmpty(), expecting: WireEmpty.self)
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
-            "ddirecta stopping (servers drained; directa daemon start to bring it back)"
+            "the daemon is stopping (servers drained; directa daemon start to bring it back)"
         }
     }
 }
@@ -1879,16 +2492,17 @@ struct DaemonRestart: AsyncParsableCommand {
     @OptionGroup var global: GlobalOptions
 
     func run() async throws {
+        AgentLifecycle.requireDefaultLayout(command: "daemon restart", json: global.json)
         let bounced: [(project: String, name: String)]
         do {
-            bounced = try await LaunchdAdmin.restart(paths: DirectaPaths())
+            bounced = try await LaunchdAdmin.restart(paths: DirectaPaths.fromEnvironment())
         } catch let error as WireError {
             CLIRunner.fail(error, json: global.json)
         }
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
             bounced.isEmpty
-                ? "ddirecta restarted (no servers were running)"
-                : "ddirecta restarted; re-ensured \(bounced.map(\.name).joined(separator: ", "))"
+                ? "the daemon restarted (no servers were running)"
+                : "the daemon restarted; re-ensured \(bounced.map(\.name).joined(separator: ", "))"
         }
     }
 }
@@ -1943,7 +2557,7 @@ struct DaemonInfoCommand: AsyncParsableCommand {
             try await client.request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
         }
         CLIRunner.emit(result, json: global.json) { info in
-            "ddirecta v\(info.daemonVersion) (proto \(info.proto)) pid \(info.pid)\nsocket \(info.socketPath)\ndata \(info.dataDir)\nlogs \(info.logsDir)"
+            "daemon v\(info.daemonVersion) (proto \(info.proto)) pid \(info.pid)\nsocket \(info.socketPath)\ndata \(info.dataDir)\nlogs \(info.logsDir)"
         }
     }
 }
@@ -1964,10 +2578,11 @@ struct Switch: AsyncParsableCommand {
     @Flag(help: "Skip the git fetch before switching.")
     var noFetch = false
 
-    @Option(help: "Per-server seconds to wait for health when coming back up.")
-    var timeout: Double = 120
+    @Option(parsing: .unconditional, help: "Per-server seconds to wait for health when coming back up.")
+    var timeout = TimeoutOption(seconds: 120)
 
     func run() async throws {
+        let timeout = global.seconds(timeout)
         let project = global.resolvedProject()
         let dirty = Self.git(["status", "--porcelain"], in: project)
         guard dirty.status == 0 else {
@@ -1990,7 +2605,7 @@ struct Switch: AsyncParsableCommand {
         print("stopping servers…")
         _ = try? await CLIRunner.client().request(
             .groupDown, params: GroupParams(project: project), expecting: GroupResult.self,
-            operationTimeoutSeconds: 120)
+            operationTimeoutSeconds: CLIRunner.stopOperationTimeoutSeconds)
         var switched = Self.git(["switch", branch], in: project)
         if switched.status != 0 {
             /** A remote-only branch needs a tracking checkout. */
@@ -2029,14 +2644,22 @@ struct Switch: AsyncParsableCommand {
             ensure makes. Recording it before the lifecycle runs keeps the state
             coherent from the moment the branch's committed argv executes, so a
             crash mid-switch still leaves the project approved for a later
-            autonomous boot restore rather than half-trusted. */
+            autonomous boot restore rather than half-trusted.
+
+            A failed write is deliberately non-fatal, the same bargain
+            `prepareSpawn` makes for an explicit ensure/start whose own
+            `setTrusted` write fails: this invocation already is the approval,
+            and refusing to run the branch's lifecycle here would not undo the
+            git switch or the drained servers that already happened above, it
+            would just leave both half-done. `WireEmpty` carries no payload, so
+            the success result itself has nothing worth reading; only the
+            thrown error on failure does. */
         do {
-            try await CLIRunner.client().request(
+            _ = try await CLIRunner.client().request(
                 .projectTrust, params: ProjectOnlyParams(project: project),
                 expecting: WireEmpty.self)
         } catch {
-            print(
-                "warning: trust was not recorded for this project (\(error)); run: directa trust")
+            print(Self.trustRecordingFailedWarning(error))
         }
         let playbook =
             validated == nil
@@ -2066,7 +2689,7 @@ struct Switch: AsyncParsableCommand {
                 CLIRunner.fail(
                     WireError(
                         code: .internalError,
-                        hint: "fix the failure, then: directa up",
+                        hint: "fix the failure, then run: directa up",
                         message: "lifecycle command failed (\(process.terminationStatus)): \(argv.joined(separator: " "))"),
                     json: global.json)
             }
@@ -2082,10 +2705,7 @@ struct Switch: AsyncParsableCommand {
         CLIRunner.emit(result, json: global.json) { r in
             r.results.isEmpty
                 ? "switched to \(branch) (no servers registered)"
-                : r.results.map { entry in
-                    entry.reason.map { "\(CLIRunner.describe(entry.server))  ·  FELL SHORT (\($0.rawValue))" }
-                        ?? CLIRunner.describe(entry.server)
-                }.joined(separator: "\n")
+                : CLIRunner.describeGroup(r.results)
         }
         if result.results.contains(where: { $0.reason != nil }) {
             Foundation.exit(1)
@@ -2094,6 +2714,14 @@ struct Switch: AsyncParsableCommand {
 
     static func git(_ arguments: [String], in project: String) -> (status: Int32, output: String) {
         LaunchdAdmin.shell("/usr/bin/git", ["-C", project] + arguments)
+    }
+
+    /** Printed when the daemon could not durably record trust for this
+        project; names the exact remediation so a later refusal (an
+        autonomous boot restore or watch sweep declining an unapproved
+        project) has somewhere to point back to. */
+    static func trustRecordingFailedWarning(_ error: Error) -> String {
+        "warning: trust was not recorded for this project (\(error)); run: directa trust"
     }
 }
 
@@ -2151,8 +2779,14 @@ enum LockNotice {
     static func unguarded(resource: String, live: [String], statePath: String?) -> String? {
         guard statePath == nil, !live.isEmpty else { return nil }
         let servers = live.sorted()
-        return
-            "directa lock: note: '\(resource)' declares no state path, so a change made while \(servers.joined(separator: ", ")) \(servers.count == 1 ? "stays" : "stay") running cannot be detected. Add a `path` to the lock declaration or use --pause."
+        /** Named rather than "the lock declaration": any of the live servers
+            works, since they all declare `resource`, but the fix is one JSON
+            edit and needs one name to attach it to. */
+        let example = servers[0]
+        return [
+            "directa lock: note: '\(resource)' declares no state path, so a change made while \(servers.joined(separator: ", ")) \(servers.count == 1 ? "stays" : "stay") running cannot be detected.",
+            "directa lock: give \(example)'s '\(resource)' entry in devservers.json a path, e.g. {\"name\": \"\(resource)\", \"path\": \"<path to \(resource)'s state>\"}, or run with --pause.",
+        ].joined(separator: "\n")
     }
 
     private static func pauseClause(_ holder: LockHolder) -> String {
@@ -2217,7 +2851,7 @@ enum LockIdentityVerdict: Equatable {
         return .fault(
             WireError(
                 code: .resourceMutated,
-                hint: "directa lock \(resource) --pause -- <command>",
+                hint: "run: directa lock \(ShellWord.argument(resource)) --pause -- <command>",
                 message:
                     "resource '\(resource)' state at \(statePath) changed (\(described)) while \(servers.joined(separator: ", ")) stayed running. \(servers.count == 1 ? "That server holds" : "Those servers hold") the old state open and can write cached pages back over the change, so what is on disk is not what the command wrote."
             ))
@@ -2273,8 +2907,8 @@ struct Lock: AsyncParsableCommand {
     @Argument(help: "Resource name (matches servers' `locks` in devservers.json).")
     var resource: String
 
-    @Option(help: "Seconds to wait for the resource if another holder has it.")
-    var acquireTimeout: Double = 300
+    @Option(parsing: .unconditional, help: "Seconds to wait for the resource if another holder has it.")
+    var acquireTimeout = TimeoutOption(seconds: 300)
 
     /** Explicit opt-in to stopping declarers; the default leaves them running.
         A bare `@Flag` (default false), not an inversion pair, so there is exactly
@@ -2282,8 +2916,8 @@ struct Lock: AsyncParsableCommand {
     @Flag(name: .customLong("pause"), help: "Stop servers that declare the resource for the command, then resume them.")
     var pause = false
 
-    @Option(help: "Per-server seconds to wait for health when servers return.")
-    var timeout: Double = 120
+    @Option(parsing: .unconditional, help: "Per-server seconds to wait for health when servers return.")
+    var timeout = TimeoutOption(seconds: 120)
 
     /** `.postTerminator`, not `.captureForPassthrough`: the latter ends option
         parsing at the first positional value, so the resource itself stopped it
@@ -2292,7 +2926,11 @@ struct Lock: AsyncParsableCommand {
         verbatim (a nested `--`, a dash option, an empty string all survive) and
         leaves the options to parse normally. The default makes a missing command
         reach the typed usage error below rather than the parser's own printer. */
-    @Argument(parsing: .postTerminator, help: "Command to run while holding the resource; everything after `--`.")
+    @Argument(
+        parsing: .postTerminator,
+        help:
+            "Command to run while holding the resource, in the caller's own working directory; everything after `--`."
+    )
     var command: [String] = []
 
     /** Pure so the exact message is asserted without spawning the CLI. */
@@ -2300,7 +2938,7 @@ struct Lock: AsyncParsableCommand {
         guard command.isEmpty else { return nil }
         return WireError(
             code: .usage,
-            hint: "directa lock \(resource) -- <command>",
+            hint: "run: directa lock \(ShellWord.argument(resource)) -- <command>",
             message: "directa lock needs a command after `--`; its own options go before it (directa lock \(resource) [--pause] [--acquire-timeout <seconds>] [--timeout <seconds>] -- <command…>)")
     }
 
@@ -2310,6 +2948,16 @@ struct Lock: AsyncParsableCommand {
         if let usage = Self.usageError(command: command, resource: resource) {
             CLIRunner.fail(usage, json: global.json)
         }
+        let acquireTimeout = global.seconds(acquireTimeout, flag: "--acquire-timeout")
+        let timeout = global.seconds(timeout)
+        /** Captured before anything below resolves `--project` or touches the
+            filesystem, so the guarded command runs where the caller actually
+            stood, which the resolved project can differ from (a monorepo
+            subpackage below the project root, or an explicit `--project`
+            pointing elsewhere): a relative file argument, or a tool that finds
+            its own config by walking up from cwd, must see the same directory
+            it would running unwrapped. */
+        let callerCwd = FileManager.default.currentDirectoryPath
         let project = global.resolvedProject()
         let holderPid = Int(getpid())
         let client = CLIRunner.client()
@@ -2350,7 +2998,7 @@ struct Lock: AsyncParsableCommand {
                         expecting: LockStatusResult.self
                     ).holder
                     if let holder {
-                        Self.note(
+                        CLIRunner.note(
                             first
                                 ? LockNotice.contended(
                                     budgetSeconds: acquireTimeout, holder: holder, now: Date(),
@@ -2374,29 +3022,17 @@ struct Lock: AsyncParsableCommand {
         /** Progress chatter is stderr: stdout belongs to the guarded command, and
             --json governs stdout schemas. */
         for name in acquired.paused {
-            Self.note("directa lock: paused \(name) (holds \(resource))")
+            CLIRunner.note("directa lock: paused \(name) (holds \(resource))")
         }
         if let warning = LockNotice.unguarded(
             resource: resource, live: acquired.live ?? [], statePath: acquired.statePath)
         {
-            Self.note(warning)
+            CLIRunner.note(warning)
         }
         /** Identity is taken before the command and again before release, so a
             resumed server's first writes are never blamed on the command. */
         let before = acquired.statePath.map(ResourceFingerprint.capture(path:))
-        /** Run the guarded command with inherited stdio. */
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = command
-        process.currentDirectoryURL = URL(fileURLWithPath: project)
-        var commandStatus: Int32 = 1
-        do {
-            try process.run()
-            process.waitUntilExit()
-            commandStatus = process.terminationStatus
-        } catch {
-            FileHandle.standardError.write(Data("directa lock: cannot run command: \(error)\n".utf8))
-        }
+        let commandStatus = Self.runGuardedCommand(command, cwd: callerCwd)
         var verdict = LockIdentityVerdict.silent
         if let statePath = acquired.statePath, let before {
             verdict = LockIdentityVerdict.of(
@@ -2411,7 +3047,7 @@ struct Lock: AsyncParsableCommand {
                 resumeTimeoutSeconds: timeout),
             expecting: LockResult.self)) ?? LockResult()
         for name in released.paused {
-            Self.note("directa lock: resuming \(name)…")
+            CLIRunner.note("directa lock: resuming \(name)…")
         }
         switch verdict {
         case .fault(let error):
@@ -2420,14 +3056,28 @@ struct Lock: AsyncParsableCommand {
             CLIRunner.emitFailure(error, json: global.json)
             Foundation.exit(commandStatus == 0 ? 1 : commandStatus)
         case .note(let text):
-            Self.note(text)
+            CLIRunner.note(text)
         case .silent:
             break
         }
         Foundation.exit(commandStatus)
     }
 
-    static func note(_ text: String) {
-        FileHandle.standardError.write(Data((text + "\n").utf8))
+    /** Spawns the guarded command with inherited stdio in `cwd`, so a test can
+        assert what directory a real child process observes without acquiring a
+        resource or a live daemon. */
+    static func runGuardedCommand(_ command: [String], cwd: String) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = command
+        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+        do {
+            try process.run()
+        } catch {
+            CLIRunner.note("directa lock: cannot run command: \(error)")
+            return 1
+        }
+        process.waitUntilExit()
+        return process.terminationStatus
     }
 }

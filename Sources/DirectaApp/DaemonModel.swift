@@ -86,12 +86,10 @@ final class ProjectAccessLog {
 
 /** The app's single source of truth: polls the daemon over the local socket
     (2s; polling is restart-safe and deletes the reconnect problem a push
-    subscription would carry), groups servers by project, derives the ambient
-    icon state, and posts crash notifications from the event feed. */
+    subscription would carry), groups servers by project, derives the presence
+    counts, and posts crash notifications from the event feed. */
 @Observable
 final class DaemonModel {
-    /** Bumped on system theme change so the baked menu bar label re-renders. */
-    var appearanceTick = 0
     var daemonReachable = false
     /** True while the daemon answers but is still bringing supervised servers
         back, which is a busy daemon rather than a missing one. */
@@ -134,27 +132,6 @@ final class DaemonModel {
             else { return (path as NSString).lastPathComponent }
             return "\(main) · \(worktree)"
         }
-    }
-
-    /** Worst phase across every server, for the menu bar glyph. */
-    enum AmbientState {
-        case attention
-        case busy
-        case quiet
-
-        init(servers: [ServerStatus]) {
-            if servers.contains(where: { $0.phase == .crashed || $0.phase == .failed || $0.phase == .unhealthy }) {
-                self = .attention
-            } else if servers.contains(where: { $0.phase == .starting || $0.phase == .stopping }) {
-                self = .busy
-            } else {
-                self = .quiet
-            }
-        }
-    }
-
-    var ambient: AmbientState {
-        AmbientState(servers: projects.flatMap(\.servers))
     }
 
     /** Presence counts for the collapsed menu bar label. */
@@ -206,14 +183,6 @@ final class DaemonModel {
     func start() {
         guard pollTask == nil else { return }
         requestNotificationPermission()
-        DistributedNotificationCenter.default().addObserver(
-            forName: Notification.Name("AppleInterfaceThemeChangedNotification"),
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                self?.appearanceTick += 1
-            }
-        }
         /** Launch-time registration runs behind the same in-flight flag and
             cooldown as recovery. Left outside them, the 2s poll sees the socket
             still silent inside launchd's respawn throttle and fires a second
@@ -312,7 +281,7 @@ final class DaemonModel {
         } else if daemonNeedsApproval {
             daemonRecoveryError = AgentService.Failure.needsApproval.localizedDescription
         } else {
-            daemonRecoveryError = "could not start ddirecta automatically"
+            daemonRecoveryError = "could not start the daemon automatically"
         }
     }
 
@@ -321,7 +290,7 @@ final class DaemonModel {
         approval is pending would write back the very `~/Library/LaunchAgents`
         job the migration removed, and Login Items would name it `ddirecta` again. */
     private func recoverAgent() async -> Bool {
-        if AgentService.bundleHasAgentPlist {
+        if AgentService.agent.bundleHasPlist {
             do {
                 try await AgentService.ensureRunning()
                 daemonNeedsApproval = false
@@ -347,7 +316,7 @@ final class DaemonModel {
             daemonRecovering = true
             daemonRecoveryError = nil
             do {
-                if AgentService.bundleHasAgentPlist {
+                if AgentService.agent.bundleHasPlist {
                     try await AgentService.ensureRunning()
                 } else {
                     try await LaunchdAdmin.startOrInstall(

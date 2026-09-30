@@ -344,6 +344,39 @@ public enum ProjectConfigLoader {
             hint: "run: directa config check",
             message: "cannot parse \(url.path): \(detail)")
     }
+
+    /** The one `not-found` for a server name a project does not have. Asked
+        from a linked worktree with no devservers.json of its own, for a name
+        its main checkout declares, the message names why (the worktree does
+        not see that file, which is often untracked) and both ways out, and
+        the hint is the command that lists the main checkout's servers, its
+        path single-quoted since a checkout path can hold any character. */
+    public static func serverNotFound(
+        name: String, project: String, hint: String = "run: directa status --json"
+    ) -> WireError {
+        let message = "no server named '\(name)' in \(project)"
+        guard !FileManager.default.fileExists(atPath: configURL(project: project).path),
+            let main = CheckoutIdentity.mainCheckout(ofLinkedWorktree: project),
+            declares(name, project: main)
+        else { return WireError(code: .notFound, hint: hint, message: message) }
+        return WireError(
+            code: .notFound,
+            hint: "run: directa status --project \(ShellWord.singleQuoted(main))",
+            message:
+                "\(message): this linked worktree has no devservers.json, and its main checkout \(main) declares '\(name)'; "
+                + "commit or copy devservers.json into this worktree, or pass --project with the main checkout's path"
+        )
+    }
+
+    /** Whether the project's devservers.json names this server. A file that
+        is missing or does not parse declares nothing, which only drops the
+        worktree hint. */
+    private static func declares(_ name: String, project: String) -> Bool {
+        guard let data = try? Data(contentsOf: configURL(project: project)),
+            let config = try? JSONCoding.decoder().decode(ProjectFileConfig.self, from: data)
+        else { return false }
+        return config.servers[name] != nil
+    }
 }
 
 /** Dependency ordering for group operations: Kahn's algorithm producing waves of

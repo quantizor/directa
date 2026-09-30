@@ -68,7 +68,7 @@ struct SetupWindowOpener: View {
     }
 }
 
-/** Close the setup SwiftUI window by id (macOS 14-safe; dismissWindow is 15+). */
+/** Close the setup SwiftUI window by id. */
 enum SetupWindowCloser {
     static func close() {
         for window in NSApp.windows where window.identifier?.rawValue == "setup" {

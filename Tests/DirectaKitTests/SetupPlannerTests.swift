@@ -1,8 +1,9 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 @testable import DirectaKit
 
-@Suite("SetupPlanner")
+@Suite("SetupPlanner", .temporaryTree)
 struct SetupPlannerTests {
     @Test func compareVersionsOrdersSemver() {
         #expect(SetupPlanner.compareVersions("1.0.0", "1.0.1") == .orderedAscending)
@@ -120,38 +121,30 @@ struct SetupPlannerTests {
         Asserted against the machine's own answer rather than a fixed list: what
         a developer puts in `.zshrc` is theirs, so the contract is "the capture
         agrees with the user's shell", not "the capture contains pnpm". */
-    @Test func theCaptureSeesWhatTheUsersShellSees() throws {
+    @Test func theCaptureSeesWhatTheUsersShellSees() async throws {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        func pathFrom(_ arguments: [String]) throws -> Set<String> {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = arguments
-            process.environment = ["HOME": home, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
+        func pathFrom(_ arguments: [String]) async throws -> Set<String> {
+            let result = try await TestProcess.run(
+                "/bin/zsh", arguments, environment: ["HOME": home, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"])
             return Set(
-                String(decoding: data, as: UTF8.self)
+                result.output
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .split(separator: ":").map(String.init))
         }
-        let interactive = try pathFrom(["-ilc", "echo $PATH"])
-        try withKnownIssue("no .zshrc on this machine, so there is nothing to miss", isIntermittent: true) {
+        let interactive = try await pathFrom(["-ilc", "echo $PATH"])
+        withKnownIssue("no .zshrc on this machine, so there is nothing to miss", isIntermittent: true) {
             try #require(FileManager.default.fileExists(atPath: "\(home)/.zshrc"))
         }
         guard FileManager.default.fileExists(atPath: "\(home)/.zshrc") else { return }
         /** The control: login-only must MISS something an interactive shell has,
             or this machine cannot demonstrate the bug and the assertion below
             would pass against the old implementation too. */
-        let loginOnly = try pathFrom(["-lc", "echo $PATH"])
-        try withKnownIssue(".zshrc adds nothing to PATH here", isIntermittent: true) {
+        let loginOnly = try await pathFrom(["-lc", "echo $PATH"])
+        withKnownIssue(".zshrc adds nothing to PATH here", isIntermittent: true) {
             try #require(!interactive.subtracting(loginOnly).isEmpty)
         }
         guard !interactive.subtracting(loginOnly).isEmpty else { return }
-        let captured = Set(LaunchdAdmin.capturedPath().split(separator: ":").map(String.init))
+        let captured = Set(await offPool { LaunchdAdmin.capturedPath() }.split(separator: ":").map(String.init))
         #expect(interactive.subtracting(captured).isEmpty)
     }
 
@@ -177,9 +170,7 @@ struct SetupPlannerTests {
     }
 
     @Test func harnessOffersDefaultCheckedOnlyWhenNeeded() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appending(path: "directa-setup-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = try TemporaryTree.directory(named: "setup")
         let home = root.appending(path: "home")
         try FileManager.default.createDirectory(
             at: home.appending(path: ".gemini"), withIntermediateDirectories: true)
@@ -237,9 +228,7 @@ struct SetupPlannerTests {
     }
 
     @Test func grokSessionStartOnlyDoesNotCountAsInstalled() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appending(path: "directa-setup-grok-old-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = try TemporaryTree.directory(named: "setup-grok-old")
         let settings = root.appending(path: ".grok/hooks/directa.json")
         try FileManager.default.createDirectory(
             at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -253,20 +242,14 @@ struct SetupPlannerTests {
     }
 
     @Test func stampRoundTrip() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appending(path: "directa-stamp-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let root = try TemporaryTree.directory(named: "stamp")
         let stamp = root.appending(path: "setup.stamp")
         try SetupPlanner.writeStamp(version: "1.2.0", to: stamp)
         #expect(SetupPlanner.readStamp(at: stamp) == "1.2.0")
     }
 
     @Test func installBinaryStageAndRename() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appending(path: "directa-bin-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let root = try TemporaryTree.directory(named: "bin")
         let source = root.appending(path: "src-bin")
         let dest = root.appending(path: "bin/directa")
         try Data("#!/bin/sh\necho ok\n".utf8).write(to: source)
@@ -280,9 +263,7 @@ struct SetupPlannerTests {
     }
 
     @Test func installAppBundleReplacesExisting() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appending(path: "directa-app-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = try TemporaryTree.directory(named: "app")
         let apps = root.appending(path: "Applications")
         try FileManager.default.createDirectory(at: apps, withIntermediateDirectories: true)
         let source = root.appending(path: "source.app")

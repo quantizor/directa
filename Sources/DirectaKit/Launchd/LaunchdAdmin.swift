@@ -54,9 +54,25 @@ public enum LaunchdAdmin {
         return shell("/usr/bin/open", [action.urlString])
     }
 
-    /** True when launchd currently has our agent in the gui domain. */
-    public static func isAgentLoaded() -> Bool {
-        shell("/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(label)"]).status == 0
+    /** True when launchd currently has our agent in the gui domain, or when
+        launchd did not answer in time: a job that exists behind a slow launchd
+        is not one to reinstall or replace. */
+    public static func isAgentLoaded() async -> Bool {
+        agentLoaded(
+            from: await shellOutcome("/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(label)"]))
+    }
+
+    /** What a `launchctl print` of the agent says about whether it is loaded:
+        a clean exit is loaded and a nonzero exit or a launchctl that could
+        not start is not. A print killed at its deadline or at the output cap
+        is unanswered, which reads as loaded, since every caller acts on
+        "not loaded" by registering or replacing the agent. */
+    static func agentLoaded(from outcome: ShellOutcome) -> Bool {
+        switch outcome {
+        case .exited(let status, _): status == 0
+        case .failedToRun: false
+        case .outputLimitExceeded, .timedOut: true
+        }
     }
 
     /** Wait until launchd drops the agent after an unregister, then idle so BTM
@@ -68,22 +84,27 @@ public enum LaunchdAdmin {
         timeoutSeconds: Double = 10,
         settleSeconds: Double = AgentRebindPolicy.settleSeconds
     ) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline, isAgentLoaded() {
-            try? await Task.sleep(for: .milliseconds(50))
+        var loaded = await pollWhileLoaded(until: Date().addingTimeInterval(timeoutSeconds))
+        if loaded {
+            _ = await shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
+            loaded = await pollWhileLoaded(until: Date().addingTimeInterval(3))
         }
-        if isAgentLoaded() {
-            _ = shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
-            let bootoutDeadline = Date().addingTimeInterval(3)
-            while Date() < bootoutDeadline, isAgentLoaded() {
-                try? await Task.sleep(for: .milliseconds(50))
-            }
-        }
-        guard !isAgentLoaded() else { return false }
+        guard !loaded else { return false }
         if settleSeconds > 0 {
             try? await Task.sleep(for: .seconds(settleSeconds))
         }
-        return !isAgentLoaded()
+        return await !isAgentLoaded()
+    }
+
+    /** Checks every 50ms while the agent stays loaded, until `deadline`;
+        answers whether it is still loaded. */
+    private static func pollWhileLoaded(until deadline: Date) async -> Bool {
+        var loaded = await isAgentLoaded()
+        while loaded, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+            loaded = await isAgentLoaded()
+        }
+        return loaded
     }
 
     /** Marker for the Applications copy: settle, then register, after a DMG
@@ -150,17 +171,20 @@ public enum LaunchdAdmin {
         return nil
     }
 
-    /** Auto-bootstrap: only against the default socket (never a test override),
-        never past a deliberate-stop marker. Prefers the Applications app's
-        SMAppService path when present; otherwise kickstarts/installs the
-        legacy home LaunchAgent. */
+    /** Auto-bootstrap: only against the default layout (never under
+        `DirectaPaths.hasEnvironmentOverride`, since the agent does not run that
+        layout's daemon), never past a deliberate-stop marker. Prefers the
+        Applications app's SMAppService path when present; otherwise
+        kickstarts/installs the legacy home LaunchAgent. */
     @discardableResult
     public static func attemptBootstrap(
         paths: DirectaPaths = DirectaPaths(),
         extraDaemonCandidates: [URL] = [],
         forceLegacy: Bool = false
     ) async -> Bool {
-        guard ProcessInfo.processInfo.environment["DIRECTA_SOCKET"] == nil else { return false }
+        guard !DirectaPaths.hasEnvironmentOverride(ProcessInfo.processInfo.environment) else {
+            return false
+        }
         guard !deliberatelyStopped(paths: paths) else { return false }
         /** With the app installed it owns registration, so a silent socket is
             answered by waiting, never by installing a second job. Falling through
@@ -202,7 +226,7 @@ public enum LaunchdAdmin {
             throw WireError(
                 code: .internalError,
                 hint: "run: make install  (or open the setup panel from the DMG)",
-                message: "no LaunchAgent and no ddirecta binary found to install")
+                message: "no LaunchAgent and no daemon binary found to install")
         }
         _ = try await install(daemonBinary: binary, paths: paths, forceLegacy: true)
     }
@@ -250,7 +274,7 @@ public enum LaunchdAdmin {
                     code: .daemonUnreachable,
                     hint: "open \"x-apple.systempreferences:com.apple.LoginItems-Settings.extension\"",
                     message:
-                        "asked \(SetupPlanner.applicationsAppPath) to start ddirecta, but it never answered. If macOS is waiting for permission, turn on quantizor/directa in System Settings > General > Login Items & Extensions, or run: directa daemon install --legacy")
+                        "asked \(SetupPlanner.applicationsAppPath) to start the daemon, but it never answered. If macOS is waiting for permission, turn on quantizor/directa in System Settings > General > Login Items & Extensions, or run: directa daemon install --legacy")
             }
             await reensure(runningServers, paths: paths)
             return runningServers
@@ -268,8 +292,8 @@ public enum LaunchdAdmin {
         try fm.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(plist.utf8).write(to: plistURL)
         try? fm.removeItem(at: paths.stoppedIntentFile)
-        _ = shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
-        let bootstrap = shell("/bin/launchctl", ["bootstrap", "\(LaunchdJobs.guiDomain)", plistURL.path])
+        _ = await shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
+        let bootstrap = await shell("/bin/launchctl", ["bootstrap", "\(LaunchdJobs.guiDomain)", plistURL.path])
         /** A concurrent session bootstrapping first reports already-bootstrapped;
             the socket poll below is the actual success signal. */
         if bootstrap.status != 0, !bootstrap.output.contains("already bootstrapped"),
@@ -300,7 +324,7 @@ public enum LaunchdAdmin {
             }
             _ = await waitUntilAgentUnloaded()
         }
-        _ = shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
+        _ = await shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
         try? FileManager.default.removeItem(at: plistURL)
         if purge {
             try? FileManager.default.removeItem(at: paths.dataDir)
@@ -317,9 +341,9 @@ public enum LaunchdAdmin {
                 hint: "run: directa daemon install",
                 message: "no LaunchAgent installed at \(plistURL.path)")
         }
-        let result = shell("/bin/launchctl", ["kickstart", "\(LaunchdJobs.guiDomain)/\(label)"])
+        let result = await shell("/bin/launchctl", ["kickstart", "\(LaunchdJobs.guiDomain)/\(label)"])
         if result.status != 0 {
-            _ = shell("/bin/launchctl", ["bootstrap", "\(LaunchdJobs.guiDomain)", plistURL.path])
+            _ = await shell("/bin/launchctl", ["bootstrap", "\(LaunchdJobs.guiDomain)", plistURL.path])
         }
         try await pollHello(paths: paths)
     }
@@ -331,7 +355,7 @@ public enum LaunchdAdmin {
         let client = DaemonClient(socketPath: paths.socketPath)
         let runningServers = await captureActiveServers(client: client)
         try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
-        let result = shell("/bin/launchctl", ["kickstart", "-k", "\(LaunchdJobs.guiDomain)/\(label)"])
+        let result = await shell("/bin/launchctl", ["kickstart", "-k", "\(LaunchdJobs.guiDomain)/\(label)"])
         if result.status != 0 {
             throw WireError(
                 code: .internalError,
@@ -374,7 +398,7 @@ public enum LaunchdAdmin {
 
     public static func launchdState(from result: (status: Int32, output: String)) -> String {
         if result.status != 0 { return "not bootstrapped" }
-        let status = LaunchdJobs.parseAgentPrint(result.output)
+        let status = LaunchdJobs.parseJobPrint(result.output)
         if let state = status.state { return "state = \(state)" }
         if let pid = status.pid { return "pid = \(pid)" }
         return "bootstrapped"
@@ -393,6 +417,10 @@ public enum LaunchdAdmin {
         allows 10 seconds by default, JetBrains 20. Measured locally at about
         1.2s, so this is roughly ten times the real cost. */
     public static let pathCaptureTimeoutSeconds = 12.0
+
+    /** "1" in the environment of the shell `capturedPath` runs, the variable
+        the README tells a profile to check. */
+    public static let resolvingEnvironmentKey = "DIRECTA_RESOLVING_ENVIRONMENT"
 
     /** The PATH the user actually has, so launchd children can find the tools
         the user installed; launchd agents otherwise get a minimal PATH. Goes
@@ -444,16 +472,29 @@ public enum LaunchdAdmin {
                 whatever needs a terminal. VS Code and the JetBrains IDEs both
                 publish one for the same purpose; ours is documented in the
                 README so it is worth guarding against. */
-            "DIRECTA_RESOLVING_ENVIRONMENT": "1",
+            resolvingEnvironmentKey: "1",
             "HOME": FileManager.default.homeDirectoryForCurrentUser.path,
             "LOGNAME": NSUserName(),
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "USER": NSUserName(),
         ]
-        let result = shell(
-            "/bin/zsh", ["-lc", #"source "$HOME/.zshrc" >/dev/null 2>&1; echo $PATH"#],
-            environment: environment, timeoutSeconds: pathCaptureTimeoutSeconds)
-        let path = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return capturedPath(
+            from: shellOutcome(
+                "/bin/zsh", ["-lc", #"source "$HOME/.zshrc" >/dev/null 2>&1; echo $PATH"#],
+                environment: environment, timeoutSeconds: pathCaptureTimeoutSeconds))
+    }
+
+    /** Only a shell that ran to its exit answers: one that could not start
+        carries an error reason, one killed at its deadline printed at most
+        part of a line, and one killed at the output cap was a runaway, none of
+        them a PATH, so the floor applies. */
+    static func capturedPath(from outcome: ShellOutcome) -> String {
+        let output =
+            switch outcome {
+            case .exited(_, let output): output
+            case .failedToRun, .timedOut, .outputLimitExceeded: ""
+            }
+        let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
         return path.isEmpty ? pathFloor : path
     }
 
@@ -533,72 +574,102 @@ public enum LaunchdAdmin {
         """
     }
 
+    /** The form async code calls: runs the synchronous `shell` on
+        `BlockingLane.system`, so a slow `launchctl` parks a lane thread
+        instead of a cooperative-pool thread. Swift picks this over the
+        synchronous form in any async context. */
     @discardableResult
-    /** `environment` nil inherits this process's, which is what most callers
-        want. Pass one to make the child's answer independent of who asked.
-
-        `timeoutSeconds` nil waits forever, which is right for a command directa
-        controls end to end. Pass one for anything that runs a file the user
-        wrote: a shell profile can prompt, wait on the network, or expect a
-        terminal that is not there, and waiting forever for it is how a menu bar
-        app hangs at launch with nothing on screen explaining why. */
     public static func shell(
         _ path: String, _ arguments: [String], environment: [String: String]? = nil,
-        timeoutSeconds: Double? = nil
+        includeStderr: Bool = true, timeoutSeconds: Double? = nil
+    ) async -> (status: Int32, output: String) {
+        await BlockingLane.system.run {
+            shell(
+                path, arguments, environment: environment, includeStderr: includeStderr,
+                timeoutSeconds: timeoutSeconds)
+        }
+    }
+
+    /** `shellOutcome` in the `(status, output)` shape most callers read: a
+        child that could not start is status -1 with the reason as output, and
+        one killed at its deadline or at the output cap is status -1 with
+        output saying so (see `timedOutOutput`, `outputLimitExceededOutput`). A caller that must tell a timeout from a finished
+        child reads `shellOutcome` instead, as `capturedPath` does. */
+    @discardableResult
+    public static func shell(
+        _ path: String, _ arguments: [String], environment: [String: String]? = nil,
+        includeStderr: Bool = true, timeoutSeconds: Double? = nil
     ) -> (status: Int32, output: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = arguments
-        process.environment = environment
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        /** Drained on another thread because the timeout path below waits on
-            termination first, and a read to EOF on this thread would block until
-            the child closed the pipe, which is the thing being timed out. The
-            untimed path could read inline as it always did; it shares this one
-            so both return output the same way. */
-        let collected = OSAllocatedUnfairLock(initialState: Data())
-        let drained = DispatchSemaphore(value: 0)
-        DispatchQueue.global(qos: .userInitiated).async {
-            let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
-            collected.withLock { $0 = data }
-            drained.signal()
-        }
-        /** Installed before `run()`, not after: a child that exits in the window
-            between `run()` returning and a later assignment is already terminated
-            when the handler is set, and Foundation does not fire terminationHandler
-            for an already-dead process. The timeout path below would then wait out
-            its full ceiling and SIGKILL a pid the kernel may have recycled, and the
-            PATH capture that rides this would silently fall back to `pathFloor`. */
-        let exited = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in exited.signal() }
-        do {
-            try process.run()
-        } catch {
-            drained.signal()
-            return (status: -1, output: String(describing: error))
-        }
-        guard let timeoutSeconds else {
-            process.waitUntilExit()
-            drained.wait()
+        let deadline = timeoutSeconds ?? HelperCommand.defaultTimeoutSeconds(executable: path, arguments: arguments)
+        switch shellOutcome(
+            path, arguments, environment: environment, includeStderr: includeStderr,
+            timeoutSeconds: deadline)
+        {
+        case .exited(let status, let output):
+            return (status: status, output: output)
+        case .failedToRun(let reason):
+            return (status: -1, output: reason)
+        case .timedOut(let partialOutput):
             return (
-                status: process.terminationStatus,
-                output: String(decoding: collected.withLock { $0 }, as: UTF8.self)
+                status: -1,
+                output: timedOutOutput(deadlineSeconds: deadline ?? 0, partialOutput: partialOutput)
             )
+        case .outputLimitExceeded:
+            return (status: -1, output: outputLimitExceededOutput(limitBytes: HelperCommand.outputLimitBytes))
         }
-        if exited.wait(timeout: .now() + timeoutSeconds) == .timedOut {
-            /** SIGKILL rather than SIGTERM: this is already the path where the
-                child ignored its chance to finish, and a profile blocked on a
-                read will not act on a term either. */
-            kill(process.processIdentifier, SIGKILL)
-            _ = exited.wait(timeout: .now() + 2)
-            return (status: -1, output: "")
+    }
+
+    /** What a command killed at the output cap reports as its output. The
+        partial output is left out: it is the whole cap, far too large to ride
+        along in an error message, and a caller that wants it reads
+        `shellOutcome`. */
+    static func outputLimitExceededOutput(limitBytes: Int) -> String {
+        "output exceeded \(limitBytes) bytes"
+    }
+
+    /** What a command killed at its deadline reports as its output: the
+        deadline, then whatever it wrote before then. */
+    static func timedOutOutput(deadlineSeconds: Double, partialOutput: String) -> String {
+        let seconds = String(format: "%g", deadlineSeconds)
+        let base = "timed out after \(seconds) seconds"
+        return partialOutput.isEmpty ? base : "\(base); output so far: \(partialOutput)"
+    }
+
+    /** The async form of `shellOutcome`, on `BlockingLane.system`. Swift picks
+        it over the synchronous form in any async context, so an async caller
+        that forgets `await` fails to compile instead of blocking a
+        cooperative-pool thread. */
+    public static func shellOutcome(
+        _ path: String, _ arguments: [String], environment: [String: String]? = nil,
+        includeStderr: Bool = true, timeoutSeconds: Double? = nil
+    ) async -> ShellOutcome {
+        await BlockingLane.system.run {
+            shellOutcome(
+                path, arguments, environment: environment, includeStderr: includeStderr,
+                timeoutSeconds: timeoutSeconds)
         }
-        drained.wait()
-        return (
-            status: process.terminationStatus,
-            output: String(decoding: collected.withLock { $0 }, as: UTF8.self)
-        )
+    }
+
+    /** Runs a command to the end on this thread alone, through
+        `HelperCommand.run`. `environment` nil inherits this process's, which
+        is what most callers want. Pass one to make the child's answer
+        independent of who asked.
+
+        `timeoutSeconds` nil takes `HelperCommand.defaultTimeoutSeconds`: a
+        deadline for launchctl, lsof, and ps, whose hang would otherwise hold a
+        daemon lane thread forever, and none for anything else, which is right
+        for a command directa controls end to end. Pass one for anything that
+        runs a file the user wrote: a shell profile can prompt, wait on the
+        network, or expect a terminal that is not there, and waiting forever
+        for it is how a menu bar app hangs at launch with nothing on screen
+        explaining why. */
+    public static func shellOutcome(
+        _ path: String, _ arguments: [String], environment: [String: String]? = nil,
+        includeStderr: Bool = true, timeoutSeconds: Double? = nil
+    ) -> ShellOutcome {
+        HelperCommand.run(
+            path, arguments, environment: environment, includeStderr: includeStderr,
+            timeoutSeconds: timeoutSeconds
+                ?? HelperCommand.defaultTimeoutSeconds(executable: path, arguments: arguments))
     }
 }

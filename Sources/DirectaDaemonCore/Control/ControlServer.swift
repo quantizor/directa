@@ -6,10 +6,20 @@ import os
 /** Routes decoded requests to the registry and supervisor pool. One instance per
     daemon; connection handling fans out but every method lands here. */
 public actor Router {
+    /** Live launchd job control, present only when this process is the
+        SMAppService agent. Its absence is what makes the adoption pid match
+        and the leftover-job reap in `recoverAtStartup` fail closed to a plain
+        bounce+respawn: a test or `ddirecta --foreground` never gets real
+        launchd side effects, no matter what it injects, because there is
+        nothing to call. See `AgentJobs`. */
+    private let agentJobs: AgentJobs?
     private let events: EventStore
     private let launcher: any ProcessLauncher
     private let paths: DirectaPaths
+    private let portProbe: PortProbe
     private let registry: Registry
+    /** Handed to every supervisor this router creates. */
+    private let stopTiming: StopTiming
     private var supervisors: [String: ServerSupervisor] = [:]
     /** devservers.json views cached by mtime; a save invalidates naturally. */
     private var configCache: [String: (mtime: Date, view: ProjectConfigView)] = [:]
@@ -27,14 +37,20 @@ public actor Router {
     private var restoring = false
 
     public init(
-        launcher: any ProcessLauncher, paths: DirectaPaths, registry: Registry,
-        watchEnabled: Bool = ProcessInfo.processInfo.environment["DIRECTA_NO_WATCH"] != "1"
+        agentJobs: AgentJobs? = LaunchdJobLauncher.runningAsAgent ? .live : nil,
+        launcher: any ProcessLauncher, paths: DirectaPaths, portProbe: PortProbe = .live,
+        registry: Registry,
+        stopTiming: StopTiming = .standard,
+        watchEnabled: Bool = ProcessInfo.processInfo.environment[WatchPolicy.disableEnvironmentKey] != "1"
     ) {
+        self.agentJobs = agentJobs
         self.watchEnabled = watchEnabled
         self.events = EventStore(url: paths.eventsFile)
         self.launcher = launcher
         self.paths = paths
+        self.portProbe = portProbe
         self.registry = registry
+        self.stopTiming = stopTiming
         self.resourceLocks =
             Self.normalizedLocks(
                 AtomicFile.loadDefensively(LocksFile.self, from: paths.locksFile)?.locks ?? [:])
@@ -84,8 +100,14 @@ public actor Router {
         frame. Any thrown WireError becomes the error envelope; anything else maps
         to internal-error so a client never sees a bare hang. */
     public func handle(line: Data) async -> Data {
+        await handle(line: line, head: try? JSONCoding.decoder().decode(WireRequestHead.self, from: line))
+    }
+
+    /** `head` is `line`'s already-decoded `{id, method}`, nil when it did not
+        decode, for a caller that read it first. */
+    public func handle(line: Data, head: WireRequestHead?) async -> Data {
         let decoder = JSONCoding.decoder()
-        guard let head = try? decoder.decode(WireRequestHead.self, from: line) else {
+        guard let head else {
             return (try? NDJSON.encodeLine(
                 WireResponse<WireEmpty>(
                     error: WireError(code: .usage, message: "unparseable request frame"),
@@ -93,17 +115,17 @@ public actor Router {
         }
         do {
             guard let method = WireMethod(rawValue: head.method) else {
-                throw WireError(code: .usage, message: "unknown method \(head.method)")
+                throw WireError(code: .usage, message: WireError.unknownMethodMessage(head.method))
             }
             guard !restoring || Self.isServableWhileRestoring(method) else {
                 throw WireError(
                     code: .daemonStarting,
                     hint: "run: directa daemon status",
-                    message: "ddirecta is still restoring supervised servers and is not serving requests yet")
+                    message: "the daemon is still restoring supervised servers and is not serving requests yet")
             }
             switch method {
             case .daemonInfo:
-                return try respond(id: head.id, result: daemonInfo())
+                return try respond(id: head.id, result: await daemonInfo())
             case .daemonShutdown:
                 let frame = try respond(id: head.id, result: WireEmpty())
                 Task { [weak self] in
@@ -170,6 +192,32 @@ public actor Router {
                 try await registry.setTrusted(
                     project: canonicalProjectPath(request.params.project))
                 return try respond(id: head.id, result: WireEmpty())
+            case .projectForget:
+                let request = try decoder.decode(WireRequest<ProjectOnlyParams>.self, from: line)
+                /** Canonicalized like every other arm: the recorded key is
+                    already canonical and canonicalizes to itself after its
+                    directory is gone, so the `project` string a prior
+                    `server.status` returned, or any spelling that resolves to
+                    it, reaches every piece of the teardown. */
+                let project = canonicalProjectPath(request.params.project)
+                guard await registry.project(project) != nil else {
+                    throw WireError(
+                        code: .notFound,
+                        hint: "run: directa status --json",
+                        message: "\(project) is not a project directa tracks")
+                }
+                guard !FileManager.default.fileExists(atPath: project) else {
+                    throw WireError(
+                        code: .projectStillExists,
+                        hint: "run: directa status --json",
+                        message: "\(project) still exists on disk; forgetting it would drop trust for a live checkout")
+                }
+                let servers = await forgetMissingProject(project)
+                return try respond(id: head.id, result: ProjectForgetResult(servers: servers))
+            case .logsRemoveOrphan:
+                let request = try decoder.decode(WireRequest<LogsRemoveOrphanParams>.self, from: line)
+                return try respond(
+                    id: head.id, result: await removeOrphanLogDirectory(named: request.params.directory))
             case .projectCheck:
                 let request = try decoder.decode(WireRequest<ProjectOnlyParams>.self, from: line)
                 let project = canonicalProjectPath(request.params.project)
@@ -188,6 +236,7 @@ public actor Router {
                             id: head.id, result: CheckResult(errors: ["cannot read \(url.path)"]))
                     }
                     let hosts = await effectiveHosts(project: project, view: view)
+                    let worktree = await CheckoutIdentity.worktreeDisplay(project: project)
                     return try respond(
                         id: head.id,
                         result: CheckResult(
@@ -196,7 +245,7 @@ public actor Router {
                             serverHosts: hosts.isEmpty ? nil : hosts,
                             servers: view.specs.map(\.name),
                             warnings: view.warnings,
-                            worktree: CheckoutIdentity.worktreeDisplay(project: project)?.label))
+                            worktree: worktree?.label))
                 } catch let error as WireError {
                     return try respond(id: head.id, result: CheckResult(errors: [error.message]))
                 }
@@ -228,8 +277,9 @@ public actor Router {
                 guard currentHash == request.params.baselineHash else {
                     throw WireError(
                         code: .configInvalid,
-                        hint: "reload the file and re-apply your edit",
-                        message: "devservers.json changed on disk since it was loaded (an editor or another session saved it)")
+                        message:
+                            "devservers.json changed on disk since it was loaded (an editor or another session saved it); reload it and re-apply your edit"
+                    )
                 }
                 let parsed: ProjectFileConfig
                 do {
@@ -267,7 +317,7 @@ public actor Router {
                     name: request.params.name, port: request.params.port,
                     project: canonicalProjectPath(request.params.project))
                 let supervisor = try await resolvedSupervisor(target)
-                let stopped = await supervisor.stop()
+                let stopped = await supervisor.stop(reason: "requested by stop")
                 DirectaLog.daemon.info("stop \(target.name)@\(target.project)")
                 return try respond(id: head.id, result: ServerResult(server: stopped))
             case .serverRestart:
@@ -276,7 +326,8 @@ public actor Router {
                 params.project = canonicalProjectPath(params.project)
                 return try respond(
                     id: head.id,
-                    result: try await restartServers(params, userInitiated: true))
+                    result: try await restartServers(
+                        params, reason: "requested by restart", userInitiated: true))
             case .serverWait:
                 let request = try decoder.decode(WireRequest<WaitParams>.self, from: line)
                 let target = ServerTargetParams(
@@ -310,30 +361,22 @@ public actor Router {
                 let target = ServerTargetParams(
                     name: request.params.name,
                     project: canonicalProjectPath(request.params.project))
+                if let refusal = request.params.refusal() { throw refusal }
                 let supervisor = try await resolvedSupervisor(target)
                 var since = request.params.since
                 if let markID = request.params.sinceMark {
                     guard let markDate = await supervisor.resolveMark(markID) else {
                         throw WireError(
                             code: .notFound,
-                            hint: "run: directa logs \(request.params.name) --stream mark",
+                            hint: "run: directa logs \(ShellWord.argument(request.params.name)) --stream mark",
                             message: "no mark with id '\(markID)' in \(request.params.name)'s log")
                     }
                     since = markDate
                 }
-                if let pattern = request.params.grep, let why = LogQuery.grepRejection(pattern) {
-                    throw WireError(
-                        code: .usage,
-                        hint: "fix the pattern, or drop --grep to see every line",
-                        message: "--grep is not a valid regular expression: \(why)")
-                }
-                let options = LogQueryOptions(
-                    grep: request.params.grep,
-                    since: since,
-                    streams: request.params.streams.map(Set.init),
-                    tail: request.params.tail)
-                let lines = await supervisor.logQuery(options)
-                return try respond(id: head.id, result: LogsQueryResult(lines: lines))
+                let window = await supervisor.logQuery(LogQueryOptions(request.params, since: since))
+                return try respond(
+                    id: head.id,
+                    result: LogsQueryResult(cursor: window.cursor, lines: window.lines, totals: window.totals))
             case .logsMark:
                 let request = try decoder.decode(WireRequest<MarkParams>.self, from: line)
                 let project = canonicalProjectPath(request.params.project)
@@ -354,6 +397,7 @@ public actor Router {
                 return try respond(id: head.id, result: MarkResult(marks: marks))
             case .eventsQuery:
                 let request = try decoder.decode(WireRequest<EventsQueryParams>.self, from: line)
+                if let refusal = request.params.refusal() { throw refusal }
                 /** Empty/nil project means machine-wide; only a real project path
                     is canonicalized, matching how EventStore.query keys the feed. */
                 let project = request.params.project.map(canonicalProjectPath)
@@ -382,13 +426,28 @@ public actor Router {
                 _ = try await resolvedSupervisor(target)
                 let merged = try await mergedSpecs(project: project)
                 var statuses: [String: ServerStatus] = [:]
-                var specsByName: [String: ServerSpec] = [:]
-                for spec in merged.specs {
-                    statuses[spec.name] = await annotatedStatus(
-                        project: project, spec: spec)
-                    specsByName[spec.name] = spec
+                for status in await annotatedStatuses(merged.specs.map { (project: project, spec: $0) }) {
+                    statuses[status.server] = status
                 }
+                let specsByName = Dictionary(uniqueKeysWithValues: merged.specs.map { ($0.name, $0) })
                 let paths = self.paths
+                /** One shot at the project's event history, read before the
+                    diagnosis runs rather than from inside a closure `describe`
+                    calls per server: `EventStore.query` is an actor method,
+                    `WhyEngine` stays a plain synchronous rule engine over data
+                    the caller already assembled. Read only when a server
+                    stopped by a signal, the one finding that consults it, since
+                    the query decodes the whole events log. Last write per
+                    server wins, which is the most recent `stopped` event since
+                    `query` returns oldest first. */
+                var lastStoppedDetail: [String: String] = [:]
+                if statuses.values.contains(where: { $0.phase == .stopped && $0.lastExit?.signal != nil }) {
+                    for event in await events.query(project: project) where event.kind == .stopped {
+                        if let detail = event.detail {
+                            lastStoppedDetail[event.server] = detail
+                        }
+                    }
+                }
                 let result = WhyEngine.diagnose(
                     target: request.params.name,
                     statuses: statuses,
@@ -404,7 +463,8 @@ public actor Router {
                             options: LogQueryOptions(
                                 since: since, streams: [.err, .out, .sys], tail: 40)
                         ).map(\.contextLine)
-                    })
+                    },
+                    lastStopDetail: { lastStoppedDetail[$0] })
                 return try respond(id: head.id, result: result)
             case .serverUnregister:
                 let request = try decoder.decode(WireRequest<ServerTargetParams>.self, from: line)
@@ -413,10 +473,49 @@ public actor Router {
                     or trailing-slash spelling from the app or a deep link
                     dropped the registry row and left the supervisor resident. */
                 let project = canonicalProjectPath(request.params.project)
-                try await registry.unregister(project: project, name: request.params.name)
-                supervisors[serverID(project: project, name: request.params.name)] = nil
-                await events.post(
-                    kind: .unregistered, project: project, server: request.params.name)
+                let name = request.params.name
+                /** A name declared only in the project's committed
+                    devservers.json was never written into the registry, so
+                    unregistering it is not the no-op `Registry.unregister`
+                    makes of it: the caller asked to remove something specific
+                    and nothing by that name is there to remove. */
+                guard await registry.spec(project: project, name: name) != nil else {
+                    throw WireError(
+                        code: .notFound,
+                        hint: "run: directa status --json",
+                        message: "'\(name)' is not registered as an ad hoc server for \(project)")
+                }
+                let id = serverID(project: project, name: name)
+                /** A server still running when it is unregistered must be
+                    stopped through the normal stop path first, awaiting its
+                    actual exit: dropping the supervisor while it keeps running
+                    leaves an unmanaged process alive. `stop()` no-ops
+                    instantly for one already terminal, so this costs nothing
+                    on the common path. Either way the row ends with no boot
+                    intent, or a server also declared in devservers.json comes
+                    back on the next daemon launch: a stop that gave up short
+                    of a terminal phase never reached the `recordOutcome` that
+                    clears it, so its row is retired; a finished one may have
+                    joined a restart's non-deliberate stop, which keeps it, so
+                    it is cleared. The supervisor is dropped before the registry
+                    write, so a failed write still leaves no removed supervisor
+                    resident to answer every later start of this name as
+                    stopped. */
+                let stopGaveUp =
+                    await removeSupervisor(
+                        id: id, name: name, project: project, reason: RemovalReason.unregistered)
+                    == .gaveUp
+                if !stopGaveUp {
+                    await clearBootIntent(name: name, project: project)
+                }
+                try await registry.unregister(project: project, name: name)
+                await events.post(kind: .unregistered, project: project, server: name)
+                /** A stop that gave up may leave the process still writing
+                    into the log directory, so it stays; doctor's leftover-log
+                    finding covers it once nothing claims it. */
+                if !stopGaveUp {
+                    await removeLogDirIfProjectIsForgotten(project)
+                }
                 return try respond(id: head.id, result: WireEmpty())
             }
         } catch let error as WireError {
@@ -436,77 +535,133 @@ public actor Router {
     public func drainAll() async {
         await withTaskGroup(of: Void.self) { group in
             for supervisor in supervisors.values {
-                group.addTask { _ = await supervisor.stop(deliberate: false) }
+                group.addTask {
+                    _ = await supervisor.stop(deliberate: false, reason: "daemon shutting down")
+                }
             }
         }
     }
 
-    /** Forget registered projects whose checkout path is gone: stop children,
-        bounce orphan pids, drop registry/state/locks/supervisors. Immediate at
-        boot and on machine-wide status; the timer sweep (`sweepMissingProjects`)
-        is the debounced variant. */
-    public func pruneMissingProjects() async {
-        for project in await registry.allProjects() {
-            if FileManager.default.fileExists(atPath: project) { continue }
-            await forgetMissingProject(project)
-        }
-    }
+    /** How long a project's checkout path must be observed continuously
+        missing before it is forgotten, and how often the daemon's timer sweep
+        checks: one rule for every automatic trigger (boot restore, machine-wide
+        status, the timer sweep), so a fast poller (the app's machine-wide
+        status, every 2s) cannot forget a project any sooner than the timer
+        sweep would, and a network mount blip or a slow unmount never costs a
+        project its trust and log history. */
+    public static let missingProjectSweepIntervalSeconds: Double = 30
 
-    /** Paths that failed the existence check on the previous sweep. A path must
-        be missing on two consecutive sweeps before teardown: a network mount or
-        a slow Finder move makes a path vanish for a moment, and a sweep that
-        runs unattended every 30 seconds must not tear down a live project on
-        one flaky stat. */
-    private var missingProjectStrikes: Set<String> = []
+    /** First-observed-missing timestamp per project path, cleared the moment a
+        stat succeeds again. Shared by every caller of `pruneMissingProjects`. */
+    private var missingProjectFirstMissedAt: [String: Date] = [:]
 
-    /** The timer-side sweep (ddirecta runs it every 30s after restore), so a
-        discarded worktree's servers stop within a minute of the checkout going
-        away instead of waiting for a machine-wide status or a reboot. */
+    /** Projects `forgetMissingProject` is tearing down right now. */
+    private var forgetting: Set<String> = []
+
+    /** Forget registered projects whose checkout path has been missing for at
+        least `missingProjectSweepIntervalSeconds`, continuously, across
+        however many callers ask: boot restore, machine-wide status, and the
+        timer sweep all funnel through this one debounced rule. Boot restore
+        is the first call of a daemon's life, so it can only record a first
+        miss, never forget. Forgetting stops children, bounces orphan pids,
+        and drops registry/state/locks/supervisors. `now` is a parameter
+        rather than `Date()` read inline so tests can move time forward
+        without sleeping. */
     @discardableResult
-    public func sweepMissingProjects() async -> Int {
+    public func pruneMissingProjects(now: Date = Date()) async -> Int {
         var pruned = 0
         let projects = await registry.allProjects()
-        missingProjectStrikes = missingProjectStrikes.filter { projects.contains($0) }
+        missingProjectFirstMissedAt = missingProjectFirstMissedAt.filter { projects.contains($0.key) }
         for project in projects {
-            if FileManager.default.fileExists(atPath: project) {
-                missingProjectStrikes.remove(project)
-                continue
+            let exists = FileManager.default.fileExists(atPath: project)
+            switch MissingProjectPolicy.decide(
+                exists: exists, firstMissedAt: missingProjectFirstMissedAt[project], now: now,
+                sweepIntervalSeconds: Self.missingProjectSweepIntervalSeconds)
+            {
+            case .present:
+                missingProjectFirstMissedAt[project] = nil
+            case .waiting(let since):
+                missingProjectFirstMissedAt[project] = since
+            case .forget:
+                missingProjectFirstMissedAt[project] = nil
+                await forgetMissingProject(project)
+                pruned += 1
             }
-            if !missingProjectStrikes.contains(project) {
-                missingProjectStrikes.insert(project)
-                continue
-            }
-            missingProjectStrikes.remove(project)
-            await forgetMissingProject(project)
-            pruned += 1
         }
         return pruned
     }
 
-    /** Startup recovery: prune vanished checkouts first, reconcile persisted
-        locks, then restore servers with boot intent. A recorded pid that is gone
-        becomes crashed(daemon-restart); a live orphan (its spool fd kept it
-        healthy while the daemon was away) is group-killed, since exit forensics
-        are unknowable for non-children. Never adopted silently. What comes back:
+    /** Startup recovery: record a first miss for each vanished checkout (the
+        forget itself waits for a later sweep), reconcile persisted locks,
+        then restore servers with boot intent. A recorded pid that is
+        still a registered launchd child job (agent mode only) is adopted: its
+        exit is re-watched through the shared `ExitWatcher` feeding
+        `recordOutcome`, and its health is re-monitored, so a jetsam SIGKILL of
+        the daemon no longer bounces a dev server that never actually died. A
+        recorded pid that is gone, or live but without a kernel start time
+        consistent with the recorded one (a recycled number), becomes
+        crashed(daemon-restart) and is never signaled; a proven live orphan
+        that is not a matching launchd child job (foreground/test mode, or a
+        pid launchd never knew about) is group-killed instead, since there is
+        no launchd job label to bootout once a fresh watch on it fires. A row
+        with no restore intent that still names a proven live run (a removal
+        whose stop gave up) is only bounced. What comes back:
         any server whose start intent survives (resumeOnBoot), which a machine
         shutdown's drain leaves set, plus the classic daemon-crash case of a
         phase left running/starting. A deliberate stop clears the flag, so only
         those stay down. Servers still paused under a live resource lock are left
-        alone: starting them would fight the harness.
+        alone: starting them would fight the harness. A server that would come
+        back but declares a resource a live holder owns joins that holder's
+        paused set (`waitUnderLiveLock`) and starts on its release. A restored
+        row reads `crashed` only when its run was live when the daemon died; a
+        row the drain left `stopped` stays `stopped`, including when its
+        restore is refused.
 
         Specs resolve through the merged view (devservers.json + ad-hoc registry),
         the same path ensure/status use. Config-defined servers are never written
         into registry.json, so a registry-only lookup would silently skip every
         committed server on boot. A rename/delete with no matching spec drops the
-        orphaned state row instead of retrying forever. */
+        orphaned state row instead of retrying forever.
+
+        Adoption bypasses `prepareSpawn`'s trust gate deliberately: it re-attaches
+        to a process a prior *trusted* daemon already spawned, acting on
+        `state.json` rather than re-materializing a project's committed config,
+        so it never opens the untrusted-config surface `userInitiated` guards.
+        `reconcileLocksAtStartup` above does not assume a supervised child is
+        dead: it only reconciles locks held by external harness processes, a
+        different identity than the server pid adoption re-attaches to. */
     public func recoverAtStartup() async {
         await pruneMissingProjects()
         await reconcileLocksAtStartup()
+        /** Loaded once per boot restore, not per server: `launchctl list` is a
+            shell-out, and every server's adoption check and the leftover-job
+            reap at the end need the same snapshot. Empty outside agent mode
+            (`agentJobs == nil`), which is what makes every match below fail
+            closed to the pre-existing bounce+respawn path; nil in agent mode
+            when launchd gave no answer, which defers instead. */
+        var listed: [LaunchdJobs.ChildJob]? = []
+        var adoptableChildJobs: [pid_t: LaunchdJobs.ChildJob] = [:]
+        if let agentJobs {
+            listed = await Self.childJobsForRecovery(agentJobs)
+            adoptableChildJobs = Dictionary(
+                (listed ?? []).compactMap { job in job.pid.map { ($0, job) } },
+                uniquingKeysWith: { first, _ in first })
+        }
         var toStart: [(project: String, spec: ServerSpec)] = []
         for (id, persisted) in await registry.allPersistedState() {
             guard let parsed = parseServerID(id) else { continue }
             let project = parsed.project
             let name = parsed.name
+            /** `pruneMissingProjects` above only forgets a path missing for a
+                full sweep interval, so a project on its first miss is still
+                here to iterate. Boot restore must never spawn (or adopt, or
+                bounce) a server for a project that is not on disk right now,
+                even mid-debounce: the automatic sweep will finish forgetting
+                it on its own schedule. */
+            guard FileManager.default.fileExists(atPath: project) else {
+                DirectaLog.daemon.info("recover skip \(name)@\(project): project path is missing")
+                continue
+            }
             let leftActive = persisted.phase == .running || persisted.phase == .starting
             let wantsRestore = persisted.resumeOnBoot ?? false
             guard persisted.pid != nil || leftActive || wantsRestore else { continue }
@@ -519,6 +674,15 @@ public actor Router {
             case .missing:
                 DirectaLog.daemon.info(
                     "recover skip \(name)@\(project): no matching spec (renamed or removed)")
+                /** Nothing will supervise this name again, so a recorded run
+                    still alive is bounced before its row goes, with the same
+                    start-time proof adoption needs: a recycled pid is left
+                    alone. */
+                if let identity = ProcessTree.provenIdentity(
+                    pid: persisted.pid, startedAt: persisted.startedAt)
+                {
+                    await bounceOrphan(identity, project: project, name: name)
+                }
                 try? await registry.removeState(serverID: id)
                 continue
             case .unavailable:
@@ -526,25 +690,76 @@ public actor Router {
                     "recover defer \(name)@\(project): config unreadable; keeping resume intent")
                 continue
             case .found(let spec):
-                if let pid = persisted.pid.flatMap(ProcessTree.narrowed),
-                    let identity = ProcessTree.identity(of: pid)
+                let restores = leftActive || wantsRestore
+                /** A bare pid match is not proof: the number may have been
+                    recycled during the daemon-down window (a reboot hands it
+                    to an unrelated app, and the pid space is only ~100k wide).
+                    Adopting or bouncing it is mutative, so both need the
+                    kernel start time to be consistent with the moment this
+                    pid was last recorded running. Without that proof the
+                    process is someone else's and is never signaled; the
+                    recorded run is treated as gone. */
+                if let identity = ProcessTree.provenIdentity(
+                    pid: persisted.pid, startedAt: persisted.startedAt)
                 {
+                    /** Without a job listing, whether this run is an adoptable
+                        child job is unknown, and bouncing it would stop a
+                        server recovery may well have kept. The row stays as
+                        it is for the next boot to decide. */
+                    if restores, listed == nil {
+                        DirectaLog.daemon.error(
+                            "recover defer \(name)@\(project): launchd's job list is unavailable; leaving live pid \(identity.pid) alone")
+                        continue
+                    }
+                    /** A row with no restore intent (a removal whose stop gave
+                        up retired it) keeps its pid only so its leftover run
+                        can be bounced here: it is never adopted or restarted. */
+                    if restores, let job = adoptableChildJobs[identity.pid],
+                        await adoptSurvivor(
+                            boundPort: persisted.boundPort, job: job, name: name, pid: identity.pid,
+                            project: project, spec: spec, startedAt: persisted.startedAt)
+                    {
+                        continue
+                    }
                     await bounceOrphan(identity, project: project, name: name)
                 } else if leftActive {
                     await events.post(
-                        kind: .crashed, project: project, server: name, detail: "daemon-restart")
+                        kind: .crashed, project: project, server: name,
+                        detail: DaemonRestartDetail.crashed)
                 }
-                try? await registry.updateState(serverID: id) { entry in
-                    entry.lastExit = entry.lastExit ?? LastExit(at: Date())
-                    entry.phase = .crashed
+                guard restores else {
+                    try? await registry.updateState(serverID: id, writer: .router) { entry in
+                        entry.pid = nil
+                        entry.startedAt = nil
+                    }
+                    continue
+                }
+                /** A row the daemon's own drain left `stopped` did not crash:
+                    it reads `stopped` until a start or a refusal says more.
+                    Any other phase here was live when the daemon died. */
+                let drained = persisted.phase == .stopped
+                try? await registry.updateState(serverID: id, writer: .router) { entry in
+                    if !drained {
+                        entry.lastExit = entry.lastExit ?? LastExit(at: Date())
+                        entry.phase = .crashed
+                    }
                     entry.pid = nil
+                    entry.startedAt = nil
                 }
-                if leftActive || wantsRestore {
-                    toStart.append((project: project, spec: spec))
-                }
+                toStart.append((project: project, spec: spec))
             }
         }
         for item in toStart {
+            /** Before the supervisor exists, which reads its first phase from
+                the row: a server waiting on a live holder reads `stopped`
+                even when its run was left active. */
+            let waiting = await waitUnderLiveLock(project: item.project, spec: item.spec)
+            if waiting {
+                try? await registry.updateState(
+                    serverID: serverID(project: item.project, name: item.spec.name), writer: .router
+                ) { $0.phase = .stopped }
+                continue
+            }
             let supervisor = await self.supervisor(project: item.project, spec: item.spec)
             do {
                 try await self.prepareSpawn(
@@ -570,6 +785,10 @@ public actor Router {
             guard let parsed = parseServerID(id) else { continue }
             let project = parsed.project
             let name = parsed.name
+            /** Same guard as the first pass: a project mid-debounce (missing,
+                but not yet forgotten) must not have its state rows read as
+                orphaned just because its config is unreadable right now. */
+            guard FileManager.default.fileExists(atPath: project) else { continue }
             if case .missing = await resolveSpecForRecover(project: project, name: name) {
                 DirectaLog.daemon.info("recover prune \(name)@\(project): orphaned state row")
                 try? await registry.removeState(serverID: id)
@@ -577,25 +796,94 @@ public actor Router {
         }
         /** SIGKILL of the agent (jetsam) skips LaunchdJobLauncher's defer
             bootout, so one-shot child labels accumulate in the gui domain.
-            Reap only when this process is that agent: tests and `--foreground`
-            never registered those jobs, and must not bootout the user's. */
-        if LaunchdJobLauncher.runningAsAgent {
+            Reap only when `agentJobs` is set: tests and `--foreground` never
+            registered those jobs and have no `AgentJobs` value to reap
+            through, so they never touch a real launchd domain, the user's
+            included. The listing is the one taken before restore, so a job a
+            restore started just now is never in it; `keepingPids` protects
+            every listed job a supervisor adopted. With no listing there is
+            nothing to judge stale. */
+        if let agentJobs, let listed {
             var keepingPids: Set<pid_t> = []
             for supervisor in supervisors.values {
                 if let pid = await supervisor.status().pid.flatMap(ProcessTree.narrowed) {
                     keepingPids.insert(pid)
                 }
             }
-            let reaped = LaunchdJobs.reapStaleChildJobs(keepingPids: keepingPids)
-            if reaped > 0 {
-                DirectaLog.daemon.info("reaped \(reaped) leftover child launchd job(s)")
+            let staleJobs = LaunchdJobs.stale(listed, keepingPids: keepingPids)
+            for job in staleJobs {
+                await agentJobs.bootOut(job)
+            }
+            if !staleJobs.isEmpty {
+                DirectaLog.daemon.info("reaped \(staleJobs.count) leftover child launchd job(s)")
             }
         }
     }
 
+    /** The child jobs recovery judges adoption and the leftover reap on, or
+        nil when `launchctl list` gave no answer twice: one retry covers a
+        launchd that was briefly slow at boot, and a second failure defers
+        every decision that needs the listing rather than reading it as "no
+        jobs", which would bounce every survivor recovery could have kept. */
+    private static func childJobsForRecovery(_ agentJobs: AgentJobs) async -> [LaunchdJobs.ChildJob]? {
+        for attempt in 1...2 {
+            switch await agentJobs.listChildJobs() {
+            case .listed(let jobs):
+                return jobs
+            case .unavailable(let reason):
+                DirectaLog.daemon.error("recover: launchd job list attempt \(attempt) of 2 failed: \(reason)")
+            }
+        }
+        return nil
+    }
+
+    /** Attaches a fresh supervisor to a launchd child job (`job`) that survived
+        the daemon's own jetsam SIGKILL, instead of the bounce+respawn
+        `recoverAtStartup` falls back to when nothing matches. Materializes the
+        spec exactly as `prepareSpawn` would for a fresh spawn (overlay, then
+        effective port, then `PortMaterializer`) but never claims or binds the
+        port: the live child already holds it. `boundPort`/`startedAt` come from
+        the persisted state so the adopted run keeps its rebind and its uptime.
+        Returns false when the spec's port claim no longer resolves (the error
+        `prepareSpawn` would refuse a spawn with) or the exit watch could not
+        be armed, which records no phase, pid, or state and sends the caller
+        down the same bounce+respawn path as a pid with no matching job. */
+    private func adoptSurvivor(
+        boundPort: Int?, job: LaunchdJobs.ChildJob, name: String, pid: pid_t, project: String,
+        spec: ServerSpec, startedAt: Date?
+    ) async -> Bool {
+        let overlaid = Self.overlaid(spec, project: project)
+        let declaredPort = overlaid.spec.port
+        let effective = overlaid.overlayPort ?? boundPort ?? declaredPort
+        let claim: PortClaim
+        do {
+            claim = try Self.claim(spec: overlaid.spec, effectivePort: effective)
+        } catch {
+            DirectaLog.daemon.error(
+                "recover adopt \(name)@\(project): \(error.message); bouncing pid \(pid) instead")
+            return false
+        }
+        let supervisor = await self.supervisor(project: project, spec: spec)
+        await materializeSpawnSpec(
+            overlaid.spec, claim: claim, declaredPort: declaredPort, effectivePort: effective,
+            on: supervisor)
+        guard await supervisor.adopt(
+            pid: pid, label: job.label, boundPort: boundPort, startedAt: startedAt)
+        else {
+            DirectaLog.daemon.error(
+                "recover adopt \(name)@\(project): cannot watch pid \(pid) for exit; bouncing it instead")
+            return false
+        }
+        DirectaLog.daemon.info(
+            "recover adopt \(name)@\(project): pid \(pid) still alive as \(job.label)")
+        return true
+    }
+
     /** Group-kill a live non-child left over from a prior daemon (or a prune that
-        could not stop through the supervisor). Signals only while the snapshotted
-        start time still matches: a recycled pid must not be killed. */
+        could not stop through the supervisor). `root` is read moments before
+        this call, so the identity checks here only cover the gap between that
+        read and each signal; a caller holding a pid from disk proves it first
+        with `ProcessTree.startTimeConsistent`, or a recycled pid is killed. */
     private func bounceOrphan(
         _ root: ProcessIdentity, project: String, name: String
     ) async {
@@ -607,49 +895,143 @@ public actor Router {
             return
         }
         let pid = root.pid
-        /** A server is spawned as a session leader (createSession), so its
-            session id is its own pid; sweeping the session as well as the parent
-            chain catches an orphan descendant that setpgid'd or setsid'd out of
-            the group, the same union stop() and the crash path use. */
-        let descendants = ProcessTree.liveDescendants(
-            rootPid: pid, sessionID: pid, snapshot: [])
-        ProcessTree.signalTree(
-            descendants: descendants, revalidate: true, rootIdentity: root, rootPid: pid,
-            signal: SIGTERM)
-        /** Poll with identity, not kill(pid,0): a recycled number must end the
-            wait as "gone" rather than escalate into the new process. A shorter
-            grace than an ordinary stop's 7s default: an orphan bounce runs during
+        /** The shape of the supervisor's stop. A server is spawned as a
+            session leader (createSession), so its session id is its own pid;
+            sweeping the session as well as the parent chain catches an orphan
+            descendant that setpgid'd or setsid'd out of the group, and the
+            root's unique id reaches one that also left the session and
+            reparented, the same union stop() and the crash path use. */
+        let candidates = ProcessTree.liveDescendants(rootPid: pid, rootIdentity: root, snapshot: [])
+        ProcessTree.signalTree(descendants: candidates, rootIdentity: root, signal: SIGTERM)
+        /** The grace ends early only once the root and every SIGTERM candidate
+            have exited, polled by identity so a recycled number reads as gone:
+            a descendant that ignores SIGTERM outlives a root that obeys it.
+            Shorter than an ordinary stop's grace: an orphan bounce runs during
             boot restore, where a prior daemon's leftover child should yield
             quickly so the fresh supervisor can claim the port. */
         let orphanBounceGraceSeconds = 2.0
         let graceDeadline = ContinuousClock.now.advanced(by: .seconds(orphanBounceGraceSeconds))
         while ContinuousClock.now < graceDeadline,
-            ProcessTree.shouldSignal(
-                snapshotted: root, live: ProcessTree.identity(of: pid))
+            ProcessTree.isRunning(root) || candidates.contains(where: ProcessTree.isRunning)
         {
             try? await Task.sleep(for: .milliseconds(50))
         }
-        if ProcessTree.shouldSignal(
-            snapshotted: root, live: ProcessTree.identity(of: pid))
-        {
-            ProcessTree.signalTree(
-                descendants: descendants, revalidate: true, rootIdentity: root, rootPid: pid,
-                signal: SIGKILL)
-        }
+        /** A fresh union, since a child may have appeared during the grace,
+            plus every SIGTERM candidate, since the root's exit may have hidden
+            one from every live source; each is signaled only while it still
+            names the identity recorded for it, and the group only while the
+            root does. */
+        ProcessTree.signalTree(
+            descendants: ProcessTree.liveDescendants(
+                rootPid: pid, rootIdentity: root, snapshot: [], priorCandidates: candidates),
+            rootIdentity: root, signal: SIGKILL)
         await events.post(
             kind: .crashed, project: project, server: name,
-            detail: "daemon-restart: orphan pid \(pid) bounced")
+            detail: DaemonRestartDetail.orphanBounced(pid: pid))
+    }
+
+    /** Stops a resident supervisor for removal and drops it from the pool,
+        retiring its state row when the stop gave up
+        (`retireRemovedState`). Nil when no supervisor was resident. */
+    private func removeSupervisor(
+        id: String, name: String, project: String, reason: String
+    ) async -> ServerSupervisor.RemovalOutcome? {
+        guard let supervisor = supervisors[id] else { return nil }
+        let outcome = await supervisor.stopForRemoval(reason: reason)
+        if outcome == .gaveUp {
+            await retireRemovedState(name: name, project: project, writer: supervisor.writerID)
+        }
+        supervisors[id] = nil
+        return outcome
+    }
+
+    /** Retires the state row of a supervisor whose removal stop gave up
+        (`Registry.retireState`) as stopped with no restore intent. The run's
+        pid and start time stay, so a later daemon launch can prove and bounce
+        a process that outlived the stop (`recoverAtStartup`). A save failure
+        is logged at error level, which persists, and the removal goes on: the
+        retirement already holds in memory, which is what refuses that
+        supervisor's late write for the rest of this daemon's life. */
+    private func retireRemovedState(name: String, project: String, writer: UUID) async {
+        let id = serverID(project: project, name: name)
+        var final = await registry.persistedState(serverID: id) ?? PersistedServerState()
+        final.phase = .stopped
+        final.resumeOnBoot = nil
+        do {
+            try await registry.retireState(serverID: id, final: final, writer: writer)
+        } catch {
+            DirectaLog.daemon.error(
+                "removing \(name)@\(project): could not save its retired state (\(error.localizedDescription)); the next daemon launch may try to restore it")
+        }
+    }
+
+    /** Clears resume-on-boot on a row that carries it, through the router's
+        own write. Never inserts a row. A save failure is logged at error
+        level and the unregister goes on, with the flag already cleared in
+        memory. */
+    private func clearBootIntent(name: String, project: String) async {
+        let id = serverID(project: project, name: name)
+        guard await registry.persistedState(serverID: id)?.resumeOnBoot != nil else { return }
+        do {
+            try await registry.updateState(serverID: id, writer: .router) { $0.resumeOnBoot = nil }
+        } catch {
+            DirectaLog.daemon.error(
+                "unregister \(name)@\(project): could not save its cleared restore-at-launch flag (\(error.localizedDescription)); the next daemon launch may try to restore it")
+        }
+    }
+
+    /** Removes a project's log directory once `serverUnregister` has dropped
+        its last ad hoc server AND nothing supervised is still resident for it.
+        The registry only tracks ad hoc servers and trust, not the config-defined
+        servers `devservers.json` declares, so a project can still have a live,
+        merely un-registered supervisor even after its registry row disappears;
+        deleting the directory out from under that supervisor's spool files
+        would be the exact bug this guards against. Never stops or signals
+        anything itself: a live supervisor means "not yet", not "force it". */
+    private func removeLogDirIfProjectIsForgotten(_ project: String) async {
+        guard await registry.project(project) == nil else { return }
+        let prefix = "\(project)::"
+        guard !supervisors.keys.contains(where: { $0.hasPrefix(prefix) }) else { return }
+        removeProjectLogDir(project)
+    }
+
+    /** Suppressed on purpose past the existence check: a permissions error or
+        a file another process still has open leaves the directory behind
+        rather than crashing the daemon over a cleanup step, and doctor's
+        orphan-log-dir finding catches whatever this leaves; but a genuine
+        failure must not vanish silently, so it is logged at error level
+        (which persists), and the common case of a project with no log
+        directory at all is not logged as one. */
+    private func removeProjectLogDir(_ project: String) {
+        let logDir = paths.projectLogDir(project: project)
+        guard FileManager.default.fileExists(atPath: logDir.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: logDir)
+        } catch {
+            DirectaLog.daemon.error(
+                "could not remove log directory for \(project): \(error.localizedDescription)")
+        }
     }
 
     /** Stop and forget one vanished checkout. Config is unreadable once the path
         is gone, so this walks supervisors + registry + state directly instead of
-        groupDown / mergedSpecs. `project` must be the registry key as stored
-        (already canonical at registration): re-canonicalizing a deleted path can
-        change `/private/var` ↔ `/var` spelling and miss every lookup. */
-    private func forgetMissingProject(_ project: String) async {
+        groupDown / mergedSpecs. `project` must be the canonical registry key,
+        since the supervisor, state, and lock matches below compare raw
+        strings. Returns the
+        sorted ad hoc and persisted-state server names it dropped, for a caller
+        (`project.forget`) that reports what actually happened rather than
+        assuming success. */
+    @discardableResult
+    private func forgetMissingProject(_ project: String) async -> [String] {
+        /** The teardown suspends in every server's stop, so a second forget of
+            the same project (the sweep and `project.forget`, or two requests)
+            can land mid-way; it does nothing and reports nothing rather than
+            stopping, retiring, and unregistering the same servers again. */
+        guard forgetting.insert(project).inserted else { return [] }
+        defer { forgetting.remove(project) }
         let prefix = "\(project)::"
         /** Snapshot identities before teardown: a composite tree can outlive a
-            no-op stop (phase already crashed/failed after the checkout vanished),
+            no-op stop (phase already crashed after the checkout vanished),
             so we keep the recorded ProcessIdentity and bounce only while that
             start time still matches. */
         var liveRoots: [(identity: ProcessIdentity, name: String)] = []
@@ -667,9 +1049,10 @@ public actor Router {
         for (id, persisted) in await registry.allPersistedState() where id.hasPrefix(prefix) {
             guard let name = parseServerID(id)?.name else { continue }
             names.insert(name)
-            if let pid = persisted.pid.flatMap(ProcessTree.narrowed),
-                let identity = ProcessTree.identity(of: pid),
-                !liveRoots.contains(where: { $0.identity.pid == pid })
+            /** A pid read from disk may have been recycled since it was
+                recorded, so it is bounced only with start-time proof. */
+            if let identity = ProcessTree.provenIdentity(pid: persisted.pid, startedAt: persisted.startedAt),
+                !liveRoots.contains(where: { $0.identity.pid == identity.pid })
             {
                 liveRoots.append((identity: identity, name: name))
             }
@@ -678,13 +1061,22 @@ public actor Router {
         DirectaLog.daemon.info(
             "prune missing project \(project) (\(sortedNames.joined(separator: ",")))")
         for name in sortedNames {
-            let id = serverID(project: project, name: name)
-            if let supervisor = supervisors[id] {
-                _ = await supervisor.stop()
+            /** `stop()` no-ops for a server already in a terminal phase
+                (recordOutcome never runs, so nothing posts its own `.stopped`
+                event). A live one's recordOutcome posts `.stopped` with this
+                same detail, either before the bounded stop returns or, for a
+                stop that gave up still `.stopping`, whenever the exit finally
+                lands; posting it here too would double the event. Only the
+                terminal case needs the manual post. A stop that gave up also
+                retires the row, so that late recordOutcome cannot recreate it
+                after `removeState` below. */
+            let outcome = await removeSupervisor(
+                id: serverID(project: project, name: name), name: name, project: project,
+                reason: RemovalReason.projectPathGone)
+            if outcome == .alreadyTerminal {
                 await events.post(
-                    kind: .stopped, project: project, server: name, detail: "project path gone")
+                    kind: .stopped, project: project, server: name, detail: RemovalReason.projectPathGone)
             }
-            supervisors[id] = nil
         }
         for entry in liveRoots {
             guard ProcessTree.shouldSignal(
@@ -702,10 +1094,16 @@ public actor Router {
         }
         try? await registry.removeState(forProject: project)
         try? await registry.removeProject(project)
+        /** Only here, after every supervisor above is stopped and dropped and
+            every live root bounced. Unlike unregister, a stop that gave up
+            does not keep the directory: the checkout is gone, so no project
+            will ever claim it again. */
+        removeProjectLogDir(project)
         for name in sortedNames {
             await events.post(
-                kind: .unregistered, project: project, server: name, detail: "project path gone")
+                kind: .unregistered, project: project, server: name, detail: RemovalReason.projectPathGone)
         }
+        return sortedNames
     }
 
     private enum RecoverSpec {
@@ -734,8 +1132,38 @@ public actor Router {
         }
     }
 
-    private func daemonInfo() -> DaemonInfo {
-        DaemonInfo(
+    /** Every registry project plus every project with a resident supervisor:
+        the set of projects the daemon claims, not the narrower set with a
+        currently readable config (a trusted project mid-edit on an invalid
+        devservers.json still claims its log directory). */
+    private func claimedProjects(registryProjects: [String]) -> Set<String> {
+        var claimed = Set(registryProjects)
+        for id in supervisors.keys {
+            if let parsed = parseServerID(id) { claimed.insert(parsed.project) }
+        }
+        return claimed
+    }
+
+    /** `logs.removeOrphan`: removes one leftover log directory while holding
+        the claim set. The registry read is the only suspension; from the
+        supervisor scan to `removeItem` the actor runs nothing else, and a
+        start creates a project's log directory only from a supervisor already
+        resident in `supervisors`, so a project started concurrently is either
+        claimed here or has not created its directory yet. */
+    private func removeOrphanLogDirectory(named name: String) async -> LogsRemoveOrphanResult {
+        let registryProjects = await registry.allProjects()
+        let claimed = claimedProjects(registryProjects: registryProjects)
+        let directory = paths.logsDir.appending(path: name)
+        let removal = OrphanProjectLogs.remove(
+            directory, logsDir: paths.logsDir,
+            claimedSlugDirs: DirectaPaths.projectLogDirNames(projects: claimed))
+        return LogsRemoveOrphanResult(path: directory, removal: removal)
+    }
+
+    private func daemonInfo() async -> DaemonInfo {
+        let claimed = claimedProjects(registryProjects: await registry.allProjects())
+        return DaemonInfo(
+            claimedProjects: claimed.sorted(),
             dataDir: paths.dataDir.path,
             daemonVersion: DirectaVersion.version,
             logsDir: paths.logsDir.path,
@@ -747,8 +1175,8 @@ public actor Router {
         )
     }
 
-    private func exitDaemon() {
-        exit(0)
+    private func exitDaemon() -> Never {
+        DaemonTelemetry.exit(code: 0, reason: "daemon.shutdown request")
     }
 
     /** Writes a devservers.json from what the daemon already knows, which is the
@@ -812,7 +1240,7 @@ public actor Router {
                 else {
                     throw WireError(
                         code: .alreadyExists,
-                        hint: "run: directa register --name \(name) --write --force",
+                        hint: "run: directa register --name \(ShellWord.argument(name)) --write --force",
                         message: "\(url.path) already declares '\(name)'; pass --force to replace that entry")
                 }
                 merged = next
@@ -841,13 +1269,14 @@ public actor Router {
         let data = try JSONCoding.fileEncoder().encode(config)
         let content = String(decoding: data, as: UTF8.self) + "\n"
         let hosts = await effectiveHosts(project: project, view: view)
+        let worktree = await CheckoutIdentity.worktreeDisplay(project: project)
         let check = CheckResult(
             errors: view.errors,
             host: view.host,
             serverHosts: hosts.isEmpty ? nil : hosts,
             servers: view.specs.map(\.name),
             warnings: view.warnings,
-            worktree: CheckoutIdentity.worktreeDisplay(project: project)?.label)
+            worktree: worktree?.label)
         guard params.dryRun != true else {
             return InitConfigResult(
                 check: check, content: content,
@@ -901,20 +1330,14 @@ public actor Router {
         force: Bool = false, userInitiated: Bool = false
     ) async throws {
         if !force {
+            /** Phase, not `hasLiveRun`: a live port-failed run still resolves
+                afresh, since `start` replaces it. */
             let current = await supervisor.status()
-            switch current.phase {
-            case .running, .starting, .stopping, .unhealthy:
-                return
-            case .crashed, .failed, .stopped:
-                break
-            }
+            if current.phase.isActive { return }
         }
         let merged = try await mergedSpecs(project: target.project)
-        guard var spec = merged.specs.first(where: { $0.name == target.name }) else {
-            throw WireError(
-                code: .notFound,
-                hint: "run: directa status --json",
-                message: "no server named '\(target.name)' in \(target.project)")
+        guard let committed = merged.specs.first(where: { $0.name == target.name }) else {
+            throw ProjectConfigLoader.serverNotFound(name: target.name, project: target.project)
         }
         if merged.fileNames.contains(target.name) {
             let trusted = await registry.isTrusted(project: target.project)
@@ -934,14 +1357,13 @@ public actor Router {
             } else if !trusted {
                 throw WireError(
                     code: .notTrusted,
-                    hint: "run: directa ensure \(target.name) --project \(target.project)",
+                    hint: "run: directa ensure \(ShellWord.argument(target.name)) --project \(ShellWord.argument(target.project))",
                     message:
                         "refusing to start '\(target.name)' from \(target.project)/devservers.json: this project's committed config has not been approved. Start a server there once by hand to approve it.")
             }
         }
-        let overlay = LocalOverlay.load(project: target.project)
-        let overlayServer = overlay?.servers?[target.name]
-        spec = LocalOverlay.apply(spec: spec, overlay: overlayServer, project: target.project)
+        let overlaid = Self.overlaid(committed, project: target.project)
+        let spec = overlaid.spec
         try await lockGate(project: target.project, spec: spec)
         /** The declared host stays the spawn host: a linked worktree keeps it
             (its name surfaces as a display label, never a subdomain), so URLs
@@ -949,142 +1371,171 @@ public actor Router {
         let declaredPort = spec.port
         let id = serverID(project: target.project, name: target.name)
         let persistedBound = await registry.persistedState(serverID: id)?.boundPort
-        var effective =
-            portOverride ?? overlayServer?.port ?? persistedBound ?? declaredPort
+        var effective = portOverride ?? overlaid.overlayPort ?? persistedBound ?? declaredPort
         var conflict: PortConflict?
+        /** Whether the claim at the final `effective` already passed the
+            pre-check below with no await since, so a second pass would only
+            repeat it. */
+        var claimChecked = false
         if let port = effective {
-            let targetID = id
-            let draft = PortClaim.resolve(spec: spec, effectivePort: port)
-            guard let draftClaim = draft.claim, draft.error == nil else {
-                throw WireError(
-                    code: .configInvalid, hint: "run: directa config check",
-                    message: draft.error ?? "invalid port claim")
-            }
-            if let busy = await firstBusyPort(in: draftClaim, excluding: targetID) {
-                let holder = await managedHolder(port: busy.port, excluding: targetID)
-                if let holder, CheckoutIdentity.shareCommonDir(target.project, holder.project),
-                    draftClaim.relative.contains(busy.port)
-                {
+            let draftClaim = try Self.claim(spec: spec, effectivePort: port)
+            let evidence = await portEvidence(for: draftClaim)
+            if let busy = await firstBusyPort(in: draftClaim, evidence: evidence, excluding: id) {
+                let holder = evidence.holds.holder(of: busy, excluding: id)
+                var holderIsSibling = false
+                if let holder, draftClaim.relative.contains(busy) {
+                    holderIsSibling = await CheckoutIdentity.shareCommonDir(target.project, holder.project)
+                }
+                if let holder, holderIsSibling {
                     let rebound = await allocateSiblingPort(
-                        declared: declaredPort ?? port, excluding: targetID, project: target.project,
-                        spec: spec)
+                        declared: declaredPort ?? port, excluding: id, holds: evidence.holds,
+                        project: target.project, spec: spec)
                     conflict = PortConflict(
                         declaredPort: declaredPort ?? port,
                         effectivePort: rebound,
                         holder: "\(holder.server)@\(holder.project)",
                         message:
-                            "port \(busy.port) held by sibling '\(holder.server)' in \(holder.project); rebound to \(rebound)",
+                            "port \(busy) held by sibling '\(holder.server)' in \(holder.project); rebound to \(rebound)",
                         state: .rebound)
                     effective = rebound
-                    try? await registry.updateState(serverID: id) { $0.boundPort = rebound }
+                    try? await registry.updateState(serverID: id, writer: .router) { $0.boundPort = rebound }
                 } else if let holder {
                     DirectaLog.daemon.error(
-                        "port-held \(busy.port) by \(holder.server)@\(holder.project) for \(target.name)")
+                        "port-held \(busy) by \(holder.server)@\(holder.project) for \(target.name)")
                     throw WireError(
                         code: .portHeld,
-                        hint: "run: directa stop \(holder.server) --project \(holder.project)",
+                        hint: "run: directa stop \(ShellWord.argument(holder.server)) --project \(ShellWord.argument(holder.project))",
                         message:
-                            "port \(busy.port) is held by managed server '\(holder.server)' in \(holder.project)"
-                    )
-                } else if let squatter = PortGuard.listenerInfo(port: busy.port) {
-                    throw WireError(
-                        code: .portHeld,
-                        hint: "run: kill \(squatter.pid)  (verify first: ps -p \(squatter.pid))",
-                        message:
-                            "port \(busy.port) is held by unmanaged pid \(squatter.pid) (\(squatter.command))"
+                            "port \(busy) is held by managed server '\(holder.server)' in \(holder.project)"
                     )
                 } else {
+                    let squatter = await portProbe.listenerInfo(busy)
+                    if let squatter {
+                        throw WireError(
+                            code: .portHeld,
+                            hint: "run: kill \(squatter.pid)  (verify first: ps -p \(squatter.pid))",
+                            message:
+                                "port \(busy) is held by unmanaged pid \(squatter.pid) (\(squatter.command))"
+                        )
+                    }
                     throw WireError(
                         code: .portHeld,
-                        message: "port \(busy.port) already has a listener that directa does not manage"
+                        message: "port \(busy) already has a listener that directa does not manage"
                     )
                 }
+            } else {
+                claimChecked = true
             }
         }
-        let resolved = PortClaim.resolve(spec: spec, effectivePort: effective)
+        let claim = try Self.claim(spec: spec, effectivePort: effective)
+        if !claimChecked {
+            let evidence = await portEvidence(for: claim)
+            if let busy = await firstBusyPort(in: claim, evidence: evidence, excluding: id) {
+                throw WireError(
+                    code: .portHeld,
+                    message: "port \(busy) is still busy after rebind resolution")
+            }
+        }
+        await materializeSpawnSpec(
+            spec, claim: claim, declaredPort: declaredPort, effectivePort: effective,
+            portConflict: conflict, on: supervisor)
+    }
+
+    /** `spec` with this checkout's `directa.local.json` entry for it applied,
+        and that entry's own port, which outranks a persisted rebind when the
+        effective port is chosen. */
+    private static func overlaid(_ spec: ServerSpec, project: String) -> (
+        overlayPort: Int?, spec: ServerSpec
+    ) {
+        let overlayServer = LocalOverlay.load(project: project)?.servers?[spec.name]
+        return (
+            overlayPort: overlayServer?.port,
+            spec: LocalOverlay.apply(spec: spec, overlay: overlayServer, project: project)
+        )
+    }
+
+    /** The ports a spawn at `effectivePort` claims, or config-invalid when the
+        spec's port declarations contradict each other there. */
+    private static func claim(spec: ServerSpec, effectivePort: Int?) throws(WireError) -> PortClaim {
+        let resolved = PortClaim.resolve(spec: spec, effectivePort: effectivePort)
         guard let claim = resolved.claim, resolved.error == nil else {
             throw WireError(
                 code: .configInvalid, hint: "run: directa config check",
                 message: resolved.error ?? "invalid port claim")
         }
-        if let busy = await firstBusyPort(in: claim, excluding: id) {
-            throw WireError(
-                code: .portHeld,
-                message: "port \(busy.port) is still busy after rebind resolution")
-        }
-        let materialized = PortMaterializer.materialize(spec: spec, effectivePort: effective)
-        await supervisor.updateSpec(materialized)
+        return claim
+    }
+
+    /** Hands a supervisor the spec it spawns or adopts under: the overlaid spec
+        with the effective port substituted (`PortMaterializer`), and the port
+        bookkeeping status reports. The one tail of `prepareSpawn` and
+        `adoptSurvivor`. */
+    private func materializeSpawnSpec(
+        _ spec: ServerSpec, claim: PortClaim, declaredPort: Int?, effectivePort: Int?,
+        portConflict: PortConflict? = nil, on supervisor: ServerSupervisor
+    ) async {
+        await supervisor.updateSpec(PortMaterializer.materialize(spec: spec, effectivePort: effectivePort))
         await supervisor.setPortMeta(
-            claim: claim, declaredPort: declaredPort, effectivePort: effective,
-            portConflict: conflict)
+            claim: claim, declaredPort: declaredPort, effectivePort: effectivePort,
+            portConflict: portConflict)
+    }
+
+    /** One port check's evidence: which of `claim`'s ports have a listener,
+        then every managed hold. Probed before the ownership read, never
+        after: every run has its phase set before it spawns, so a listener
+        seen here belongs to a run the read finds. Reading the phase first let
+        a run spawned between the read and the probe (a concurrent ensure of
+        this very server winning the single flight) look like an unmanaged
+        squatter. */
+    private func portEvidence(for claim: PortClaim) async -> (holds: ManagedHolds, listening: Set<Int>) {
+        var listening: Set<Int> = []
+        for port in claim.allPorts {
+            let isListening = await portProbe.isListening(port)
+            if isListening { listening.insert(port) }
+        }
+        return (holds: await managedHolds(), listening: listening)
     }
 
     /** First claimed port that is held (managed or unmanaged). Absolutes and
         relatives are treated the same for freeness; only sibling rebind cares
         which set a conflict came from. */
-    private func firstBusyPort(in claim: PortClaim, excluding targetID: String) async -> (
-        port: Int, managed: Bool
-    )? {
+    private func firstBusyPort(
+        in claim: PortClaim, evidence: (holds: ManagedHolds, listening: Set<Int>),
+        excluding targetID: String
+    ) async -> Int? {
+        var ownPorts: Set<Int>?
         for port in claim.allPorts {
-            if await managedHolder(port: port, excluding: targetID) != nil {
-                return (port: port, managed: true)
-            }
-            /** A listener the target itself owns is not a conflict for the
-                target: it is the run about to be replaced, or a sibling ensure
-                that just won the single flight. `managedHolder` excludes the
-                target by id, so without this the target's own socket falls
-                through to the unmanaged-squatter branch and one server reports
-                its own port as held. */
-            if await targetOwnsPort(port, id: targetID) { continue }
-            if PortGuard.isListening(port: port) {
-                return (port: port, managed: false)
-            }
+            if evidence.holds.holder(of: port, excluding: targetID) != nil { return port }
+            guard evidence.listening.contains(port) else { continue }
+            /** A listener the target itself holds is not a conflict for the
+                target: it is the run about to be replaced (`start` stops a
+                live port-failed run first), or a concurrent ensure that just
+                won the single flight. The holder lookup excludes the target
+                by id, so without this the target's own socket falls through
+                to the unmanaged-squatter branch. */
+            if ownPorts == nil { ownPorts = await heldPorts(id: targetID) }
+            if ownPorts?.contains(port) != true { return port }
         }
         return nil
     }
 
-    private func targetOwnsPort(_ port: Int, id: String) async -> Bool {
-        guard let supervisor = supervisors[id] else { return false }
-        let status = await supervisor.status()
-        switch status.phase {
-        case .running, .starting, .unhealthy:
-            break
-        case .crashed, .failed, .stopped, .stopping:
-            return false
-        }
-        return status.declaredPort == port || status.effectivePort == port
-            || status.observedPort == port || (status.ports?.values.contains(port) ?? false)
+    /** The ports one resident server holds right now; empty when it has no
+        supervisor or holds nothing. */
+    private func heldPorts(id: String) async -> Set<Int> {
+        guard let supervisor = supervisors[id] else { return [] }
+        let snapshot = await supervisor.portSnapshot()
+        return snapshot.status.heldPorts(claim: snapshot.claim)
     }
 
-    /** How many candidates a sibling rebind tries before giving up and handing
-        back the last one, which then fails the ordinary port-held way. A bound
-        rather than a budget: the search walks consecutive ports, so needing more
-        than this many means the range is genuinely full and a wider search would
-        only take longer to say so. */
-    private static let siblingRebindAttempts = 200
-
-    /** Where a rebind is allowed to land. Stays clear of the low ports a project
-        actually declares and stops short of the ephemeral range the kernel hands
-        to outbound connections, which a listener cannot hold reliably. */
-    private static let siblingPortRange = 10_000...65_000
-
+    /** The whole rebound block must clear every port a live managed server
+        holds, span members included, not only the ports it listens on. */
     private func allocateSiblingPort(
-        declared: Int, excluding: String, project: String, spec: ServerSpec
+        declared: Int, excluding targetID: String, holds: ManagedHolds, project: String,
+        spec: ServerSpec
     ) async -> Int {
-        var candidate = CheckoutIdentity.siblingPortCandidate(declared: declared, project: project)
-        for _ in 0..<Self.siblingRebindAttempts {
-            let resolved = PortClaim.resolve(spec: spec, effectivePort: candidate)
-            if let claim = resolved.claim, resolved.error == nil,
-                await firstBusyPort(in: claim, excluding: excluding) == nil
-            {
-                return candidate
-            }
-            candidate += 1
-            if candidate > Self.siblingPortRange.upperBound {
-                candidate = Self.siblingPortRange.lowerBound
-            }
-        }
-        return candidate
+        await SiblingRebind.search(
+            isListening: portProbe.isListening, reserved: holds.ports(excluding: targetID), spec: spec,
+            start: CheckoutIdentity.siblingPortCandidate(declared: declared, project: project))
     }
 
     /** Wait until every claimed port is free, or return the first still-busy port. */
@@ -1092,9 +1543,12 @@ public actor Router {
         let deadline = ContinuousClock.now.advanced(by: .seconds(budgetSeconds))
         while true {
             var busy: Int?
-            for port in claim.allPorts where PortGuard.isListening(port: port) {
-                busy = port
-                break
+            for port in claim.allPorts {
+                let listening = await portProbe.isListening(port)
+                if listening {
+                    busy = port
+                    break
+                }
             }
             if busy == nil { return nil }
             if ContinuousClock.now >= deadline { return busy }
@@ -1102,47 +1556,74 @@ public actor Router {
         }
     }
 
-    /** Which managed server holds `port`, if any. The resident supervisor pool
-        answers for servers this daemon has been asked about; state.json answers
-        for the rest, since the pool is built lazily and a server started before
-        this daemon's first request for it has no entry there at all. A persisted
-        row counts only while its recorded pid is still alive. */
-    private func managedHolder(port: Int, excluding targetID: String) async -> (
-        project: String, server: String
-    )? {
-        for (id, other) in supervisors where id != targetID {
-            let status = await other.status()
-            let active =
-                status.phase == .running || status.phase == .starting || status.phase == .unhealthy
-            if active,
-                status.effectivePort == port || status.declaredPort == port
-                    || status.observedPort == port
-                    || (status.ports?.values.contains(port) ?? false)
-            {
-                return (project: status.project, server: status.server)
+    /** One managed server and every port it holds right now. */
+    private struct ManagedHold: Sendable {
+        let id: String
+        let ports: Set<Int>
+        let project: String
+        let server: String
+    }
+
+    /** Every managed hold, read once per request and looked up by port. A
+        port maps to a list rather than one hold so a lookup can skip the
+        server the check is for, whichever request asks. */
+    private struct ManagedHolds: Sendable {
+        let byPort: [Int: [ManagedHold]]
+
+        init(_ holds: [ManagedHold]) {
+            var byPort: [Int: [ManagedHold]] = [:]
+            for hold in holds {
+                for port in hold.ports { byPort[port, default: []].append(hold) }
             }
+            self.byPort = byPort
         }
-        for (id, persisted) in await registry.allPersistedState() where id != targetID {
-            guard supervisors[id] == nil else { continue }
-            let active =
-                persisted.phase == .running || persisted.phase == .starting
-                || persisted.phase == .unhealthy
-            guard active, let pid = persisted.pid, ProcessTree.isAlive(pid) else { continue }
-            guard let parsed = parseServerID(id) else { continue }
-            let project = parsed.project
-            let name = parsed.name
-            guard let merged = try? await mergedSpecs(project: project),
-                let spec = merged.specs.first(where: { $0.name == name })
+
+        func holder(of port: Int, excluding id: String) -> ManagedHold? {
+            byPort[port]?.first { $0.id != id }
+        }
+
+        func ports(excluding id: String) -> Set<Int> {
+            Set(byPort.compactMap { port, holds in holds.contains { $0.id != id } ? port : nil })
+        }
+    }
+
+    /** Every managed server that holds ports right now, with the ports it
+        holds. The resident supervisor pool answers for servers this daemon has
+        been asked about; state.json answers for the rest, since the pool is
+        built lazily and a server started before this daemon's first request
+        for it has no entry there at all. A persisted row counts only while its
+        phase holds ports and its recorded pid is still alive. */
+    private func managedHolds() async -> ManagedHolds {
+        var holds: [ManagedHold] = []
+        for (id, other) in supervisors {
+            let snapshot = await other.portSnapshot()
+            let ports = snapshot.status.heldPorts(claim: snapshot.claim)
+            guard !ports.isEmpty else { continue }
+            holds.append(
+                ManagedHold(
+                    id: id, ports: ports, project: snapshot.status.project,
+                    server: snapshot.status.server))
+        }
+        var specsByProject: [String: [ServerSpec]] = [:]
+        for (id, persisted) in await registry.allPersistedState() {
+            guard supervisors[id] == nil, persisted.phase.holdsPort, let pid = persisted.pid,
+                ProcessTree.isAlive(pid), let parsed = parseServerID(id)
             else { continue }
-            let bound = persisted.boundPort ?? spec.port
-            let resolved = PortClaim.resolve(spec: spec, effectivePort: bound)
-            if let claim = resolved.claim, claim.allPorts.contains(port) {
-                return (project: project, server: name)
+            if specsByProject[parsed.project] == nil {
+                specsByProject[parsed.project] = (try? await mergedSpecs(project: parsed.project))?.specs ?? []
             }
-            guard bound == port else { continue }
-            return (project: project, server: name)
+            guard let committed = specsByProject[parsed.project]?.first(where: { $0.name == parsed.name })
+            else { continue }
+            /** The spec the run was spawned from: the checkout's overlay can
+                move its port and reshape its claim. */
+            let spec = Self.overlaid(committed, project: parsed.project).spec
+            let bound = persisted.boundPort ?? spec.port
+            let ports = Set(
+                PortClaim.resolve(spec: spec, effectivePort: bound).claim?.allPorts ?? bound.map { [$0] } ?? [])
+            guard !ports.isEmpty else { continue }
+            holds.append(ManagedHold(id: id, ports: ports, project: parsed.project, server: parsed.name))
         }
-        return nil
+        return ManagedHolds(holds)
     }
 
     /** The merged project view: committed devservers.json specs (source of
@@ -1201,9 +1682,9 @@ public actor Router {
         if let holder = resourceLocks[key], holder.pid != params.holderPid {
             throw WireError(
                 code: .resourceLocked,
-                hint: "wait for pid \(holder.pid) to finish, or verify it: ps -p \(holder.pid)",
+                hint: "run: ps -p \(holder.pid)",
                 message:
-                    "resource '\(params.resource)' is locked by pid \(holder.pid) since \(JSONCoding.formatISO8601(holder.since))"
+                    "resource '\(params.resource)' is locked by pid \(holder.pid) since \(JSONCoding.formatISO8601(holder.since)); wait for it to finish"
             )
         }
         /** Same holder re-acquiring (retry after a blip) keeps the existing pause
@@ -1236,24 +1717,21 @@ public actor Router {
         where LockResource.declares(resource: params.resource, spec: spec) {
             let supervisor = await supervisor(project: params.project, spec: spec)
             let status = await supervisor.status()
-            switch status.phase {
-            case .running, .starting, .unhealthy, .stopping:
-                guard shouldPause else {
-                    /** Sound for the whole hold: lockGate refuses to start a
-                        declarer while a live holder owns the resource, so this
-                        set can only shrink. */
-                    live.append(spec.name)
-                    continue
-                }
-                /** Non-retiring stop: boot intent survives so a daemon crash
-                    mid-hold can still bring the server back if the holder is gone. */
-                _ = await supervisor.stop(deliberate: false)
-                paused.append(spec.name)
-                DirectaLog.daemon.info(
-                    "lock \(params.resource) paused \(spec.name)@\(params.project)")
-            case .stopped, .crashed, .failed:
-                break
+            guard status.hasLiveRun else { continue }
+            guard shouldPause else {
+                /** Sound for the whole hold: lockGate refuses to start a
+                    declarer while a live holder owns the resource, so this set
+                    can only shrink. */
+                live.append(spec.name)
+                continue
             }
+            /** Non-retiring stop: boot intent survives so a daemon crash
+                mid-hold can still bring the server back if the holder is gone. */
+            _ = await supervisor.stop(
+                deliberate: false, reason: "paused for lock \(params.resource)")
+            paused.append(spec.name)
+            DirectaLog.daemon.info(
+                "lock \(params.resource) paused \(spec.name)@\(params.project)")
         }
         live.sort()
         paused.sort()
@@ -1325,6 +1803,8 @@ public actor Router {
             do {
                 let merged = try await mergedSpecs(project: project)
                 guard let spec = merged.specs.first(where: { $0.name == name }) else { continue }
+                let waiting = await waitUnderLiveLock(project: project, spec: spec)
+                if waiting { continue }
                 let supervisor = await supervisor(project: project, spec: spec)
                 let id = serverID(project: project, name: name)
                 let bound = await registry.persistedState(serverID: id)?.boundPort ?? spec.port
@@ -1362,6 +1842,41 @@ public actor Router {
         }
     }
 
+    /** Whether `spec` has to wait for a resource a live holder owns, and if so
+        the server is now in that holder's paused set, so the holder's release
+        starts it (`resumePaused`). Only the first held resource is joined: a
+        server declaring several resumes from each release in turn, and this
+        runs again before each start, so the next held one is joined then. A
+        dead holder is released on the way (`releaseOrphanedLock`), so a
+        resource only counts as held while its holder is alive. Both callers
+        are autonomous starts, so a server `prepareSpawn` would refuse at its
+        trust gate (committed config of a never-approved project) never
+        waits: it falls through to that refusal instead of being listed as
+        paused for a start that cannot come. */
+    private func waitUnderLiveLock(project: String, spec: ServerSpec) async -> Bool {
+        guard let merged = try? await mergedSpecs(project: project) else { return false }
+        if merged.fileNames.contains(spec.name) {
+            let trusted = await registry.isTrusted(project: project)
+            if !trusted { return false }
+        }
+        for declaration in spec.locks ?? [] {
+            let resource = declaration.name
+            let key = Self.lockKey(project: project, resource: resource)
+            await releaseOrphanedLock(key: key)
+            guard var holder = resourceLocks[key] else { continue }
+            if !holder.paused.contains(spec.name) {
+                holder.paused.append(spec.name)
+                resourceLocks[key] = holder
+                persistLocks()
+            }
+            DirectaLog.daemon.info(
+                "recover wait \(spec.name)@\(project): resource '\(resource)' is locked by pid \(holder.pid); starts when it is released"
+            )
+            return true
+        }
+        return false
+    }
+
     private func isPausedUnderLiveLock(project: String, name: String) -> Bool {
         let prefix = "\(canonicalProjectPath(project))::"
         for (key, holder) in resourceLocks {
@@ -1389,9 +1904,9 @@ public actor Router {
             if let holder = resourceLocks[key] {
                 throw WireError(
                     code: .resourceLocked,
-                    hint: "the holder releases it when done; check: ps -p \(holder.pid)",
+                    hint: "run: ps -p \(holder.pid)",
                     message:
-                        "server '\(spec.name)' holds resource '\(resource)', locked by pid \(holder.pid) since \(JSONCoding.formatISO8601(holder.since))"
+                        "server '\(spec.name)' holds resource '\(resource)', locked by pid \(holder.pid) since \(JSONCoding.formatISO8601(holder.since)); it is released when the holder finishes"
                 )
             }
         }
@@ -1400,11 +1915,7 @@ public actor Router {
     private func resolvedSupervisor(_ params: ServerTargetParams) async throws -> ServerSupervisor {
         let merged = try await mergedSpecs(project: params.project)
         guard let spec = merged.specs.first(where: { $0.name == params.name }) else {
-            throw WireError(
-                code: .notFound,
-                hint: "run: directa status --json",
-                message: "no server named '\(params.name)' is registered for \(params.project)"
-            )
+            throw ProjectConfigLoader.serverNotFound(name: params.name, project: params.project)
         }
         return await supervisor(project: params.project, spec: spec)
     }
@@ -1414,7 +1925,7 @@ public actor Router {
             machine-wide reads skip config errors rather than failing the sweep. */
         if params.project.isEmpty {
             await pruneMissingProjects()
-            var statuses: [ServerStatus] = []
+            var targets: [(project: String, spec: ServerSpec)] = []
             for project in await registry.allProjects() {
                 var specs = (try? await mergedSpecs(project: project))?.specs
                 if specs == nil {
@@ -1423,56 +1934,97 @@ public actor Router {
                 guard let specs else { continue }
                 for spec in specs {
                     if let name = params.name, name != spec.name { continue }
-                    statuses.append(await annotatedStatus(project: project, spec: spec))
+                    targets.append((project: project, spec: spec))
                 }
             }
-            return ServerListResult(servers: statuses)
+            return ServerListResult(servers: await annotatedStatuses(targets))
         }
         let merged = try await mergedSpecs(project: params.project)
-        var statuses: [ServerStatus] = []
-        for spec in merged.specs {
-            if let name = params.name, name != spec.name { continue }
-            statuses.append(await annotatedStatus(project: params.project, spec: spec))
-        }
+        let targets = merged.specs
+            .filter { params.name == nil || params.name == $0.name }
+            .map { (project: params.project, spec: $0) }
         return ServerListResult(
-            servers: statuses, trusted: await registry.isTrusted(project: params.project))
+            servers: await annotatedStatuses(targets),
+            trusted: await registry.isTrusted(project: params.project))
     }
 
-    /** The supported way to read a status for a response: every reader gets the
+    /** The supported way to read statuses for a response: every reader gets the
         latent-port-conflict annotation. A handler that calls `supervisor.status()`
         directly reports a stopped server without naming the holder keeping it
-        down, so route status reads through here. */
-    private func annotatedStatus(project: String, spec: ServerSpec) async -> ServerStatus {
-        let status = await supervisor(project: project, spec: spec).status()
-        return await annotateLatentPortConflict(
-            status, excluding: serverID(project: project, name: spec.name))
+        down, so route status reads through here. The ports are probed and the
+        managed holds read once for the whole list, in the order `portEvidence`
+        gives, rather than once per server. */
+    private func annotatedStatuses(_ targets: [(project: String, spec: ServerSpec)]) async -> [ServerStatus] {
+        var statuses: [ServerStatus] = []
+        for target in targets {
+            statuses.append(await supervisor(project: target.project, spec: target.spec).status())
+        }
+        let latentPorts = Set(statuses.compactMap(Self.latentConflictPort))
+        guard !latentPorts.isEmpty else { return statuses }
+        var listening: Set<Int> = []
+        for port in latentPorts {
+            let isListening = await portProbe.isListening(port)
+            if isListening { listening.insert(port) }
+        }
+        let holds = await managedHolds()
+        var commonDirs: [String: String?] = [:]
+        var annotated: [ServerStatus] = []
+        for status in statuses {
+            annotated.append(
+                await annotateLatentPortConflict(
+                    status, commonDirs: &commonDirs, holds: holds, listening: listening))
+        }
+        return annotated
+    }
+
+    /** `CheckoutIdentity.shareCommonDir` with each project's answer read
+        once per `memo`. A checkout root answers from files, but a project
+        below its checkout's root still runs git, and one status read can
+        annotate many servers against the same holder. Scoped to one request
+        on purpose: a checkout can become or stop being a worktree between
+        requests, and nothing signals that. */
+    private static func sharesCommonDir(_ a: String, _ b: String, memo: inout [String: String?]) async -> Bool {
+        guard let left = await commonDir(a, memo: &memo), let right = await commonDir(b, memo: &memo) else {
+            return false
+        }
+        return left == right
+    }
+
+    private static func commonDir(_ project: String, memo: inout [String: String?]) async -> String? {
+        if let known = memo[project] { return known }
+        let found = await CheckoutIdentity.gitCommonDir(project: project)
+        memo[project] = .some(found)
+        return found
+    }
+
+    /** The port a latent conflict is judged on: set only for a server that is
+        not up and has no conflict recorded already. */
+    private static func latentConflictPort(_ status: ServerStatus) -> Int? {
+        guard status.portConflict == nil, !status.hasLiveRun else { return nil }
+        return status.declaredPort ?? status.effectivePort
     }
 
     /** When a server is not up but its declared port is held, surface a latent
         conflict so session context warns before the agent runs ensure. */
-    private func annotateLatentPortConflict(_ status: ServerStatus, excluding: String) async -> ServerStatus {
-        guard status.portConflict == nil else { return status }
-        switch status.phase {
-        case .stopped, .crashed, .failed:
-            break
-        case .running, .starting, .stopping, .unhealthy:
-            return status
-        }
-        guard let port = status.declaredPort ?? status.effectivePort else { return status }
+    private func annotateLatentPortConflict(
+        _ status: ServerStatus, commonDirs: inout [String: String?], holds: ManagedHolds, listening: Set<Int>
+    ) async -> ServerStatus {
+        guard let port = Self.latentConflictPort(status) else { return status }
         var annotated = status
-        if let holder = await managedHolder(port: port, excluding: excluding) {
-            let sibling = CheckoutIdentity.shareCommonDir(status.project, holder.project)
+        if let holder = holds.holder(
+            of: port, excluding: serverID(project: status.project, name: status.server))
+        {
+            let sibling = await Self.sharesCommonDir(status.project, holder.project, memo: &commonDirs)
             annotated.portConflict = PortConflict(
                 declaredPort: port,
                 holder: "\(holder.server)@\(holder.project)",
                 message: sibling
                     ? "port \(port) held by sibling '\(holder.server)' in \(holder.project); ensure will auto-rebind"
-                    : "port \(port) held by '\(holder.server)' in \(holder.project); run: directa stop \(holder.server) --project \(holder.project)",
+                    : "port \(port) held by '\(holder.server)' in \(holder.project); run: directa stop \(ShellWord.argument(holder.server)) --project \(ShellWord.argument(holder.project))",
                 state: .held)
-        } else if PortGuard.isListening(port: port) {
-            let detail = PortGuard.listenerInfo(port: port).map {
-                "unmanaged pid \($0.pid) (\($0.command))"
-            } ?? "an unmanaged listener"
+        } else if listening.contains(port) {
+            let listener = await portProbe.listenerInfo(port)
+            let detail = listener.map { "unmanaged pid \($0.pid) (\($0.command))" } ?? "an unmanaged listener"
             annotated.portConflict = PortConflict(
                 declaredPort: port,
                 holder: detail,
@@ -1488,16 +2040,13 @@ public actor Router {
         non-retiring because the server is coming straight back, so resume-on-boot
         survives what `stop` would otherwise clear. */
     private func restartServers(
-        _ params: RestartParams, rearm: Bool = true, userInitiated: Bool = false
+        _ params: RestartParams, rearm: Bool = true, reason: String, userInitiated: Bool = false
     ) async throws -> GroupResult {
         let merged = try await mergedSpecs(project: params.project)
         var wanted = merged.specs
         if let names = params.names {
             for name in names where !merged.specs.contains(where: { $0.name == name }) {
-                throw WireError(
-                    code: .notFound,
-                    hint: "run: directa status --json",
-                    message: "no server named '\(name)' in \(params.project)")
+                throw ProjectConfigLoader.serverNotFound(name: name, project: params.project)
             }
             wanted = merged.specs.filter { names.contains($0.name) }
         }
@@ -1527,8 +2076,13 @@ public actor Router {
                 reads it, and clearing it here made that a no-op for every
                 refusal raised after this point. */
             if rearm { await entry.supervisor.rearmWatch() }
-            _ = await entry.supervisor.stop(deliberate: false)
-            results.append(await entry.supervisor.ensure(timeoutSeconds: params.timeoutSeconds))
+            let activity = DaemonActivity.shared.begin(
+                .restart, label: "\(serverID(project: params.project, name: entry.spec.name)): \(reason)")
+            _ = await entry.supervisor.stop(deliberate: false, reason: reason)
+            let restarted = await entry.supervisor.ensure(timeoutSeconds: params.timeoutSeconds)
+            DaemonActivity.shared.end(
+                activity, outcome: restarted.reason?.rawValue ?? restarted.server.phase.rawValue)
+            results.append(restarted)
             DirectaLog.daemon.info("restart \(entry.spec.name)@\(params.project)")
         }
         return GroupResult(results: results.sorted { $0.server.server < $1.server.server })
@@ -1545,14 +2099,24 @@ public actor Router {
                 continue
             }
             guard let split = parseServerID(id) else { continue }
+            /** `changed` comes out of WatchPaths.resolve, which builds both the
+                project root and every watched path through `.standardizedFileURL`;
+                for a real, existing project directory that quietly rewrites a
+                `/private/var` (or `/private/tmp`, `/private/etc`) prefix to its
+                shorter symlinked form. Stripping against `split.project` (built by
+                the fuller `canonicalProjectPath`, which keeps the `/private`
+                spelling) would silently fail to match and leave the reason
+                showing the whole absolute path, so the prefix is rebuilt with the
+                exact same standardization WatchPaths used. */
+            let projectRoot = URL(fileURLWithPath: split.project).standardizedFileURL.path
             let relative = changed.map {
-                $0.replacingOccurrences(of: split.project + "/", with: "")
+                $0.replacingOccurrences(of: projectRoot + "/", with: "")
             }
             do {
                 _ = try await restartServers(
                     RestartParams(
                         names: [split.name], project: split.project, timeoutSeconds: 60),
-                    rearm: false)
+                    rearm: false, reason: "watch change in \(relative.joined(separator: ", "))")
                 await supervisor.recordWatchRestart(now)
                 restarted.append(id)
                 DirectaLog.daemon.info(
@@ -1671,7 +2235,7 @@ public actor Router {
                                 server: ServerStatus(logPath: "", phase: .stopped, project: params.project, server: name))
                         }
                         let supervisor = await self.supervisor(project: params.project, spec: spec)
-                        return EnsureResult(server: await supervisor.stop())
+                        return EnsureResult(server: await supervisor.stop(reason: "requested by down"))
                     }
                 }
                 var collected: [EnsureResult] = []
@@ -1692,17 +2256,23 @@ public actor Router {
                 status must not clobber that, or agents see the committed port in
                 status while the child listens on the rebind, and a stale flag
                 fires for a config that matches what was actually spawned. */
-            switch await existing.status().phase {
-            case .running, .starting, .unhealthy, .stopping:
-                break
-            case .stopped, .crashed, .failed:
+            let current = await existing.status()
+            if !current.hasLiveRun {
                 await existing.updateSpec(spec)
             }
             return existing
         }
+        let worktree = await CheckoutIdentity.worktreeDisplay(project: project)
+        /** The git read above suspends this actor, so a concurrent call for
+            the same server may have created its supervisor meanwhile; that
+            one wins and goes through the existing-supervisor path, so one
+            server never has two supervisors. */
+        if supervisors[id] != nil {
+            return await supervisor(project: project, spec: spec)
+        }
         let created = ServerSupervisor(
             events: events, launcher: launcher, paths: paths, projectPath: project,
-            registry: registry, spec: spec)
+            registry: registry, spec: spec, stopTiming: stopTiming, worktree: worktree)
         supervisors[id] = created
         return created
     }
@@ -1717,11 +2287,9 @@ public actor Router {
     never blocks the connection. */
 public final class ControlServer: Sendable {
     private let listener: NWListener
-    private let router: Router
     private let socketPath: String
 
     public init(router: Router, socketPath: String) throws {
-        self.router = router
         self.socketPath = socketPath
         let socketDir = (socketPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(
@@ -1744,6 +2312,15 @@ public final class ControlServer: Sendable {
         a slow start and a daemon that will never serve, and crossing it means
         the process exits so launchd can try a clean one. */
     static let listenerReadySeconds = 10.0
+
+    /** Ceiling on one pending (not yet newline-terminated) request line. The
+        largest legitimate request is a `project.writeConfig` carrying a whole
+        devservers.json, which is a handful of KB even for a large monorepo; 1
+        MiB is generous headroom above that while still bounding how much a
+        client streaming bytes with no newline can grow the daemon's memory.
+        The client side is never capped: a `directa logs` response with no
+        `--tail` can legitimately run tens of MB. */
+    static let maxPendingRequestBytes = 1 << 20
 
     /** Returns when the listener is actually accepting, which is later than
         `NWListener.start` returns: start is asynchronous, and the socket path is
@@ -1789,7 +2366,7 @@ public final class ControlServer: Sendable {
                         code: .internalError,
                         hint: "run: directa doctor",
                         message:
-                            "ddirecta could not start listening on \(socketPath) (listener state: \(stuck))"
+                            "the daemon could not start listening on \(socketPath) (listener state: \(stuck))"
                     ))
             }
             listener.stateUpdateHandler = { state in
@@ -1846,11 +2423,12 @@ public final class ControlServer: Sendable {
                 }
                 connection.cancel()
             case .cancelled:
-                break
+                DaemonActivity.shared.clientDisconnected()
             default:
                 break
             }
         }
+        DaemonActivity.shared.clientConnected()
         connection.start(queue: queue)
         let hello = try? NDJSON.encodeLine(
             WireEvent(
@@ -1869,11 +2447,40 @@ public final class ControlServer: Sendable {
             var advanced = buffer
             if let data, !data.isEmpty {
                 for line in advanced.feed(data) {
+                    /** Begun here, on the connection queue, so a request still
+                        waiting for a pool thread is counted with its age. */
+                    let head = try? JSONCoding.decoder().decode(WireRequestHead.self, from: line)
+                    let activity = DaemonActivity.shared.begin(.request, label: head?.method ?? "unparseable")
                     Task {
-                        let response = await router.handle(line: line)
+                        let response = await router.handle(line: line, head: head)
                         connection.send(content: response, completion: .contentProcessed { _ in })
+                        DaemonActivity.shared.end(activity)
                     }
                 }
+            }
+            /** A client streaming bytes with no newline would otherwise grow
+                this connection's buffer without limit; no request this daemon
+                serves comes anywhere near the cap, so reaching it means the
+                frame will never complete and the connection is refused rather
+                than left to grow forever. No request id is known yet (nothing
+                has framed), the same posture `handle(line:)` takes for an
+                unparseable frame. */
+            if advanced.pendingByteCount > maxPendingRequestBytes {
+                let refusal =
+                    (try? NDJSON.encodeLine(
+                        WireResponse<WireEmpty>(
+                            error: WireError(
+                                code: .requestTooLarge,
+                                /** No hint: the cause is a client writing raw
+                                    NDJSON to the socket without a directa
+                                    command to run as the fix (the CLI and app
+                                    never trigger this), so a literal
+                                    remediation command would be dishonest. */
+                                message: "request line exceeded \(maxPendingRequestBytes) bytes with no newline"),
+                            id: "?", ok: false))) ?? Data()
+                connection.send(
+                    content: refusal, completion: .contentProcessed { _ in connection.cancel() })
+                return
             }
             if isComplete || error != nil {
                 connection.cancel()

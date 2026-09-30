@@ -10,16 +10,29 @@ public enum LaunchdJobs {
     public static let childLabelPrefix = "dev.quantizor.directa.job."
     public static var guiDomain: String { "gui/\(getuid())" }
 
-    public struct AgentStatus: Equatable, Sendable {
+    /** One job's `launchctl print` fields: the agent's own, or a child job's. */
+    public struct JobStatus: Equatable, Sendable {
+        /** `last exit code`, the leading number of `64: EX_USAGE` and the like;
+            nil while the job has never exited (launchd prints `(never
+            exited)`) and for a death launchd reports only as a terminating
+            signal. */
+        public var lastExitCode: Int?
         public var lastExitReason: String?
+        /** The signal number of `last terminating signal = Killed: 9`, which
+            launchd prints in place of an exit code for a job a signal ended. */
+        public var lastTerminatingSignal: Int?
         public var pid: pid_t?
         public var runs: Int?
         public var state: String?
 
         public init(
-            lastExitReason: String? = nil, pid: pid_t? = nil, runs: Int? = nil, state: String? = nil
+            lastExitCode: Int? = nil, lastExitReason: String? = nil,
+            lastTerminatingSignal: Int? = nil, pid: pid_t? = nil, runs: Int? = nil,
+            state: String? = nil
         ) {
+            self.lastExitCode = lastExitCode
             self.lastExitReason = lastExitReason
+            self.lastTerminatingSignal = lastTerminatingSignal
             self.pid = pid
             self.runs = runs
             self.state = state
@@ -32,20 +45,18 @@ public enum LaunchdJobs {
 
     public struct ChildJob: Equatable, Sendable {
         public var label: String
-        public var lastExitStatus: Int32?
         public var pid: pid_t?
 
-        public init(label: String, lastExitStatus: Int32? = nil, pid: pid_t? = nil) {
+        public init(label: String, pid: pid_t? = nil) {
             self.label = label
-            self.lastExitStatus = lastExitStatus
             self.pid = pid
         }
     }
 
-    /** `launchctl print gui/$UID/dev.quantizor.directa`. First `state` / `pid`
-        at the job level; later coalition blocks repeat `state = active`. */
-    public static func parseAgentPrint(_ output: String) -> AgentStatus {
-        var status = AgentStatus()
+    /** `launchctl print gui/$UID/<label>`. First `state` / `pid` at the job
+        level; later coalition blocks repeat `state = active`. */
+    public static func parseJobPrint(_ output: String) -> JobStatus {
+        var status = JobStatus()
         for line in output.split(separator: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if status.state == nil, trimmed.hasPrefix("state =") {
@@ -57,6 +68,18 @@ public enum LaunchdJobs {
             } else if status.runs == nil, trimmed.hasPrefix("runs =") {
                 let number = trimmed.dropFirst("runs =".count).trimmingCharacters(in: .whitespaces)
                 status.runs = Int(number)
+            } else if status.lastExitCode == nil, trimmed.hasPrefix("last exit code =") {
+                let value = trimmed.dropFirst("last exit code =".count).trimmingCharacters(
+                    in: .whitespaces)
+                status.lastExitCode = Int(value.prefix { $0 == "-" || $0.isASCII && $0.isNumber })
+            } else if status.lastTerminatingSignal == nil,
+                trimmed.hasPrefix("last terminating signal =")
+            {
+                let value = trimmed.dropFirst("last terminating signal =".count)
+                let number = value.split(separator: ":").last.map {
+                    $0.trimmingCharacters(in: .whitespaces)
+                }
+                status.lastTerminatingSignal = number.flatMap { Int($0) }
             } else if status.lastExitReason == nil, trimmed.hasPrefix("last exit reason =") {
                 status.lastExitReason = String(trimmed.dropFirst("last exit reason =".count))
                     .trimmingCharacters(in: .whitespaces)
@@ -79,12 +102,7 @@ public enum LaunchdJobs {
                 guard raw != "-", let parsed = pid_t(raw), parsed > 0 else { return nil }
                 return parsed
             }()
-            let lastExitStatus: Int32? = {
-                let raw = parts[1]
-                guard raw != "-" else { return nil }
-                return Int32(raw)
-            }()
-            jobs.append(ChildJob(label: label, lastExitStatus: lastExitStatus, pid: pid))
+            jobs.append(ChildJob(label: label, pid: pid))
         }
         return jobs
     }
@@ -99,32 +117,103 @@ public enum LaunchdJobs {
         }
     }
 
-    public static func loadAgentStatus() -> AgentStatus? {
-        let printed = LaunchdAdmin.shell(
-            "/bin/launchctl", ["print", "\(guiDomain)/\(LaunchdAdmin.label)"])
-        guard printed.status == 0 else { return nil }
-        return parseAgentPrint(printed.output)
+    public static func loadAgentStatus() -> JobStatus? {
+        printJob(label: LaunchdAdmin.label)
     }
 
-    public static func loadChildJobs() -> [ChildJob] {
-        let listed = LaunchdAdmin.shell("/bin/launchctl", ["list"])
-        guard listed.status == 0 else { return [] }
-        return parseChildJobs(fromList: listed.output)
-    }
+    /** What one `launchctl print` of a job found. */
+    public enum JobPrint: Equatable, Sendable {
+        /** launchd has no such job, or launchctl exited nonzero or could not
+            start: an answer, so a caller that is waiting for the job to show
+            a state asks again. */
+        case absent
+        case found(JobStatus)
+        /** launchctl outlived its deadline or wrote past the output cap and
+            was killed: launchd gave no answer, and asking again costs another
+            whole deadline, so a polling caller stops. */
+        case unresponsive
 
-    /** Boot out leftover child jobs. Returns how many bootouts ran. Never
-        touches the agent label. Caller must pass the live supervisor pids so a
-        running server is not torn down. */
-    @discardableResult
-    public static func reapStaleChildJobs(keepingPids: Set<pid_t>) -> Int {
-        let staleJobs = stale(loadChildJobs(), keepingPids: keepingPids)
-        guard !staleJobs.isEmpty else { return 0 }
-        let domain = guiDomain
-        var reaped = 0
-        for job in staleJobs {
-            _ = LaunchdAdmin.shell("/bin/launchctl", ["bootout", "\(domain)/\(job.label)"])
-            reaped += 1
+        /** The job's status, nil for anything but `found`. */
+        public var status: JobStatus? {
+            guard case .found(let status) = self else { return nil }
+            return status
         }
-        return reaped
+    }
+
+    /** The `JobPrint` a `launchctl print` outcome means. */
+    static func jobPrint(from outcome: ShellOutcome) -> JobPrint {
+        switch outcome {
+        case .exited(status: 0, let output): .found(parseJobPrint(output))
+        case .exited, .failedToRun: .absent
+        case .outputLimitExceeded, .timedOut: .unresponsive
+        }
+    }
+
+    /** `launchctl print` of one gui-domain job, nil when launchd has no such
+        job (or the print failed). */
+    public static func printJob(label: String) -> JobStatus? {
+        jobPrint(from: LaunchdAdmin.shellOutcome("/bin/launchctl", printArguments(label: label))).status
+    }
+
+    /** `printJob` on `BlockingLane.system`, the overload an async caller gets. */
+    public static func printJob(label: String) async -> JobStatus? {
+        await printOutcome(label: label).status
+    }
+
+    /** `printJob` that tells a print that never answered from one that
+        answered with no job, on `BlockingLane.system`. */
+    public static func printOutcome(label: String) async -> JobPrint {
+        jobPrint(from: await LaunchdAdmin.shellOutcome("/bin/launchctl", printArguments(label: label)))
+    }
+
+    private static func printArguments(label: String) -> [String] {
+        ["print", "\(guiDomain)/\(label)"]
+    }
+
+    /** What one `launchctl list` read found. */
+    public enum ChildJobListing: Equatable, Sendable {
+        case listed([ChildJob])
+        /** launchctl gave no usable answer (it timed out, wrote past the
+            output cap, could not start, or exited nonzero): nothing is known about which jobs exist,
+            which is not the same as knowing there are none. */
+        case unavailable(reason: String)
+    }
+
+    /** `launchctl list` filtered to directa's child jobs, under launchctl's
+        default deadline. */
+    public static func listChildJobs() -> ChildJobListing {
+        switch LaunchdAdmin.shellOutcome("/bin/launchctl", ["list"]) {
+        case .exited(status: 0, let output):
+            .listed(parseChildJobs(fromList: output))
+        case .exited(let status, let output):
+            .unavailable(reason: "launchctl list exited \(status): \(output.prefix(200))")
+        case .failedToRun(let reason):
+            .unavailable(reason: "launchctl list did not start: \(reason.prefix(200))")
+        case .timedOut:
+            .unavailable(reason: "launchctl list timed out")
+        case .outputLimitExceeded:
+            .unavailable(reason: "launchctl list wrote more than \(HelperCommand.outputLimitBytes) bytes")
+        }
+    }
+
+    /** `listChildJobs` for a report that reads an unavailable listing as no
+        jobs (doctor's leftover-job finding). */
+    public static func loadChildJobs() -> [ChildJob] {
+        guard case .listed(let jobs) = listChildJobs() else { return [] }
+        return jobs
+    }
+
+    /** Boot out one child job. Never called for the agent label itself: the
+        daemon's own teardown boots out each job it launched or adopted once
+        that job exits, and the leftover-job reap reaches this only through
+        `AgentJobs`, whose optionality on `Router` is what keeps a non-agent
+        process (every unit test, `ddirecta --foreground`) from ever running a
+        real `launchctl bootout` there. */
+    public static func bootOut(label: String) async {
+        _ = await LaunchdAdmin.shell("/bin/launchctl", bootOutArguments(label: label))
+    }
+
+    private static func bootOutArguments(label: String) -> [String] {
+        ["bootout", "\(guiDomain)/\(label)"]
     }
 }

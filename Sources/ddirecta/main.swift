@@ -54,14 +54,14 @@ if let selfExecutable = currentExecutablePath() {
     let decision = DaemonImagePolicy.decide(
         currentExecutable: selfExecutable,
         candidates: candidates,
-        alreadyReexeced: ProcessInfo.processInfo.environment["DIRECTA_DAEMON_REEXECED"] == "1",
+        alreadyReexeced: ProcessInfo.processInfo.environment[DaemonImagePolicy.reexecEnvironmentKey] == "1",
         fileExists: { FileManager.default.fileExists(atPath: $0) })
     if case .reexec(let target) = decision {
         FileHandle.standardError.write(
             Data(
                 "ddirecta: image is on a mounted volume (\(selfExecutable)); re-exec from \(target)\n"
                     .utf8))
-        setenv("DIRECTA_DAEMON_REEXECED", "1", 1)
+        setenv(DaemonImagePolicy.reexecEnvironmentKey, "1", 1)
         var argv = CommandLine.arguments
         argv[0] = target
         let cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
@@ -76,7 +76,7 @@ if let selfExecutable = currentExecutablePath() {
 }
 
 if let socketOverride {
-    setenv("DIRECTA_SOCKET", socketOverride, 1)
+    setenv(DirectaPaths.socketEnvironmentKey, socketOverride, 1)
 }
 
 let paths = DirectaPaths(
@@ -92,6 +92,18 @@ do {
     exit(1)
 }
 
+/** Checked before the lock, not after: an over-long `DIRECTA_SOCKET` reaches
+    `NWListener` as a truncated `sockaddr_un` that binds nowhere, so the daemon
+    printed its "listening on" line and held the single-instance lock forever
+    over a socket nothing could ever connect to. `DaemonClient` already refuses
+    this path with the same wording before ever calling `connect(2)`; failing
+    here first means neither end pretends the daemon is reachable. */
+guard DirectaPaths.fitsSunPath(paths.socketPath) else {
+    FileHandle.standardError.write(
+        Data("ddirecta: \(DirectaPaths.sunPathLimitMessage(paths.socketPath))\n".utf8))
+    exit(1)
+}
+
 /** Single-instancing: an exclusive flock held for the daemon's lifetime. Only the
     lock holder may unlink and rebind the socket, so stale-socket takeover cannot
     race between two starting daemons. */
@@ -104,6 +116,13 @@ guard flock(lockFD, LOCK_EX | LOCK_NB) == 0 else {
     FileHandle.standardError.write(Data("ddirecta: another ddirecta instance holds \(paths.lockFile.path); exiting\n".utf8))
     exit(0)
 }
+
+/** Sweeps `.<name>.tmp-<pid>-<uuid>` leftovers from a prior ddirecta killed
+    between an `AtomicFile.write`'s temp write and its rename: nothing else
+    ever names that file, so it survives forever otherwise. Safe only here,
+    holding the single-instance lock, so a live writer's temp (a concurrent
+    `write` mid-flight) is never mistaken for one a dead process abandoned. */
+AtomicFile.sweepStaleTemps(in: paths.dataDir, isAlive: ProcessTree.isAlive)
 
 /** Raise the fd ceiling only when below the target: launchd jobs default to a
     256 soft limit, and a dozen servers plus log subscribers approaches it. Never
@@ -145,6 +164,19 @@ do {
             "ddirecta: a saved store exists but could not be read (\(error)); refusing to start so it is not overwritten. Free file descriptors or fix the file's permissions, then retry.\n"
                 .utf8))
     exit(1)
+}
+
+/** Telemetry starts after the single-instance lock, so a second daemon that is
+    about to exit never touches the file, and before the socket, so the first
+    requests are already counted. Its slow work (the boot incident's
+    launchctl and `log show`) runs on its own background thread. */
+if DaemonTelemetry.isEnabled(environment: ProcessInfo.processInfo.environment) {
+    DaemonTelemetry.start(paths: paths, runningAsAgent: LaunchdJobLauncher.runningAsAgent)
+    /** For an `exit` that does not go through `DaemonTelemetry.exit`; after
+        one that does, this records nothing. */
+    atexit {
+        DaemonTelemetry.current?.recordExit(code: nil, reason: "exit")
+    }
 }
 
 let registry = Registry(paths: paths)
@@ -225,7 +257,7 @@ terminationSource.setEventHandler {
             IONotificationPortDestroy(port)
             powerPort = nil
         }
-        exit(0)
+        DaemonTelemetry.exit(code: 0, reason: "SIGTERM")
     }
 }
 terminationSource.resume()
@@ -248,7 +280,7 @@ Task {
     } catch {
         FileHandle.standardError.write(
             Data("ddirecta: control listener never accepted on \(socketPath): \(error)\n".utf8))
-        exit(1)
+        DaemonTelemetry.exit(code: 1, reason: "control listener never accepted")
     }
     await router.recoverAtStartup()
     await router.setRestoring(false)
@@ -280,19 +312,20 @@ Task {
         }
         DirectaLog.daemon.info("watch sweep stopped")
     }
-    /** The missing-project sweep: one stat per registered project per interval,
-        pruned only on the second consecutive miss. Also after restore for the
-        same reason: pruning is destructive on the registry rows recovery
+    /** The missing-project sweep: one stat per registered project per
+        interval, forgetting a project only once its path has stayed missing
+        for a whole interval (`MissingProjectPolicy`). Also after restore for
+        the same reason: pruning is destructive on the registry rows recovery
         replays, and the two must not race. */
     Task {
         DirectaLog.daemon.info("missing-project sweep started")
         while !Task.isCancelled {
-            let pruned = await router.sweepMissingProjects()
+            let pruned = await router.pruneMissingProjects()
             if pruned > 0 {
                 DirectaLog.daemon.info("missing-project sweep pruned \(pruned)")
             }
             do {
-                try await Task.sleep(for: .seconds(30))
+                try await Task.sleep(for: .seconds(Router.missingProjectSweepIntervalSeconds))
             } catch {
                 break
             }

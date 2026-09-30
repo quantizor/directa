@@ -1,3 +1,5 @@
+import Darwin
+import DirectaTestSupport
 import Foundation
 import Testing
 
@@ -37,9 +39,10 @@ import Testing
         #expect(abs(parsed!.timeIntervalSince(date)) < 0.001)
     }
 
-    /** The formatter builds its fractional digits from a millisecond integer,
-        and Swift's `/` and `%` round toward zero, so a date before the epoch
-        used to render as `.-500Z`: the formatter's own parser rejects that, and
+    /** The formatter builds its fractional digits from a millisecond integer.
+        Flooring that division, rather than Swift's default `/` and `%`
+        truncation toward zero, keeps a pre-epoch date's negative remainder
+        from rendering as `.-500Z`, which the formatter's own parser rejects;
         a timestamp that will not parse is a log line that cannot be queried.
         Nothing in directa formats a pre-1970 date today, so this pins a property
         of the formatter rather than a live path. */
@@ -59,6 +62,73 @@ import Testing
         let second = buffer.feed(Data("2}\n".utf8))
         #expect(second.count == 1)
         #expect(String(data: second[0], encoding: .utf8) == "{\"b\":2}")
+    }
+
+    /** A single very long line (an unbounded `directa logs` response) fed in
+        fixed-size chunks comes out as exactly one identical line. `NDJSONBuffer`
+        tracks how far it has already scanned for a newline (`scanned`) so each
+        chunk resumes from there instead of rescanning the whole buffer; feeding
+        several thousand chunks here pins correctness across that many `feed`
+        calls without asserting on timing. */
+    @Test func ndjsonBufferFramesAMultiMegabyteLineSplitAcrossManyChunks() {
+        var buffer = NDJSONBuffer()
+        let payload = Data(repeating: UInt8(ascii: "x"), count: 2_000_000)
+        var line = payload
+        line.append(0x0A)
+        var framed: [Data] = []
+        var offset = line.startIndex
+        let chunkSize = 8192
+        while offset < line.endIndex {
+            let end = line.index(offset, offsetBy: chunkSize, limitedBy: line.endIndex) ?? line.endIndex
+            framed.append(contentsOf: buffer.feed(line[offset..<end]))
+            offset = end
+        }
+        #expect(framed.count == 1)
+        #expect(framed[0] == payload)
+    }
+
+    /** Several complete lines delivered in one chunk all come back from the
+        same `feed` call, in order. */
+    @Test func ndjsonBufferFramesSeveralLinesInOneChunk() {
+        var buffer = NDJSONBuffer()
+        let lines = buffer.feed(Data("{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n".utf8))
+        #expect(lines.map { String(data: $0, encoding: .utf8) } == ["{\"a\":1}", "{\"b\":2}", "{\"c\":3}"])
+    }
+
+    /** A chunk boundary that lands exactly on the newline byte: the first
+        `feed` call ends with `\n` and nothing else, the second starts a fresh
+        line with no leftover partial data from the first. */
+    @Test func ndjsonBufferHandlesAChunkBoundaryOnTheNewlineByte() {
+        var buffer = NDJSONBuffer()
+        let first = buffer.feed(Data("{\"a\":1}\n".utf8))
+        #expect(first.map { String(data: $0, encoding: .utf8) } == ["{\"a\":1}"])
+        let second = buffer.feed(Data("{\"b\":2}\n".utf8))
+        #expect(second.map { String(data: $0, encoding: .utf8) } == ["{\"b\":2}"])
+    }
+
+    /** Empty lines (a bare `\n`) are dropped rather than surfaced as
+        zero-length frames. */
+    @Test func ndjsonBufferSkipsEmptyLines() {
+        var buffer = NDJSONBuffer()
+        let lines = buffer.feed(Data("\n\n{\"a\":1}\n\n".utf8))
+        #expect(lines.map { String(data: $0, encoding: .utf8) } == ["{\"a\":1}"])
+    }
+
+    /** A trailing partial line with no newline yet returns nothing and stays
+        buffered until the newline arrives on a later `feed`. A third feed with
+        two more lines, one of them starting well within the byte count the
+        earlier partial line advanced the internal scan position by, catches a
+        buffer that forgets to reset that position once a line drains: a stale
+        position past a later chunk's first newline would skip it and merge two
+        lines into one. */
+    @Test func ndjsonBufferRetainsAPartialTailAcrossFeeds() {
+        var buffer = NDJSONBuffer()
+        let first = buffer.feed(Data("{\"a\":1".utf8))
+        #expect(first.isEmpty)
+        let second = buffer.feed(Data("}\n{\"b\":2}\n".utf8))
+        #expect(second.map { String(data: $0, encoding: .utf8) } == ["{\"a\":1}", "{\"b\":2}"])
+        let third = buffer.feed(Data("{}\n123\n".utf8))
+        #expect(third.map { String(data: $0, encoding: .utf8) } == ["{}", "123"])
     }
 
     @Test func statusSchemaGolden() throws {
@@ -176,6 +246,22 @@ import Testing
         )
     }
 
+    /** `claimedProjects` is append-only like `restoring`: present only once a
+        caller sets it, so `directa doctor` can tell a daemon that never
+        claims anything (an empty array) apart from one built before the field
+        existed (absent, and the orphan-log-dir finding must skip rather than
+        guess). */
+    @Test func daemonInfoSchemaGoldenWithClaimedProjects() throws {
+        let info = DaemonInfo(
+            claimedProjects: ["/p/api", "/p/web"], dataDir: "/data", daemonVersion: "1.4.0",
+            logsDir: "/logs", pid: 42, proto: 1, socketPath: "/data/daemon.sock")
+        let json = String(data: try JSONCoding.encoder().encode(info), encoding: .utf8)!
+        #expect(
+            json
+                == #"{"claimedProjects":["/p/api","/p/web"],"daemonVersion":"1.4.0","dataDir":"/data","logsDir":"/logs","pid":42,"proto":1,"socketPath":"/data/daemon.sock"}"#
+        )
+    }
+
     /** A main checkout answers exactly as it did before the effective-host
         fields existed: they are omitted when nil, which is the compatibility
         claim, asserted rather than assumed. */
@@ -210,6 +296,66 @@ import Testing
         )
     }
 
+    /** `project.forget`'s result names the servers it dropped along with the
+        row, trust, and log directory: `doctor --fix` reports the count in its
+        finding without a second query. */
+    @Test func projectForgetResultSchemaGolden() throws {
+        let result = ProjectForgetResult(servers: ["api", "web"])
+        let json = String(data: try JSONCoding.encoder().encode(result), encoding: .utf8)!
+        #expect(json == #"{"servers":["api","web"]}"#)
+    }
+
+    /** `logs.removeOrphan` carries a directory name, never a path, and answers
+        with the outcome and the path it checked. */
+    @Test func logsRemoveOrphanSchemaGolden() throws {
+        let params = LogsRemoveOrphanParams(directory: "app-deadbeef")
+        #expect(
+            String(data: try JSONCoding.encoder().encode(params), encoding: .utf8)
+                == #"{"directory":"app-deadbeef"}"#)
+        let refused = LogsRemoveOrphanResult(
+            path: URL(fileURLWithPath: "/logs/app-deadbeef"), removal: .refused(.link))
+        #expect(
+            String(data: try JSONCoding.encoder().encode(refused), encoding: .utf8)
+                == #"{"outcome":"refused","path":"/logs/app-deadbeef","reason":"it is a link to another location, not a log directory directa created","remedy":"remove the link yourself if nothing needs it"}"#
+        )
+        let removed = LogsRemoveOrphanResult(
+            path: URL(fileURLWithPath: "/logs/app-deadbeef"), removal: .removed)
+        #expect(
+            String(data: try JSONCoding.encoder().encode(removed), encoding: .utf8)
+                == #"{"outcome":"removed","path":"/logs/app-deadbeef"}"#)
+        let failed = LogsRemoveOrphanResult(
+            path: URL(fileURLWithPath: "/logs/app-deadbeef"), removal: .failed("busy"))
+        #expect(
+            String(data: try JSONCoding.encoder().encode(failed), encoding: .utf8)
+                == #"{"outcome":"failed","path":"/logs/app-deadbeef","reason":"busy"}"#)
+        for result in [refused, removed, failed] {
+            let decoded = try JSONCoding.decoder().decode(
+                LogsRemoveOrphanResult.self, from: JSONCoding.encoder().encode(result))
+            #expect(decoded == result)
+        }
+    }
+
+    /** The contract makes `reason` optional on the wire, so a refusal or a
+        failure that arrives without one still decodes, with a generic reason. */
+    @Test func logsRemoveOrphanResultWithoutAReasonStillDecodes() throws {
+        let refused = try JSONCoding.decoder().decode(
+            LogsRemoveOrphanResult.self, from: Data(#"{"outcome":"refused","path":"/l/a-deadbeef"}"#.utf8))
+        #expect(refused.outcome == .refused(reason: "the daemon refused", remedy: nil))
+        let failed = try JSONCoding.decoder().decode(
+            LogsRemoveOrphanResult.self, from: Data(#"{"outcome":"failed","path":"/l/a-deadbeef"}"#.utf8))
+        #expect(failed.outcome == .failed(reason: "the removal failed"))
+    }
+
+    @Test func isUnknownMethodMatchesOnlyTheExactRefusalForThatMethod() {
+        let refusal = WireError(
+            code: .usage, message: WireError.unknownMethodMessage(WireMethod.projectForget.rawValue))
+        #expect(refusal.isUnknownMethod(.projectForget))
+        #expect(!refusal.isUnknownMethod(.logsRemoveOrphan))
+        #expect(
+            !WireError(code: .internalError, message: refusal.message).isUnknownMethod(.projectForget))
+        #expect(!WireError(code: .usage, message: "bad params").isUnknownMethod(.projectForget))
+    }
+
     /** Append-only is a wire promise: a reason the current daemon never
         produces (the worktree label host was removed) must still decode, so an
         older daemon on the socket does not break a newer CLI. */
@@ -220,12 +366,192 @@ import Testing
         #expect(result.effectiveHost == "worktree-review.app.localhost")
         #expect(result.effectiveHostReason == .linkedWorktree)
     }
+
+    /** An events response from a daemon newer than this build can carry a kind
+        this build predates. Decoding must not fail the whole response over one
+        unrecognized string, the rest of the events must stay intact, and the
+        unrecognized kind must round-trip byte-identical (a client that only
+        relays events, rather than interpreting them, must never mutate data it
+        does not understand). */
+    @Test func unknownEventKindDecodesAndRoundTripsWithTheRestOfTheEvents() throws {
+        let json =
+            #"{"events":[{"at":"2025-07-18T19:46:40.000Z","kind":"started","project":"/tmp/proj","server":"web"},{"at":"2025-07-18T19:46:40.000Z","kind":"rebalanced","project":"/tmp/proj","server":"web"}]}"#
+        let result = try JSONCoding.decoder().decode(EventsQueryResult.self, from: Data(json.utf8))
+        #expect(result.events.count == 2)
+        #expect(result.events[0].kind == .started)
+        #expect(result.events[1].kind == .unknown("rebalanced"))
+        let reencoded = String(data: try JSONCoding.encoder().encode(result), encoding: .utf8)
+        #expect(reencoded == json)
+    }
+
+    /** Every kind this build names decodes to that case, never to `.unknown`. */
+    @Test func everyNamedEventKindDecodesToItsCase() throws {
+        let expected: [String: EventKind] = [
+            "crashed": .crashed, "failed": .failed, "healthy": .healthy, "marked": .marked,
+            "registered": .registered, "started": .started, "stopped": .stopped,
+            "unhealthy": .unhealthy, "unregistered": .unregistered,
+        ]
+        var decoded: [String: EventKind] = [:]
+        for raw in expected.keys {
+            decoded[raw] = try JSONCoding.decoder().decode(EventKind.self, from: Data("\"\(raw)\"".utf8))
+        }
+        #expect(decoded == expected)
+    }
+
+    private func encoded<T: Encodable>(_ value: T) throws -> String {
+        try #require(String(data: JSONCoding.encoder().encode(value), encoding: .utf8))
+    }
+
+    private let logAt = Date(timeIntervalSince1970: 1_752_868_000)
+
+    /** `LogStream` is not `CodingKeyRepresentable`, so a `[LogStream: Int]`
+        would encode as an alternating array; both count types are structs so
+        they encode as objects. */
+    @Test func logCursorAndStreamCountsEncodeAsObjects() throws {
+        #expect(try encoded(LogCursor(at: logAt, count: 3)) == #"{"at":"2025-07-18T19:46:40.000Z","count":3}"#)
+        #expect(
+            try encoded(LogStreamCounts(err: 1, mark: 0, out: 20, sys: 4))
+                == #"{"err":1,"mark":0,"out":20,"sys":4}"#)
+        #expect(try encoded(LogStreamCounts(out: 300)) == #"{"out":300}"#)
+        #expect(
+            try encoded(LogStreamTotals(err: 1, mark: 0, out: 20, sys: 4))
+                == #"{"err":1,"mark":0,"out":20,"sys":4}"#)
+        #expect(try encoded(LogStreamTotals()) == #"{"err":0,"mark":0,"out":0,"sys":0}"#)
+        #expect(try encoded(LogCursor.origin) == #"{"at":"1970-01-01T00:00:00.000Z","count":0}"#)
+        #expect(
+            try encoded(LogCursor(at: logAt, count: 30_000, position: LogFilePosition(file: 1_234_567, offset: 2_097_151)))
+                == #"{"at":"2025-07-18T19:46:40.000Z","count":30000,"position":{"file":1234567,"offset":2097151}}"#)
+    }
+
+    /** A cursor from a daemon that predates positions decodes with none,
+        and one carrying a position decodes it whole. */
+    @Test func logCursorsDecodeWithAndWithoutAPosition() throws {
+        let plain = #"{"at":"2025-07-18T19:46:40.000Z","count":3}"#
+        #expect(try JSONCoding.decoder().decode(LogCursor.self, from: Data(plain.utf8)) == LogCursor(at: logAt, count: 3))
+        let positioned = #"{"at":"2025-07-18T19:46:40.000Z","count":3,"position":{"file":9,"offset":120}}"#
+        #expect(
+            try JSONCoding.decoder().decode(LogCursor.self, from: Data(positioned.utf8))
+                == LogCursor(at: logAt, count: 3, position: LogFilePosition(file: 9, offset: 120)))
+    }
+
+    @Test func logsQueryParamsSchemaGolden() throws {
+        let params = LogsQueryParams(
+            after: LogCursor(at: logAt, count: 2), maxLineCharacters: 400, name: "web", project: "/tmp/proj",
+            streams: [.out, .sys], tailByStream: LogStreamCounts(err: 300, mark: 50, out: 300, sys: 50))
+        #expect(
+            try encoded(params)
+                == #"{"after":{"at":"2025-07-18T19:46:40.000Z","count":2},"maxLineCharacters":400,"name":"web","project":"/tmp/proj","streams":["out","sys"],"tailByStream":{"err":300,"mark":50,"out":300,"sys":50}}"#
+        )
+        #expect(
+            try encoded(LogsQueryParams(head: 200, name: "web", project: "/tmp/proj"))
+                == #"{"head":200,"name":"web","project":"/tmp/proj"}"#)
+    }
+
+    @Test func logsQueryResultSchemaGolden() throws {
+        let result = LogsQueryResult(
+            cursor: LogCursor(at: logAt, count: 1), lines: [LogRecord(at: logAt, stream: .out, text: "ready")],
+            totals: LogStreamTotals(err: 0, mark: 0, out: 1, sys: 0))
+        #expect(
+            try encoded(result)
+                == #"{"cursor":{"at":"2025-07-18T19:46:40.000Z","count":1},"lines":[{"at":"2025-07-18T19:46:40.000Z","stream":"out","text":"ready"}],"totals":{"err":0,"mark":0,"out":1,"sys":0}}"#
+        )
+    }
+
+    /** Append-only both ways: an older client's params decode with every new
+        field absent, and an older daemon's result (no cursor, no totals)
+        decodes too, which is how a newer CLI tells it needs a restart. */
+    @Test func olderLogsFramesStillDecode() throws {
+        let oldParams = #"{"name":"web","project":"/tmp/proj","since":"2025-07-18T19:46:40.000Z","tail":5}"#
+        let params = try JSONCoding.decoder().decode(LogsQueryParams.self, from: Data(oldParams.utf8))
+        #expect(params == LogsQueryParams(name: "web", project: "/tmp/proj", since: logAt, tail: 5))
+        #expect(params.refusal() == nil)
+        let oldResult = #"{"lines":[]}"#
+        let result = try JSONCoding.decoder().decode(LogsQueryResult.self, from: Data(oldResult.utf8))
+        #expect(result == LogsQueryResult(lines: []))
+        #expect(result.cursor == nil)
+    }
+
+    @Test func logsQueryParamsRefuseEachExclusivePair() {
+        let cursor = LogCursor(at: logAt, count: 0)
+        let byStream = LogStreamCounts(out: 10)
+        let refused: [(LogsQueryParams, String)] = [
+            (LogsQueryParams(after: cursor, name: "web", project: "/p", since: logAt), "after with since"),
+            (LogsQueryParams(after: cursor, name: "web", project: "/p", sinceMark: "m1"), "after with sinceMark"),
+            (LogsQueryParams(name: "web", project: "/p", tail: 5, tailByStream: byStream), "tail with tailByStream"),
+            (LogsQueryParams(head: 5, name: "web", project: "/p", tail: 5), "head with tail"),
+            (LogsQueryParams(head: 5, name: "web", project: "/p", tailByStream: byStream), "head with tailByStream"),
+        ]
+        for (params, label) in refused {
+            #expect(params.refusal()?.code == .usage, "\(label)")
+            #expect(params.refusal()?.hint != nil, "\(label)")
+        }
+        #expect(
+            LogsQueryParams(after: cursor, head: 5, name: "web", project: "/p").refusal() == nil)
+        #expect(
+            LogsQueryParams(name: "web", project: "/p", since: logAt, sinceMark: "m1", tail: 5).refusal() == nil)
+    }
+
+    @Test func logsQueryParamsRefuseNegativeCountsAndAnEmptyLineBudget() {
+        let refused: [(LogsQueryParams, String)] = [
+            (LogsQueryParams(after: LogCursor(at: logAt, count: -1), name: "w", project: "/p"), "after.count"),
+            (LogsQueryParams(head: -1, name: "w", project: "/p"), "head"),
+            (LogsQueryParams(name: "w", project: "/p", tail: -1), "tail"),
+            (LogsQueryParams(name: "w", project: "/p", tailByStream: LogStreamCounts(sys: -3)), "tailByStream.sys"),
+        ]
+        for (params, field) in refused {
+            let refusal = params.refusal()
+            #expect(refusal?.code == .usage, "\(field)")
+            #expect(refusal?.message.hasPrefix("\(field) is ") == true, "\(field)")
+        }
+        #expect(LogsQueryParams(maxLineCharacters: 0, name: "w", project: "/p").refusal()?.code == .usage)
+        #expect(LogsQueryParams(maxLineCharacters: 1, name: "w", project: "/p").refusal() == nil)
+        #expect(
+            LogsQueryParams(
+                name: "w", project: "/p", tailByStream: LogStreamCounts(err: 0, mark: 0, out: Int.max, sys: 0)
+            ).refusal() == nil)
+    }
+
+    @Test func eventsQueryParamsRefuseANegativeTailOnly() {
+        #expect(
+            EventsQueryParams(project: "/p", tail: -1).refusal()
+                == WireError(
+                    code: .usage, hint: "send tail as 0 or more",
+                    message: "tail is -1, but an event count cannot be negative"))
+        #expect(EventsQueryParams(tail: Int.min).refusal()?.code == .usage)
+        #expect(EventsQueryParams(project: "/p", tail: 0).refusal() == nil)
+        #expect(EventsQueryParams(project: "/p").refusal() == nil)
+    }
+
+    /** A pattern that does not compile, or that nests an unbounded repeat,
+        is refused before any server is looked up; a safe one passes. */
+    @Test func logsQueryParamsRefuseAnUnsafeGrep() throws {
+        let broken = try #require(LogsQueryParams(grep: "(unbalanced", name: "w", project: "/p").refusal())
+        #expect(broken.code == .usage)
+        #expect(broken.hint == "fix the pattern, or drop --grep to see every line")
+        #expect(broken.message.hasPrefix("--grep is not a valid regular expression: "))
+        let nested = try #require(LogsQueryParams(grep: "^(a+)+$", name: "w", project: "/p").refusal())
+        #expect(
+            nested.message
+                == "--grep is not a valid regular expression: '^(a+)+$' repeats a group that itself repeats without bound (like (a+)+), which can make the log reader run for minutes on a single line; rewrite it without the nested repeat"
+        )
+        #expect(LogsQueryParams(grep: "error|warn", name: "w", project: "/p").refusal() == nil)
+    }
 }
 
-@Suite struct PathTests {
+@Suite(.temporaryTree) struct PathTests {
     @Test func sunPathLimit() {
         #expect(DirectaPaths.fitsSunPath("/tmp/short.sock"))
         #expect(!DirectaPaths.fitsSunPath(String(repeating: "x", count: 104)))
+    }
+
+    /** The client and the daemon must refuse an over-long `DIRECTA_SOCKET` with
+        the exact same text, since that is the one place either side names the
+        cause: the client raises it before `connect(2)`, and the daemon raises
+        it before taking the single-instance lock. */
+    @Test func sunPathLimitMessageNamesTheOffendingPath() {
+        #expect(
+            DirectaPaths.sunPathLimitMessage("/tmp/too-long.sock")
+                == "socket path exceeds sun_path limit: /tmp/too-long.sock")
     }
 
     @Test func serverIDShape() {
@@ -278,7 +604,7 @@ import Testing
     }
 
     @Test func atomicWriteAndDefensiveLoad() throws {
-        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-test-\(UUID().uuidString)")
+        let dir = try TemporaryTree.path(named: "atomic")
         let file = dir.appending(path: "state.json")
         struct Payload: Codable, Equatable {
             var value: Int
@@ -292,7 +618,6 @@ import Testing
         let quarantined = try FileManager.default.contentsOfDirectory(atPath: dir.path)
             .filter { $0.contains(".corrupt-") }
         #expect(quarantined.count == 1)
-        try? FileManager.default.removeItem(at: dir)
     }
 
     /** Two writers inside one process must both succeed: a pid-only temp name
@@ -300,7 +625,7 @@ import Testing
         how the app lost agent.path when launch registration and the recovery
         poll wrote it at the same moment. */
     @Test func concurrentWritesToOneFileAllSucceed() async throws {
-        let dir = FileManager.default.temporaryDirectory.appending(path: "directa-test-\(UUID().uuidString)")
+        let dir = try TemporaryTree.path(named: "concurrent-writes")
         let file = dir.appending(path: "agent.path")
         let payloads = (0..<8).map { "payload-\($0)" }
         try await withThrowingTaskGroup(of: Void.self) { group in
@@ -317,6 +642,59 @@ import Testing
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: dir.path)
             .filter { $0.hasPrefix(".agent.path.tmp-") }
         #expect(leftovers.isEmpty)
-        try? FileManager.default.removeItem(at: dir)
+    }
+
+    /** A rename that fails (here, a destination `chflags`'d immutable, which
+        macOS refuses to replace) must not leave the temp file behind: nothing
+        else ever names it, so a leftover here sits in the state directory
+        forever, the same class of leak `sweepStaleTemps` exists to clean up
+        for an earlier crash rather than a failed replace. */
+    @Test func failedReplaceLeavesNoTempBehind() throws {
+        let dir = try TemporaryTree.directory(named: "immutable")
+        let file = dir.appending(path: "state.json")
+        try Data("{}".utf8).write(to: file)
+        #expect(chflags(file.path, UInt32(UF_IMMUTABLE)) == 0)
+        #expect(throws: (any Error).self) {
+            try AtomicFile.write(Data("{\"value\":1}".utf8), to: file)
+        }
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.contains(".tmp-") }
+        #expect(leftovers.isEmpty)
+    }
+
+    /** The boot-time sweep removes a temp whose writer already died and leaves
+        alone one whose writer (this test process) is still running: the same
+        distinction that keeps the sweep from ever touching a concurrent
+        `write` mid-flight under a live daemon. */
+    @Test func sweepRemovesADeadPidTempAndKeepsALivePidTemp() async throws {
+        let dir = try TemporaryTree.directory(named: "sweep")
+
+        let deadProcess = try await TestProcess.run("/usr/bin/true", [])
+        let deadTemp = dir.appending(
+            path: ".registry.json.tmp-\(deadProcess.pid)-\(UUID().uuidString)")
+        let liveTemp = dir.appending(path: ".registry.json.tmp-\(getpid())-\(UUID().uuidString)")
+        try Data().write(to: deadTemp)
+        try Data().write(to: liveTemp)
+
+        AtomicFile.sweepStaleTemps(in: dir) { pid in
+            guard let narrow = pid_t(exactly: pid) else { return false }
+            return kill(narrow, 0) == 0
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: deadTemp.path))
+        #expect(FileManager.default.fileExists(atPath: liveTemp.path))
+    }
+
+    /** `tempFilePid` is the seam `sweepStaleTemps` trusts to tell a `write`
+        temp from anything else in the state directory; a bare `.corrupt-`
+        quarantine file or an unrelated dotfile must never parse as one. */
+    @Test func tempFilePidParsesOnlyTheWriteGeneratedShape() {
+        #expect(AtomicFile.tempFilePid(".registry.json.tmp-4242-\(UUID().uuidString)") == 4242)
+        #expect(
+            AtomicFile.tempFilePid(AtomicFile.tempName(for: URL(fileURLWithPath: "/d/registry.json")))
+                == Int(getpid()))
+        #expect(AtomicFile.tempFilePid("registry.json") == nil)
+        #expect(AtomicFile.tempFilePid("registry.json.corrupt-2025-07-18T19-46-40.000Z") == nil)
+        #expect(AtomicFile.tempFilePid(".registry.json.tmp-not-a-pid-abc") == nil)
     }
 }

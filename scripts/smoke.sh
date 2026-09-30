@@ -48,15 +48,54 @@ await_daemon() {
   fail "daemon never finished restoring over $DIRECTA_SOCKET ($label); last status: ${probe:-<none>}"
 }
 
+# Arrays, never space-joined strings: zsh does not word-split an unquoted
+# parameter, so a loop over a joined string runs once with the whole string,
+# and `kill` rejects it as an illegal pid while the processes live on.
+CLIENT_PIDS=()
+STRAY_PIDS=()
+MONITOR_PIDS=()
+
 cleanup() {
+  local cleanup_status=$? survivors=""
+  cd /
   [[ -n "${DAEMON_PID:-}" ]] && kill -9 "$DAEMON_PID" 2>/dev/null || true
   [[ -n "${CHILD_PID:-}" ]] && kill -9 "-$CHILD_PID" 2>/dev/null || true
   # Grandchildren escape the process group on purpose (that is what the teardown
   # assertions exercise), so a group kill leaves them behind. Reap them by pid.
-  for stray in ${STRAY_PIDS:-}; do kill -9 "$stray" 2>/dev/null || true; done
+  for stray in "${STRAY_PIDS[@]}"; do kill -9 "$stray" 2>/dev/null || true; done
+  # Every `directa monitor` invocation started for the monitor checks below is
+  # tracked here too, so a `fail` partway through that section (which exits and
+  # runs this trap) cannot leave one running past this script.
+  for mon in "${MONITOR_PIDS[@]}"; do kill -9 "$mon" 2>/dev/null || true; done
+  # Other CLI invocations a section backgrounds (a lock holder, a restart that
+  # rides out a daemon kill) are normally waited on; a `fail` before that wait
+  # leaves them running.
+  for client in "${CLIENT_PIDS[@]}"; do kill -9 "$client" 2>/dev/null || true; done
+  # A fixture-server the daemon spawned leads its own session, and a
+  # --spawn-grandchild child sits in a process group of its own inside that
+  # session, so neither a group kill nor the pkill below reaches it. A failure
+  # partway through leaves such roots running with no stop ever sent. Killing
+  # each live root's whole session reaches their grandchildren; a root that does
+  # not lead a session names no session, so this only ever hits what a fixture
+  # started.
+  for root in $(pgrep -f "$BIN/fixture-server" 2>/dev/null); do pkill -9 -s "$root" 2>/dev/null || true; done
   # Orphans from a mid-smoke abort can hold fixed listen ports across reruns.
   pkill -f "$BIN/fixture-server" 2>/dev/null || true
+  # Every process this run started works under $WORK, so anything still holding
+  # a directory or file there once the kills above have landed outlived the run.
+  # It is named and fails the run rather than surviving into the next one.
+  for i in {1..20}; do
+    survivors="$(lsof -t +D "$WORK" 2>/dev/null | sort -u | tr '\n' ' ')"
+    [[ -z "$survivors" ]] && break
+    sleep 0.1
+  done
   rm -rf "$WORK"
+  if [[ -n "$survivors" ]]; then
+    echo "SMOKE FAIL: processes outlived cleanup: $survivors" >&2
+    ps -o pid,ppid,pgid,command -p "${(j:,:)${(z)survivors}}" >&2 || true
+    exit 1
+  fi
+  return $cleanup_status
 }
 trap cleanup EXIT
 
@@ -160,7 +199,7 @@ sleep 1
 AFTER="$(wc -l < "$RAW_SPOOL")"
 [[ "$AFTER" -gt "$BEFORE" ]] || fail "raw spool stopped growing after daemon death"
 pass "child survived daemon kill and kept logging ($BEFORE -> $AFTER raw lines)"
-STRAY_PIDS="${STRAY_PIDS:-} $(grep grandchild "$RAW_SPOOL" | tail -1 | awk '{print $NF}')"
+STRAY_PIDS+=("$(grep grandchild "$RAW_SPOOL" | tail -1 | awk '{print $NF}')")
 kill -9 "-$CHILD_PID" 2>/dev/null || true
 CHILD_PID=""
 
@@ -335,6 +374,19 @@ grep -q "directa lock data --" "$WORK/stop.err" || fail "stop did not hint towar
 grep -q "hint:" "$WORK/stop.json" && fail "stop --json leaked the hint into stdout"
 pass "stop hints toward lock in human mode and keeps --json stdout clean"
 
+# lock runs the guarded command in the CALLER's own working directory, never
+# the resolved project root: a relative file argument or a config-discovery
+# tool must see what it would running unwrapped. `pwd -P` matches what the
+# child's getcwd(2) reports, so the comparison tolerates no symlink drift.
+mkdir -p "$PROJECT3/sub"
+EXPECTED_SUBDIR="$(cd "$PROJECT3/sub" && pwd -P)"
+(cd "$PROJECT3/sub" && "$DIRECTA" lock data -- sh -c "pwd -P > '$WORK/lock-cwd.txt'") \
+  || fail "lock cwd check failed to run"
+SEEN_SUBDIR="$(cat "$WORK/lock-cwd.txt")"
+[[ "$SEEN_SUBDIR" == "$EXPECTED_SUBDIR" ]] \
+  || fail "lock ran the guarded command outside the caller's cwd: expected $EXPECTED_SUBDIR, got $SEEN_SUBDIR"
+pass "lock runs the guarded command in the caller's own working directory"
+
 "$DIRECTA" down --json > /dev/null
 
 # Deep-link and default/`--pause` lock coverage stay below; worktree coexistence first.
@@ -467,6 +519,7 @@ pass "lock options before -- do not reach the guarded command"
 rm -f "$WORK/held"
 "$DIRECTA" lock data -- sh -c "touch '$WORK/held'; sleep 6" >/dev/null 2>&1 &
 HOLDER_JOB=$!
+CLIENT_PIDS+=("$HOLDER_JOB")
 for _ in $(seq 1 100); do
   [[ -f "$WORK/held" ]] && break
   /bin/sleep 0.1
@@ -518,7 +571,7 @@ set +e
 MUTATED_EXIT=$?
 set -e
 [[ "$MUTATED_EXIT" -ne 0 ]] || fail "default hold accepted a command that replaced the locked state"
-/usr/bin/python3 -c "import json;d=json.load(open('$WORK/mutated.json'));assert d['error']['code']=='resource-mutated', d; assert d['error']['hint']=='directa lock data --pause -- <command>', d" || fail "resource-mutated envelope wrong: $(cat "$WORK/mutated.json")"
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/mutated.json'));assert d['error']['code']=='resource-mutated', d; assert d['error']['hint']=='run: directa lock data --pause -- <command>', d" || fail "resource-mutated envelope wrong: $(cat "$WORK/mutated.json")"
 pass "a default-hold command over changed state fails loudly with resource-mutated"
 
 # And an untouched resource stays quiet, so the check cannot fire on everything.
@@ -543,6 +596,262 @@ pass "restart under a live lock is refused and the server stays up"
 
 "$DIRECTA" down --json > /dev/null
 
+# Restarting a flooding server: the stop's final log drain runs long, and the
+# restart's ensure must wait for the phase to leave stopping rather than spin.
+# The daemon itself, not just the restarted server, has to survive this.
+FLOODPROJ="$WORK/floodproj"
+mkdir -p "$FLOODPROJ"
+cd "$FLOODPROJ"
+FLOOD_PORT=$((44000 + (RANDOM % 500)))
+"$DIRECTA" register --name flood --cmd "$BIN/fixture-server" --cmd --listen-tcp --cmd "$FLOOD_PORT" --cmd --flood --port "$FLOOD_PORT" --json > /dev/null
+"$DIRECTA" ensure flood --timeout 10 --json > /dev/null || fail "flooding fixture never became healthy"
+sleep 1
+"$DIRECTA" restart flood --timeout 15 --json > "$WORK/flood-restart.json" || fail "restart of a flooding server did not complete"
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/flood-restart.json'));s=d['results'][0]['server'];assert s['phase']=='running', d" || fail "flooding server did not come back running: $(cat "$WORK/flood-restart.json")"
+kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon (pid $DAEMON_PID) died restarting a flooding server"
+pass "restarting a flooding server completes and the daemon (pid $DAEMON_PID) stays up"
+"$DIRECTA" stop flood --json > /dev/null
+
+# A daemon that dies while a restart waits for health (a crash, a jetsam kill)
+# closes the connection with the outcome unknown. The CLI must wait for the
+# daemon to come back and finish on the server's state, exit 0, and never send
+# the restart a second time: the events carry exactly one restart stop.
+SLOW_PORT=$((44500 + (RANDOM % 400)))
+"$DIRECTA" register --name slowboot --cmd /bin/sh --cmd -c \
+  --cmd "sleep 4; exec $BIN/fixture-server --listen-tcp $SLOW_PORT" --port "$SLOW_PORT" --json > /dev/null
+"$DIRECTA" ensure slowboot --timeout 20 --json > /dev/null || fail "slowboot fixture never became healthy"
+set +e
+"$DIRECTA" restart slowboot --timeout 30 --json > "$WORK/slow-restart.json" 2> "$WORK/slow-restart.err" &
+SLOW_RESTART_PID=$!
+CLIENT_PIDS+=("$SLOW_RESTART_PID")
+set -e
+sleep 1.5
+kill -9 "$DAEMON_PID"
+wait "$DAEMON_PID" 2>/dev/null || true
+"$BIN/ddirecta" --foreground --socket "$DIRECTA_SOCKET" --data-dir "$WORK/data" --logs-dir "$WORK/logs" \
+  >>"$DAEMON_LOG" 2>&1 &
+DAEMON_PID=$!
+await_daemon "restart daemon-kill recovery"
+set +e
+wait "$SLOW_RESTART_PID"
+SLOW_RESTART_EXIT=$?
+set -e
+[[ "$SLOW_RESTART_EXIT" -eq 0 ]] \
+  || fail "restart across a daemon kill exited $SLOW_RESTART_EXIT: $(cat "$WORK/slow-restart.json") $(cat "$WORK/slow-restart.err")"
+grep -q "instead of restarting it again" "$WORK/slow-restart.err" \
+  || fail "restart across a daemon kill never said it was recovering: $(cat "$WORK/slow-restart.err")"
+/usr/bin/python3 -c "import json;d=json.load(open('$WORK/slow-restart.json'));s=d['results'][0]['server'];assert s['phase']=='running', d" \
+  || fail "restart across a daemon kill did not end running: $(cat "$WORK/slow-restart.json")"
+RESTART_STOPS="$("$DIRECTA" events --json | /usr/bin/python3 -c 'import json,sys; print(sum(1 for e in json.load(sys.stdin)["events"] if e["server"]=="slowboot" and e["kind"]=="stopped" and e.get("detail")=="requested by restart"))')"
+[[ "$RESTART_STOPS" -eq 1 ]] || fail "restart across a daemon kill stopped slowboot $RESTART_STOPS times for one restart"
+pass "restart across a daemon kill waits for the daemon and never restarts twice"
+"$DIRECTA" stop slowboot --json > /dev/null
+
+# directa monitor: a client-side polling loop over logs.query/server.status
+# shaped for an agent's own streaming tool. Every check below runs against
+# this script's own temp daemon/socket, never a live one.
+MONPROJ="$WORK/monitor-project"
+mkdir -p "$MONPROJ"
+cd "$MONPROJ"
+"$DIRECTA" register --name monweb --cmd "$BIN/fixture-server" --json > /dev/null
+"$DIRECTA" ensure monweb --timeout 10 --json > /dev/null || fail "monitor fixture never became healthy"
+
+MON_OUT="$WORK/monitor-out.log"
+"$DIRECTA" monitor monweb --tick 0.5 > "$MON_OUT" 2>/dev/null &
+MON_PID=$!
+MONITOR_PIDS+=("$MON_PID")
+for i in {1..50}; do grep -q "^directa monweb: monitoring" "$MON_OUT" && break; sleep 0.1; done
+grep -q "^directa monweb: monitoring" "$MON_OUT" || fail "monitor never printed its start marker"
+for i in {1..30}; do grep -q "monweb out| heartbeat" "$MON_OUT" && break; sleep 0.1; done
+grep -q "monweb out| heartbeat" "$MON_OUT" || fail "monitor never showed a line through the pipe within a tick"
+pass "monitor shows a line through a pipe within one tick"
+kill -9 "$MON_PID" 2>/dev/null || true
+wait "$MON_PID" 2>/dev/null || true
+
+# Lifecycle survives an over-cap burst, and RSS stays bounded under a flood
+# at max budget flags. One 20 s run covers both: a restart 2 s in exercises
+# the lifecycle lines, then 18 s of RSS sampling.
+# The RSS ceiling was set by measuring this exact scenario: peak observed
+# while writing this check was ~12 MB (11.6-12.1 MB), settling near 11.5 MB;
+# 40 MB leaves wide headroom while still catching a real leak, since nothing
+# in the design accumulates for the life of a run (a fixed-size LRU, bounded
+# token-bucket budgets, one query and at most one status call per tick).
+"$DIRECTA" register --name monflood --cmd "$BIN/fixture-server" --cmd --flood --json > /dev/null
+"$DIRECTA" ensure monflood --timeout 10 --json > /dev/null || fail "flooding fixture for monitor never became healthy"
+FLOOD_MON_OUT="$WORK/monitor-flood.log"
+"$DIRECTA" monitor monflood --tick 0.5 --lines-per-minute 1200 --lines-per-arm 20000 \
+  --errors-per-minute 600 --errors-per-arm 5000 > "$FLOOD_MON_OUT" 2>/dev/null &
+FLOOD_MON_PID=$!
+MONITOR_PIDS+=("$FLOOD_MON_PID")
+sleep 2
+"$DIRECTA" restart monflood --timeout 15 --json > /dev/null || fail "restart under a flooding monitor failed"
+MON_RSS_CEILING_KB=40000
+MAX_RSS=0
+for i in $(seq 1 18); do
+  RSS="$(ps -o rss= -p "$FLOOD_MON_PID" 2>/dev/null | tr -d ' ')"
+  [[ -n "$RSS" ]] || fail "monitor process died during the flood RSS check"
+  [[ "$RSS" -gt "$MAX_RSS" ]] && MAX_RSS="$RSS"
+  sleep 1
+done
+kill -9 "$FLOOD_MON_PID" 2>/dev/null || true
+wait "$FLOOD_MON_PID" 2>/dev/null || true
+grep -q "stopping: requested by restart" "$FLOOD_MON_OUT" || fail "lifecycle 'stopping' line lost inside an over-cap burst"
+grep -q "started pid=" "$FLOOD_MON_OUT" || fail "lifecycle 'started' line lost inside an over-cap burst"
+pass "lifecycle lines survive an over-cap flood burst across a restart"
+[[ "$MAX_RSS" -le "$MON_RSS_CEILING_KB" ]] || fail "monitor RSS peaked at ${MAX_RSS}KB under flood, over the ${MON_RSS_CEILING_KB}KB ceiling"
+pass "monitor RSS stays under ${MON_RSS_CEILING_KB}KB (peaked ${MAX_RSS}KB) through a flood at max budget flags"
+"$DIRECTA" stop monflood --json > /dev/null 2>&1 || true
+"$DIRECTA" unregister monflood --json > /dev/null 2>&1 || true
+
+# Daemon kill and restart keeps streaming: the client's persistent connection
+# goes unreachable across the kill, reports it once, and resumes once the
+# daemon (restored from the same registry/data dirs) answers again.
+KEEP_OUT="$WORK/monitor-keepalive.log"
+"$DIRECTA" monitor monweb --tick 0.5 > "$KEEP_OUT" 2>/dev/null &
+KEEP_MON_PID=$!
+MONITOR_PIDS+=("$KEEP_MON_PID")
+for i in {1..30}; do grep -q "monweb out| heartbeat" "$KEEP_OUT" && break; sleep 0.1; done
+grep -q "monweb out| heartbeat" "$KEEP_OUT" || fail "monitor never streamed before the daemon kill"
+BEFORE_LINES="$(wc -l < "$KEEP_OUT" | tr -d ' ')"
+kill -9 "$DAEMON_PID"
+wait "$DAEMON_PID" 2>/dev/null || true
+"$BIN/ddirecta" --foreground --socket "$DIRECTA_SOCKET" --data-dir "$WORK/data" --logs-dir "$WORK/logs" \
+  >>"$DAEMON_LOG" 2>&1 &
+DAEMON_PID=$!
+await_daemon "monitor daemon-kill recovery"
+# Resumed means a child line printed AFTER the unreachable line: the transient
+# line alone grows the file, so a line count cannot tell a reconnect from a
+# client stuck on its dead socket. The backoff ceiling is 10 s, so 20 s covers
+# the first successful poll after the restart.
+UNREACHABLE_AT=""
+RESUMED=0
+for i in {1..100}; do
+  UNREACHABLE_AT="$(grep -n "the daemon is unreachable, retrying" "$KEEP_OUT" | head -1 | cut -d: -f1 || true)"
+  if [[ -n "$UNREACHABLE_AT" ]] && tail -n "+$((UNREACHABLE_AT + 1))" "$KEEP_OUT" | grep -q "monweb out| heartbeat"; then
+    RESUMED=1
+    break
+  fi
+  sleep 0.2
+done
+[[ -n "$UNREACHABLE_AT" ]] || fail "monitor never reported the daemon as unreachable across the kill"
+[[ "$RESUMED" -eq 1 ]] || fail "monitor printed no heartbeat after its unreachable line (line $UNREACHABLE_AT); it did not reconnect to the restarted daemon: $(tail -3 "$KEEP_OUT")"
+AFTER_LINES="$(wc -l < "$KEEP_OUT" | tr -d ' ')"
+pass "monitor survives a daemon kill and restart, streaming heartbeats after its transient line ($BEFORE_LINES -> $AFTER_LINES lines)"
+kill -9 "$KEEP_MON_PID" 2>/dev/null || true
+wait "$KEEP_MON_PID" 2>/dev/null || true
+
+# Linked-worktree cwd: a worktree under <repo>/.claude/worktrees/ attaches to
+# its OWN server while a same-named main-checkout server keeps running, with
+# a distinct label.
+MON_WT_ROOT="$WORK/monitor-wt"
+mkdir -p "$MON_WT_ROOT/main"
+cd "$MON_WT_ROOT/main"
+git init -b main >/dev/null
+git config user.email "smoke@directa.test"
+git config user.name "directa-smoke"
+echo ok > README
+git add README
+git commit -m init >/dev/null
+mkdir -p "$MON_WT_ROOT/main/.claude/worktrees"
+git worktree add -b review "$MON_WT_ROOT/main/.claude/worktrees/review" >/dev/null
+MON_WT_PORT=$((49000 + (RANDOM % 400)))
+cat > "$MON_WT_ROOT/main/devservers.json" <<CFG
+{
+  "host": "monitorwt.localhost",
+  "servers": {
+    "web": {
+      "command": ["$BIN/fixture-server", "--listen-tcp", "{port}"],
+      "healthcheck": { "type": "tcp", "port": $MON_WT_PORT },
+      "port": $MON_WT_PORT
+    }
+  },
+  "version": 1
+}
+CFG
+cp "$MON_WT_ROOT/main/devservers.json" "$MON_WT_ROOT/main/.claude/worktrees/review/devservers.json"
+"$DIRECTA" ensure web --timeout 15 --json > /dev/null || fail "monitor worktree main ensure failed"
+cd "$MON_WT_ROOT/main/.claude/worktrees/review"
+"$DIRECTA" ensure web --timeout 15 --json > /dev/null || fail "monitor worktree review ensure failed"
+WT_MON_OUT="$WORK/monitor-wt.log"
+"$DIRECTA" monitor web --tick 1 > "$WT_MON_OUT" 2>/dev/null &
+WT_MON_PID=$!
+MONITOR_PIDS+=("$WT_MON_PID")
+for i in {1..30}; do grep -q "^directa web@review: monitoring" "$WT_MON_OUT" && break; sleep 0.1; done
+grep -q "^directa web@review: monitoring" "$WT_MON_OUT" || fail "monitor from a linked worktree cwd did not attach with the @review label: $(head -3 "$WT_MON_OUT" 2>/dev/null)"
+pass "monitor from a linked-worktree cwd attaches to that worktree's server with a distinct label"
+kill -9 "$WT_MON_PID" 2>/dev/null || true
+wait "$WT_MON_PID" 2>/dev/null || true
+
+# --project overrides cwd.
+cd "$MONPROJ"
+PROJ_OVERRIDE_OUT="$WORK/monitor-project-override.log"
+# directa canonicalizes the project path (resolving /tmp -> /private/tmp);
+# pwd -P matches that so the comparison below is exact, not a near-miss.
+MON_WT_MAIN_CANONICAL="$(cd "$MON_WT_ROOT/main" && pwd -P)"
+"$DIRECTA" monitor web --project "$MON_WT_ROOT/main" --tick 1 > "$PROJ_OVERRIDE_OUT" 2>/dev/null &
+PROJ_OVERRIDE_PID=$!
+MONITOR_PIDS+=("$PROJ_OVERRIDE_PID")
+for i in {1..30}; do grep -q "^directa web: monitoring $MON_WT_MAIN_CANONICAL" "$PROJ_OVERRIDE_OUT" && break; sleep 0.1; done
+grep -q "^directa web: monitoring $MON_WT_MAIN_CANONICAL" "$PROJ_OVERRIDE_OUT" || fail "--project did not override cwd for monitor: $(head -3 "$PROJ_OVERRIDE_OUT" 2>/dev/null)"
+pass "--project overrides cwd for monitor"
+kill -9 "$PROJ_OVERRIDE_PID" 2>/dev/null || true
+wait "$PROJ_OVERRIDE_PID" 2>/dev/null || true
+cd "$MON_WT_ROOT/main"
+"$DIRECTA" stop web --json > /dev/null 2>&1 || true
+cd "$MON_WT_ROOT/main/.claude/worktrees/review"
+"$DIRECTA" stop web --json > /dev/null 2>&1 || true
+
+# Reader-gone exit: the pipe's read end closes after 1 s, well inside the 2 s
+# budget; polls for the real `directa monitor` process (a child of the
+# pipeline below, not this job's own pid) so the timing is measured against
+# the process whose lifetime is actually under test.
+cd "$MONPROJ"
+READER_START=$SECONDS
+"$DIRECTA" monitor monweb | ( sleep 1; exit 0 ) &
+READER_MON_PID=""
+for i in {1..30}; do
+  READER_MON_PID="$(pgrep -f "$BIN/directa monitor monweb" | head -1)"
+  [[ -n "$READER_MON_PID" ]] && break
+  sleep 0.05
+done
+[[ -n "$READER_MON_PID" ]] || fail "reader-gone check never saw the monitor process start"
+MONITOR_PIDS+=("$READER_MON_PID")
+for i in {1..30}; do
+  kill -0 "$READER_MON_PID" 2>/dev/null || break
+  sleep 0.1
+done
+READER_ELAPSED=$((SECONDS - READER_START))
+kill -0 "$READER_MON_PID" 2>/dev/null && fail "monitor did not exit within 2 s of its reader closing (still alive after ${READER_ELAPSED}s)"
+[[ "$READER_ELAPSED" -le 2 ]] || fail "monitor took ${READER_ELAPSED}s to exit after its reader closed, wanted <= 2s"
+pass "monitor exits within 2 s once its stdout reader is gone"
+
+# One poll per tick, and idle CPU, both over a quiet server (no flood
+# processing overhead to skew either number): DIRECTA_MONITOR_DEBUG=1 prints
+# one stderr line per logs.query call (documented at its callsite in
+# MonitorCommand.swift), so 20 s at --tick 0.5 is nominally 40; negligible
+# cumulative CPU time over the same real wall-clock window means the loop is
+# sleeping between ticks (and the lifetime watcher blocking in the kernel),
+# not spinning.
+IDLE_OUT="$WORK/monitor-idle.log"
+IDLE_DEBUG="$WORK/monitor-idle-debug.log"
+DIRECTA_MONITOR_DEBUG=1 "$DIRECTA" monitor monweb --tick 0.5 > "$IDLE_OUT" 2>"$IDLE_DEBUG" &
+IDLE_MON_PID=$!
+MONITOR_PIDS+=("$IDLE_MON_PID")
+sleep 20
+IDLE_TIME_RAW="$(ps -o time= -p "$IDLE_MON_PID" | tr -d ' ')"
+kill -9 "$IDLE_MON_PID" 2>/dev/null || true
+wait "$IDLE_MON_PID" 2>/dev/null || true
+[[ -n "$IDLE_TIME_RAW" ]] || fail "could not read monitor's CPU time"
+IDLE_UNDER_ONE_SECOND=$(awk -F: -v t="$IDLE_TIME_RAW" 'BEGIN{n=split(t,a,":"); s=0; for(i=1;i<=n;i++) s=s*60+a[i]; print (s<1.0)?1:0}')
+[[ "$IDLE_UNDER_ONE_SECOND" -eq 1 ]] || fail "monitor used ${IDLE_TIME_RAW} of CPU over 20 idle seconds, wanted well under 1s"
+pass "monitor stays near-idle (<1s CPU) over 20 s attached to a quiet server"
+POLL_COUNT="$(wc -l < "$IDLE_DEBUG" | tr -d ' ')"
+[[ "$POLL_COUNT" -ge 34 && "$POLL_COUNT" -le 44 ]] || fail "expected ~40 polls over 20s at --tick 0.5 against a quiet server, got $POLL_COUNT"
+pass "one poll per tick over 20 s at --tick 0.5 ($POLL_COUNT polls)"
+
+cd "$MONPROJ"
+"$DIRECTA" stop monweb --json > /dev/null 2>&1 || true
+
 # watch: a config the server reads at boot changes, and the server comes back
 # having read it. The pid moving is not the point; the new value in the log is.
 WATCHP="$WORK/watchproj"
@@ -565,7 +874,10 @@ cat > "$WATCHP/devservers.json" <<CFG
 CFG
 cd "$WATCHP"
 "$DIRECTA" ensure web --timeout 15 --json > /dev/null || fail "ensure watch server"
-"$DIRECTA" logs web --json | grep -q "config: v1" || fail "watch fixture never read its config"
+# --all: the default 200-line tail could plausibly miss the boot-time config
+# line by the time this asserts, given the fixture's 200ms heartbeat plus the
+# restart loop below piling up lines ahead of it.
+"$DIRECTA" logs web --all --json | grep -q "config: v1" || fail "watch fixture never read its config"
 W_PID_BEFORE="$("$DIRECTA" status web --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["servers"][0]["pid"])')"
 # The baseline is taken once the run has been alive for the settle window, which
 # is what stops a server that writes its own config during boot from bouncing
@@ -580,7 +892,7 @@ for _ in $(seq 1 80); do
 done
 [[ "$W_PID_NOW" != "$W_PID_BEFORE" ]] || fail "a watched file changed and the server never restarted (status: $("$DIRECTA" status web --json 2>&1 | head -c 400))"
 "$DIRECTA" wait web --healthy --timeout 15 --json > /dev/null || fail "watch restart never became healthy"
-"$DIRECTA" logs web --json | grep -q "config: v2" || fail "the restarted server did not read the new config"
+"$DIRECTA" logs web --all --json | grep -q "config: v2" || fail "the restarted server did not read the new config"
 pass "a watched file change restarts the server and it reads the new config"
 
 # A server that declares no watch must behave exactly as before.
@@ -620,6 +932,70 @@ set -e
 echo "$BAD_OUT" | grep -Eq 'not-found|"ok":false' || fail "x-url bad slug envelope: $BAD_OUT"
 pass "x-url rejects unknown slug"
 
+# doctor against the smoke daemon: every file a daemon owns is read and written
+# in that daemon's own data and logs dirs (daemon.info), never the real ones
+# under $HOME. A fresh update-check cache naming a far-future release is seeded
+# in the smoke data dir, so an `update` finding proves doctor read this cache
+# (and needs no network), and the real cache's mtime proves it wrote nothing
+# there. A planted leftover log dir must be reported, then removed by --fix
+# through the daemon, while the smoke project's own log dir stays.
+REAL_CACHE="$HOME/Library/Application Support/directa/update-check.json"
+REAL_CACHE_BEFORE="$(stat -f %m "$REAL_CACHE" 2>/dev/null || echo absent)"
+printf '{"checkedAt":"%s","latestVersion":"999.0.0"}' "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+  > "$WORK/data/update-check.json"
+ORPHAN_DIR="$WORK/logs/smoke-orphan-deadbeef"
+mkdir -p "$ORPHAN_DIR/web"
+echo leftover > "$ORPHAN_DIR/web/current.log"
+WEB_LOG_DIR="$(dirname "$(dirname "$SPOOL")")"
+[[ -d "$WEB_LOG_DIR" ]] || fail "smoke project log dir $WEB_LOG_DIR missing before doctor"
+set +e
+DOCTOR_JSON="$("$DIRECTA" doctor --json --no-bootstrap 2>/dev/null)"
+DOCTOR_EXIT=$?
+set -e
+[[ "$DOCTOR_EXIT" -eq 0 ]] || fail "doctor exited $DOCTOR_EXIT: $DOCTOR_JSON"
+/usr/bin/python3 - "$DOCTOR_JSON" "$ORPHAN_DIR" "$HOME" <<'PY' || fail "doctor report: $DOCTOR_JSON"
+import json, sys
+findings = json.loads(sys.argv[1])["findings"]
+orphan, home = sys.argv[2], sys.argv[3]
+orphans = [f for f in findings if f["kind"] == "orphan-log-dir" and f["detail"].startswith(orphan + " (")]
+assert [f["severity"] for f in orphans] == ["warning"], findings
+assert "directa doctor --fix" in orphans[0]["detail"], orphans
+updates = [f for f in findings if f["kind"] == "update"]
+assert len(updates) == 1 and "999.0.0" in updates[0]["detail"], updates
+real_logs = home + "/Library/Logs/directa"
+assert not any(real_logs in f["detail"] for f in findings), [f for f in findings if real_logs in f["detail"]]
+PY
+[[ -d "$ORPHAN_DIR" ]] || fail "report-only doctor removed $ORPHAN_DIR"
+pass "doctor reports the planted leftover log dir and reads the smoke daemon's update cache"
+set +e
+FIX_JSON="$("$DIRECTA" doctor --fix --json --no-bootstrap 2>/dev/null)"
+FIX_EXIT=$?
+set -e
+[[ "$FIX_EXIT" -eq 0 ]] || fail "doctor --fix exited $FIX_EXIT: $FIX_JSON"
+/usr/bin/python3 - "$FIX_JSON" "$ORPHAN_DIR" <<'PY' || fail "doctor --fix report: $FIX_JSON"
+import json, sys
+findings = json.loads(sys.argv[1])["findings"]
+orphans = [f for f in findings if f["kind"] == "orphan-log-dir"]
+assert {"detail": "removed %s, which matched no registered project" % sys.argv[2],
+        "kind": "orphan-log-dir", "severity": "fixed"} in orphans, orphans
+assert not [f for f in orphans if f["severity"] != "fixed"], orphans
+PY
+[[ ! -e "$ORPHAN_DIR" ]] || fail "doctor --fix left $ORPHAN_DIR in place"
+[[ -d "$WEB_LOG_DIR" ]] || fail "doctor --fix removed the claimed log dir $WEB_LOG_DIR"
+REAL_CACHE_AFTER="$(stat -f %m "$REAL_CACHE" 2>/dev/null || echo absent)"
+[[ "$REAL_CACHE_AFTER" == "$REAL_CACHE_BEFORE" ]] \
+  || fail "doctor touched the real update cache $REAL_CACHE ($REAL_CACHE_BEFORE -> $REAL_CACHE_AFTER)"
+pass "doctor --fix removes the leftover through the daemon, keeps the claimed dir, and leaves the real data dir alone"
+
+# Antigravity's PreInvocation hook fires before every model call; only the
+# first (invocationNum 0) carries the context block.
+"$DIRECTA" trust --json > /dev/null
+FIRST_CALL="$(printf '{"invocationNum":0,"workspacePaths":["%s"]}' "$PROJECT" | "$DIRECTA" hook antigravity-session-start)"
+grep -q '"ephemeralMessage"' <<<"$FIRST_CALL" || fail "antigravity hook was silent on the first model call: $FIRST_CALL"
+LATER_CALL="$(printf '{"invocationNum":1,"workspacePaths":["%s"]}' "$PROJECT" | "$DIRECTA" hook antigravity-session-start)"
+[[ "$LATER_CALL" == '{"injectSteps":[]}' ]] || fail "antigravity hook spoke on a later model call: $LATER_CALL"
+pass "antigravity hook injects context on the first model call only"
+
 # Bundle advertises the custom URL scheme and ships CLI + daemon for first-run.
 # Ad-hoc on purpose: the gate asserts layout and never installs this bundle, so
 # it needs no signing identity and wants no warning about lacking one.
@@ -657,6 +1033,17 @@ BUNDLE_PROG="$(/usr/libexec/PlistBuddy -c 'Print :BundleProgram' "$AGENT_PLIST")
 AGENT_EXIT_TIMEOUT="$(/usr/libexec/PlistBuddy -c 'Print :ExitTimeOut' "$AGENT_PLIST")"
 [[ "$AGENT_EXIT_TIMEOUT" -le 60 ]] || fail "ExitTimeOut was '$AGENT_EXIT_TIMEOUT'; launchd caps it at 60"
 pass "assembled app ships Helpers/ddirecta + in-bundle LaunchAgent"
+
+# The app's own KeepAlive agent: same bundle-layout shape as the daemon's, but
+# BundleProgram points at the app binary itself and there is no PATH floor to
+# check (the app never spawns dev servers).
+APP_AGENT_PLIST="$ROOT/directa.app/Contents/Library/LaunchAgents/dev.quantizor.directa.app.plist"
+[[ -f "$APP_AGENT_PLIST" ]] || fail "bundle missing Library/LaunchAgents/dev.quantizor.directa.app.plist"
+APP_BUNDLE_PROG="$(/usr/libexec/PlistBuddy -c 'Print :BundleProgram' "$APP_AGENT_PLIST")"
+[[ "$APP_BUNDLE_PROG" == "Contents/MacOS/directa-app" ]] || fail "app agent BundleProgram was '$APP_BUNDLE_PROG'"
+APP_KEEPALIVE="$(/usr/libexec/PlistBuddy -c 'Print :KeepAlive:SuccessfulExit' "$APP_AGENT_PLIST")"
+[[ "$APP_KEEPALIVE" == "false" ]] || fail "app agent KeepAlive:SuccessfulExit was '$APP_KEEPALIVE'"
+pass "assembled app ships its own KeepAlive LaunchAgent (dev.quantizor.directa.app)"
 
 kill -9 "$DAEMON_PID" 2>/dev/null || true
 DAEMON_PID=""

@@ -91,9 +91,10 @@ public enum ConfigProjection {
         directa injects it on every spawn. */
     static func declarableEnv(_ spec: ServerSpec) -> [String: String]? {
         guard var env = spec.env else { return nil }
-        env.removeValue(forKey: "DIRECTA_HOST")
-        if let port = spec.port, env[spec.portEnv ?? "PORT"] == String(port) {
-            env.removeValue(forKey: spec.portEnv ?? "PORT")
+        env.removeValue(forKey: PortMaterializer.hostEnvironmentKey)
+        let portKey = spec.portEnv ?? PortMaterializer.portEnvironmentKey
+        if let port = spec.port, env[portKey] == String(port) {
+            env.removeValue(forKey: portKey)
         }
         return env.isEmpty ? nil : env
     }

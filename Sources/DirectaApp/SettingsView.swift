@@ -1,6 +1,5 @@
 import AppKit
 import DirectaKit
-import ServiceManagement
 import SwiftUI
 
 /** Whether the app checks for a newer release in the background. Read by the
@@ -26,7 +25,12 @@ struct SettingsView: View {
     @State private var offers: [HarnessOffer] = []
     @State private var busyHarness: String?
     @State private var hookError: String?
-    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var launchAtLogin = false
+    /** What starts the app at login as last read; nil until the first read
+        lands and while a change is in flight, which keeps the toggle
+        disabled. */
+    @State private var launchAtLoginActual: Bool?
+    @State private var launchAtLoginError: String?
     @State private var checkForUpdates = UpdatePreference.enabled
     @State private var confirmingUninstall = false
 
@@ -47,6 +51,10 @@ struct SettingsView: View {
         .onAppear {
             AppFocus.promote()
             refreshOffers()
+        }
+        .task {
+            let actual = await BlockingLane.system.run { AppAgentService.startsAtLogin }
+            showLaunchAtLogin(actual)
         }
     }
 
@@ -99,19 +107,29 @@ struct SettingsView: View {
     private var generalSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             sectionTitle("General")
+            /** `onChange` acts only on a value that differs from the last
+                read, and the resync after a failed On sets the toggle to that
+                read, so the resync never reaches the Off path and never
+                records Off for someone who asked for On. */
             Toggle("Start at login", isOn: $launchAtLogin)
                 .toggleStyle(.checkbox)
+                .disabled(launchAtLoginActual == nil)
                 .onChange(of: launchAtLogin) { _, wanted in
-                    do {
-                        if wanted {
-                            try SMAppService.mainApp.register()
-                        } else {
-                            try SMAppService.mainApp.unregister()
-                        }
-                    } catch {
-                        launchAtLogin = SMAppService.mainApp.status == .enabled
+                    guard let actual = launchAtLoginActual, wanted != actual else { return }
+                    launchAtLoginActual = nil
+                    Task {
+                        let outcome = await BlockingLane.system.run { AppAgentService.applyUserChoice(wanted) }
+                        launchAtLoginError = outcome.error
+                        showLaunchAtLogin(outcome.startsAtLogin)
                     }
                 }
+            if let launchAtLoginError {
+                Text(launchAtLoginError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Toggle("Check for updates in the background", isOn: $checkForUpdates)
                 .toggleStyle(.checkbox)
                 .onChange(of: checkForUpdates) { _, wanted in
@@ -172,6 +190,13 @@ struct SettingsView: View {
             .font(.headline)
     }
 
+    /** The read lands before the toggle moves, so the `onChange` this
+        assignment fires finds nothing to apply. */
+    private func showLaunchAtLogin(_ actual: Bool) {
+        launchAtLoginActual = actual
+        launchAtLogin = actual
+    }
+
     private func refreshOffers() {
         let cliPath = owner.cliPath.path
         Task { @MainActor in
@@ -211,20 +236,23 @@ struct SettingsView: View {
 
     /** Non-Homebrew uninstall: drop launch items in-process (this is already
         the hosting app), then shell the CLI for hooks and binaries, then move
-        this bundle to the Trash and quit. A running bundle can be trashed
-        because the process holds the inode. */
+        this bundle to the Trash, and only then unregister the app's own
+        agent, which ends this process when launchd started it. A running
+        bundle can be trashed because the process holds the inode. */
     private func performLocalUninstall() {
         guard let cli = SetupPerformer.resourceURLs()?.cli else {
             hookError = "This copy of directa.app is missing its bundled CLI."
             return
         }
+        AppAgentService.uninstallInProgress = true
         Task { @MainActor in
             _ = await Task.detached(priority: .userInitiated) {
-                try? await AgentService.unregisterAllLaunchItems()
-                LaunchdAdmin.shell(cli.path, ["uninstall"])
+                try? await AgentService.unregisterLaunchItemsButAppAgent()
+                await LaunchdAdmin.shell(cli.path, ["uninstall"])
             }.value
             try? FileManager.default.trashItem(
                 at: Bundle.main.bundleURL, resultingItemURL: nil)
+            await BlockingLane.system.run { AppAgentService.unregister() }
             NSApp.terminate(nil)
         }
     }

@@ -77,9 +77,12 @@ enum AppDeepLinkDispatch {
                 try await AgentService.unregister()
                 DirectaLog.app.info("deeplink daemon/unregister ok")
             case .unregisterAll:
-                try await AgentService.unregisterAllLaunchItems()
+                try await AgentService.unregisterLaunchItemsButAppAgent()
                 SpotlightIndexer.deleteAll()
                 DirectaLog.app.info("deeplink daemon/unregister-all ok")
+                if !AppAgentService.uninstallInProgress {
+                    await BlockingLane.system.run { AppAgentService.unregister() }
+                }
             }
         } catch {
             DirectaLog.app.error("deeplink daemon/\(action.rawValue): \(error.localizedDescription)")

@@ -8,9 +8,18 @@ import Foundation
                            Foundation's Process puts it in its OWN process group,
                            so a group-directed kill cannot reach it and only the
                            daemon's descendant snapshot can find it
-    --grandchild-after S   delay that spawn, which is what puts it past the
-                           supervisor's early snapshot and makes the teardown
-                           race deterministic instead of load-dependent
+    --grandchild-after S   delay that spawn (or the --setsid-listener spawn),
+                           which is what puts it past the supervisor's early
+                           snapshot and makes the teardown race deterministic
+                           instead of load-dependent
+    --setsid-listener PORT spawn a copy of this fixture listening on PORT in a
+                           session of its own (POSIX_SPAWN_SETSID), so neither
+                           the root's group nor its session can reach it and
+                           only a descendant snapshot taken while the root
+                           still parents it can. Prints `setsid listener pid N`
+    --exit-after-spawn     exit with --code the moment the setsid listener is
+                           spawned, so no snapshot refresh can land between the
+                           spawn and the root's exit
     --orphan-grandchild    background a `sleep 1000` through a shell that then
                            exits, so the sleep reparents away from this process
                            but keeps its session. A parent-chain sweep can no
@@ -24,7 +33,14 @@ import Foundation
     --ignore-sigterm       install SIG_IGN for SIGTERM (escalation verification)
     --emit-binary          write raw non-UTF8 bytes into stdout once
     --err-lines N          write N lines to stderr at startup (error-tally fixture)
-    --flood                write lines as fast as possible
+    --flood                write lines as fast as possible, only while the
+                           process that started this one lives: a flood exits
+                           when that process exits, or at once if it is gone
+                           before the watch is armed (ppid already 1), so a
+                           test run killed part way never leaves one burning
+                           a core under launchd. No other mode is tied to its
+                           parent, since the teardown fixtures exist to
+                           outlive theirs
     --print-file PATH      print `config: <first line>` of PATH once at startup,
                            which is how a watch test proves the RESTARTED process
                            read the new file rather than only that a pid changed
@@ -34,10 +50,12 @@ import Foundation
 var listenPort: UInt16?
 var exitAfter: Double?
 var exitCode: Int32 = 0
+var exitAfterSpawn = false
 var spawnGrandchild = false
 var grandchildAfter: Double?
 var orphanGrandchild = false
 var orphanGrandchildIgnoresTerm = false
+var setsidListenerPort: UInt16?
 var ignoreSigterm = false
 var emitBinary = false
 var errLines = 0
@@ -54,6 +72,8 @@ while let arg = argIterator.next() {
         exitAfter = argIterator.next().flatMap { Double($0) }
     case "--code":
         exitCode = argIterator.next().flatMap { Int32($0) } ?? 0
+    case "--exit-after-spawn":
+        exitAfterSpawn = true
     case "--spawn-grandchild":
         spawnGrandchild = true
     case "--grandchild-after":
@@ -62,6 +82,8 @@ while let arg = argIterator.next() {
         orphanGrandchild = true
     case "--orphan-grandchild-ignterm":
         orphanGrandchildIgnoresTerm = true
+    case "--setsid-listener":
+        setsidListenerPort = argIterator.next().flatMap { UInt16($0) }
     case "--ignore-sigterm":
         ignoreSigterm = true
     case "--emit-binary":
@@ -113,13 +135,57 @@ func launchOrphanGrandchild(ignoreTerm: Bool) {
     shell.waitUntilExit()
 }
 
-if spawnGrandchild {
-    if let grandchildAfter {
-        /** On a background queue so the heartbeat loop below still runs and the
-            supervisor sees a normal, healthy-looking server for the whole delay. */
-        DispatchQueue.global().asyncAfter(deadline: .now() + grandchildAfter) { launchGrandchild() }
+/** posix_spawn rather than Foundation's `Process`, which cannot set
+    POSIX_SPAWN_SETSID. The child inherits this process's stdout and stderr, so
+    its own lines land in the same spool. The child's signal mask is emptied and
+    every disposition reset to default: a Dispatch worker thread can have
+    SIGTERM blocked, and a child inheriting that mask would never notice a stop. */
+func launchSetsidListener(port: UInt16) {
+    var attr: posix_spawnattr_t?
+    posix_spawnattr_init(&attr)
+    defer { posix_spawnattr_destroy(&attr) }
+    var noSignals = sigset_t()
+    var allSignals = sigset_t()
+    sigemptyset(&noSignals)
+    sigfillset(&allSignals)
+    posix_spawnattr_setflags(
+        &attr, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF))
+    posix_spawnattr_setsigmask(&attr, &noSignals)
+    posix_spawnattr_setsigdefault(&attr, &allSignals)
+    let argv = [CommandLine.arguments[0], "--listen-tcp", String(port)]
+    let cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
+    defer { for arg in cArgs { free(arg) } }
+    var child: pid_t = 0
+    let status = posix_spawn(&child, argv[0], nil, &attr, cArgs, environ)
+    guard status == 0 else {
+        FileHandle.standardError.write(
+            Data("fixture-server: setsid listener spawn failed: \(String(cString: strerror(status)))\n".utf8))
+        return
+    }
+    print("setsid listener pid \(child)")
+}
+
+/** On a background queue so the heartbeat loop below still runs and the
+    supervisor sees a normal, healthy-looking server for the whole delay. */
+func launch(after delay: Double?, _ body: @escaping @Sendable () -> Void) {
+    if let delay {
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) { body() }
     } else {
-        launchGrandchild()
+        body()
+    }
+}
+
+if spawnGrandchild {
+    launch(after: grandchildAfter) { launchGrandchild() }
+}
+
+if let port = setsidListenerPort {
+    /** Captured for the same reason as `code` under --exit-after below. */
+    let exitNow = exitAfterSpawn
+    let code = exitCode
+    launch(after: grandchildAfter) {
+        launchSetsidListener(port: port)
+        if exitNow { exit(code) }
     }
 }
 
@@ -197,11 +263,30 @@ if let exitAfter {
     }
 }
 
-var heartbeat = 0
-while true {
-    heartbeat += 1
-    print("heartbeat \(heartbeat)")
-    if !flood {
-        usleep(200_000)
+/** Checked again after arming, since a parent that exits before the source
+    registers is never reported. A released source stops watching, so the
+    heartbeat loop below holds it. */
+let floodOwnerWatch: DispatchSourceProcess? = {
+    guard flood else { return nil }
+    let owner = getppid()
+    if owner > 1 {
+        let source = DispatchSource.makeProcessSource(identifier: owner, eventMask: .exit, queue: .global())
+        source.setEventHandler { _exit(0) }
+        source.resume()
+        if getppid() == owner { return source }
+    }
+    FileHandle.standardError.write(
+        Data("fixture-server: --flood runs only while the process that started it lives, and that process has exited\n".utf8))
+    exit(0)
+}()
+
+withExtendedLifetime(floodOwnerWatch) {
+    var heartbeat = 0
+    while true {
+        heartbeat += 1
+        print("heartbeat \(heartbeat)")
+        if !flood {
+            usleep(200_000)
+        }
     }
 }

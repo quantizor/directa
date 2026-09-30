@@ -1,0 +1,14 @@
+# Periphery (unused-code scan) settings. Run it only through
+# scripts/dead-code.sh, which builds the index, pins the Periphery version, and
+# keeps every scan on this machine; a bare `periphery scan` reports the
+# project's line count to the vendor.
+disable_redundant_public_analysis: true
+disable_update_check: true
+index_store_path:
+  - .build/out
+relative_results: true
+retain_encodable_properties: true
+retain_equatable_properties: true
+retain_hashable_properties: true
+skip_build: true
+strict: true

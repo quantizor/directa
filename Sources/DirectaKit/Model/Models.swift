@@ -9,7 +9,7 @@ public enum DirectaVersion {
 
 /** Lifecycle phase of a supervised server. `failed` means the spawn itself never
     succeeded (ENOENT, EACCES) and is distinct from `crashed` (ran, then died). */
-public enum ServerPhase: String, Codable, Sendable {
+public enum ServerPhase: String, CaseIterable, Codable, Sendable {
     case crashed
     case failed
     case running
@@ -17,6 +17,37 @@ public enum ServerPhase: String, Codable, Sendable {
     case stopped
     case stopping
     case unhealthy
+
+    /** A run is in flight: up, on its way up, or on its way down. Start-shaped
+        paths join or skip such a run rather than spawning beside it. The phase
+        alone cannot see a port-failed run that is still alive; ask
+        `hasLiveRun(pid:)` whenever the question is whether a process exists. */
+    public var isActive: Bool {
+        switch self {
+        case .running, .starting, .stopping, .unhealthy: true
+        case .crashed, .failed, .stopped: false
+        }
+    }
+
+    /** The run is expected to be the listener on every port it claims.
+        `stopping` is deliberately excluded although `isActive` counts it: a
+        server tearing down is releasing its ports, so a port check neither
+        credits it with a listener nor names it as the holder, while start
+        still waits for it rather than spawning beside it. */
+    public var holdsPort: Bool {
+        switch self {
+        case .running, .starting, .unhealthy: true
+        case .crashed, .failed, .stopped, .stopping: false
+        }
+    }
+
+    /** Whether a process of this server is alive, given the run's pid. The one
+        home for that question: an active phase, or a port failure (drift, or a
+        port another managed server owns), which is a finding rather than a
+        teardown and so leaves the run alive with its pid. */
+    public func hasLiveRun(pid: Int?) -> Bool {
+        isActive || (self == .failed && pid != nil)
+    }
 }
 
 /** Healthcheck configuration. Absent spec + declared port implies a TCP probe;
@@ -289,6 +320,17 @@ public struct LastExit: Codable, Equatable, Sendable {
         self.code = code
         self.signal = signal
     }
+
+    /** "exit N" or "signal N"; nil when the exit status was never observed. */
+    public var causeDescription: String? {
+        code.map { "exit \($0)" } ?? signal.map { "signal \($0)" }
+    }
+
+    /** "last exit <cause> at <time>": how status, the session context, and
+        monitor's start marker name the most recent exit. */
+    public var summary: String {
+        "last exit \(causeDescription ?? "unknown") at \(JSONCoding.formatISO8601(at))"
+    }
 }
 
 /** Forensics for a spawn that never produced a process. */
@@ -439,11 +481,42 @@ extension ServerStatus {
         effective port, so the menu bar and the statusline disagreed with the
         agent context about where the same server was. */
     public var displayPort: Int? { observedPort ?? effectivePort ?? declaredPort }
+
+    /** Whether a process of this server is alive; see `ServerPhase.hasLiveRun`. */
+    public var hasLiveRun: Bool { phase.hasLiveRun(pid: pid) }
+
+    /** The ports this server's run holds right now. A holding phase answers
+        for its whole claim: the port it binds, the observed and named ports,
+        plus `claim`, the full set resolved at spawn, whose span members no
+        status field names. The bound port is the effective one; the declared
+        port counts only when no effective port was resolved, since a sibling
+        rebound off its committed port has left that port to the checkout it
+        moved away from. A live port-failed run holds only the port it was
+        seen listening on, since its failure says the claim is not what it
+        holds. A `stopping` run is live but holds nothing
+        (`ServerPhase.holdsPort`). Empty otherwise. */
+    public func heldPorts(claim: PortClaim?) -> Set<Int> {
+        guard hasLiveRun else { return [] }
+        guard phase.holdsPort else {
+            return phase == .failed ? Set([observedPort].compactMap { $0 }) : []
+        }
+        var held = Set(claim?.allPorts ?? [])
+        held.formUnion([effectivePort ?? declaredPort, observedPort].compactMap { $0 })
+        if let ports { held.formUnion(ports.values) }
+        return held
+    }
 }
 
 /** The unified event feed: lifecycle transitions, health changes, and marks as
-    one queryable stream. */
-public enum EventKind: String, Codable, Sendable {
+    one queryable stream.
+
+    Decoding is hand-written rather than the raw-value synthesis a plain
+    `String` enum would get, so a kind this build predates falls back to
+    `.unknown` instead of failing the whole events response: a client one
+    version behind the daemon must still show every other event in the feed.
+    `.rawValue` stays available (not just `Codable`) since callers outside this
+    file print it directly. */
+public enum EventKind: Codable, Equatable, Sendable {
     case crashed
     case failed
     case healthy
@@ -453,6 +526,39 @@ public enum EventKind: String, Codable, Sendable {
     case stopped
     case unhealthy
     case unregistered
+    /** A kind a newer daemon emits that this build does not recognize. Carries
+        the original wire string so encoding round-trips it byte-identical. */
+    case unknown(String)
+
+    public var rawValue: String {
+        switch self {
+        case .crashed: "crashed"
+        case .failed: "failed"
+        case .healthy: "healthy"
+        case .marked: "marked"
+        case .registered: "registered"
+        case .started: "started"
+        case .stopped: "stopped"
+        case .unhealthy: "unhealthy"
+        case .unregistered: "unregistered"
+        case .unknown(let raw): raw
+        }
+    }
+
+    /** Every kind this build names, which decoding matches by `rawValue`. */
+    static let known: [EventKind] = [
+        .crashed, .failed, .healthy, .marked, .registered, .started, .stopped, .unhealthy, .unregistered,
+    ]
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = Self.known.first { $0.rawValue == raw } ?? .unknown(raw)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 public struct EventRecord: Codable, Equatable, Sendable {
@@ -472,11 +578,11 @@ public struct EventRecord: Codable, Equatable, Sendable {
 }
 
 /** Whether the menu bar should banner an event. Expected daemon bounce markers
-    (`daemon-restart`) are forensics for the feed, not user alerts. */
+    (`DaemonRestartDetail`) are forensics for the feed, not user alerts. */
 public enum CrashNotificationPolicy {
     public static func shouldNotify(kind: EventKind, detail: String?) -> Bool {
         guard kind == .crashed || kind == .failed else { return false }
-        if let detail, detail.hasPrefix("daemon-restart") { return false }
+        if let detail, DaemonRestartDetail.matches(detail) { return false }
         return true
     }
 }
@@ -509,6 +615,13 @@ public struct WhyResult: Codable, Equatable, Sendable {
 
 /** Basic daemon identity returned by `daemon.info`. */
 public struct DaemonInfo: Codable, Equatable, Sendable {
+    /** Every project the daemon currently claims: every registry project plus
+        every project with a resident supervisor, sorted. Optional and
+        append-only like `restoring`, so an older daemon that never set it is
+        read as "unknown" rather than "claims nothing"; `directa doctor`'s
+        orphan-log-dir finding skips entirely rather than guessing when this
+        is nil. */
+    public var claimedProjects: [String]?
     public var dataDir: String
     public var daemonVersion: String
     public var logsDir: String
@@ -523,6 +636,7 @@ public struct DaemonInfo: Codable, Equatable, Sendable {
     public var socketPath: String
 
     public init(
+        claimedProjects: [String]? = nil,
         dataDir: String,
         daemonVersion: String,
         logsDir: String,
@@ -532,6 +646,7 @@ public struct DaemonInfo: Codable, Equatable, Sendable {
         searchPath: String? = nil,
         socketPath: String
     ) {
+        self.claimedProjects = claimedProjects
         self.dataDir = dataDir
         self.daemonVersion = daemonVersion
         self.logsDir = logsDir

@@ -1,6 +1,8 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
+import os
 
 @testable import directa
 
@@ -8,9 +10,8 @@ import Testing
     owns and directa does not: `~/.claude/settings.json` holds every other hook,
     permission and preference the harness reads. The install writes the whole
     file back from what it read, so what the read does on a file it cannot parse
-    decides whether the merge is a merge or a replacement. It used to answer with
-    an empty dictionary, which the write then persisted as the entire file. */
-@Suite struct HarnessSettingsTests {
+    decides whether the merge is a merge or a replacement. */
+@Suite(.temporaryTree) struct HarnessSettingsTests {
     /** Stands in for a real adapter so these exercise the shared load/write pair
         rather than either harness's key layout. */
     private struct StubAdapter: HarnessAdapter {
@@ -22,10 +23,7 @@ import Testing
     }
 
     private func inScratch(_ body: (StubAdapter) throws -> Void) throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-harness-settings-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
+        let dir = try TemporaryTree.directory(named: "harness-settings")
         try body(StubAdapter(settingsURL: dir.appending(path: "settings.json")))
     }
 
@@ -95,7 +93,7 @@ import Testing
             let error = #expect(throws: WireError.self) { try adapter.loadSettings() }
             #expect(error?.code == .configInvalid)
             #expect(error?.message.contains(adapter.settingsURL.path) == true)
-            #expect(error?.hint == "directa hook install")
+            #expect(error?.hint == "run: directa hook install")
         }
     }
 
@@ -108,11 +106,7 @@ import Testing
     }
 
     private func inScratchDir(_ body: (URL) throws -> Void) throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-harness-real-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        try body(dir)
+        try body(try TemporaryTree.directory(named: "harness-real"))
     }
 
     /** Install then uninstall leaves the file byte-for-byte as it started, and
@@ -527,6 +521,115 @@ import Testing
         #expect(GrokHookEvent.parse("post_tool_use") == .leftover)
     }
 
+    /** Payload shapes copied from the vendor docs: Claude Code's SessionStart
+        example (code.claude.com/docs/en/hooks, "SessionStart input") and
+        Cursor's sessionStart input over its common base
+        (cursor.com/docs/hooks, "Common schema" and "sessionStart"). */
+    @Test(arguments: [
+        (
+            #"{"session_id":"abc123","transcript_path":"/Users/me/.claude/projects/x/abc123.jsonl","cwd":"/Users/me/code/app","hook_event_name":"SessionStart","source":"startup","model":"claude-opus-5"}"#,
+            true
+        ),
+        (
+            #"{"session_id":"abc123","transcript_path":"/t.jsonl","cwd":"/p","hook_event_name":"SessionStart","source":"compact"}"#,
+            true
+        ),
+        (
+            #"{"conversation_id":"c1","generation_id":"g1","model":"claude-opus-5","model_id":"claude-opus-5","model_params":[],"hook_event_name":"sessionStart","cursor_version":"3.14.2","workspace_roots":["/Users/me/code/app"],"user_email":null,"transcript_path":null,"session_id":"c1","is_background_agent":false,"composer_mode":"agent"}"#,
+            false
+        ),
+        (#"{"cursor_version":"1.7.2"}"#, false),
+        ("", true),
+        ("not json", true),
+        ("[1,2]", true),
+    ])
+    func claudeHookStandsDownOnlyUnderCursor(payload: String, emits: Bool) {
+        let parsed = HookPayload.parse(Data(payload.utf8))
+        #expect(HookPayloadGate.claudeHookShouldEmit(parsed, cursorHookInstalled: { true }) == emits)
+        /** Without directa's own Cursor hook, the claude hook is the only
+            source of the block in a Cursor session, so it always speaks. */
+        #expect(HookPayloadGate.claudeHookShouldEmit(parsed, cursorHookInstalled: { false }))
+    }
+
+    /** A `cursor_version` of any type, `null` included, is still Cursor. */
+    @Test(arguments: [#"{"cursor_version":null}"#, #"{"cursor_version":3}"#, #"{"cursor_version":{}}"#])
+    func anyCursorVersionValueCounts(payload: String) {
+        #expect(
+            !HookPayloadGate.claudeHookShouldEmit(
+                HookPayload.parse(Data(payload.utf8)), cursorHookInstalled: { true }))
+    }
+
+    /** Cursor's settings file is read only for a payload that came from
+        Cursor, so a Claude Code session start never pays for it. */
+    @Test func theCursorSettingsAreReadOnlyForACursorPayload() {
+        let claude = HookPayload.parse(Data(#"{"cwd":"/p","hook_event_name":"SessionStart"}"#.utf8))
+        #expect(
+            HookPayloadGate.claudeHookShouldEmit(
+                claude,
+                cursorHookInstalled: {
+                    Issue.record("read Cursor's settings for a Claude Code payload")
+                    return true
+                }))
+    }
+
+    /** PreInvocation input copied from antigravity.google/docs/hooks (the
+        example carries `invocationNum: 3`), with the number varied. */
+    @Test(arguments: [
+        (0, true), (1, false), (3, false),
+    ])
+    func antigravityHookEmitsOnlyOnTheFirstModelCall(invocation: Int, emits: Bool) {
+        let payload = """
+            {"invocationNum": \(invocation), "initialNumSteps": 10, \
+            "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587", \
+            "workspacePaths": ["/workspace/project"], \
+            "transcriptPath": "~/.gemini/antigravity/brain/ec33ebf9-0cba-4100-8142-c61503f6c587/.system_generated/logs/transcript.jsonl", \
+            "artifactDirectoryPath": "~/.gemini/antigravity/brain/ec33ebf9-0cba-4100-8142-c61503f6c587", \
+            "modelName": "gemini-3.6-flash-medium"}
+            """
+        #expect(HookPayloadGate.antigravityHookShouldEmit(HookPayload.parse(Data(payload.utf8))) == emits)
+    }
+
+    @Test(arguments: [
+        #"{"workspacePaths":["/p"]}"#, #"{"invocationNum":"2"}"#, #"{"invocationNum":null}"#, "", "garbage",
+        #"{"invocationNum":true}"#, #"{"invocationNum":false}"#, "[0]", #"{"invocationNum":0.5}"#,
+    ])
+    func antigravityHookEmitsWhenTheInvocationNumberIsMissingOrUnreadable(payload: String) {
+        #expect(HookPayloadGate.antigravityHookShouldEmit(HookPayload.parse(Data(payload.utf8))))
+    }
+
+    @Test(arguments: [#"{"invocationNum":1.5}"#, #"{"invocationNum":-1}"#, #"{"invocationNum":1e3}"#])
+    func antigravityHookIsSilentForAnyNumberPastTheFirstCall(payload: String) {
+        #expect(!HookPayloadGate.antigravityHookShouldEmit(HookPayload.parse(Data(payload.utf8))))
+    }
+
+    /** One wrong-typed field reads as absent without costing the others. */
+    @Test func aWrongTypedFieldDoesNotFailTheWholePayload() {
+        let payload = HookPayload.parse(
+            Data(#"{"cwd":7,"invocationNum":"x","workspace":"flat","workspace_roots":[1],"workspaceRoot":"/r"}"#.utf8))
+        #expect(
+            payload
+                == HookPayload.parse(Data(#"{"workspaceRoot":"/r"}"#.utf8)))
+        #expect(payload?.workspaceRoot == "/r")
+        #expect(payload?.cwd == nil)
+    }
+
+    /** Each hook's stdout, byte for byte: sorted keys, slashes unescaped. */
+    @Test func hookOutputsEncodeTheHarnessShapes() throws {
+        func text(_ value: some Encodable) throws -> String {
+            String(decoding: try #require(HookOutput.encoded(value)), as: UTF8.self)
+        }
+        #expect(try text(HookOutput.Antigravity(injectSteps: [])) == #"{"injectSteps":[]}"#)
+        #expect(
+            try text(HookOutput.Antigravity(injectSteps: [.init(ephemeralMessage: "a/b")]))
+                == #"{"injectSteps":[{"ephemeralMessage":"a/b"}]}"#)
+        #expect(
+            try text(
+                HookOutput.AdditionalContext(
+                    hookSpecificOutput: .init(additionalContext: "a/b", hookEventName: "SessionStart")))
+                == #"{"hookSpecificOutput":{"additionalContext":"a/b","hookEventName":"SessionStart"}}"#)
+        #expect(try text(HookOutput.Cursor(additionalContext: "a/b")) == #"{"additional_context":"a/b"}"#)
+    }
+
     @Test func grokSessionHookActionMatrix() {
         var state = GrokSessionHook.TurnState(emittedThisTurn: false, turn: 0)
         #expect(GrokSessionHook.action(for: .leftover, state: &state) == .silent)
@@ -564,12 +667,6 @@ import Testing
         #expect(!GrokTurnGate.sessionKey("../../etc/passwd").contains("/"))
         let long = String(repeating: "a", count: 200)
         #expect(GrokTurnGate.sessionKey(long).count == GrokTurnGate.maxKeyLength)
-    }
-
-    @Test func grokTurnGateReadsSessionIdFromStdin() {
-        #expect(GrokTurnGate.sessionId(in: Data(#"{"sessionId":"abc"}"#.utf8)) == "abc")
-        #expect(GrokTurnGate.sessionId(in: Data(#"{"session_id":"def"}"#.utf8)) == "def")
-        #expect(GrokTurnGate.sessionId(in: Data("{}".utf8)) == nil)
     }
 
     @Test func grokTurnGateRoundTripsState() throws {
@@ -929,10 +1026,8 @@ import Testing
     }
 
     @Test func opencodeHookStateReportsNotInstalledWhenTheConfigDirectoryExists() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-oc-home-\(UUID().uuidString)/.config/opencode")
+        let dir = try TemporaryTree.directory(named: "oc-home").appending(path: ".config/opencode")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
         let settings = dir.appending(path: "opencode.jsonc")
         let adapter = OpenCodeAdapter(settingsURLOverride: settings)
         #expect(adapter.harnessPresent)
@@ -948,8 +1043,7 @@ import Testing
         #expect(
             OpenCodeWiring.instructionsEntry(forManagedFileAt: managed)
                 == "~/.config/opencode/" + OpenCodeWiring.managedFileName)
-        let scratch = FileManager.default.temporaryDirectory
-            .appending(path: "directa-oc-entry-\(UUID().uuidString)/directa.md")
+        let scratch = URL(fileURLWithPath: "/var/empty/directa-oc-entry/directa.md")
         #expect(OpenCodeWiring.instructionsEntry(forManagedFileAt: scratch) == scratch.path)
     }
 
@@ -1007,26 +1101,169 @@ import Testing
     }
 
     /** A refusal from one harness must not discard the others: their files are
-        already rewritten when the throw lands, so uninstallAll collects. */
-    @Test func uninstallAllCollectsFailuresInsteadOfAborting() throws {
+        already rewritten when the throw lands, so the batch collects. */
+    @Test func anUninstallBatchCollectsFailuresInsteadOfAborting() throws {
         try inScratchDir { dir in
             let good = StubAdapter(settingsURL: dir.appending(path: "a.json"))
             let bad = FailingAdapter(settingsURL: dir.appending(path: "b.json"))
-            let result = HookUninstall.uninstallAll([good, bad, good])
+            let result = HarnessBatch.run([good, bad, good]) { try $0.uninstall() }
             #expect(result.summaries.count == 2)
-            #expect(result.failures.count == 1)
-            #expect(result.failures.first?.name == "failing")
-            #expect(result.failures.first?.message == "nope")
+            #expect(result.failures == [HarnessBatchResult.Failure(message: "nope", name: "failing")])
+            #expect(result.succeeded == [good.name, good.name])
         }
+    }
+
+    /** The one report both commands fail with: what succeeded, each failure
+        with its cause, and the rerun command as a literal hint. */
+    @Test func aBatchWithFailuresReportsBothHalvesPerVerb() {
+        var result = HarnessBatchResult()
+        #expect(result.failure(verb: .install) == nil)
+        result.succeeded = ["claude", "grok"]
+        result.failures = [HarnessBatchResult.Failure(message: "unreadable", name: "cursor")]
+        #expect(
+            result.failure(verb: .install)
+                == WireError(
+                    code: .internalError, hint: "run: directa hook install",
+                    message:
+                        "hook install finished with errors; installed claude, grok. Failed: cursor (unreadable) Fix each cause and rerun directa hook install."
+                ))
+        result.succeeded = []
+        #expect(
+            result.failure(verb: .uninstall)
+                == WireError(
+                    code: .internalError, hint: "run: directa hook uninstall",
+                    message:
+                        "hook uninstall finished with errors. Failed: cursor (unreadable) Fix each cause and rerun directa hook uninstall."
+                ))
+    }
+
+    @Test func anUnknownHarnessNamesTheSupportedOnesPerVerb() {
+        let stub = DetectableStub(name: "claude", settingsURL: URL(fileURLWithPath: "/a"), state: .notInstalled)
+        guard case .failure(let uninstall) = HarnessBatch.adapter(named: "x", in: [stub], verb: .uninstall) else {
+            Issue.record("expected an unknown harness to fail")
+            return
+        }
+        #expect(
+            uninstall
+                == WireError(
+                    code: .usage, hint: "run: directa hook uninstall --harness <name>",
+                    message: "unknown harness 'x' (supported: claude)"))
+        guard case .success(let found) = HarnessBatch.adapter(named: "claude", in: [stub], verb: .install) else {
+            Issue.record("expected a known harness to resolve")
+            return
+        }
+        #expect(found.name == "claude")
+    }
+
+    /** Stands in for a harness whose detection state and install outcome are
+        both controllable, for `HookInstall.resolveTargets` and `HarnessBatch`. */
+    private struct DetectableStub: HarnessAdapter {
+        var installError: WireError?
+        var installSummary: String = ""
+        let name: String
+        let settingsURL: URL
+        var state: HarnessHookState
+        func install(cliPath: String) throws -> String {
+            if let installError { throw installError }
+            return installSummary
+        }
+        func uninstall() throws -> String { "" }
+        func hookState() -> HarnessHookState { state }
+    }
+
+    /** `hook install` with no `--harness` installs every harness `hookState()`
+        reads as present, skipping (never touching) one that reads
+        `.harnessAbsent`. */
+    @Test func resolveTargetsWithNoHarnessInstallsOnlyDetectedOnes() {
+        let claude = DetectableStub(name: "claude", settingsURL: URL(fileURLWithPath: "/a"), state: .notInstalled)
+        let cursor = DetectableStub(name: "cursor", settingsURL: URL(fileURLWithPath: "/b"), state: .harnessAbsent)
+        let grok = DetectableStub(
+            name: "grok", settingsURL: URL(fileURLWithPath: "/c"),
+            state: .installed(path: "/x", pathExists: true))
+        guard case .success(let resolved) = HookInstall.resolveTargets(
+            harness: nil, adapters: [claude, cursor, grok])
+        else {
+            Issue.record("expected resolveTargets to succeed")
+            return
+        }
+        #expect(resolved.install.map(\.name) == ["claude", "grok"])
+        #expect(resolved.skipped.map(\.name) == ["cursor"])
+    }
+
+    @Test func resolveTargetsFailsUsageWhenNothingIsDetected() {
+        let absent = DetectableStub(name: "a", settingsURL: URL(fileURLWithPath: "/a"), state: .harnessAbsent)
+        guard case .failure(let error) = HookInstall.resolveTargets(harness: nil, adapters: [absent])
+        else {
+            Issue.record("expected resolveTargets to fail")
+            return
+        }
+        #expect(error.code == .usage)
+        #expect(error.message.contains("no supported harness detected on this machine"))
+        #expect(error.message.contains("(checked: a)"))
+    }
+
+    /** An explicit `--harness` is unconditional: it installs even a harness
+        this machine has never run, the same as every prior version did. */
+    @Test func resolveTargetsWithAnExplicitHarnessIgnoresDetection() {
+        let absent = DetectableStub(name: "a", settingsURL: URL(fileURLWithPath: "/a"), state: .harnessAbsent)
+        guard case .success(let resolved) = HookInstall.resolveTargets(harness: "a", adapters: [absent])
+        else {
+            Issue.record("expected resolveTargets to succeed")
+            return
+        }
+        #expect(resolved.install.map(\.name) == ["a"])
+        #expect(resolved.skipped.isEmpty)
+    }
+
+    @Test func resolveTargetsFailsUsageForAnUnknownExplicitHarness() {
+        guard case .failure(let error) = HookInstall.resolveTargets(harness: "bogus", adapters: [])
+        else {
+            Issue.record("expected resolveTargets to fail")
+            return
+        }
+        #expect(error.code == .usage)
+        #expect(error.hint == "run: directa hook install --harness <name>")
+        #expect(
+            error.message
+                == "unknown harness 'bogus' (supported: ; adding one: CONTRIBUTING.md)")
+    }
+
+    @Test func anInstallBatchCollectsFailuresInsteadOfAborting() {
+        let good = DetectableStub(
+            installSummary: "installed good", name: "good", settingsURL: URL(fileURLWithPath: "/g"),
+            state: .notInstalled)
+        let bad = DetectableStub(
+            installError: WireError(code: .configInvalid, message: "nope"), name: "bad",
+            settingsURL: URL(fileURLWithPath: "/b"), state: .notInstalled)
+        let result = HarnessBatch.run([good, bad, good]) { try $0.install(cliPath: "/bin/directa") }
+        #expect(result.summaries == ["installed good", "installed good"])
+        #expect(result.failures == [HarnessBatchResult.Failure(message: "nope", name: "bad")])
+    }
+
+    /** `hookState()` reads a settings file, so the detection pass asks each
+        adapter once. */
+    @Test func resolveTargetsAsksEachAdapterForItsStateOnce() {
+        struct Counting: HarnessAdapter {
+            let calls: OSAllocatedUnfairLock<Int>
+            let name = "counted"
+            let settingsURL = URL(fileURLWithPath: "/c")
+            func install(cliPath: String) throws -> String { "" }
+            func uninstall() throws -> String { "" }
+            func hookState() -> HarnessHookState {
+                calls.withLock { $0 += 1 }
+                return .notInstalled
+            }
+        }
+        let calls = OSAllocatedUnfairLock(initialState: 0)
+        _ = HookInstall.resolveTargets(harness: nil, adapters: [Counting(calls: calls)])
+        #expect(calls.withLock { $0 } == 1)
     }
 
     /** OpenCode's own preference order decides which global config file wins:
         jsonc over json over the legacy config.json, and opencode.jsonc is what
         OpenCode seeds on a fresh machine. */
     @Test func opencodeSettingsURLFollowsTheHarnessPreferenceOrder() throws {
-        let root = FileManager.default.temporaryDirectory
-            .appending(path: "directa-oc-pref-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: root) }
+        let root = try TemporaryTree.path(named: "oc-pref")
         let home = root.appending(path: "home")
         let dir = OpenCodeWiring.configDirectory(home: home)
 
@@ -1050,71 +1287,67 @@ import Testing
     }
 
     @Test func hookStateIsAbsentWhenTheHarnessDirectoryIsMissing() throws {
-        let missing = FileManager.default.temporaryDirectory
-            .appending(path: "directa-absent-\(UUID().uuidString)/settings.json")
+        let missing = try TemporaryTree.path(named: "absent").appending(path: "settings.json")
         let adapter = ClaudeCodeAdapter(settingsURLOverride: missing)
         #expect(adapter.hookState() == .harnessAbsent)
-        let antigravityMissing = FileManager.default.temporaryDirectory
-            .appending(path: "directa-ag-absent-\(UUID().uuidString)/config/hooks.json")
+        let antigravityMissing = try TemporaryTree.path(named: "ag-absent").appending(path: "config/hooks.json")
         let agAdapter = AntigravityAdapter(settingsURLOverride: antigravityMissing)
         #expect(agAdapter.hookState() == .harnessAbsent)
-        let grokMissing = FileManager.default.temporaryDirectory
-            .appending(path: "directa-grok-absent-\(UUID().uuidString)/hooks/directa.json")
+        let grokMissing = try TemporaryTree.path(named: "grok-absent").appending(path: "hooks/directa.json")
         let grokAdapter = GrokAdapter(settingsURLOverride: grokMissing)
         #expect(grokAdapter.hookState() == .harnessAbsent)
-        let opencodeMissing = FileManager.default.temporaryDirectory
-            .appending(path: "directa-oc-absent-\(UUID().uuidString)/.config/opencode/opencode.jsonc")
+        let opencodeMissing = try TemporaryTree.path(named: "oc-absent")
+            .appending(path: ".config/opencode/opencode.jsonc")
         let ocAdapter = OpenCodeAdapter(settingsURLOverride: opencodeMissing)
         #expect(ocAdapter.hookState() == .harnessAbsent)
     }
 
     @Test func hookStateReportsNotInstalledWhenAntigravityHomeDirectoryExists() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-ag-home-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
+        let dir = try TemporaryTree.directory(named: "ag-home")
         let settings = dir.appending(path: "config/hooks.json")
         let agAdapter = AntigravityAdapter(settingsURLOverride: settings)
         #expect(agAdapter.hookState() == .notInstalled)
     }
 
     @Test func hookStateReportsNotInstalledWhenGrokHomeDirectoryExists() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appending(path: "directa-grok-home-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
+        let dir = try TemporaryTree.directory(named: "grok-home")
         let settings = dir.appending(path: "hooks/directa.json")
         let grokAdapter = GrokAdapter(settingsURLOverride: settings)
         #expect(grokAdapter.hookState() == .notInstalled)
     }
 
+    private func sessionCwd(_ json: String, environment: [String: String] = [:]) -> String {
+        HookSessionCwd.resolve(HookPayload.parse(Data(json.utf8)), environment: environment)
+    }
+
     @Test func sessionCwdResolvesAntigravityWorkspacePaths() {
-        let json = #"{"workspacePaths":["/my/workspace/path"]}"#
-        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
-        #expect(resolved == "/my/workspace/path")
+        #expect(sessionCwd(#"{"workspacePaths":["/my/workspace/path"]}"#) == "/my/workspace/path")
     }
 
     @Test func sessionCwdResolvesClaudeCwd() {
-        let json = #"{"cwd":"/my/claude/cwd"}"#
-        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
-        #expect(resolved == "/my/claude/cwd")
+        #expect(sessionCwd(#"{"cwd":"/my/claude/cwd"}"#) == "/my/claude/cwd")
     }
 
     @Test func sessionCwdResolvesCursorWorkspaceRoots() {
-        let json = #"{"workspace_roots":["/my/cursor/root"]}"#
-        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
-        #expect(resolved == "/my/cursor/root")
+        #expect(sessionCwd(#"{"workspace_roots":["/my/cursor/root"]}"#) == "/my/cursor/root")
     }
 
     @Test func sessionCwdResolvesGrokWorkspaceRoot() {
-        let json = #"{"workspaceRoot":"/my/grok/root"}"#
-        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
-        #expect(resolved == "/my/grok/root")
+        #expect(sessionCwd(#"{"workspaceRoot":"/my/grok/root"}"#) == "/my/grok/root")
     }
 
     @Test func sessionCwdPrefersGrokCwdOverWorkspaceRoot() {
-        let json = #"{"cwd":"/my/grok/cwd","workspaceRoot":"/my/grok/root"}"#
-        let resolved = HookSessionCwd.resolve(stdin: Data(json.utf8))
-        #expect(resolved == "/my/grok/cwd")
+        #expect(sessionCwd(#"{"cwd":"/my/grok/cwd","workspaceRoot":"/my/grok/root"}"#) == "/my/grok/cwd")
+    }
+
+    /** An empty first entry falls through to the next source, then to the
+        environment, then to the process directory. */
+    @Test func sessionCwdSkipsEmptyValuesInOrder() {
+        #expect(sessionCwd(#"{"workspace_roots":[""],"cwd":"/c"}"#) == "/c")
+        #expect(
+            sessionCwd(#"{"cwd":""}"#, environment: ["CURSOR_PROJECT_DIR": "", "GROK_WORKSPACE_ROOT": "/g"])
+                == "/g")
+        #expect(sessionCwd("garbage", environment: ["CURSOR_PROJECT_DIR": "/cp"]) == "/cp")
+        #expect(sessionCwd("garbage") == FileManager.default.currentDirectoryPath)
     }
 }

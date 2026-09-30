@@ -51,6 +51,10 @@ public struct WatchFingerprint: Equatable, Sendable {
 /** Whether a watched change has settled enough to act on. Pure and clock-driven
     so the debounce is exercised without sleeping on a real timer. */
 public enum WatchPolicy {
+    /** "1" in the daemon's environment turns the watch sweep off for every
+        server. */
+    public static let disableEnvironmentKey = "DIRECTA_NO_WATCH"
+
     public struct Limits: Equatable, Sendable {
         /** Auto-restarts allowed inside `burstWindowSeconds` before the watch
             suspends itself. */

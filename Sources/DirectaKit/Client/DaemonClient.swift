@@ -2,8 +2,17 @@ import Foundation
 
 /** Thin blocking-POSIX unix-socket client wrapped in an actor. Used unchanged by
     the CLI and the menu bar app. Request/response is correlated by id; the daemon
-    may interleave push frames, which this client ignores beyond the hello handshake. */
+    may interleave push frames, which this client ignores beyond the hello handshake.
+
+    The actor runs on a serial Dispatch queue of its own, never the cooperative
+    pool: its connect, read, and write block the thread for as long as the
+    daemon takes to answer (up to the response deadline), and a caller holding
+    several clients at once would otherwise hold that many pool threads. */
 public actor DaemonClient {
+    private let queue = DispatchSerialQueue(label: "dev.quantizor.directa.client", qos: .userInitiated)
+
+    public nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
+
     private var buffer = NDJSONBuffer()
     private var fd: Int32 = -1
     private var nextID = 0
@@ -30,6 +39,12 @@ public actor DaemonClient {
 
     /** Connects and consumes the hello frame, enforcing protocol compatibility. */
     public func connect() throws {
+        try connect(responseTimeoutSeconds: Self.defaultResponseTimeout)
+    }
+
+    /** `responseTimeoutSeconds` bounds the hello read, so a daemon that
+        accepts and never greets cannot hold a caller past its own deadline. */
+    private func connect(responseTimeoutSeconds: Double) throws {
         guard fd < 0 else { return }
         let sock = socket(AF_UNIX, SOCK_STREAM, 0)
         guard sock >= 0 else {
@@ -40,7 +55,7 @@ public actor DaemonClient {
         let pathBytes = Array(socketPath.utf8)
         guard DirectaPaths.fitsSunPath(socketPath) else {
             close(sock)
-            throw WireError(code: .daemonUnreachable, message: "socket path exceeds sun_path limit: \(socketPath)")
+            throw WireError(code: .daemonUnreachable, message: DirectaPaths.sunPathLimitMessage(socketPath))
         }
         withUnsafeMutableBytes(of: &addr.sun_path) { raw in
             raw.copyBytes(from: pathBytes)
@@ -57,11 +72,17 @@ public actor DaemonClient {
             throw WireError(
                 code: .daemonUnreachable,
                 hint: "run: directa daemon status",
-                message: "cannot connect to ddirecta at \(socketPath): \(String(cString: strerror(err)))"
+                message: "cannot connect to the daemon at \(socketPath): \(String(cString: strerror(err)))"
             )
         }
         fd = sock
-        setResponseTimeout(Self.defaultResponseTimeout)
+        /** A write to a daemon that died mid-connection must fail with EPIPE
+            (which disconnects, so the next request reconnects), not raise
+            SIGPIPE, whose default action kills a CLI or app process that
+            never ignored the signal. */
+        var noSigPipe: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        setResponseTimeout(responseTimeoutSeconds)
         /** The socket is open but unproven from here, and `fd >= 0` is what the
             guard above reads as "already connected". So every failing exit has
             to put the client back to disconnected: leaving a live fd behind with
@@ -109,10 +130,13 @@ public actor DaemonClient {
         value, and this deadline ultimately derives from a caller-supplied
         `--timeout`, so `--timeout inf` must degrade to the default rather than
         crash the process. One day is far above any real deadline and well inside
-        Int range. */
+        Int range. The floor is one millisecond, not zero, because a zero
+        `SO_RCVTIMEO` means no deadline at all. */
     static func clampedResponseTimeout(_ seconds: Double) -> Double {
-        seconds.isFinite ? min(max(seconds, 0), 86_400) : defaultResponseTimeout
+        seconds.isFinite ? min(max(seconds, minimumResponseTimeout), 86_400) : defaultResponseTimeout
     }
+
+    static let minimumResponseTimeout: Double = 0.001
 
     /** Sets the socket receive timeout (`SO_RCVTIMEO`); a blocking `read` then
         fails with `EAGAIN` once no data arrives within the window. */
@@ -129,17 +153,24 @@ public actor DaemonClient {
     /** `operationTimeoutSeconds` is the command's own health/wait budget, when it
         has one. The response deadline is set well above it so a legitimately long
         `ensure`/`wait`/group rollout (including a few dependency waves) is never
-        cut off, while a wedged daemon still fails in bounded time. */
+        cut off, while a wedged daemon still fails in bounded time.
+        `responseTimeoutSeconds`, when given, is the whole deadline instead,
+        connect and hello included, for a caller that must give up within a
+        budget of its own (a poll waiting for a daemon to come back). */
     public func request<P: Codable & Sendable, R: Codable & Sendable>(
         _ method: WireMethod,
         params: P,
         expecting: R.Type,
-        operationTimeoutSeconds: Double? = nil
+        operationTimeoutSeconds: Double? = nil,
+        responseTimeoutSeconds: Double? = nil
     ) throws -> R {
-        try connect()
-        if let operationTimeoutSeconds {
-            setResponseTimeout(max(Self.defaultResponseTimeout, operationTimeoutSeconds * 2 + 60))
-        }
+        /** A long operation widens only the wait for its answer; the hello
+            that precedes it is always a prompt reply. */
+        try connect(responseTimeoutSeconds: responseTimeoutSeconds ?? Self.defaultResponseTimeout)
+        setResponseTimeout(
+            responseTimeoutSeconds
+                ?? operationTimeoutSeconds.map { max(Self.defaultResponseTimeout, $0 * 2 + 60) }
+                ?? Self.defaultResponseTimeout)
         defer { setResponseTimeout(Self.defaultResponseTimeout) }
         nextID += 1
         let id = "c\(nextID)"
@@ -162,23 +193,33 @@ public actor DaemonClient {
         }
     }
 
+    /** Every failure here disconnects before it throws, as `writeAll` does:
+        `connect()` treats a live fd as connected, so a dead socket left in
+        place would be written to forever by a client that outlives one
+        daemon (the monitor loop, `lock`), never reaching the reconnect and
+        hello check a daemon restart needs. A timed-out read disconnects too,
+        since its late answer would otherwise sit in the socket ahead of the
+        next request's. */
     private func readLine() throws -> Data {
         var scratch = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
             if let line = pendingLine() { return line }
             let n = read(fd, &scratch, scratch.count)
             if n == 0 {
+                disconnect()
                 throw WireError(code: .daemonUnreachable, message: "daemon closed the connection")
             }
             if n < 0 {
-                if errno == EINTR { continue }
-                if errno == EAGAIN || errno == EWOULDBLOCK {
+                let err = errno
+                if err == EINTR { continue }
+                disconnect()
+                if err == EAGAIN || err == EWOULDBLOCK {
                     throw WireError(
                         code: .daemonUnreachable,
                         hint: "run: directa daemon restart",
-                        message: "ddirecta did not answer in time; it may be wedged")
+                        message: "the daemon did not answer in time; it may be wedged")
                 }
-                throw WireError(code: .daemonUnreachable, message: "read failed: \(String(cString: strerror(errno)))")
+                throw WireError(code: .daemonUnreachable, message: "read failed: \(String(cString: strerror(err)))")
             }
             pending.append(contentsOf: buffer.feed(Data(scratch[0..<n])))
         }
@@ -195,8 +236,10 @@ public actor DaemonClient {
         while !remaining.isEmpty {
             let n = remaining.withUnsafeBufferPointer { write(fd, $0.baseAddress, $0.count) }
             if n < 0 {
-                if errno == EINTR { continue }
-                throw WireError(code: .daemonUnreachable, message: "write failed: \(String(cString: strerror(errno)))")
+                let err = errno
+                if err == EINTR { continue }
+                disconnect()
+                throw WireError(code: .daemonUnreachable, message: "write failed: \(String(cString: strerror(err)))")
             }
             remaining.removeFirst(n)
         }
