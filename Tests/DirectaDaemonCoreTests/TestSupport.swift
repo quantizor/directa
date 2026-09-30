@@ -216,7 +216,7 @@ func awaitPhase(
     `limit`; a line still being written does not count. */
 func printedPid(_ label: String, in url: URL, within limit: Duration = .seconds(5)) async throws -> pid_t? {
     let marker = "\(label) pid "
-    return try await poll(within: limit) {
+    return try await firstAnswer(within: limit) {
         let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
         guard let range = text.range(of: marker) else { return nil }
         let rest = text[range.upperBound...]
@@ -282,7 +282,7 @@ extension Router {
 func awaitStoppedEvents(
     _ router: Router, project: String, detail: String? = nil, within limit: Duration = .seconds(5)
 ) async throws -> [EventRecord]? {
-    try await poll(within: limit) {
+    try await firstAnswer(within: limit) {
         let stopped = try await router.call(
             .eventsQuery, EventsQueryParams(project: project), EventsQueryResult.self
         ).events.filter { $0.kind == .stopped }
@@ -520,7 +520,7 @@ final class DelayedSpawnLauncher: NeverAdopts {
 
     /** The first pid `run` spawned, once it has, within `limit`. */
     func firstPid(within limit: Duration) async throws -> pid_t? {
-        try await poll(within: limit) { pids.first }
+        try await firstAnswer(within: limit) { pids.first }
     }
 }
 

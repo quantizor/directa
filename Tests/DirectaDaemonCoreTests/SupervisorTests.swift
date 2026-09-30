@@ -712,7 +712,7 @@ private func makeEnv() throws -> RouterEnv {
         let health = try spawnReapedSessionLeader([fixture, "--listen-tcp", "\(healthPort)"])
         defer { kill(health, SIGKILL) }
         #expect(try await awaitPhase(supervisor, .running).phase == .running)
-        let status = try await poll(within: .seconds(3)) {
+        let status = try await firstAnswer(within: .seconds(3)) {
             let current = await supervisor.status()
             return current.observedPort == nil && current.portConflict == nil ? nil : current
         }

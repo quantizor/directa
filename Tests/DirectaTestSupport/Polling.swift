@@ -8,7 +8,7 @@ import Darwin
 /** The first non-nil `produce()` answer, asked every `interval` until
     `limit` elapses; nil when none arrived. `produce` runs once more at the
     deadline, so a condition that turns true during the final sleep counts. */
-public func poll<Value>(
+public func firstAnswer<Value>(
     within limit: Duration, every interval: Duration = .milliseconds(10),
     _ produce: () async throws -> Value?
 ) async throws -> Value? {
@@ -28,7 +28,7 @@ public func eventually(
     within limit: Duration, every interval: Duration = .milliseconds(10),
     _ condition: () async throws -> Bool
 ) async throws -> Bool {
-    try await poll(within: limit, every: interval) { try await condition() ? true : nil } ?? false
+    try await firstAnswer(within: limit, every: interval) { try await condition() ? true : nil } ?? false
 }
 
 /** Whether `pid` stopped answering `kill(pid, 0)` within `limit`. A zombie

@@ -91,7 +91,7 @@ import Testing
             sweep and the rest of this test would prove nothing. */
         #expect(getsid(leader) == leader)
 
-        let members: [pid_t] = try await poll(within: .seconds(5), every: .milliseconds(50)) {
+        let members: [pid_t] = try await firstAnswer(within: .seconds(5), every: .milliseconds(50)) {
             let members = ProcessTree.sessionMembers(of: leader).identities.map(\.pid)
             return members.isEmpty ? nil : members
         } ?? []
@@ -116,7 +116,7 @@ import Testing
         let stranger = ProcessIdentity(
             pid: leader, startMicroseconds: real.startMicroseconds,
             startSeconds: real.startSeconds - 60, uniqueID: unissuedUniqueID)
-        let found: [pid_t] = try await poll(within: .seconds(5), every: .milliseconds(50)) {
+        let found: [pid_t] = try await firstAnswer(within: .seconds(5), every: .milliseconds(50)) {
             let found = ProcessTree.liveDescendants(rootPid: leader, rootIdentity: real, snapshot: [])
                 .map(\.pid)
             return found.isEmpty ? nil : found

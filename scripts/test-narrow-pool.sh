@@ -16,7 +16,7 @@
 #                              reported (default 1)
 #
 # How: builds scripts/narrow-pool/narrow-pool.c into .build/narrow-pool, then
-# runs the built test bundle through the toolchain's swiftpm-testing-helper
+# runs each built test bundle through the toolchain's swiftpm-testing-helper
 # directly (`swift test` goes through a SIP-protected /usr/bin shim that
 # strips DYLD_INSERT_LIBRARIES) with the library inserted. The library's
 # header says what it narrows and how it watches.
