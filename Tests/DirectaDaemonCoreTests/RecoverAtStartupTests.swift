@@ -908,4 +908,168 @@ private func logTexts(router: Router, project: String, name: String) async throw
         #expect(recorder.labels == ["dev.quantizor.directa.job.leftover"])
         #expect(recorder.listingCount == 1)
     }
+
+    /** The shutdown-drain case: the daemon stopped `db` on its way down and a
+        `directa lock` holder (which leaves declarers running by default) still
+        owns `data` at the next boot. The server joins the holder's paused set
+        rather than being refused, reads `stopped` (never `crashed`), keeps its
+        boot intent, and starts when the holder releases. */
+    @Test func aDrainedServerUnderALiveLockWaitsForTheReleaseThenStarts() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(project: env.projectPath, serversJSON: Self.lockedDatabase(locks: ["data"]))
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let id = serverID(project: env.projectPath, name: "db")
+        try await seedRow(registry, id: id, phase: .stopped)
+        try seedLiveHolds(env, resources: ["data"])
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+
+        let waiting = try #require(
+            try await statusList(router: router, project: env.projectPath).first { $0.server == "db" })
+        #expect(waiting.phase == .stopped)
+        #expect(waiting.pid == nil)
+        let row = await registry.persistedState(serverID: id)
+        #expect(row?.phase == .stopped)
+        #expect(row?.resumeOnBoot == true)
+        #expect(try await pausedNames(router, env, resource: "data") == ["db"])
+
+        try await release(router, env, resource: "data")
+        let started = try await eventually(within: .seconds(5)) {
+            let phase = try await statusList(router: router, project: env.projectPath)
+                .first { $0.server == "db" }?.phase
+            return phase == .starting || phase == .running
+        }
+        #expect(started, "db never started after the holder released")
+        await stopServer(router: router, project: env.projectPath, name: "db")
+    }
+
+    /** A row left `running` (the process died with the daemon) that has to
+        wait on a live holder also reads `stopped` until the release: the
+        waiting state is what the reader should see, not a crash the lock
+        caused. */
+    @Test func aLeftActiveServerUnderALiveLockReadsStoppedAndJoinsThePausedSet() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(project: env.projectPath, serversJSON: Self.lockedDatabase(locks: ["data"]))
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        let id = serverID(project: env.projectPath, name: "db")
+        try await seedRow(registry, id: id, phase: .running)
+        try seedLiveHolds(env, resources: ["data"])
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+
+        let waiting = try #require(
+            try await statusList(router: router, project: env.projectPath).first { $0.server == "db" })
+        #expect(waiting.phase == .stopped)
+        #expect(await registry.persistedState(serverID: id)?.phase == .stopped)
+        #expect(try await pausedNames(router, env, resource: "data") == ["db"])
+        try await release(router, env, resource: "data")
+        await stopServer(router: router, project: env.projectPath, name: "db")
+    }
+
+    /** A server declaring two held resources waits on each in turn: released
+        from the first, it joins the second holder's paused set instead of
+        failing with resource-locked, and starts only after the second release. */
+    @Test func aServerDeclaringTwoHeldResourcesWaitsOnEachInTurn() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(
+            project: env.projectPath, serversJSON: Self.lockedDatabase(locks: ["data", "cache"]))
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.projectPath)
+        try await seedRow(registry, id: serverID(project: env.projectPath, name: "db"), phase: .stopped)
+        try seedLiveHolds(env, resources: ["data", "cache"])
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+
+        #expect(try await pausedNames(router, env, resource: "data") == ["db"])
+        #expect(try await pausedNames(router, env, resource: "cache") == [])
+
+        try await release(router, env, resource: "data")
+        #expect(try await pausedNames(router, env, resource: "cache") == ["db"])
+        let between = try await statusList(router: router, project: env.projectPath)
+            .first { $0.server == "db" }
+        #expect(between?.phase == .stopped)
+        #expect(between?.pid == nil)
+
+        try await release(router, env, resource: "cache")
+        let started = try await eventually(within: .seconds(5)) {
+            let phase = try await statusList(router: router, project: env.projectPath)
+                .first { $0.server == "db" }?.phase
+            return phase == .starting || phase == .running
+        }
+        #expect(started, "db never started after both holders released")
+        await stopServer(router: router, project: env.projectPath, name: "db")
+    }
+
+    /** A restore refused for a reason other than a lock (here: the project was
+        never approved) leaves a drained server `stopped`, the state the daemon
+        put it in on its way down, and marks a server whose run was left active
+        `crashed`, since that process died with the daemon. */
+    @Test(arguments: [(ServerPhase.stopped, ServerPhase.stopped), (.starting, .crashed), (.running, .crashed)])
+    func aRefusedRestoreReadsStoppedForADrainedRowAndCrashedForALeftActiveOne(
+        left: ServerPhase, reads: ServerPhase
+    ) async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(project: env.projectPath, serversJSON: Self.lockedDatabase(locks: []))
+        let registry = Registry(paths: env.paths)
+        let id = serverID(project: env.projectPath, name: "db")
+        try await seedRow(registry, id: id, phase: left)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+
+        let server = try #require(
+            try await statusList(router: router, project: env.projectPath).first { $0.server == "db" })
+        #expect(server.phase == reads)
+        #expect(server.pid == nil)
+        #expect(await registry.persistedState(serverID: id)?.phase == reads)
+        #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
+    }
+
+    private static func lockedDatabase(locks: [String]) -> String {
+        let declared = locks.map { "\"\($0)\"" }.joined(separator: ", ")
+        return """
+        {
+          "db": {
+            "command": ["/bin/sh", "-c", "sleep 30"],
+            "locks": [\(declared)]
+          }
+        }
+        """
+    }
+}
+
+/** A row as shutdown left it: boot intent kept, no process recorded. */
+private func seedRow(_ registry: Registry, id: String, phase: ServerPhase) async throws {
+    try await registry.updateState(serverID: id, writer: .router) { entry in
+        entry.phase = phase
+        entry.pid = nil
+        entry.resumeOnBoot = true
+    }
+}
+
+/** locks.json with this test process as the live holder of each resource, the
+    way a `directa lock` run that outlived a daemon restart looks at boot. */
+private func seedLiveHolds(_ env: RecoverEnv, resources: [String]) throws {
+    var locks: [String: LockHolder] = [:]
+    for resource in resources {
+        locks["\(canonicalProjectPath(env.projectPath))::\(resource)"] = LockHolder(
+            live: ["db"], pause: false, paused: [], pid: Int(getpid()), resumeTimeoutSeconds: 15,
+            since: Date())
+    }
+    try AtomicFile.write(JSONCoding.encoder().encode(LocksFile(locks: locks)), to: env.paths.locksFile)
+}
+
+private func pausedNames(_ router: Router, _ env: RecoverEnv, resource: String) async throws -> [String] {
+    let status = try await router.call(
+        .lockStatus, LockStatusParams(project: env.projectPath, resource: resource), LockStatusResult.self)
+    return try #require(status.holder).paused
+}
+
+private func release(_ router: Router, _ env: RecoverEnv, resource: String) async throws {
+    _ = try await router.call(
+        .lockRelease,
+        LockParams(
+            holderPid: Int(getpid()), project: env.projectPath, resource: resource, resumeTimeoutSeconds: 15),
+        LockResult.self)
 }

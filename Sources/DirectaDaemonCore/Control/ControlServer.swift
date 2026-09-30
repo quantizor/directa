@@ -610,7 +610,12 @@ public actor Router {
         shutdown's drain leaves set, plus the classic daemon-crash case of a
         phase left running/starting. A deliberate stop clears the flag, so only
         those stay down. Servers still paused under a live resource lock are left
-        alone: starting them would fight the harness.
+        alone: starting them would fight the harness. A server that would come
+        back but declares a resource a live holder owns joins that holder's
+        paused set (`waitUnderLiveLock`) and starts on its release. A restored
+        row reads `crashed` only when its run was live when the daemon died; a
+        row the drain left `stopped` stays `stopped`, including when its
+        restore is refused.
 
         Specs resolve through the merged view (devservers.json + ad-hoc registry),
         the same path ensure/status use. Config-defined servers are never written
@@ -729,9 +734,15 @@ public actor Router {
                     }
                     continue
                 }
+                /** A row the daemon's own drain left `stopped` did not crash:
+                    it reads `stopped` until a start or a refusal says more.
+                    Any other phase here was live when the daemon died. */
+                let drained = persisted.phase == .stopped
                 try? await registry.updateState(serverID: id, writer: .router) { entry in
-                    entry.lastExit = entry.lastExit ?? LastExit(at: Date())
-                    entry.phase = .crashed
+                    if !drained {
+                        entry.lastExit = entry.lastExit ?? LastExit(at: Date())
+                        entry.phase = .crashed
+                    }
                     entry.pid = nil
                     entry.startedAt = nil
                 }
@@ -739,6 +750,16 @@ public actor Router {
             }
         }
         for item in toStart {
+            /** Before the supervisor exists, which reads its first phase from
+                the row: a server waiting on a live holder reads `stopped`
+                even when its run was left active. */
+            let waiting = await waitUnderLiveLock(project: item.project, spec: item.spec)
+            if waiting {
+                try? await registry.updateState(
+                    serverID: serverID(project: item.project, name: item.spec.name), writer: .router
+                ) { $0.phase = .stopped }
+                continue
+            }
             let supervisor = await self.supervisor(project: item.project, spec: item.spec)
             do {
                 try await self.prepareSpawn(
@@ -1782,6 +1803,8 @@ public actor Router {
             do {
                 let merged = try await mergedSpecs(project: project)
                 guard let spec = merged.specs.first(where: { $0.name == name }) else { continue }
+                let waiting = await waitUnderLiveLock(project: project, spec: spec)
+                if waiting { continue }
                 let supervisor = await supervisor(project: project, spec: spec)
                 let id = serverID(project: project, name: name)
                 let bound = await registry.persistedState(serverID: id)?.boundPort ?? spec.port
@@ -1817,6 +1840,32 @@ public actor Router {
             DirectaLog.daemon.info(
                 "rehydrated \(resourceLocks.count) live resource lock(s) after restart")
         }
+    }
+
+    /** Whether `spec` has to wait for a resource a live holder owns, and if so
+        the server is now in that holder's paused set, so the holder's release
+        starts it (`resumePaused`). Only the first held resource is joined: a
+        server declaring several resumes from each release in turn, and this
+        runs again before each start, so the next held one is joined then. A
+        dead holder is released on the way (`releaseOrphanedLock`), so a
+        resource only counts as held while its holder is alive. */
+    private func waitUnderLiveLock(project: String, spec: ServerSpec) async -> Bool {
+        for declaration in spec.locks ?? [] {
+            let resource = declaration.name
+            let key = Self.lockKey(project: project, resource: resource)
+            await releaseOrphanedLock(key: key)
+            guard var holder = resourceLocks[key] else { continue }
+            if !holder.paused.contains(spec.name) {
+                holder.paused.append(spec.name)
+                resourceLocks[key] = holder
+                persistLocks()
+            }
+            DirectaLog.daemon.info(
+                "recover wait \(spec.name)@\(project): resource '\(resource)' is locked by pid \(holder.pid); starts when it is released"
+            )
+            return true
+        }
+        return false
     }
 
     private func isPausedUnderLiveLock(project: String, name: String) -> Bool {
