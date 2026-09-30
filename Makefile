@@ -5,7 +5,7 @@ PREFIX ?= $(HOME)/.local
 # with SIGN_IDENTITY=... to pick a specific identity or to force ad-hoc.
 SIGN_IDENTITY ?= $(shell scripts/signing-identity.sh)
 
-.PHONY: build test sweep-test-temp sweep-swift-temp app dmg release-dmg install clean icon
+.PHONY: build test dead-code sweep-test-temp sweep-swift-temp app dmg release-dmg install clean icon
 
 # The shipped products only. A bare `swift build -c release` also compiles the
 # test-only targets (DirectaTestSupport imports Testing). `--product` keeps
@@ -14,6 +14,11 @@ build: sweep-swift-temp
 	swift build -c release --product directa
 	swift build -c release --product ddirecta
 	swift build -c release --product DirectaApp
+
+# Unused-code scan; the script's header covers the index location, the version
+# pin, and the vendor call it blocks.
+dead-code: sweep-swift-temp
+	scripts/dead-code.sh
 
 # A run killed part way leaves its scratch trees under the user temp dir
 # (directa-run.* from `make test`, directa-test-* from TemporaryTree when no
