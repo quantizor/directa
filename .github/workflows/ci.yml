@@ -46,4 +46,6 @@ jobs:
         run: swift build
 
       - name: Test
-        run: swift test
+        # Every test is Swift Testing; the XCTest runner only prints empty
+        # "Executed 0 tests" banners.
+        run: swift test --disable-xctest
