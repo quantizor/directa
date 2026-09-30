@@ -456,6 +456,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
                 LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-adopt", pid: survivor)
             ]),
             launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
+        defer { gate.signal(.exitedStatusUnknown) }
         await router.recoverAtStartup()
         var web = try await statusList(router: router, project: env.projectPath)
             .first { $0.server == "web" }
@@ -489,6 +490,15 @@ private func logTexts(router: Router, project: String, name: String) async throw
         }
         #expect(texts.contains("post-adopt line"))
         #expect(!texts.contains("preexisting line"))
+
+        /** The adopted run's exit writes its log, event, and state row; waiting
+            for it keeps those writes inside the test's tree. */
+        gate.signal(.signaled(signal: Int(SIGKILL)))
+        let exited = try await eventually(within: .seconds(5)) {
+            try await statusList(router: router, project: env.projectPath).first { $0.server == "web" }?.phase
+                == .crashed
+        }
+        #expect(exited, "the adopted run never recorded its exit")
     }
 
     /** A `launchctl list` that does not answer (it timed out, twice) says
@@ -525,6 +535,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let router = Router(
             agentJobs: recorder.agentJobs(answering: [.unavailable(reason: "launchctl list timed out")]),
             launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
+        defer { gate.signal(.exitedStatusUnknown) }
         await router.recoverAtStartup()
 
         #expect(recorder.listingCount == 2)
@@ -574,6 +585,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
                 .listed([LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-retry", pid: survivor)]),
             ]),
             launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
+        defer { gate.signal(.exitedStatusUnknown) }
         await router.recoverAtStartup()
 
         #expect(recorder.listingCount == 2)
@@ -581,6 +593,13 @@ private func logTexts(router: Router, project: String, name: String) async throw
         #expect(recorder.labels.isEmpty)
         let web = try await statusList(router: router, project: env.projectPath).first { $0.server == "web" }
         #expect(web?.pid == Int(survivor))
+
+        gate.signal(.signaled(signal: Int(SIGKILL)))
+        let exited = try await eventually(within: .seconds(5)) {
+            try await statusList(router: router, project: env.projectPath).first { $0.server == "web" }?.phase
+                == .crashed
+        }
+        #expect(exited, "the adopted run never recorded its exit")
     }
 
     /** A survivor whose ports no longer resolve (here the checkout's
@@ -621,6 +640,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
                 LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-bad-claim", pid: survivor)
             ]),
             launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
+        defer { gate.signal(.exitedStatusUnknown) }
         await router.recoverAtStartup()
 
         #expect(await gate.callCount == 0)
@@ -730,6 +750,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let router = Router(
             agentJobs: recorder.agentJobs(listing: listed),
             launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
+        defer { gate.signal(.exitedStatusUnknown) }
         await router.recoverAtStartup()
         let web = try await statusList(router: router, project: env.projectPath)
             .first { $0.server == "web" }
@@ -787,6 +808,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
                 LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-retired", pid: survivor)
             ]),
             launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
+        defer { gate.signal(.exitedStatusUnknown) }
         await router.recoverAtStartup()
 
         #expect(await gate.callCount == 0)

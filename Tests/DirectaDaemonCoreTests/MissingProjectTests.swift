@@ -66,6 +66,7 @@ import Testing
         let router = Router(
             launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
+        defer { gate.signal(.exitedStatusUnknown) }
 
         _ = try await router.call(
             .serverStart, ServerTargetParams(name: "web", project: env.project),
@@ -84,7 +85,7 @@ import Testing
         try await registry.updateState(serverID: id, writer: .supervisor(retired)) { $0.resumeOnBoot = true }
         #expect(await registry.persistedState(serverID: id) == nil)
 
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        gate.signal(.signaled(signal: Int(SIGKILL)))
         let stopped = try await awaitStoppedEvents(router, project: canonicalProject)
         #expect(stopped?.map(\.detail) == ["project path gone"])
         #expect(await registry.persistedState(serverID: id) == nil)
@@ -101,6 +102,7 @@ import Testing
         let router = Router(
             launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
+        defer { gate.signal(.exitedStatusUnknown) }
         guard let recorder = DirectaLog.backend as? RecordingBackend else {
             Issue.record("expected the swift-test host's default backend to be a RecordingBackend")
             return
@@ -126,7 +128,7 @@ import Testing
                 entry.level == .error && entry.message.contains(canonicalProject)
                     && entry.message.contains("could not save its retired state")
             })
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        gate.signal(.signaled(signal: Int(SIGKILL)))
         #expect(try await awaitStoppedEvents(router, project: canonicalProject) != nil)
     }
 

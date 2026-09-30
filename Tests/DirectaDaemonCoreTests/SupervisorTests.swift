@@ -169,6 +169,7 @@ private func makeEnv() throws -> RouterEnv {
             launcher: StuckRunLauncher(gate: gate), paths: paths, projectPath: env.project,
             registry: registry, spec: spec,
             stopTiming: StopTiming(graceSeconds: StopTiming.standard.graceSeconds, overtimeSeconds: 0.2))
+        defer { gate.signal(.exitedStatusUnknown) }
         let started = await supervisor.start()
         #expect(started.pid != nil)
 
@@ -180,7 +181,7 @@ private func makeEnv() throws -> RouterEnv {
 
         /** Let the fake `run()` resolve now, so recordOutcome can actually
             finish and nothing is left suspended past the test. */
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        gate.signal(.signaled(signal: Int(SIGKILL)))
         let cleared = try await eventually(within: .seconds(5)) { await supervisor.status().phase != .stopping }
         #expect(cleared, "server never left .stopping after the bounded wait gave up")
     }
@@ -205,12 +206,13 @@ private func makeEnv() throws -> RouterEnv {
         #expect(await supervisor.start().pid != nil)
 
         async let stopped = supervisor.stop(graceSeconds: 0.05, reason: "test")
+        defer { gate.signal(.exitedStatusUnknown) }
         #expect(try await awaitPhase(supervisor, .stopping, within: .seconds(1)).phase == .stopping)
         let valveOpened = OSAllocatedUnfairLock(initialState: false)
         let safetyValve = Task {
             try? await Task.sleep(for: .seconds(10))
             valveOpened.withLock { $0 = true }
-            await gate.signal(.signaled(signal: Int(SIGKILL)))
+            gate.signal(.signaled(signal: Int(SIGKILL)))
         }
 
         let joined = await supervisor.start()
@@ -255,13 +257,17 @@ private func makeEnv() throws -> RouterEnv {
         #expect(first.pid != nil)
 
         async let stopped = supervisor.stop(graceSeconds: 0.05, reason: "test")
+        defer {
+            gate.signal(.exitedStatusUnknown)
+            freshRunGate.signal(.exitedStatusUnknown)
+        }
         #expect(try await awaitPhase(supervisor, .stopping, within: .seconds(1)).phase == .stopping)
         let timeout = Duration.seconds(3)
         let releasedAt = OSAllocatedUnfairLock<ContinuousClock.Instant?>(initialState: nil)
         let release = Task {
             try? await Task.sleep(for: .milliseconds(1_500))
             releasedAt.withLock { $0 = .now }
-            await gate.signal(.signaled(signal: Int(SIGKILL)))
+            gate.signal(.signaled(signal: Int(SIGKILL)))
         }
 
         let ensureStart = ContinuousClock.now
@@ -283,7 +289,7 @@ private func makeEnv() throws -> RouterEnv {
             run's gate lets its fake `run()` return, and the wait for
             `.stopped` keeps the run's last write inside the test. */
         async let cleanup = supervisor.stop(graceSeconds: 0.05, reason: "test cleanup")
-        await freshRunGate.signal(.signaled(signal: Int(SIGKILL)))
+        freshRunGate.signal(.signaled(signal: Int(SIGKILL)))
         _ = await cleanup
         #expect(try await awaitPhase(supervisor, .stopped, within: .seconds(5)).phase == .stopped)
     }
@@ -628,6 +634,7 @@ private func makeEnv() throws -> RouterEnv {
             },
             registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "web"),
             stopTiming: StopTiming(graceSeconds: 0.2, overtimeSeconds: 0.2))
+        defer { gate.signal(.exitedStatusUnknown) }
         let root = try #require(await supervisor.start().pid.flatMap { pid_t(exactly: $0) })
         defer { kill(root, SIGKILL) }
 
@@ -636,7 +643,7 @@ private func makeEnv() throws -> RouterEnv {
         #expect(kill(root, 0) == 0, "stop signaled pid \(root), which no longer names the spawned root")
 
         kill(root, SIGKILL)
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        gate.signal(.signaled(signal: Int(SIGKILL)))
         #expect(try await awaitPhase(supervisor, .stopped).phase == .stopped)
     }
 
@@ -795,6 +802,7 @@ private func makeEnv() throws -> RouterEnv {
                 name: "late-pid"))
 
         async let started = supervisor.start()
+        defer { gate.open() }
         let root = try #require(try await launcher.firstPid(within: .seconds(2)))
         let spool = env.paths.spoolOutFile(project: env.project, server: "late-pid")
         let child = try #require(
@@ -803,7 +811,7 @@ private func makeEnv() throws -> RouterEnv {
         defer { kill(child, SIGKILL) }
         try #require(try await eventually(within: .seconds(5)) { getsid(root) == -1 }, "root \(root) never exited")
 
-        await gate.open()
+        gate.open()
         _ = await started
         #expect(try await awaitPhase(supervisor, .crashed, within: .seconds(8)).phase == .crashed)
         let reaped = try await awaitExit(child, within: .seconds(5))
@@ -839,6 +847,7 @@ private func makeEnv() throws -> RouterEnv {
             launcher: launcher, paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths),
             spec: ServerSpec(command: ["/bin/true"], name: "setsid"))
+        defer { gate.signal(.exitedStatusUnknown) }
         let root = try #require(await supervisor.start().pid.flatMap { pid_t(exactly: $0) })
         close(writeEnd)
         defer { kill(root, SIGKILL) }
@@ -853,7 +862,7 @@ private func makeEnv() throws -> RouterEnv {
         try #require(try await eventually(within: .seconds(5)) { getsid(root) == -1 }, "root \(root) never exited")
         try await Task.sleep(for: .milliseconds(600))
 
-        await gate.signal(.exited(code: 1))
+        gate.signal(.exited(code: 1))
         #expect(try await awaitPhase(supervisor, .crashed, within: .seconds(8)).phase == .crashed)
         let reaped = try await awaitExit(child, within: .seconds(5))
         #expect(reaped, "setsid listener \(child) survived a crash its snapshot had recorded")
@@ -886,6 +895,7 @@ private func makeEnv() throws -> RouterEnv {
             launcher: launcher, paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths),
             spec: ServerSpec(command: ["/bin/true"], name: "late-setsid"))
+        defer { gate.signal(.exitedStatusUnknown) }
         let root = try #require(await supervisor.start().pid.flatMap { pid_t(exactly: $0) })
         close(writeEnd)
         let child = try #require(
@@ -896,7 +906,7 @@ private func makeEnv() throws -> RouterEnv {
         #expect(getsid(child) == child)
         #expect(kill(child, 0) == 0)
 
-        await gate.signal(.exited(code: 1))
+        gate.signal(.exited(code: 1))
         #expect(try await awaitPhase(supervisor, .crashed, within: .seconds(8)).phase == .crashed)
         let reaped = try await awaitExit(child, within: .seconds(5))
         #expect(reaped, "setsid child \(child) outlived a crash (ppid \(parentPid(of: child)))")
@@ -1089,6 +1099,7 @@ private func makeEnv() throws -> RouterEnv {
         let supervisor = ServerSupervisor(
             launcher: FakeAdoptLauncher(gate: gate), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
+        defer { gate.signal(.exitedStatusUnknown) }
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
         #expect(
@@ -1107,7 +1118,7 @@ private func makeEnv() throws -> RouterEnv {
             reaching recordOutcome at all, not about signal classification (see
             externalSIGTERMLandsStoppedWithTheSignalNamedAsExternal for that), so
             it uses the one signal that stays `crashed` regardless of who sent it. */
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        gate.signal(.signaled(signal: Int(SIGKILL)))
         let crashed = try await awaitPhase(supervisor, .crashed)
         #expect(crashed.phase == .crashed)
         #expect(crashed.lastExit?.signal == Int(SIGKILL))
@@ -1176,6 +1187,7 @@ private func makeEnv() throws -> RouterEnv {
         let supervisor = ServerSupervisor(
             launcher: launcher, paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "web"))
+        defer { gate.signal(.exitedStatusUnknown) }
         let stopTask = OSAllocatedUnfairLock<Task<ServerStatus, Never>?>(initialState: nil)
         launcher.onPrepare {
             stopTask.withLock { $0 = Task { await supervisor.stop(graceSeconds: 3, reason: "test") } }
@@ -1197,7 +1209,7 @@ private func makeEnv() throws -> RouterEnv {
                 pid: survivor, label: "dev.quantizor.directa.job.adopt-stop", boundPort: nil,
                 startedAt: nil))
         #expect(try await awaitExit(survivor, within: .seconds(5)))
-        await gate.signal(.signaled(signal: Int(SIGTERM)))
+        gate.signal(.signaled(signal: Int(SIGTERM)))
         let stop = try #require(stopTask.withLock { $0 })
         #expect(await stop.value.phase == .stopped)
         let written = try? String(contentsOf: marker, encoding: .utf8)
@@ -1384,7 +1396,7 @@ private func makeEnv() throws -> RouterEnv {
         let paths = env.paths
         let registry = Registry(paths: paths)
         let gate = AdoptGate()
-        await gate.signal(.exited(code: 1))
+        gate.signal(.exited(code: 1))
         let supervisor = ServerSupervisor(
             launcher: StuckRunLauncher(gate: gate), paths: paths, projectPath: env.project,
             registry: registry, spec: ServerSpec(command: ["/bin/true"], name: "web"))
@@ -1412,10 +1424,11 @@ private func makeEnv() throws -> RouterEnv {
             spec: ServerSpec(
                 command: ["/bin/true"], healthcheck: HealthCheckSpec(port: port, type: .tcp),
                 name: "web", port: port))
+        defer { gate.signal(.exitedStatusUnknown) }
         let started = await supervisor.start()
         defer { if let pid = started.pid { kill(pid_t(pid), SIGKILL) } }
         #expect(try await awaitPhase(supervisor, .running).phase == .running)
-        await gate.signal(.exited(code: 1))
+        gate.signal(.exited(code: 1))
         #expect(try await awaitPhase(supervisor, .crashed).phase == .crashed)
         let persisted = await registry.persistedState(
             serverID: serverID(project: env.project, name: "web"))
@@ -1438,13 +1451,14 @@ private func makeEnv() throws -> RouterEnv {
             launcher: StuckRunLauncher(gate: gate), paths: paths, projectPath: env.project,
             registry: registry, spec: ServerSpec(command: ["/bin/true"], name: "stuck"),
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
+        defer { gate.signal(.exitedStatusUnknown) }
         #expect(await supervisor.start().pid != nil)
         #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
 
         #expect(await supervisor.stopForRemoval(reason: "unregistered") == .gaveUp)
         try await registry.updateState(serverID: id, writer: .router) { $0 = PersistedServerState(phase: .stopped) }
 
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        gate.signal(.signaled(signal: Int(SIGKILL)))
         let settled = try await awaitPhase(supervisor, .stopped)
         #expect(settled.phase == .stopped)
         #expect(settled.lastExit?.signal == Int(SIGKILL))
@@ -1488,12 +1502,14 @@ private func makeEnv() throws -> RouterEnv {
         #expect(await gate.callCount == 1)
 
         async let restartStop = supervisor.stop(deliberate: false, reason: "requested by restart")
+        defer { gate.signal(.exitedStatusUnknown) }
         #expect(try await awaitPhase(supervisor, .stopping).phase == .stopping)
         async let removal = supervisor.stopForRemoval(reason: "unregistered")
+        defer { gate.signal(.exitedStatusUnknown) }
         /** Lets the removal join the stop in flight; the assertions below hold
             for either order. */
         try await Task.sleep(for: .milliseconds(100))
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        gate.signal(.signaled(signal: Int(SIGKILL)))
         _ = await restartStop
         #expect(await removal == .stopped)
 
@@ -1517,6 +1533,7 @@ private func makeEnv() throws -> RouterEnv {
         let supervisor = ServerSupervisor(
             launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "web"))
+        defer { gate.signal(.exitedStatusUnknown) }
         #expect(await supervisor.stopForRemoval(reason: "unregistered") == .alreadyTerminal)
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
@@ -1544,6 +1561,7 @@ private func makeEnv() throws -> RouterEnv {
         defer { for pid in launcher.pids { kill(pid, SIGKILL) } }
 
         async let started = supervisor.start()
+        defer { gate.open() }
         let child = try #require(try await launcher.firstPid(within: .seconds(2)))
         let pending = await supervisor.status()
         #expect(pending.phase == .starting)
@@ -1551,7 +1569,7 @@ private func makeEnv() throws -> RouterEnv {
 
         let opener = Task {
             try? await Task.sleep(for: .milliseconds(200))
-            await gate.open()
+            gate.open()
         }
         let stopped = await supervisor.stop(graceSeconds: 2, reason: "test")
         _ = await started
@@ -1582,11 +1600,12 @@ private func makeEnv() throws -> RouterEnv {
         defer { for pid in launcher.pids { kill(pid, SIGKILL) } }
 
         async let started = supervisor.start()
+        defer { gate.open() }
         let child = try #require(try await launcher.firstPid(within: .seconds(2)))
         #expect(await supervisor.stopForRemoval(reason: "unregistered") == .gaveUp)
         #expect(await supervisor.status().phase == .starting)
 
-        await gate.open()
+        gate.open()
         _ = await started
         #expect(
             try await awaitExit(child, within: .seconds(2)), "pid \(child) kept running after its supervisor was removed")

@@ -183,6 +183,7 @@ import Testing
         let router = Router(
             launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
+        defer { gate.signal(.exitedStatusUnknown) }
         let id = serverID(project: env.project, name: "web")
         let canonicalID = serverID(project: canonicalProjectPath(env.project), name: "web")
 
@@ -209,7 +210,7 @@ import Testing
         try await registry.updateState(serverID: id, writer: .supervisor(writer)) { $0.resumeOnBoot = true }
         #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == nil)
 
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        gate.signal(.signaled(signal: Int(SIGKILL)))
         #expect(try await awaitStoppedEvents(router, project: env.project, detail: "unregistered") != nil)
         let row = await registry.persistedState(serverID: id)
         #expect(row?.phase == .stopped)
@@ -232,6 +233,7 @@ import Testing
         let router = Router(
             launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
+        defer { gate.signal(.exitedStatusUnknown) }
         let target = ServerTargetParams(name: "web", project: env.project)
 
         _ = try await router.call(.serverStart, target, ServerResult.self)
@@ -241,7 +243,7 @@ import Testing
 
         #expect(await registry.project(env.project) == nil)
         #expect(FileManager.default.fileExists(atPath: logDir))
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        gate.signal(.signaled(signal: Int(SIGKILL)))
         #expect(try await awaitStoppedEvents(router, project: env.project, detail: "unregistered") != nil)
     }
 
@@ -267,6 +269,7 @@ import Testing
         async let restart = router.attempt(
             .serverRestart, RestartParams(names: ["web"], project: env.project, timeoutSeconds: 3),
             GroupResult.self)
+        defer { gate.signal(.exitedStatusUnknown) }
         let stopping = try await eventually(within: .seconds(1)) {
             try await router.call(
                 .serverStatus, ProjectParams(name: "web", project: env.project), ServerListResult.self
@@ -274,7 +277,7 @@ import Testing
         }
         #expect(stopping)
         _ = try await router.call(.serverUnregister, target, WireEmpty.self)
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        gate.signal(.signaled(signal: Int(SIGKILL)))
         let restarted = try await restart
         if case .success(let group) = restarted {
             for pid in group.results.compactMap(\.server.pid) { kill(pid_t(pid), SIGKILL) }
@@ -320,6 +323,7 @@ import Testing
         let router = Router(
             launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
+        defer { gate.signal(.exitedStatusUnknown) }
         let id = serverID(project: env.project, name: "web")
         let target = ServerTargetParams(name: "web", project: env.project)
 
@@ -330,7 +334,7 @@ import Testing
         _ = try await router.call(
             .serverRegister, RegisterParams(project: env.project, spec: sleeperSpec(name: "web")),
             ServerResult.self)
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        gate.signal(.signaled(signal: Int(SIGKILL)))
         let restarted = try await router.call(.serverStart, target, ServerResult.self)
         let pid = try #require(restarted.server.pid)
         defer { kill(pid_t(pid), SIGKILL) }
@@ -353,6 +357,7 @@ import Testing
         let router = Router(
             launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
+        defer { gate.signal(.exitedStatusUnknown) }
         let id = serverID(project: env.project, name: "web")
         let target = ServerTargetParams(name: "web", project: env.project)
         guard let recorder = DirectaLog.backend as? RecordingBackend else {
@@ -377,7 +382,7 @@ import Testing
                     && entry.message.contains("web")
             })
 
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        gate.signal(.signaled(signal: Int(SIGKILL)))
         #expect(try await awaitStoppedEvents(router, project: env.project, detail: "unregistered") != nil)
         let row = try #require(await registry.persistedState(serverID: id))
         #expect(row.resumeOnBoot == nil)
@@ -614,13 +619,14 @@ import Testing
         if point == .afterRegister {
             removed = try await router.call(.logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
         }
-        if point != .duringSpawn { await gate.open() }
+        if point != .duringSpawn { gate.open() }
         async let started = router.call(.serverStart, target, ServerResult.self)
+        defer { gate.open() }
         if point == .duringSpawn {
             try #require(
                 try await launcher.firstPid(within: .seconds(2)) != nil, "the held spawn never produced a process")
             removed = try await router.call(.logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
-            await gate.open()
+            gate.open()
         }
         let run = try await started
         if point == .afterStart {

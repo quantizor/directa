@@ -306,22 +306,39 @@ func awaitStoppedEvents(
 // MARK: - Latches
 
 /** A one-shot latch: `wait` suspends until `open`, then every waiter, and
-    every later `wait`, gets the opened value. A second `open` is ignored. */
-actor Latch<Value: Sendable> {
-    private var value: Value?
-    private var waiters: [CheckedContinuation<Value, Never>] = []
+    every later `wait`, gets the opened value. A second `open` is ignored.
+    `open` is synchronous so a test can open every gate it holds a job on from
+    a `defer`: the scope's exit then cannot be stuck behind a job that waits on
+    the gate, however the test ends. Declare that `defer` after the `async let`
+    or `Task` that waits, because a scope tears down in reverse order and an
+    earlier `defer` would run after the implicit await on the job. */
+final class Latch<Value: Sendable>: Sendable {
+    private struct State {
+        var value: Value?
+        var waiters: [CheckedContinuation<Value, Never>] = []
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
     func open(_ value: Value) {
-        guard self.value == nil else { return }
-        self.value = value
-        let pending = waiters
-        waiters = []
+        let pending = state.withLock { state -> [CheckedContinuation<Value, Never>] in
+            guard state.value == nil else { return [] }
+            state.value = value
+            defer { state.waiters = [] }
+            return state.waiters
+        }
         for waiter in pending { waiter.resume(returning: value) }
     }
 
     func wait() async -> Value {
-        if let value { return value }
-        return await withCheckedContinuation { waiters.append($0) }
+        await withCheckedContinuation { continuation in
+            let opened = state.withLock { state -> Value? in
+                if let value = state.value { return value }
+                state.waiters.append(continuation)
+                return nil
+            }
+            if let opened { continuation.resume(returning: opened) }
+        }
     }
 }
 
@@ -335,7 +352,8 @@ typealias SpawnGate = Latch<Void>
 /** Resolves every `outcome()` once `signal(_:)` is called (at once, for a call
     made after), so a test controls exactly when a fake child "exits" without
     tying that to a real process death. Counts calls so a test can tell
-    "waiting on the exit" apart from "never asked". */
+    "waiting on the exit" apart from "never asked". `signal` is synchronous
+    (see `Latch`), so a test opens the gate from a `defer`. */
 actor AdoptGate {
     private(set) var callCount = 0
     private let called = Latch<Void>()
@@ -343,12 +361,12 @@ actor AdoptGate {
 
     func outcome() async -> ProcessOutcome {
         callCount += 1
-        await called.open()
+        called.open()
         return await exit.wait()
     }
 
-    func signal(_ outcome: ProcessOutcome) async {
-        await exit.open(outcome)
+    nonisolated func signal(_ outcome: ProcessOutcome) {
+        exit.open(outcome)
     }
 
     /** Returns once `outcome()` has been called at least once. */

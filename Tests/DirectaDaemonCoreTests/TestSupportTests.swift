@@ -114,8 +114,9 @@ import os
     @Test func anAdoptGateSignalledUnderAWaiterStaysOpen() async throws {
         let gate = AdoptGate()
         let first = Task { await gate.outcome() }
+        defer { gate.signal(.exitedStatusUnknown) }
         try #require(try await eventually(within: .seconds(5)) { await gate.callCount == 1 })
-        await gate.signal(.exited(code: 3))
+        gate.signal(.exited(code: 3))
         #expect(Self.exitCode(await first.value) == 3)
 
         /** Unstructured, so a second call that never returns fails this test
@@ -142,11 +143,73 @@ import os
                 }
             }
         }
+        defer { gate.signal(.exitedStatusUnknown) }
         try #require(try await eventually(within: .seconds(5)) { await gate.callCount == 2 })
-        await gate.signal(.exited(code: 4))
+        gate.signal(.exited(code: 4))
         let resumed = try await eventually(within: .seconds(2)) { codes.withLock { $0.count } == 2 }
         #expect(resumed, "\(codes.withLock { $0.count }) of 2 waiters resumed after the signal")
         #expect(codes.withLock { $0 } == [4, 4])
+    }
+
+    /** The first value stays, and a `wait` after the open answers at once. */
+    @Test func aLatchKeepsItsFirstValueAndAnswersLaterWaits() async {
+        let latch = Latch<Int>()
+        latch.open(1)
+        latch.open(2)
+        #expect(await latch.wait() == 1)
+    }
+
+    /** A test that throws while a job it started waits on a gate must still
+        finish: Swift cancels and then awaits an `async let` at scope exit,
+        and a checked continuation ignores the cancellation, so the job ends
+        only once the gate opens. The `defer` that opens it is declared after
+        the `async let`, which scope exit unwinds first. Run unstructured and
+        raced against a deadline, so a regression fails here instead of
+        hanging the run. */
+    @Test func aGateOpenedInADeferAfterTheJobLetsAThrowingTestFinish() async throws {
+        let gate = SpawnGate()
+        let thrown = OSAllocatedUnfairLock<(any Error)?>(initialState: nil)
+        Task {
+            do { try await Self.throwWhileAJobWaits(on: gate) } catch { thrown.withLock { $0 = error } }
+        }
+        /** Frees a job a broken `defer` left waiting. */
+        defer { gate.open() }
+
+        let finished = try await eventually(within: .seconds(2)) { thrown.withLock { $0 } != nil }
+        #expect(finished, "the throwing test never finished: its gate was not opened before the job was awaited")
+        #expect(thrown.withLock { $0 } is EarlyExit)
+    }
+
+    /** The ordering rule itself: a `defer` declared before the `async let`
+        runs after the implicit await, so the test stays stuck until something
+        else opens the gate. */
+    @Test func aGateOpenedInADeferBeforeTheJobLeavesAThrowingTestStuck() async throws {
+        let gate = SpawnGate()
+        let thrown = OSAllocatedUnfairLock<(any Error)?>(initialState: nil)
+        Task {
+            do { try await Self.throwWhileAJobWaitsWithTheDeferFirst(on: gate) } catch { thrown.withLock { $0 = error } }
+        }
+        defer { gate.open() }
+
+        let finished = try await eventually(within: .milliseconds(500)) { thrown.withLock { $0 } != nil }
+        #expect(!finished, "the test finished without the gate opening")
+        gate.open()
+        let released = try await eventually(within: .seconds(2)) { thrown.withLock { $0 } != nil }
+        #expect(released, "opening the gate did not release the stuck test")
+    }
+
+    private struct EarlyExit: Error {}
+
+    private static func throwWhileAJobWaits(on gate: SpawnGate) async throws {
+        async let _: Void = gate.wait()
+        defer { gate.open() }
+        throw EarlyExit()
+    }
+
+    private static func throwWhileAJobWaitsWithTheDeferFirst(on gate: SpawnGate) async throws {
+        defer { gate.open() }
+        async let _: Void = gate.wait()
+        throw EarlyExit()
     }
 
     /** The fixture's setsid listener is spawned from a Dispatch worker thread

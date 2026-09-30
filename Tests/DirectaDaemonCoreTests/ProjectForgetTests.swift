@@ -185,6 +185,7 @@ import Testing
 
         async let sweep = router.pruneMissingProjects(
             now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
+        defer { gate.signal(.exitedStatusUnknown) }
         /** The stop writes its reason into the server's log before it waits,
             so the sweep is suspended inside the teardown from here on. */
         let stopping = try await eventually(within: .seconds(5)) {
@@ -201,7 +202,7 @@ import Testing
             .eventsQuery, EventsQueryParams(project: canonicalProject), EventsQueryResult.self)
         #expect(events.events.filter { $0.kind == .unregistered }.map(\.server) == ["web"])
         #expect(await registry.project(canonicalProject) == nil)
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        gate.signal(.signaled(signal: Int(SIGKILL)))
         #expect(try await awaitStoppedEvents(router, project: canonicalProject) != nil)
     }
 
