@@ -9,6 +9,10 @@ public enum ShellOutcome: Equatable, Sendable {
     /** The child, or a process holding its output open, outlived the
         timeout; `partialOutput` is what arrived before it. */
     case timedOut(partialOutput: String)
+    /** The child wrote more than `HelperCommand.outputLimitBytes` and its
+        process group was killed; `partialOutput` is the first
+        `outputLimitBytes` of what it wrote. */
+    case outputLimitExceeded(partialOutput: String)
 }
 
 /** The one home for running a short helper command (git, launchctl, lsof,
@@ -39,6 +43,13 @@ public enum HelperCommand {
 
     /** `ps` normally finishes in a few milliseconds. */
     public static let psTimeoutSeconds: Double = 5
+
+    /** How much output a command may write before its process group is killed
+        exactly as at a deadline. Every helper here answers with a few lines
+        to a few hundred kilobytes; the cap keeps a runaway writer from
+        growing the daemon's memory until its deadline, or for ever when it
+        has none. */
+    public static let outputLimitBytes = 4 * 1024 * 1024
 
     /** The deadline a command gets when its caller names none: one of the
         constants above for launchctl, lsof, and ps, and nil (wait for the
@@ -77,11 +88,16 @@ public enum HelperCommand {
         let outcome = runUnmeasured(
             path, arguments, currentDirectory: currentDirectory, environment: environment,
             includeStderr: includeStderr, timeoutSeconds: timeoutSeconds)
-        if case .timedOut = outcome {
+        switch outcome {
+        case .timedOut:
             DaemonActivity.shared.end(token, outcome: "timed out")
             DirectaLog.daemon.error(
                 "helper command timed out after \(timeoutSeconds ?? 0)s and its process group was killed: \(label)")
-        } else {
+        case .outputLimitExceeded:
+            DaemonActivity.shared.end(token, outcome: "output limit exceeded")
+            DirectaLog.daemon.error(
+                "helper command wrote more than \(outputLimitBytes) bytes and its process group was killed: \(label)")
+        case .exited, .failedToRun:
             DaemonActivity.shared.end(token)
         }
         return outcome
@@ -116,7 +132,10 @@ public enum HelperCommand {
         let reader = pipe.fileHandleForReading.fileDescriptor
         var output = Data()
         guard let timeoutSeconds else {
-            _ = drain(reader, into: &output, until: nil)
+            if drain(reader, into: &output, until: nil) == .overLimit {
+                killGroup(of: process, exited: exited, pipeStillHeld: true)
+                return .outputLimitExceeded(partialOutput: decodedCapped(output))
+            }
             exited.wait()
             return .exited(status: process.terminationStatus, output: String(decoding: output, as: UTF8.self))
         }
@@ -124,37 +143,55 @@ public enum HelperCommand {
             value. */
         let boundedSeconds = timeoutSeconds.isFinite ? min(max(timeoutSeconds, 0), 86_400) : 86_400
         let deadline = ContinuousClock.now.advanced(by: .seconds(boundedSeconds))
-        let reachedEndOfFile = drain(reader, into: &output, until: deadline)
-        if reachedEndOfFile,
+        let end = drain(reader, into: &output, until: deadline)
+        if end == .endOfFile,
             exited.wait(timeout: .now() + max(ContinuousClock.now.duration(to: deadline) / .seconds(1), 0))
                 == .success
         {
             return .exited(status: process.terminationStatus, output: String(decoding: output, as: UTF8.self))
         }
-        /** SIGKILL rather than SIGTERM: this is already the path where the
-            child ignored its chance to finish, and a profile blocked on a read
-            will not act on a term either. The group is signaled only while
-            something still belongs to it: the command itself still running,
-            or the pipe still held open, whose holder inherited the group. A
-            group id stays reserved while any member lives, and once the group
-            is empty the id could only name a stranger after the pid space
-            wrapped within this one deadline. */
-        let pid = process.processIdentifier
-        if process.isRunning || !reachedEndOfFile {
-            kill(-pid, SIGKILL)
-            _ = exited.wait(timeout: .now() + 2)
+        killGroup(of: process, exited: exited, pipeStillHeld: end != .endOfFile)
+        if end == .overLimit {
+            return .outputLimitExceeded(partialOutput: decodedCapped(output))
         }
         /** What the command wrote before it died is still in the pipe. */
         _ = drain(reader, into: &output, until: ContinuousClock.now.advanced(by: .milliseconds(200)))
-        return .timedOut(partialOutput: String(decoding: output, as: UTF8.self))
+        return .timedOut(partialOutput: decodedCapped(output))
     }
 
-    /** Reads `fd` into `output` until end of file (true) or `deadline`
-        (false; nil never passes), polling so the wait needs no second
-        thread. */
+    /** SIGKILL rather than SIGTERM: this is already the path where the child
+        ignored its chance to finish, and a profile blocked on a read will not
+        act on a term either. The group is signaled only while something still
+        belongs to it: the command itself still running, or the pipe still
+        held open, whose holder inherited the group. A group id stays reserved
+        while any member lives, and once the group is empty the id could only
+        name a stranger after the pid space wrapped within this one deadline. */
+    private static func killGroup(of process: Process, exited: DispatchSemaphore, pipeStillHeld: Bool) {
+        guard process.isRunning || pipeStillHeld else { return }
+        kill(-process.processIdentifier, SIGKILL)
+        _ = exited.wait(timeout: .now() + 2)
+    }
+
+    /** `output` as text, cut to the output cap: the drain stops within one
+        read of the cap, so a kill's last reads can leave a little more. */
+    private static func decodedCapped(_ output: Data) -> String {
+        String(decoding: output.prefix(outputLimitBytes), as: UTF8.self)
+    }
+
+    private enum DrainEnd {
+        /** The deadline passed, or the pipe could not be read. */
+        case deadline
+        case endOfFile
+        /** More than `outputLimitBytes` arrived. */
+        case overLimit
+    }
+
+    /** Reads `fd` into `output` until end of file, `deadline` (nil never
+        passes), or more than the output cap has arrived, polling so the wait
+        needs no second thread. */
     private static func drain(
         _ fd: Int32, into output: inout Data, until deadline: ContinuousClock.Instant?
-    ) -> Bool {
+    ) -> DrainEnd {
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
             var request = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
@@ -166,19 +203,20 @@ public enum HelperCommand {
             let ready = poll(&request, 1, timeoutMilliseconds)
             if ready < 0 {
                 if errno == EINTR { continue }
-                return false
+                return .deadline
             }
             if ready == 0 {
-                if let remaining, remaining <= .zero { return false }
+                if let remaining, remaining <= .zero { return .deadline }
                 continue
             }
             let count = read(fd, &buffer, buffer.count)
             if count > 0 {
                 output.append(contentsOf: buffer[0..<count])
+                if output.count > outputLimitBytes { return .overLimit }
             } else if count == 0 {
-                return true
+                return .endOfFile
             } else if errno != EINTR, errno != EAGAIN {
-                return false
+                return .deadline
             }
         }
     }

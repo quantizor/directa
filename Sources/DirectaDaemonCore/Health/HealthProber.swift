@@ -198,13 +198,14 @@ public enum PortGuard {
     }
 
     /** stdout of a command that ran to the end, or nil when it could not
-        start or outlived `timeoutSeconds`: a lookup that hung is no evidence,
-        the same as one that found nothing. A nonzero exit still answers its
+        start, outlived `timeoutSeconds`, or wrote past `HelperCommand`'s output
+        cap: a lookup that hung or ran away is no evidence, the same as one that
+        found nothing. A nonzero exit still answers its
         output, since `lsof` exits 1 when nothing matches. */
     static func output(_ path: String, _ arguments: [String], timeoutSeconds: Double) -> String? {
         switch HelperCommand.run(path, arguments, includeStderr: false, timeoutSeconds: timeoutSeconds) {
         case .exited(_, let output): output
-        case .failedToRun, .timedOut: nil
+        case .failedToRun, .timedOut, .outputLimitExceeded: nil
         }
     }
 }

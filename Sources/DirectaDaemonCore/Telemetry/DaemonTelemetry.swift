@@ -214,6 +214,10 @@ public final class DaemonTelemetry: Sendable {
             /** The lines found before the deadline are still evidence. */
             parsed = DaemonIncident.parseLogShow(partialOutput)
             outcome = "timed out"
+        case .outputLimitExceeded(let partialOutput):
+            /** Same as a timeout: what arrived before the cap is still evidence. */
+            parsed = DaemonIncident.parseLogShow(partialOutput)
+            outcome = "output limit exceeded: log show wrote more than \(HelperCommand.outputLimitBytes) bytes"
         }
         incident.append(parsed.lines)
         let reports = Self.diagnosticReports(

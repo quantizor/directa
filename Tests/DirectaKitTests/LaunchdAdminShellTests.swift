@@ -134,6 +134,60 @@ import Testing
         #expect(elapsed < .seconds(3))
     }
 
+    /** A runaway writer is killed at the output cap, on the timed and the
+        untimed path alike, and answers the first cap's worth of what it wrote
+        long before its deadline. */
+    @Test(arguments: [nil, 5.0])
+    func aRunawayWriterIsKilledAtTheOutputCap(timeout: Double?) async {
+        let (outcome, elapsed) = await offPool {
+            let started = ContinuousClock.now
+            let outcome = LaunchdAdmin.shellOutcome("/usr/bin/yes", [], timeoutSeconds: timeout)
+            return (outcome, started.duration(to: .now))
+        }
+        guard case .outputLimitExceeded(let partialOutput) = outcome else {
+            Issue.record("a child writing without end read as \(String("\(outcome)".prefix(60)))")
+            return
+        }
+        #expect(partialOutput.utf8.count == HelperCommand.outputLimitBytes)
+        #expect(elapsed < .seconds(3))
+    }
+
+    /** Exactly the cap is an answer; one byte more is a runaway. */
+    @Test func theOutputCapAdmitsExactlyItsOwnSize() async {
+        let cap = HelperCommand.outputLimitBytes
+        let atCap = await offPool {
+            LaunchdAdmin.shellOutcome("/bin/sh", ["-c", "yes | head -c \(cap)"], timeoutSeconds: 30)
+        }
+        let pastCap = await offPool {
+            LaunchdAdmin.shellOutcome("/bin/sh", ["-c", "yes | head -c \(cap + 1)"], timeoutSeconds: 30)
+        }
+        guard case .exited(status: 0, let output) = atCap else {
+            Issue.record("output exactly at the cap read as \(String("\(atCap)".prefix(60)))")
+            return
+        }
+        #expect(output.utf8.count == cap)
+        guard case .outputLimitExceeded(let partialOutput) = pastCap else {
+            Issue.record("output one byte past the cap read as \(String("\(pastCap)".prefix(60)))")
+            return
+        }
+        #expect(partialOutput.utf8.count == cap)
+    }
+
+    /** The `(status, output)` form names the cap and leaves the partial
+        output out, so an error message built from it stays small. */
+    @Test func aRunawayWriterReportsTheCapInTheStatusForm() async {
+        let result = await offPool { LaunchdAdmin.shell("/usr/bin/yes", [], timeoutSeconds: 5) }
+        #expect(result.status == -1)
+        #expect(result.output == "output exceeded \(HelperCommand.outputLimitBytes) bytes")
+    }
+
+    /** `capturedPath` reads a runaway shell as no answer too. */
+    @Test func aPathCaptureThatRanAwayFallsBackToTheFloor() {
+        #expect(
+            LaunchdAdmin.capturedPath(from: .outputLimitExceeded(partialOutput: "/partial/bin:"))
+                == LaunchdAdmin.pathFloor)
+    }
+
     /** The helpers the daemon runs on a fixed-width lane get a deadline when
         the caller names none, so a hung one cannot hold a lane thread forever;
         a launchctl verb that waits for a job to exit gets room for launchd's

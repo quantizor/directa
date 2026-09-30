@@ -469,13 +469,14 @@ public enum LaunchdAdmin {
     }
 
     /** Only a shell that ran to its exit answers: one that could not start
-        carries an error reason, and one killed at its deadline printed at most
-        part of a line, neither of them a PATH, so the floor applies. */
+        carries an error reason, one killed at its deadline printed at most
+        part of a line, and one killed at the output cap was a runaway, none of
+        them a PATH, so the floor applies. */
     static func capturedPath(from outcome: ShellOutcome) -> String {
         let output =
             switch outcome {
             case .exited(_, let output): output
-            case .failedToRun, .timedOut: ""
+            case .failedToRun, .timedOut, .outputLimitExceeded: ""
             }
         let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
         return path.isEmpty ? pathFloor : path
@@ -575,8 +576,8 @@ public enum LaunchdAdmin {
 
     /** `shellOutcome` in the `(status, output)` shape most callers read: a
         child that could not start is status -1 with the reason as output, and
-        one killed at its deadline is status -1 with output saying so (see
-        `timedOutOutput`). A caller that must tell a timeout from a finished
+        one killed at its deadline or at the output cap is status -1 with
+        output saying so (see `timedOutOutput`, `outputLimitExceededOutput`). A caller that must tell a timeout from a finished
         child reads `shellOutcome` instead, as `capturedPath` does. */
     @discardableResult
     public static func shell(
@@ -597,7 +598,17 @@ public enum LaunchdAdmin {
                 status: -1,
                 output: timedOutOutput(deadlineSeconds: deadline ?? 0, partialOutput: partialOutput)
             )
+        case .outputLimitExceeded:
+            return (status: -1, output: outputLimitExceededOutput(limitBytes: HelperCommand.outputLimitBytes))
         }
+    }
+
+    /** What a command killed at the output cap reports as its output. The
+        partial output is left out: it is the whole cap, far too large to ride
+        along in an error message, and a caller that wants it reads
+        `shellOutcome`. */
+    static func outputLimitExceededOutput(limitBytes: Int) -> String {
+        "output exceeded \(limitBytes) bytes"
     }
 
     /** What a command killed at its deadline reports as its output: the

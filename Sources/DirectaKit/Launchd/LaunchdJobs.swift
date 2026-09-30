@@ -143,8 +143,8 @@ public enum LaunchdJobs {
     /** What one `launchctl list` read found. */
     public enum ChildJobListing: Equatable, Sendable {
         case listed([ChildJob])
-        /** launchctl gave no usable answer (it timed out, could not start,
-            or exited nonzero): nothing is known about which jobs exist,
+        /** launchctl gave no usable answer (it timed out, wrote past the
+            output cap, could not start, or exited nonzero): nothing is known about which jobs exist,
             which is not the same as knowing there are none. */
         case unavailable(reason: String)
     }
@@ -161,6 +161,8 @@ public enum LaunchdJobs {
             .unavailable(reason: "launchctl list did not start: \(reason.prefix(200))")
         case .timedOut:
             .unavailable(reason: "launchctl list timed out")
+        case .outputLimitExceeded:
+            .unavailable(reason: "launchctl list wrote more than \(HelperCommand.outputLimitBytes) bytes")
         }
     }
 
