@@ -1,5 +1,0 @@
----
-"directa": patch
----
-
-When directa runs as the background daemon installed with the app, a dev server whose start command exits immediately (a bad script, a typo'd binary, a config error caught before the server even binds) now reports that it exited, instead of the unhelpful "never became a session leader" spawn failure. It carries the real exit code, or the signal that ended it, whenever macOS still has that on record. A command directa cannot run at all, such as a typo'd path, now exits with code 127 and prints `directa: cannot run <command>: <reason>` as its error output, where before it exited 0 without a word. `directa status` and `directa why` can now tell an instant, wrong-command failure apart from directa itself failing to launch the process, and the command's own error output (printed to stderr before it exited) now reaches `directa logs` and `directa why` instead of being silently dropped. A command that exits before directa is able to watch it is not started again just because the daemon comes back; a server that was actually watched, including one that exited a moment after directa started watching it, still is.
