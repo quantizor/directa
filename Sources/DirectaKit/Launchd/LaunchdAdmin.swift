@@ -619,10 +619,10 @@ public enum LaunchdAdmin {
         return partialOutput.isEmpty ? base : "\(base); output so far: \(partialOutput)"
     }
 
-    /** The async form of `shellOutcome`, on `BlockingLane.system`. Kept with no
-        caller: its presence makes an async caller that forgets `await` fail to
-        compile instead of blocking a cooperative-pool thread. */
-    /* periphery:ignore - compile-time guard */
+    /** The async form of `shellOutcome`, on `BlockingLane.system`. Swift picks
+        it over the synchronous form in any async context, so an async caller
+        that forgets `await` fails to compile instead of blocking a
+        cooperative-pool thread. */
     public static func shellOutcome(
         _ path: String, _ arguments: [String], environment: [String: String]? = nil,
         includeStderr: Bool = true, timeoutSeconds: Double? = nil

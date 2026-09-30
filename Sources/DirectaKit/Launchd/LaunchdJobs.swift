@@ -121,23 +121,53 @@ public enum LaunchdJobs {
         printJob(label: LaunchdAdmin.label)
     }
 
+    /** What one `launchctl print` of a job found. */
+    public enum JobPrint: Equatable, Sendable {
+        /** launchd has no such job, or launchctl exited nonzero or could not
+            start: an answer, so a caller that is waiting for the job to show
+            a state asks again. */
+        case absent
+        case found(JobStatus)
+        /** launchctl outlived its deadline or wrote past the output cap and
+            was killed: launchd gave no answer, and asking again costs another
+            whole deadline, so a polling caller stops. */
+        case unresponsive
+
+        /** The job's status, nil for anything but `found`. */
+        public var status: JobStatus? {
+            guard case .found(let status) = self else { return nil }
+            return status
+        }
+    }
+
+    /** The `JobPrint` a `launchctl print` outcome means. */
+    static func jobPrint(from outcome: ShellOutcome) -> JobPrint {
+        switch outcome {
+        case .exited(status: 0, let output): .found(parseJobPrint(output))
+        case .exited, .failedToRun: .absent
+        case .outputLimitExceeded, .timedOut: .unresponsive
+        }
+    }
+
     /** `launchctl print` of one gui-domain job, nil when launchd has no such
         job (or the print failed). */
     public static func printJob(label: String) -> JobStatus? {
-        parsedPrint(LaunchdAdmin.shell("/bin/launchctl", printArguments(label: label)))
+        jobPrint(from: LaunchdAdmin.shellOutcome("/bin/launchctl", printArguments(label: label))).status
     }
 
     /** `printJob` on `BlockingLane.system`, the overload an async caller gets. */
     public static func printJob(label: String) async -> JobStatus? {
-        parsedPrint(await LaunchdAdmin.shell("/bin/launchctl", printArguments(label: label)))
+        await printOutcome(label: label).status
+    }
+
+    /** `printJob` that tells a print that never answered from one that
+        answered with no job, on `BlockingLane.system`. */
+    public static func printOutcome(label: String) async -> JobPrint {
+        jobPrint(from: await LaunchdAdmin.shellOutcome("/bin/launchctl", printArguments(label: label)))
     }
 
     private static func printArguments(label: String) -> [String] {
         ["print", "\(guiDomain)/\(label)"]
-    }
-
-    private static func parsedPrint(_ printed: (status: Int32, output: String)) -> JobStatus? {
-        printed.status == 0 ? parseJobPrint(printed.output) : nil
     }
 
     /** What one `launchctl list` read found. */

@@ -295,20 +295,23 @@ public struct LaunchdJobLauncher: ProcessLauncher {
         kernel gave no exit status. */
     private static func launchdExitRecord(label: String) async -> ProcessOutcome {
         await exitRecord(attempts: exitRecordAttempts, interval: exitRecordInterval) {
-            await LaunchdJobs.printJob(label: label)
+            await LaunchdJobs.printOutcome(label: label)
         }
     }
 
-    /** Polls `read` (nil when the print failed) until it shows a job with no
-        pid and an exit code or terminating signal, then maps that record
-        through `unseenExitOutcome`. Status-unknown once `attempts` reads pass
-        without one. */
+    /** Polls `read` until it shows a job with no pid and an exit code or
+        terminating signal, then maps that record through `unseenExitOutcome`.
+        Status-unknown once `attempts` reads pass without one, and at once
+        after a print that never answered: it already held a `system` lane
+        thread for a whole launchctl deadline, and each retry could hold it
+        for another. */
     static func exitRecord(
-        attempts: Int, interval: Duration, read: () async -> LaunchdJobs.JobStatus?
+        attempts: Int, interval: Duration, read: () async -> LaunchdJobs.JobPrint
     ) async -> ProcessOutcome {
         for attempt in 0..<attempts {
-            let status = await read()
-            if let status, status.pid == nil,
+            let printed = await read()
+            if printed == .unresponsive { break }
+            if let status = printed.status, status.pid == nil,
                 status.lastExitCode != nil || status.lastTerminatingSignal != nil
             {
                 return unseenExitOutcome(status)

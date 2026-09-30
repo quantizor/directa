@@ -146,6 +146,19 @@ import Testing
         #expect(LaunchdJobs.parseChildJobs(fromList: listed).isEmpty)
     }
 
+    /** Only a print that never answered is `unresponsive`: a nonzero exit or a
+        launchctl that would not start is an answer with no job. */
+    @Test func aPrintOutcomeIsUnresponsiveOnlyWhenLaunchctlNeverAnswered() {
+        let printed = "state = running\npid = 4242\n"
+        #expect(
+            LaunchdJobs.jobPrint(from: .exited(status: 0, output: printed))
+                == .found(LaunchdJobs.JobStatus(pid: 4242, state: "running")))
+        #expect(LaunchdJobs.jobPrint(from: .exited(status: 113, output: "Could not find service")) == .absent)
+        #expect(LaunchdJobs.jobPrint(from: .failedToRun("no such file")) == .absent)
+        #expect(LaunchdJobs.jobPrint(from: .timedOut(partialOutput: "state = running\n")) == .unresponsive)
+        #expect(LaunchdJobs.jobPrint(from: .outputLimitExceeded(partialOutput: printed)) == .unresponsive)
+    }
+
     @Test func staleWithNoLivePidsReapsEveryChildJob() {
         let jobs = [
             LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.a", pid: 10),
