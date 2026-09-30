@@ -1141,22 +1141,18 @@ struct HeadRow: View {
 
 /** The tally light: state as color, `starting` breathes. Never shouts. */
 struct TallyDot: View {
-    @State private var breathing = false
     let phase: ServerPhase
 
     var body: some View {
-        Circle()
-            .fill(color)
-            .frame(width: 8, height: 8)
-            .opacity(phase == .starting ? (breathing ? 1.0 : 0.35) : 1.0)
-            .animation(
-                phase == .starting
-                    ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true)
-                    : .default,
-                value: breathing
-            )
-            .onAppear { breathing = true }
-            .accessibilityLabel(Text(phase.rawValue))
+        Group {
+            if phase == .starting {
+                BreathingDot(color: color)
+            } else {
+                Circle().fill(color)
+            }
+        }
+        .frame(width: 8, height: 8)
+        .accessibilityLabel(Text(phase.rawValue))
     }
 
     private var color: Color {
@@ -1167,6 +1163,23 @@ struct TallyDot: View {
         case .crashed, .failed: .red
         case .stopped: Color(nsColor: .tertiaryLabelColor)
         }
+    }
+}
+
+/** The starting dot's breath. Its own view so the repeating animation ends
+    with it: SwiftUI never cancels a `repeatForever` in flight when the
+    animation modifier changes, and the menu bar window keeps its content alive
+    while closed, so a breath left running redraws the window forever. */
+private struct BreathingDot: View {
+    @State private var inhaled = false
+    let color: Color
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .opacity(inhaled ? 1.0 : 0.35)
+            .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: inhaled)
+            .onAppear { inhaled = true }
     }
 }
 
