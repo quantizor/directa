@@ -1,5 +1,303 @@
 # Changelog
 
+## 3.0.0
+### Major Changes
+
+
+
+- [#34](https://github.com/quantizor/directa/pull/34) [`e6bd7b6`](https://github.com/quantizor/directa/commit/e6bd7b6894844af8f1e406c29069eda7001bf7fe) - `directa lock` now leaves the project's servers running by default, instead of stopping them for the duration of the command. Other commands still wait their turn for the named resource. If a running server has the locked files open, and the command changes those files, lock reports the mismatch (and by default fails) so the server cannot quietly write the old data back.
+  
+  Stopping those servers is now opt-in with `--pause`, which stops them for the command and starts them again when the lock is released. The old `--no-pause` flag is gone: a plain `directa lock <resource> -- <command>` now does what `--no-pause` used to. Drop `--no-pause` from scripts. Add `--pause` if the servers really need to be down.
+  
+  A lock that is only a name, with no `path` to the files it protects, cannot detect those changes. In that case lock warns on stderr and points to adding a `path` or using `--pause`.
+  
+  `directa up` will not start a stopped server that uses the locked resource while another command still holds the lock. Servers that are already running stay running. The same is true when the background daemon comes back after a crash.
+
+### Minor Changes
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa doctor` now checks the files of the daemon it is talking to. Pointed at a separate daemon (for example one started for a test with its own data and logs folders), it reads that daemon's update notice cache and saved PATH instead of the ones in your home folder, so a test run no longer touches your real directa data. The CLI also accepts `DIRECTA_DATA_DIR` and `DIRECTA_LOGS_DIR` to name its own data and logs folders; with either one (or `DIRECTA_SOCKET`) set, it never installs or starts the background daemon on its own.
+  
+  `directa doctor --fix` now asks the daemon to remove each leftover log folder, and the daemon checks at that moment that no project uses it, so a project started while doctor runs always keeps its logs. An older daemon that cannot do this gets the report without any removal and a note to run `directa daemon restart`.
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa hook install` with no `--harness` now installs into every supported agent harness detected on your machine (Claude Code, Cursor, Grok Build, OpenCode, Antigravity), printing one line for each harness installed and one for each skipped as not detected, instead of only Claude Code. It fails with a clear error, naming the harnesses it checked, if none is detected at all. Passing `--harness` still installs exactly that one harness, whether or not it is detected.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa logs <name>` now shows only the last 200 lines by default instead of a long-running server's entire history. Pass `--all` for the old full-history behavior, or `--tail`/`--since`/`--since-mark`/`--follow` as before to bound the query yourself.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa monitor <name>` streams a server's output shaped for an agent's own streaming tool: Claude Code's Monitor tool, or Grok Build's monitor tool. It attaches with a start marker (checkout path, phase, pid, last exit), then polls for new lines, collapsing repeats, holding lifecycle and stderr to their own budgets so a flooding server never crowds them out, and naming the exact command to read whatever it skipped. A default budget of 120 stdout lines and 30 error lines per minute (`--lines-per-minute`, `--errors-per-minute`, and their `--lines-per-arm`/`--errors-per-arm` per-run totals) keeps a chatty or looping server from filling an agent's context; re-run the command to reset it. It keeps streaming across a daemon restart and never starts the daemon itself. The command ends on its own after 29 minutes (naming a command that reads anything written after it stops), when the server is unregistered, after a sustained daemon outage, or when the daemon refuses it, always naming what happened and how to keep watching.
+  
+  Claude Code and Grok Build sessions now see a line at session start naming this command for the project's servers; Cursor, Antigravity, and `directa context` are unchanged.
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa up` and `directa down` now accept an optional server name, matching every other single-server command (`ensure`, `restart`, `stop`, `wait`). `directa up web` is shorthand for `directa up --only web` (passing both is a usage error); `directa down api` stops only that server, leaving the rest of the project running. Omitting the name still targets the whole project.
+
+
+### Patch Changes
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - When the daemon restarts and shuts down a leftover dev server it can no longer supervise, a helper process of that server that ignores the polite stop request is now force-stopped too, instead of being left running (and possibly holding the server's port) once the server itself exits.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - A server that prints a lot no longer fills your disk through its raw output files (`out.spool` and `err.spool` in the server's log folder). Once directa has copied output into the server's log, it frees the disk space behind it and keeps only the newest megabyte of raw output, so a chatty or runaway server stays at a small, steady size on disk however long it runs. The server keeps writing exactly as before and nothing directa has not read yet is ever discarded. The files report a large size to tools like `ls` because the freed space is left as an empty gap rather than removed; read them with `tail` rather than `cat`.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - The background daemon's control socket now refuses a request that streams past 1 MiB without ever sending a newline to end it, instead of letting a misbehaving client grow the daemon's memory without limit. This never affects the `directa` command or the menu bar app, which always send small, complete requests; it only guards a client writing to the socket directly.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Fixed the background daemon leaking two threads and their file descriptors every time it tried to read git information (for sibling-port rebind, or worktree detection) from a working directory that could not actually be used to run a process (a checkout mid-move, an invalid path). Repeated failures no longer accumulate; a normal git checkout is unaffected.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - A project's log directory now gets removed automatically once directa forgets the project, either because you unregistered its last server or because the daemon noticed the checkout is gone. Before, that directory sat under `~/Library/Logs/directa` forever, and only `directa uninstall --purge` ever cleaned it up. `directa doctor` also now flags any log directory left over from before this fix (or orphaned some other way), naming its size, and `directa doctor --fix` removes it for you. It only ever deletes a leftover folder directa itself created inside its own logs folder, never another app's folder, never a shortcut (symbolic link) pointing somewhere else, and never one a project still uses, including a project you started while `doctor` was busy with its other checks.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - When a dev server crashes, directa now reliably stops the helper processes it left behind. Two cases slipped through before, both more likely on a busy machine. A server that exited moments after starting could leave its helpers running, because directa lost track of which session (the group of processes a server starts together) they belonged to. And a helper that had moved into a session of its own could be forgotten if directa happened to refresh its list of the server's processes in the instant between the crash and handling it. Either way the leftover helper kept holding its port, so the next start failed with the port still in use.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - The background daemon now keeps a small diagnostic record of its own health, to help explain unexpected restarts. It notes how many threads and how much memory it is using, what it is waiting on, and when servers stop and restart. After each restart it also saves a short report on how the previous run ended. Everything lives in a `daemon` folder inside directa's logs folder (`~/Library/Logs/directa/daemon`). Old entries are removed automatically, so the record settles at about 70 MB of disk and never grows past about 100 MB. Nothing is sent anywhere.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Fixed the background daemon forgetting a project, including its approval and log history, on the very first moment its checkout path went missing when checked through `directa status --all` or the menu bar app's regular polling (both run every couple of seconds). It now waits for the same debounce the timer sweep always used: a checkout has to stay missing for a full sweep interval before directa forgets it, so a brief unmounted drive or a slow move no longer costs a project its trust.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - When a dev server exits or is stopped, a helper process it started just before exiting is no longer left running. A helper that detached itself (moved into a session of its own, the group of processes a server starts together) in the moment before the server quit could slip past every way directa had of finding it, and it kept holding its port so the next start failed with the port still in use. directa now also follows the kernel's record of which process started which, which survives the server exiting, so these helpers are stopped along with the server.
+
+
+
+- [#34](https://github.com/quantizor/directa/pull/34) [`e6bd7b6`](https://github.com/quantizor/directa/commit/e6bd7b6894844af8f1e406c29069eda7001bf7fe) - Replacing `/Applications/directa.app` from a mounted DMG now stops the background agent (the installer used to hang on that step) and quits after a successful copy, so the disk can be ejected.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa doctor --fix` now actually forgets a leftover registry entry for a project whose checkout is gone (its registry row, trust, and log directory), rather than reporting success while leaving the entry in place, which could otherwise leave a trusted project stuck registered forever with no checkout behind it. The tool still refuses to touch a project whose checkout has reappeared on disk, since forgetting a live project would drop its approval to run its committed config.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa doctor --fix` now says plainly when the running background daemon is too old to know `project.forget` ("run: directa daemon restart") instead of printing a raw "unknown method" error, and correctly says "1 server" instead of "1 servers" when forgetting a project with exactly one.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Saved daemon state (which servers are registered, what is running) is now written more durably. A crash at exactly the wrong moment during a save no longer risks silently losing the update, and a failed save no longer leaves a stray temporary file behind. The daemon also now cleans up any such leftover file from an earlier crash the next time it starts.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Fixed `directa why` and `directa doctor`'s jetsam-restart count misreading a watch-triggered restart as an externally sent stop signal, or as a daemon restart, whenever the changed file's path happened to contain the literal text "(external)" or "daemon-restart" (a directory or file legitimately named that). Both now recognize only the exact detail directa itself writes for those events.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - When macOS will not tell the background daemon how a dev server exited, directa now reads the exit code or signal from the record launchd keeps for that server, instead of reporting the exit as unknown in `directa status`, `directa why`, and the event history.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - A dev server killed by something other than directa (an IDE stop button, a forwarded Ctrl-C, an external process manager) now shows as stopped instead of crashed, as long as it was asked to shut down gracefully (SIGTERM, SIGINT, or SIGHUP). The event history says the signal and that it came from outside directa. Before, any such exit looked identical to a real crash everywhere directa surfaces server health, including the coding-agent session summary, which nudged an agent to investigate a shutdown nobody needed explained. A server actually killed (SIGKILL) or that exits on its own with a nonzero code still shows as crashed.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Commands that receive a very large reply from the daemon, most visibly `directa logs` without `--tail` on a long-running server, now finish in seconds instead of minutes. Reading a 36 MB reply took over ten minutes before and now takes well under a second on the client side.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa status` and the menu bar app's polling now answer instantly for a crashed or failed dev server after a daemon restart. Before, each check reread that server's entire log history from disk, noticeably slow on a server with a large log, so the menu bar app's regular polling competed with the read it had just finished.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - When `directa doctor --fix` forgets a vanished project while the daemon's own cleanup is already removing it, the project's servers are now stopped and recorded as unregistered once, not twice.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa doctor --fix` now fully forgets a vanished project whatever spelling of its path it is given (a trailing slash, a `~` path, or a path through a symbolic link such as `/var` for `/private/var`, for example). Before, such a spelling dropped the project's registry entry but left its running dev servers, resource locks, and supervision behind, or was refused as a project directa never knew.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Fixed sibling-port rebind and worktree detection hanging indefinitely against a git checkout that prints a long warning (a "detached HEAD" or "unsafe repository" notice, for example) before answering.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Unregistering a server now always leaves it stopped for good. Unregistering it while a restart of it is still in progress no longer starts a copy that nothing keeps track of, and a server whose stop hangs no longer comes back the next time the daemon launches. The same holds for a project directa forgot because its folder was gone, if that folder later comes back. A server whose stop hangs is now also shut down the next time the daemon starts, if it is still running then.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - When directa runs as the background daemon installed with the app, a dev server whose start command exits immediately (a bad script, a typo'd binary, a config error caught before the server even binds) now reports that it exited, instead of the unhelpful "never became a session leader" spawn failure. It carries the real exit code, or the signal that ended it, whenever macOS still has that on record. A command directa cannot run at all, such as a typo'd path, now exits with code 127 and prints `directa: cannot run <command>: <reason>` as its error output, where before it exited 0 without a word. `directa status` and `directa why` can now tell an instant, wrong-command failure apart from directa itself failing to launch the process, and the command's own error output (printed to stderr before it exited) now reaches `directa logs` and `directa why` instead of being silently dropped. A command that exits before directa is able to watch it is not started again just because the daemon comes back; a server that was actually watched, including one that exited a moment after directa started watching it, still is.
+
+
+
+- [#34](https://github.com/quantizor/directa/pull/34) [`e6bd7b6`](https://github.com/quantizor/directa/commit/e6bd7b6894844af8f1e406c29069eda7001bf7fe) - `directa doctor` now warns when macOS killed the background daemon to free memory (jetsam), and when leftover server-process entries are still registered after that death. The daemon also cleans those leftovers up when it comes back, so they do not pile up across automatic restarts.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - After macOS kills the background daemon to free memory, a dev server that is still running is picked up again instead of being stopped and started. If macOS does not answer when the daemon asks which of those servers are still running, the daemon leaves them running rather than restarting them.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - The suggested fix that `directa lock` prints when it is missing a command, or when the locked state changed under a running server, now starts with `run: ` like every other suggestion directa gives, and puts a resource name containing spaces or other shell characters in quotes so it can be pasted as is. The suggestion after a failed `directa switch` step reads "fix the failure, then run: directa up".
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - The warning `directa lock` prints when a resource has no `path` declared (so it cannot detect a change while a declaring server keeps running) now names the exact fix: which server declares the resource, and the `devservers.json` object to give it, for example `{"name": "d1", "path": "<path to d1's state>"}`, instead of the vaguer "add a `path` to the lock declaration".
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Fixed `directa lock <resource> -- <command>` running `<command>` in the project's root directory instead of wherever you actually ran it from. A relative file argument, or a tool that finds its own config by walking up from the current directory, now sees the same directory it would running the command directly; this holds even when you pass `--project` to lock a different project's resource, since `<command>` still runs where you are, not there.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Fixed the menu bar app using a steady share of a CPU core after any server had started. The breathing dot a starting server shows kept redrawing after the server came up, even with the popover closed. The dot now stops breathing the moment the server leaves the starting state.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - More messages that led with "ddirecta" (the background daemon's own binary name) now say "the daemon" instead: the wait notice while a fresh daemon restores its servers, a stuck-listener failure, a lost-connection error, a wedged-daemon timeout, `directa doctor`'s jetsam finding, the `directa daemon install/uninstall/start/stop/restart` confirmations, and the equivalent status text in the menu bar app. Several of these previously combined with the CLI's own "directa: " prefix to read as "directa: ddirecta …", easy to mistake for a typo.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - A few more messages that led with "ddirecta" (the background daemon's own binary name) now say "the daemon" instead: the install failure when neither a LaunchAgent nor the daemon binary can be found, the app's "asked the app to start it, but it never answered" message, and `directa daemon info`'s human-readable output. The menu bar app's "the daemon is stopped" and "the daemon is not running" rows are now capitalized consistently with the "Starting the daemon…" row beside them. `directa hook install --harness bogus` and `directa hook uninstall --harness bogus` now point at the literal command to run instead of a bare list of supported names.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Fixed a message that read as a typo: waiting on a daemon still restoring servers used to print "directa: ddirecta is restoring supervised servers", which looks like a doubled or misspelled word. It now reads "directa: the daemon is restoring supervised servers". A related message shown when a deliberately stopped daemon is not running now also says "the daemon" instead of "ddirecta".
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa events --tail` with a negative number now fails with a usage error naming the fix. Before, the background daemon crashed on it, and the system restarted it only to crash again for as long as a client kept sending that request.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Commands that fall short now say what to run next. `directa status` in a folder with no servers points to `directa status --all` when other projects have some. `directa wait` that ends on a crashed or stopped server names `directa ensure <name>`. `directa restart` prints why a server fell short, the same way `up` and `switch` do. A command that times out while directa asks macOS about its background agent now says it timed out instead of reporting a blank error.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - After the daemon restarts, a still-running dev server whose port settings no longer make sense (for example a `directa.local.json` entry that places a named port inside its port span) is no longer silently taken back over with no ports recorded. It is stopped, and the restart reports the configuration error the same way `directa ensure` would.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa events` and the dashboard timeline no longer show a duplicate "stopped" entry when directa notices a project's checkout is gone and stops a server that was still running. A server that was already stopped still gets its one entry recording that the checkout disappeared.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Agent sessions no longer get directa's server summary more than once. Cursor also runs the hooks Claude Code is configured with, so a machine with directa's hook installed for both used to show the summary twice in every Cursor session; the Claude Code hook now stays quiet when Cursor runs it and directa's Cursor hook is installed. Antigravity runs its hook before every model call rather than once at session start, so the summary is now added only on the first call instead of every one.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - The menu bar popover now has a solid background, so server rows stay readable no matter what window or wallpaper sits behind it. The filter and sort controls at the top are solid too, so rows scrolling beneath them no longer show through. The popover also follows your system Light or Dark setting; before, it followed the menu bar, which macOS tints to match the wallpaper, so a Dark Mode user on a bright wallpaper got a light popover.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Fixed `directa doctor`'s orphan-log-dir finding recommending `rm -rf` on a live project's log directory when that project's devservers.json was mid-edit invalid or had just been deleted: the daemon still claims that project and is still writing to its logs, but it had temporarily dropped out of the machine-wide server list the finding used to check against. It now checks against every project the daemon actually claims (including one it cannot currently read the config for), and skips the finding entirely when talking to a daemon too old to report that list, rather than guessing.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - A dev server running on the port its checkout's `directa.local.json` gives it is now recognized as directa's own when another project asks for that port, even right after a daemon restart. Before, `directa ensure` and `directa status` could call it an unknown process holding the port, and a sibling worktree could not rebind around it.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Fixed several cases where directa lost track of a server that failed because of its port (another server answered on it, or the server listened somewhere other than the port it was given). That kind of failure leaves the server's process running, and now every part of directa treats it that way: `directa lock --pause` stops it like any running server, `directa lock` without `--pause` lists it as still running, checking its status no longer resets the port and URL it was started with, `directa ensure` no longer reports its own process as an unknown program holding the port, and the menu bar app offers Stop and Restart for it instead of only Start.
+  
+  Fixed a server in a second git worktree (a second checkout of the same repository) sometimes landing on ports inside the block the first checkout's server reserves with `portSpan`, when the first checkout was only listening on the first port of that block. The second checkout now always moves to a block that clears every port the first one reserves.
+  
+  Fixed two `directa ensure` calls for the same server, arriving at nearly the same moment, occasionally refusing the second one with a "port is held by an unmanaged process" error that named the first call's own freshly started server.
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa doctor` no longer warns about an unmanaged program on a server's port when the listener is another directa server whose port check failed but whose process is still running on that port.
+  
+  A server in a second git worktree (a second checkout of the same repository) that moved to a different port no longer counts as holding the port it moved away from. Starting the first checkout's server on its own port no longer mistakes the moved server for the one in the way.
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - When directa runs as the background daemon installed with the app, it now records the real reason a dev server exited. Before, every exit read as a clean `code=0`, so a server that failed with an error or was killed by a signal looked the same as one that quit normally in `directa status`, `directa why`, and the event history. The warning for a server stuck waiting on an interactive login can now appear for these servers too.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Every `--timeout`/`--acquire-timeout` option (`ensure`, `wait`, `restart`, `up`, `switch`, `lock`) now takes a number of seconds from 0 to 86400 and rejects anything else (text, `inf`, `nan`, a negative number, a larger number) before contacting the background daemon, instead of silently accepting it and letting the daemon quietly clamp it to something else. The error names the option, the value you gave, and the accepted range, and exits with status 2 like any other usage mistake. With `--json`, it arrives as the usual error object on standard output, with the code `usage`.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - An extremely long `DIRECTA_SOCKET` override used to make the background daemon fail silently: it printed a "listening" line and kept running, but never actually opened a socket, so every command timed out with no clear reason why. The daemon now refuses to start in that case with a clear error naming the offending path, matching what the CLI already reported when it hit the same limit.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - The app, the command-line tool, and the Homebrew cask now declare macOS 26 (Tahoe) as their minimum, the oldest macOS directa is tested on (continuous integration runs macOS 26, and day-to-day use is on macOS 27).
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Restarting a dev server that prints a lot of output no longer takes down the background daemon. Before, the daemon's memory could climb to several gigabytes in seconds until macOS killed it, stopping every other server's supervision with it. A stop that cannot finish now gives up after a bounded wait and notes it in that server's log instead of hanging the command, and a `start` or `ensure` that arrives during such a stop gives up the same way (an `ensure` within its own `--timeout`, counting the time it spent waiting).
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa restart` no longer fails with "daemon closed the connection" when the daemon goes away in the middle of it (for example when macOS stops it under memory pressure and it starts again). The command now waits for the daemon to come back, checks the server, and finishes the restart from where it stopped, so it does not restart the server a second time. Before, the error invited running the command again, which bounced a server that had already come back. A daemon that comes back but never answers ends that wait on time rather than holding the command for minutes.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - A dev server that was running when the background daemon restarted now comes back once a resource lock it depends on is released, instead of staying marked crashed until someone runs `directa ensure`. (A resource lock is what `directa lock` holds while a command like a database migration runs.) A server the daemon stopped on its way down now reads stopped rather than crashed when it cannot be brought back right away.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Fixed the setup panel (and Gatekeeper quarantine clearing during install) hanging indefinitely if a command it ran printed more output than fits in one pipe buffer before exiting.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - The background daemon now uses the same small, fixed amount of resources to watch its dev servers no matter how many are running, so a machine running many servers under the app no longer risks the daemon running short of threads. A dev server whose start command runs with elevated privileges (for example `sudo caddy run`) also starts again instead of being torn down as failed.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - The background daemon stays responsive while `git`, `launchctl`, or a port lookup is slow. A checkout on a slow network drive or a stuck repository could tie up the threads the daemon uses for everything else, so `directa status`, starts, and health checks all stalled together, and a burst of those calls could push the daemon past the thread limit macOS gives it. Those commands now wait on a small, fixed set of their own threads, repository reads never hold up starting or supervising servers, and a `git`, `launchctl`, `lsof`, or `ps` call that hangs is stopped after a timeout, together with anything it started.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - With Start at login on, the menu bar app now comes back on its own after macOS or a memory-pressure pass kills it. Start at login stays your choice: upgrading does not turn it on, turning it off keeps it off, and choosing Quit from the menu still keeps the app closed. If you already had Start at login on and macOS asks you to allow directa in System Settings after the upgrade, directa keeps starting at login the old way until you do.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa status --all` and the menu bar stay quick when many stopped servers have a port held by another server. Each of those servers used to cost two `git` runs on every status read, which added up to seconds with a few dozen worktrees; the check now reads the checkout's own files instead.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Reading a server's logs stays quick and light on memory in two cases that used to be slow. Asking for the last lines of one stream that rarely appears (for example `directa logs web --stream err --tail 50` on a server that mostly prints to stdout) no longer loads the whole log into memory to find them, and the error tally recorded when a server stops no longer holds every error line at once. And after your Mac's clock jumps backward (a time sync after sleep, for instance), directa stamps new lines with the last time it wrote until the clock catches up; `directa monitor` and `directa logs --follow` now read only the lines that arrived since their last check in that stretch, instead of rereading the whole log file every couple of seconds.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Stopping a server in the first moments of its launch, before directa has its process ID, now waits for the process to appear and stops it, instead of reporting it stopped while it comes up anyway. And when the daemon relaunches to find a server was renamed or removed from `devservers.json` while its process kept running, that leftover process is now shut down instead of running on with nothing tracking it. A server marked failed because it listened on the wrong port, or because another server answered on its port, is now really stopped by `directa stop`, and starting it again replaces that copy instead of running a second one beside it. After a restart of the Mac, directa no longer stops an unrelated app that happens to reuse a process ID a dev server had before the restart: it checks the process start time first.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - A dev server's log and event history now say why directa stopped it (a restart, a watch-triggered restart naming the file that changed, a resource lock pausing it, a `down`, or the daemon shutting down), not just the exit code. Before, that reason only ever appeared in the background daemon's own internal log, which macOS does not keep, so `directa logs`, `directa why`, and the event timeline showed the same `exited code=0` for every deliberate stop regardless of cause.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa logs <name> --tail N` (no `--since`, no `--grep`) now answers from the end of the log file instead of reading and parsing the whole thing first. Measured against a real 26 MB log asking for the last 50 lines: about 920 ms before, about 2 ms now, reading roughly 64 KB off disk instead of the full file.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa events` and the dashboard timeline no longer fail the whole response when the daemon reports an event kind this build of directa predates; that one event now shows up with its kind as reported instead of the entire list disappearing.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa unregister` no longer drops a project's recorded trust as a side effect of removing a server. Before, unregistering a project's last ad hoc server (one added with `directa register`, distinct from a server declared in devservers.json) could silently forget the whole project, including its trust, if the project also had a committed devservers.json server still running: that server's logs were then deleted out from under it, and a later reboot or watch-triggered restart refused to bring it back until you approved it again. Unregistering a name directa never registered ad hoc, including one declared only in devservers.json and never added with `directa register`, now fails with a clear "not found" error instead of silently succeeding.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa unregister` now stops a server before removing it if that server is still running, instead of dropping it from tracking while leaving the real process alive and its logs deleted out from under it. An already stopped server unregisters exactly as before.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - `directa why` now says when a server was stopped by something other than directa: an IDE stop button, a forwarded Ctrl-C, or another process manager sending a graceful signal (SIGTERM, SIGINT, or SIGHUP). Before, that server showed the same bare "not running (stopped)" as a server directa itself stopped, giving no hint that something outside directa shut it down.
+
+
+
+- [#37](https://github.com/quantizor/directa/pull/37) [`e4d22ea`](https://github.com/quantizor/directa/commit/e4d22ea5db61408bee29b6cdfa2e9d9331354314) - Commands run inside a git worktree now act on that worktree's own servers. Before, a worktree nested inside its main checkout (the layout Claude Code uses for isolated agents) could pick up the main checkout's `devservers.json` and act on the main checkout's servers without saying so. When a worktree has no config of its own, the not-found message says how to fix it (commit or copy `devservers.json` into the worktree, or pass `--project`) and gives the command that lists the main checkout's servers. One setup changes: a bare repository with a worktree per branch and a single `devservers.json` in the parent folder now needs `--project` or a config in each worktree.
+  
+  `directa logs --follow` now streams reliably through a pipe. Lines arrive as they are written instead of sitting in a buffer, lines written in the same millisecond are never dropped or repeated, and a follow that starts before the server has printed anything no longer re-reads the whole log on every poll. The new `--head N` option reads the oldest lines from a starting point, for catching up on a stretch of output in order. Log queries over large histories are also much faster and use far less memory.
+
 ## 2.0.0
 ### Major Changes
 
