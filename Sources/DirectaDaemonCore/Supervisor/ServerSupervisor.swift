@@ -435,11 +435,11 @@ public actor ServerSupervisor {
                     stdoutPath: outURL.path),
                 cwd: cwd,
                 environment: environment,
-                onExitedBeforeWatch: { [weak self] childPid in
-                    await self?.recordExitedBeforeWatch(pid: childPid)
+                onExitedBeforeWatch: { childPid in
+                    await self.recordExitedBeforeWatch(pid: childPid)
                 },
-                onSpawn: { [weak self] childPid in
-                    await self?.recordSpawn(pid: childPid)
+                onSpawn: { childPid in
+                    await self.recordSpawn(pid: childPid)
                 }
             )
             close(outFD)
