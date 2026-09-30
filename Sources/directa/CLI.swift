@@ -543,12 +543,28 @@ struct Status: AsyncParsableCommand {
                     : ProjectConfigLoader.serverNotFound(name: name, project: project),
                 json: global.json)
         }
-        CLIRunner.emit(result, json: global.json) { list in
-            if list.servers.isEmpty {
-                return "no servers registered for this project (hint: directa register --name myproj --cmd …)"
-            }
+        /** Human mode on the empty scoped path only: one machine-wide read tells
+            an empty project from an empty machine. The lookup is a hint, so a
+            failed one falls back to the register text rather than failing a
+            status that already answered. */
+        var machineHasServers = false
+        if !global.json, name == nil, !all, result.servers.isEmpty {
+            let everything = try? await CLIRunner.client().request(
+                .serverStatus, params: ProjectParams(name: nil, project: ""), expecting: ServerListResult.self)
+            machineHasServers = everything?.servers.isEmpty == false
+        }
+        CLIRunner.emit(result, json: global.json) {
+            Self.humanText($0, machineHasServers: machineHasServers)
+        }
+    }
+
+    static func humanText(_ list: ServerListResult, machineHasServers: Bool) -> String {
+        if !list.servers.isEmpty {
             return list.servers.map(CLIRunner.describe).joined(separator: "\n")
         }
+        return machineHasServers
+            ? "no servers registered for this project, but other projects on this machine have some (hint: directa status --all)"
+            : "no servers registered for this project (hint: directa register --name myproj --cmd …)"
     }
 }
 
