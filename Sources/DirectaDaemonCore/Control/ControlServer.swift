@@ -1848,8 +1848,17 @@ public actor Router {
         server declaring several resumes from each release in turn, and this
         runs again before each start, so the next held one is joined then. A
         dead holder is released on the way (`releaseOrphanedLock`), so a
-        resource only counts as held while its holder is alive. */
+        resource only counts as held while its holder is alive. Both callers
+        are autonomous starts, so a server `prepareSpawn` would refuse at its
+        trust gate (committed config of a never-approved project) never
+        waits: it falls through to that refusal instead of being listed as
+        paused for a start that cannot come. */
     private func waitUnderLiveLock(project: String, spec: ServerSpec) async -> Bool {
+        guard let merged = try? await mergedSpecs(project: project) else { return false }
+        if merged.fileNames.contains(spec.name) {
+            let trusted = await registry.isTrusted(project: project)
+            if !trusted { return false }
+        }
         for declaration in spec.locks ?? [] {
             let resource = declaration.name
             let key = Self.lockKey(project: project, resource: resource)

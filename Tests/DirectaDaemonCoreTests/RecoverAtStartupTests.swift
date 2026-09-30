@@ -1026,6 +1026,29 @@ private func logTexts(router: Router, project: String, name: String) async throw
         #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
     }
 
+    /** Boot restore is autonomous, so a server from a never-approved project's
+        committed config is refused at the trust gate; it must not also be
+        registered as waiting on the holder, which would list it as paused and
+        promise a start that never comes. */
+    @Test func anUnapprovedProjectsServerDoesNotJoinALiveHoldersPausedSet() async throws {
+        let env = try makeRecoverEnv()
+        try writeDevservers(project: env.projectPath, serversJSON: Self.lockedDatabase(locks: ["data"]))
+        let registry = Registry(paths: env.paths)
+        let id = serverID(project: env.projectPath, name: "db")
+        try await seedRow(registry, id: id, phase: .stopped)
+        try seedLiveHolds(env, resources: ["data"])
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+
+        let server = try #require(
+            try await statusList(router: router, project: env.projectPath).first { $0.server == "db" })
+        #expect(server.phase == .stopped)
+        #expect(await registry.persistedState(serverID: id)?.phase == .stopped)
+        #expect(try await pausedNames(router, env, resource: "data") == [])
+        #expect(await registry.isTrusted(project: env.projectPath) == false)
+        try await release(router, env, resource: "data")
+    }
+
     private static func lockedDatabase(locks: [String]) -> String {
         let declared = locks.map { "\"\($0)\"" }.joined(separator: ", ")
         return """
