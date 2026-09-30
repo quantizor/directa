@@ -8,6 +8,10 @@ public enum PortMaterializer {
         beside its port. */
     public static let hostEnvironmentKey = "DIRECTA_HOST"
 
+    /** The variable a spawned server reads its effective port from when its
+        spec names no `portEnv`. */
+    public static let portEnvironmentKey = "PORT"
+
     /** Apply `effectivePort` (and optional `effectiveHost`) to a committed/ad-hoc
         spec. `declaredPort` on status remains the pre-materialization `spec.port`.
         `matchHost` gates URL host replacement to URLs already printed with that
@@ -37,7 +41,7 @@ public enum PortMaterializer {
             }
             next.env = env
         } else if let effectivePort {
-            let envKey = spec.portEnv ?? "PORT"
+            let envKey = spec.portEnv ?? portEnvironmentKey
             var env = next.env ?? [:]
             env[envKey] = String(effectivePort)
             if let host {

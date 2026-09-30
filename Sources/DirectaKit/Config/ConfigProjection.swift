@@ -92,8 +92,9 @@ public enum ConfigProjection {
     static func declarableEnv(_ spec: ServerSpec) -> [String: String]? {
         guard var env = spec.env else { return nil }
         env.removeValue(forKey: PortMaterializer.hostEnvironmentKey)
-        if let port = spec.port, env[spec.portEnv ?? "PORT"] == String(port) {
-            env.removeValue(forKey: spec.portEnv ?? "PORT")
+        let portKey = spec.portEnv ?? PortMaterializer.portEnvironmentKey
+        if let port = spec.port, env[portKey] == String(port) {
+            env.removeValue(forKey: portKey)
         }
         return env.isEmpty ? nil : env
     }

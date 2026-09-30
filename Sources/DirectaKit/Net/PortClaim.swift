@@ -97,7 +97,7 @@ public struct PortClaim: Equatable, Sendable {
         var injections: [String: Int] = [:]
         if let primary = effectivePort {
             relative.insert(primary)
-            let envKey = spec.portEnv ?? "PORT"
+            let envKey = spec.portEnv ?? PortMaterializer.portEnvironmentKey
             injections[envKey] = primary
         }
         if let span = spec.portSpan {
