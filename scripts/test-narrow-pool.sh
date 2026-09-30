@@ -14,6 +14,7 @@
 #   NARROW_POOL_WIDTH          pool threads to leave (default 3)
 #   NARROW_POOL_BLOCKED_SECONDS  how long a pool thread may wait before it is
 #                              reported (default 1)
+# Tests run as many at once as make test allows (Makefile, TEST_PARALLEL_WIDTH).
 #
 # How: builds scripts/narrow-pool/narrow-pool.c into .build/narrow-pool, then
 # runs each built test bundle through the toolchain's swiftpm-testing-helper
@@ -44,6 +45,12 @@ helper="$toolchain_bin/../libexec/swift/pm/swiftpm-testing-helper"
 platform=$(xcrun --show-sdk-platform-path) || { echo "error: xcrun cannot find the macOS platform" >&2; exit 1 }
 sdk=$(xcrun --show-sdk-path) || { echo "error: xcrun cannot find the macOS SDK" >&2; exit 1 }
 [[ -x $helper ]] || { echo "error: no swiftpm-testing-helper at $helper; this toolchain runs tests differently" >&2; exit 1 }
+
+# The same parallel-width cap make test runs under (the why: Makefile,
+# TEST_PARALLEL_WIDTH).
+width=$(make --no-print-directory -s test-parallel-width) || width=
+[[ -n $width ]] || { echo "error: cannot read TEST_PARALLEL_WIDTH from the Makefile" >&2; echo "fix: run from a checkout whose Makefile has the test-parallel-width target" >&2; exit 1 }
+export SWT_EXPERIMENTAL_MAXIMUM_PARALLELIZATION_WIDTH=$width
 
 mkdir -p .build/narrow-pool
 library=$root/.build/narrow-pool/libnarrow-pool.dylib

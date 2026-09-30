@@ -1,6 +1,6 @@
 # Contributing to directa
 
-directa is a personal tool first; issues and patches are welcome all the same. Read `AGENTS.md` for the codebase map, invariants, and commands (`CLAUDE.md` is a one-line pointer to it), and `docs/cli-contract.md` for the JSON surface. `make test` and `scripts/smoke.sh` must pass locally, and `make dead-code` (after `brew install periphery`) must report no unused code; `scripts/smoke-launchd.sh` exercises the real launchd lifecycle if your change touches daemon management. GitHub Actions (`.github/workflows/ci.yml`) runs `swift build` + `swift test` on `macos-26` only: no smoke, no large runners.
+directa is a personal tool first; issues and patches are welcome all the same. Read `AGENTS.md` for the codebase map, invariants, and commands (`CLAUDE.md` is a one-line pointer to it), and `docs/cli-contract.md` for the JSON surface. `make test` and `scripts/smoke.sh` must pass locally, and `make dead-code` (after `brew install periphery`) must report no unused code; `scripts/smoke-launchd.sh` exercises the real launchd lifecycle if your change touches daemon management. GitHub Actions (`.github/workflows/ci.yml`) runs `swift build` + `make test` on `macos-26` only: no smoke, no large runners.
 
 ## Swift temp folder cleanup
 

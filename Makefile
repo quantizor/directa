@@ -5,7 +5,7 @@ PREFIX ?= $(HOME)/.local
 # with SIGN_IDENTITY=... to pick a specific identity or to force ad-hoc.
 SIGN_IDENTITY ?= $(shell scripts/signing-identity.sh)
 
-.PHONY: build test dead-code sweep-test-temp sweep-swift-temp app dmg release-dmg install clean icon
+.PHONY: build test test-parallel-width dead-code sweep-test-temp sweep-swift-temp app dmg release-dmg install clean icon
 
 # The shipped products only. A bare `swift build -c release` also compiles the
 # test-only targets (DirectaTestSupport imports Testing). `--product` keeps
@@ -36,6 +36,15 @@ sweep-test-temp:
 sweep-swift-temp:
 	@scripts/sweep-swift-temp.sh
 
+# How many test cases Swift Testing runs at once. Unset, it starts every test
+# at the same moment (Swift 6.3+ reads this variable; older toolchains ignore
+# it), and on a three-core CI runner that opening burst leaves ready work
+# waiting seconds for a cooperative-pool thread, so every wall-clock bound in
+# the suites (a deadline, a "fails fast" check) misses. The cap keeps that wait
+# short without lengthening the run. make test (and so CI) and
+# scripts/test-narrow-pool.sh read this one value.
+TEST_PARALLEL_WIDTH := 16
+
 # Every test's scratch tree comes from TemporaryTree
 # (Tests/DirectaTestSupport/TemporaryTree.swift), which removes it when the
 # test ends. The run gets its own root through DIRECTA_TEST_TEMP_ROOT, and a
@@ -44,6 +53,7 @@ sweep-swift-temp:
 # returned.
 test: sweep-test-temp sweep-swift-temp
 	@root="$$(mktemp -d "$$(getconf DARWIN_USER_TEMP_DIR)directa-run.XXXXXX")" || exit 1; \
+	SWT_EXPERIMENTAL_MAXIMUM_PARALLELIZATION_WIDTH=$(TEST_PARALLEL_WIDTH) \
 	DIRECTA_TEST_TEMP_ROOT="$$root" swift test --disable-xctest; status=$$?; \
 	left="$$(find "$$root" -mindepth 1 -maxdepth 1)"; \
 	if [ -n "$$left" ]; then \
@@ -54,6 +64,9 @@ test: sweep-test-temp sweep-swift-temp
 	fi; \
 	rm -rf "$$root"; \
 	exit $$status
+
+test-parallel-width:
+	@echo $(TEST_PARALLEL_WIDTH)
 
 app: build
 	scripts/make-app-bundle.sh "$(SIGN_IDENTITY)"
