@@ -462,10 +462,22 @@ public enum LaunchdAdmin {
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "USER": NSUserName(),
         ]
-        let result = shell(
-            "/bin/zsh", ["-lc", #"source "$HOME/.zshrc" >/dev/null 2>&1; echo $PATH"#],
-            environment: environment, timeoutSeconds: pathCaptureTimeoutSeconds)
-        let path = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return capturedPath(
+            from: shellOutcome(
+                "/bin/zsh", ["-lc", #"source "$HOME/.zshrc" >/dev/null 2>&1; echo $PATH"#],
+                environment: environment, timeoutSeconds: pathCaptureTimeoutSeconds))
+    }
+
+    /** A shell killed at its deadline has no answer: whatever it printed
+        before then is not a PATH, so the floor applies. */
+    static func capturedPath(from outcome: ShellOutcome) -> String {
+        let output =
+            switch outcome {
+            case .exited(_, let output): output
+            case .failedToRun(let reason): reason
+            case .timedOut: ""
+            }
+        let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
         return path.isEmpty ? pathFloor : path
     }
 
@@ -563,24 +575,37 @@ public enum LaunchdAdmin {
 
     /** `shellOutcome` in the `(status, output)` shape most callers read: a
         child that could not start is status -1 with the reason as output, and
-        one killed at its timeout is status -1 with no output, which
-        `capturedPath` reads as "fall back to the PATH floor". */
+        one killed at its deadline is status -1 with output saying so (see
+        `timedOutOutput`). A caller that must tell a timeout from a finished
+        child reads `shellOutcome` instead, as `capturedPath` does. */
     @discardableResult
     public static func shell(
         _ path: String, _ arguments: [String], environment: [String: String]? = nil,
         includeStderr: Bool = true, timeoutSeconds: Double? = nil
     ) -> (status: Int32, output: String) {
+        let deadline = timeoutSeconds ?? HelperCommand.defaultTimeoutSeconds(executable: path, arguments: arguments)
         switch shellOutcome(
             path, arguments, environment: environment, includeStderr: includeStderr,
-            timeoutSeconds: timeoutSeconds)
+            timeoutSeconds: deadline)
         {
         case .exited(let status, let output):
-            (status: status, output: output)
+            return (status: status, output: output)
         case .failedToRun(let reason):
-            (status: -1, output: reason)
-        case .timedOut:
-            (status: -1, output: "")
+            return (status: -1, output: reason)
+        case .timedOut(let partialOutput):
+            return (
+                status: -1,
+                output: timedOutOutput(deadlineSeconds: deadline ?? 0, partialOutput: partialOutput)
+            )
         }
+    }
+
+    /** What a command killed at its deadline reports as its output: the
+        deadline, then whatever it wrote before then. */
+    static func timedOutOutput(deadlineSeconds: Double, partialOutput: String) -> String {
+        let seconds = String(format: "%g", deadlineSeconds)
+        let base = "timed out after \(seconds) seconds"
+        return partialOutput.isEmpty ? base : "\(base); output so far: \(partialOutput)"
     }
 
     /** The async form of `shellOutcome`, on `BlockingLane.system`. Kept with no

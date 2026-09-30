@@ -80,6 +80,41 @@ import Testing
         #expect(elapsed < .seconds(3))
     }
 
+    /** The `(status, output)` form says a timeout happened, with the deadline,
+        instead of answering a bare -1 and an empty string, and appends what
+        the child wrote first. */
+    @Test func aTimedOutChildReportsTheDeadlineAndItsPartialOutput() async {
+        let result = await offPool {
+            LaunchdAdmin.shell("/bin/sh", ["-c", "echo early; sleep 5"], timeoutSeconds: 0.5)
+        }
+        #expect(result.status == -1)
+        #expect(result.output == "timed out after 0.5 seconds; output so far: early\n")
+    }
+
+    @Test func aTimedOutChildWithNoOutputReportsOnlyTheDeadline() async {
+        let result = await offPool { LaunchdAdmin.shell("/bin/sleep", ["5"], timeoutSeconds: 1) }
+        #expect(result.status == -1)
+        #expect(result.output == "timed out after 1 seconds")
+    }
+
+    /** The deadline a caller never named (launchctl's default) reads as a whole
+        number of seconds. */
+    @Test func aDefaultDeadlineReadsWithoutADecimal() {
+        #expect(
+            LaunchdAdmin.timedOutOutput(deadlineSeconds: HelperCommand.launchctlTimeoutSeconds, partialOutput: "")
+                == "timed out after 10 seconds")
+    }
+
+    /** `capturedPath` reads a timed-out shell as no answer, never as the
+        timeout message or the partial output, so the PATH floor applies. */
+    @Test func aTimedOutPathCaptureFallsBackToTheFloor() {
+        #expect(
+            LaunchdAdmin.capturedPath(from: .timedOut(partialOutput: "/partial/bin:")) == LaunchdAdmin.pathFloor)
+        #expect(
+            LaunchdAdmin.capturedPath(from: .exited(status: 0, output: "/usr/bin:/opt/bin\n")) == "/usr/bin:/opt/bin")
+        #expect(LaunchdAdmin.capturedPath(from: .exited(status: 0, output: "\n")) == LaunchdAdmin.pathFloor)
+    }
+
     /** A child that exits while a process it started still holds the output
         open ends at the deadline rather than waiting on that process. The
         call is timed on the thread that makes it, so a busy pool delaying the
