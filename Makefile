@@ -44,7 +44,7 @@ sweep-swift-temp:
 # returned.
 test: sweep-test-temp sweep-swift-temp
 	@root="$$(mktemp -d "$$(getconf DARWIN_USER_TEMP_DIR)directa-run.XXXXXX")" || exit 1; \
-	DIRECTA_TEST_TEMP_ROOT="$$root" swift test; status=$$?; \
+	DIRECTA_TEST_TEMP_ROOT="$$root" swift test --disable-xctest; status=$$?; \
 	left="$$(find "$$root" -mindepth 1 -maxdepth 1)"; \
 	if [ -n "$$left" ]; then \
 		echo "error: the test run left temporary trees in $$root:" >&2; \
