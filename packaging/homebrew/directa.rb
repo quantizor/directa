@@ -21,7 +21,7 @@ cask "directa" do
     strategy :github_latest
   end
 
-  depends_on macos: :sonoma
+  depends_on macos: :tahoe
 
   app "directa.app"
   binary "#{appdir}/directa.app/Contents/Resources/directa"

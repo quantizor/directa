@@ -7,7 +7,7 @@ let strictCore: [SwiftSetting] = [
 
 let package = Package(
     name: "directa",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v26)],
     products: [
         .executable(name: "directa", targets: ["directa"]),
         .executable(name: "ddirecta", targets: ["ddirecta"]),

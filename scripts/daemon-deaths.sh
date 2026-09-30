@@ -23,7 +23,7 @@ if [[ -x /usr/bin/jq ]]; then
 elif JQ=$(command -v jq); then
   :
 else
-  echo "daemon-deaths: jq not found; macOS 15 and later ship /usr/bin/jq, on macOS 14 run: brew install jq" >&2
+  echo "daemon-deaths: jq not found at /usr/bin/jq or on PATH; macOS ships it at /usr/bin/jq, so check that path, or run: brew install jq" >&2
   exit 2
 fi
 
