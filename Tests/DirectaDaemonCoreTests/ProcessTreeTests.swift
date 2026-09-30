@@ -234,7 +234,7 @@ import Testing
         let reported = await offPool { () -> pid_t? in
             var status: Int32 = 0
             waitpid(root, &status, 0)
-            return readSetsidListenerPid(from: readEnd)
+            return readPrintedPid("setsid listener", from: readEnd)
         }
         let child = try #require(reported)
         defer { kill(child, SIGKILL) }

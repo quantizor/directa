@@ -98,21 +98,6 @@ private final class RecordingAgentJobs: Sendable {
     }
 }
 
-/** The pid a fixture's `--orphan-grandchild-ignterm` prints, read from `fd`
-    up to that line (the fixture keeps writing heartbeats after it). */
-private func readGrandchildPid(from fd: Int32) -> pid_t? {
-    let pattern = #"grandchild pid (\d+)\n"#
-    var text = ""
-    var buffer = [UInt8](repeating: 0, count: 4096)
-    while text.range(of: pattern, options: .regularExpression) == nil {
-        let count = read(fd, &buffer, buffer.count)
-        guard count > 0 else { return nil }
-        text += String(decoding: buffer.prefix(count), as: UTF8.self)
-    }
-    guard let match = text.range(of: pattern, options: .regularExpression) else { return nil }
-    return text[match].split(whereSeparator: \.isWhitespace).last.flatMap { pid_t($0) }
-}
-
 private func logTexts(router: Router, project: String, name: String) async throws -> [String] {
     let line = try NDJSON.encodeLine(
         WireRequest(
@@ -297,7 +282,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
             [fixture, "--orphan-grandchild-ignterm"], stdoutFD: output.write)
         close(output.write)
         defer { if kill(root, 0) == 0 { kill(root, SIGKILL) } }
-        let grandchild = try #require(readGrandchildPid(from: output.read))
+        let grandchild = try #require(await readPrintedPid("grandchild", from: output.read))
         defer { if kill(grandchild, 0) == 0 { kill(grandchild, SIGKILL) } }
         try await registry.updateState(serverID: serverID(project: env.projectPath, name: "dev"), writer: .router) {
             entry in

@@ -163,19 +163,23 @@ func makeOutputPipe() throws -> (read: Int32, write: Int32) {
     return (fds[0], fds[1])
 }
 
-/** The pid a fixture's `--setsid-listener` prints, read from `fd`. Stops at
-    that line rather than end of file, since the listener keeps the same
-    stdout open for as long as it lives; nil if every writer closes first or
-    nothing arrives within `within`, so a listener that holds stdout open
-    without printing fails the test rather than hanging it. */
-func readSetsidListenerPid(from fd: Int32, within limit: Duration = .seconds(10)) -> pid_t? {
-    let pattern = #/setsid listener pid (\d+)\n/#
+/** The pid a fixture prints as a whole `<label> pid <n>` line (`grandchild`,
+    `setsid listener`), read from `fd`. Stops at that line rather than end of
+    file, since the fixture keeps the same stdout open for as long as it
+    lives; nil if every writer closes first or nothing arrives within
+    `limit`, so a fixture that holds stdout open without printing fails the
+    test rather than hanging it. */
+func readPrintedPid(_ label: String, from fd: Int32, within limit: Duration = .seconds(10)) -> pid_t? {
+    let marker = "\(label) pid "
     let clock = ContinuousClock()
     let deadline = clock.now.advanced(by: limit)
     var text = ""
     var buffer = [UInt8](repeating: 0, count: 4096)
     while true {
-        if let match = text.firstMatch(of: pattern) { return pid_t(match.1) }
+        let completeLines = text.split(separator: "\n", omittingEmptySubsequences: false).dropLast()
+        for line in completeLines where line.hasPrefix(marker) {
+            if let pid = pid_t(line.dropFirst(marker.count)) { return pid }
+        }
         let remaining = clock.now.duration(to: deadline)
         guard remaining > .zero else { return nil }
         let (seconds, attoseconds) = remaining.components
@@ -188,11 +192,11 @@ func readSetsidListenerPid(from fd: Int32, within limit: Duration = .seconds(10)
     }
 }
 
-/** `readSetsidListenerPid` from async code: the read blocks until the
-    fixture prints, so it runs off the pool. Swift picks this form in any
-    async context, so a test that forgets `await` does not compile. */
-func readSetsidListenerPid(from fd: Int32) async -> pid_t? {
-    await offPool { readSetsidListenerPid(from: fd) }
+/** `readPrintedPid` from async code: the read blocks until the fixture
+    prints, so it runs off the pool. Swift picks this form in any async
+    context, so a test that forgets `await` does not compile. */
+func readPrintedPid(_ label: String, from fd: Int32) async -> pid_t? {
+    await offPool { readPrintedPid(label, from: fd) }
 }
 
 // MARK: - Polling

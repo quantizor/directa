@@ -227,11 +227,41 @@ import os
             ], stdoutFD: writeEnd)
         close(writeEnd)
         defer { kill(root, SIGKILL) }
-        let listener = try #require(await readSetsidListenerPid(from: readEnd))
+        let listener = try #require(await readPrintedPid("setsid listener", from: readEnd))
         defer { kill(listener, SIGKILL) }
 
         kill(listener, SIGTERM)
         #expect(try await awaitExit(listener, within: .seconds(5)), "the listener kept the spawning thread's mask")
+    }
+
+    /** The fixture keeps its stdout open and keeps printing after the pid
+        line, so the read stops at that line, not at end of file. */
+    @Test func aPrintedPidIsTakenFromItsWholeLineAmongOtherOutput() async throws {
+        let (readEnd, writeEnd) = try makeOutputPipe()
+        defer {
+            close(readEnd)
+            close(writeEnd)
+        }
+        let text = Array("heartbeat 1\ngrandchild pid 4242\nheartbeat 2\n".utf8)
+        try #require(write(writeEnd, text, text.count) == text.count)
+
+        #expect(await offPool { readPrintedPid("grandchild", from: readEnd, within: .seconds(5)) } == 4242)
+    }
+
+    /** A writer that holds stdout open without finishing the line, or prints
+        another label, ends the read at the deadline rather than hanging it or
+        returning a half-written pid. */
+    @Test(arguments: ["grandchild pid 12", "setsid listener pid 12\n", ""])
+    func aReadWithoutItsPidLineEndsAtTheDeadline(printed: String) async throws {
+        let (readEnd, writeEnd) = try makeOutputPipe()
+        defer {
+            close(readEnd)
+            close(writeEnd)
+        }
+        let text = Array(printed.utf8)
+        try #require(write(writeEnd, text, text.count) == text.count)
+
+        #expect(await offPool { readPrintedPid("grandchild", from: readEnd, within: .milliseconds(200)) } == nil)
     }
 
     private static func exitCode(_ outcome: ProcessOutcome) -> Int? {

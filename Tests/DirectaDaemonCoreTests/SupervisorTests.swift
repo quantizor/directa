@@ -852,7 +852,7 @@ private func makeEnv() throws -> RouterEnv {
         close(writeEnd)
         defer { kill(root, SIGKILL) }
         let child = try #require(
-            await readSetsidListenerPid(from: readEnd), "root \(root) never spawned its setsid listener")
+            await readPrintedPid("setsid listener", from: readEnd), "root \(root) never spawned its setsid listener")
         defer { kill(child, SIGKILL) }
         /** The premise: a session of its own, so the session sweep cannot
             stand in for the snapshot. */
@@ -899,7 +899,7 @@ private func makeEnv() throws -> RouterEnv {
         let root = try #require(await supervisor.start().pid.flatMap { pid_t(exactly: $0) })
         close(writeEnd)
         let child = try #require(
-            await readSetsidListenerPid(from: readEnd), "root \(root) never spawned its setsid listener")
+            await readPrintedPid("setsid listener", from: readEnd), "root \(root) never spawned its setsid listener")
         defer { kill(child, SIGKILL) }
         try #require(try await eventually(within: .seconds(5)) { getsid(root) == -1 }, "root \(root) never exited")
         /** The premise: a session of its own, alive after the root is gone. */
