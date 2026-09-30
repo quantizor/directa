@@ -104,6 +104,8 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             WireResponse<EnsureResult>.self, from: ensureData)
         #expect(ensureResponse.ok == false)
         #expect(ensureResponse.error?.code == .resourceLocked)
+        #expect(ensureResponse.error?.hint == "run: ps -p \(getpid())")
+        #expect(ensureResponse.error?.message.hasSuffix("; it is released when the holder finishes") == true)
 
         let released = try await handle(
             router: router, method: .lockRelease,
@@ -297,6 +299,36 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             expecting: ServerResult.self)
     }
 
+    /** A second holder's acquire is refused with the live holder's pid as the
+        one command to run, and the wait advice in the message. */
+    @Test func acquireByASecondHolderNamesTheLiveHolder() async throws {
+        let env = try makeLockEnv()
+        let registry = Registry(paths: env.paths)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        _ = try await handle(
+            router: router, method: .lockAcquire,
+            params: LockParams(holderPid: Int(getpid()), project: env.projectPath, resource: "data"),
+            expecting: LockResult.self)
+
+        let outcome = try await router.attempt(
+            .lockAcquire,
+            LockParams(holderPid: Int(getpid()) + 1, project: env.projectPath, resource: "data"),
+            LockResult.self)
+        guard case .failure(let error) = outcome else {
+            Issue.record("a second holder acquired a resource a live process holds")
+            return
+        }
+        #expect(error.code == .resourceLocked)
+        #expect(error.hint == "run: ps -p \(getpid())")
+        #expect(error.message.hasPrefix("resource 'data' is locked by pid \(getpid()) since "))
+        #expect(error.message.hasSuffix("; wait for it to finish"))
+
+        _ = try await handle(
+            router: router, method: .lockRelease,
+            params: LockParams(holderPid: Int(getpid()), project: env.projectPath, resource: "data"),
+            expecting: LockResult.self)
+    }
+
     /** If the harness survived the daemon restart, recover must leave the
         paused server down and keep the lock so ensure stays refused. */
     @Test func recoverLeavesPausedWhenHolderStillAlive() async throws {
@@ -333,6 +365,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
         let ensureResponse = try JSONCoding.decoder().decode(
             WireResponse<EnsureResult>.self, from: ensureData)
         #expect(ensureResponse.error?.code == .resourceLocked)
+        #expect(ensureResponse.error?.hint == "run: ps -p \(livePid)")
 
         _ = try await handle(
             router: router, method: .lockRelease,
@@ -382,6 +415,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
         let upResponse = try JSONCoding.decoder().decode(
             WireResponse<GroupResult>.self, from: upData)
         #expect(upResponse.error?.code == .resourceLocked)
+        #expect(upResponse.error?.hint == "run: ps -p \(getpid())")
         _ = try await handle(
             router: router, method: .lockRelease,
             params: LockParams(

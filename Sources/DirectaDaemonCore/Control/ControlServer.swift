@@ -277,8 +277,9 @@ public actor Router {
                 guard currentHash == request.params.baselineHash else {
                     throw WireError(
                         code: .configInvalid,
-                        hint: "reload the file and re-apply your edit",
-                        message: "devservers.json changed on disk since it was loaded (an editor or another session saved it)")
+                        message:
+                            "devservers.json changed on disk since it was loaded (an editor or another session saved it); reload it and re-apply your edit"
+                    )
                 }
                 let parsed: ProjectFileConfig
                 do {
@@ -1660,9 +1661,9 @@ public actor Router {
         if let holder = resourceLocks[key], holder.pid != params.holderPid {
             throw WireError(
                 code: .resourceLocked,
-                hint: "wait for pid \(holder.pid) to finish, or verify it: ps -p \(holder.pid)",
+                hint: "run: ps -p \(holder.pid)",
                 message:
-                    "resource '\(params.resource)' is locked by pid \(holder.pid) since \(JSONCoding.formatISO8601(holder.since))"
+                    "resource '\(params.resource)' is locked by pid \(holder.pid) since \(JSONCoding.formatISO8601(holder.since)); wait for it to finish"
             )
         }
         /** Same holder re-acquiring (retry after a blip) keeps the existing pause
@@ -1845,9 +1846,9 @@ public actor Router {
             if let holder = resourceLocks[key] {
                 throw WireError(
                     code: .resourceLocked,
-                    hint: "the holder releases it when done; check: ps -p \(holder.pid)",
+                    hint: "run: ps -p \(holder.pid)",
                     message:
-                        "server '\(spec.name)' holds resource '\(resource)', locked by pid \(holder.pid) since \(JSONCoding.formatISO8601(holder.since))"
+                        "server '\(spec.name)' holds resource '\(resource)', locked by pid \(holder.pid) since \(JSONCoding.formatISO8601(holder.since)); it is released when the holder finishes"
                 )
             }
         }

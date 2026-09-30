@@ -187,6 +187,35 @@ import Testing
                 atPath: URL(fileURLWithPath: env.project).appending(path: "devservers.json").path))
     }
 
+    /** No command resolves a stale-baseline save, so the refusal carries no hint
+        and the remedy reads in the message. */
+    @Test func writeConfigRefusesAStaleBaselineWithTheRemedyInTheMessage() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(
+            project: env.project, spec: ServerSpec(command: ["bun", "dev"], name: "web"))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let body = """
+            {"servers":{"web":{"command":["bun","dev"]}},"version":1}
+            """
+        try Data(body.utf8).write(
+            to: URL(fileURLWithPath: env.project).appending(path: "devservers.json"))
+        let outcome = try await router.attempt(
+            .projectWriteConfig,
+            WriteConfigParams(baselineHash: "not-the-current-hash", content: body, project: env.project),
+            CheckResult.self)
+        guard case .failure(let error) = outcome else {
+            Issue.record("writeConfig overwrote a file that changed since it was loaded")
+            return
+        }
+        #expect(error.code == .configInvalid)
+        #expect(error.hint == nil)
+        #expect(
+            error.message
+                == "devservers.json changed on disk since it was loaded (an editor or another session saved it); reload it and re-apply your edit"
+        )
+    }
+
     @Test func anExplicitStartRecordsTrust() async throws {
         let env = try makeEnv()
         let body = """
