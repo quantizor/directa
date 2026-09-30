@@ -1134,10 +1134,6 @@ public actor ServerSupervisor {
         await logStore.resolveMark(markID)
     }
 
-    public func currentSpec() -> ServerSpec {
-        spec
-    }
-
     private func postHealthEvent(_ kind: EventKind) {
         Task { [events, projectPath, name = spec.name] in
             await events?.post(kind: kind, project: projectPath, server: name)

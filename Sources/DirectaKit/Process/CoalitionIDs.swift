@@ -36,7 +36,10 @@ private struct ProcPIDCoalitionInfo {
     static let flavor: Int32 = 20
     var resource: UInt64 = 0
     var jetsam: UInt64 = 0
+    /** periphery:ignore - the reserved fields size the struct to the kernel's 40 bytes; proc_pidinfo flavor 20 refuses a smaller buffer */
     var reserved1: UInt64 = 0
+    /** periphery:ignore - the reserved fields size the struct to the kernel's 40 bytes; proc_pidinfo flavor 20 refuses a smaller buffer */
     var reserved2: UInt64 = 0
+    /** periphery:ignore - the reserved fields size the struct to the kernel's 40 bytes; proc_pidinfo flavor 20 refuses a smaller buffer */
     var reserved3: UInt64 = 0
 }

@@ -177,11 +177,6 @@ public enum LaunchdJobs {
         `AgentJobs`, whose optionality on `Router` is what keeps a non-agent
         process (every unit test, `ddirecta --foreground`) from ever running a
         real `launchctl bootout` there. */
-    public static func bootOut(label: String) {
-        _ = LaunchdAdmin.shell("/bin/launchctl", bootOutArguments(label: label))
-    }
-
-    /** `bootOut` on `BlockingLane.system`, the overload an async caller gets. */
     public static func bootOut(label: String) async {
         _ = await LaunchdAdmin.shell("/bin/launchctl", bootOutArguments(label: label))
     }

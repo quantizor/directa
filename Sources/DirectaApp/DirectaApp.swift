@@ -213,7 +213,7 @@ final class AppActivationDelegate: NSObject, NSApplicationDelegate, UNUserNotifi
     }
 
     @objc private func handleGetURLEvent(
-        _ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor
+        _ event: NSAppleEventDescriptor, withReplyEvent _: NSAppleEventDescriptor
     ) {
         guard let raw = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
             let url = URL(string: raw)

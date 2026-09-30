@@ -8,7 +8,6 @@ public enum DirectaLogCategory: String, Sendable, Equatable, CaseIterable {
     case app
     case daemon
     case deeplink
-    case health
     case supervisor
 }
 
@@ -77,9 +76,8 @@ public final class RecordingBackend: DirectaLogBackend {
     }
 }
 
-/** The logging front door. Call the ergonomic per-category members
-    (`DirectaLog.deeplink.info("…")`) or the category-parameterized statics; both
-    reach the swappable `backend`. */
+/** The logging front door. Call the per-category members
+    (`DirectaLog.deeplink.info("…")`); each reaches the swappable `backend`. */
 public enum DirectaLog {
     public static let subsystem = "dev.quantizor.directa"
 
@@ -103,7 +101,6 @@ public enum DirectaLog {
     public static let app = CategoryLogger(category: .app)
     public static let daemon = CategoryLogger(category: .daemon)
     public static let deeplink = CategoryLogger(category: .deeplink)
-    public static let health = CategoryLogger(category: .health)
     public static let supervisor = CategoryLogger(category: .supervisor)
 
     /** The active backend, guarded by a lock so a test's swap and a concurrent
@@ -111,18 +108,6 @@ public enum DirectaLog {
     public static var backend: any DirectaLogBackend {
         get { backendLock.withLock { $0 } }
         set { backendLock.withLock { $0 = newValue } }
-    }
-
-    public static func debug(_ category: DirectaLogCategory, _ message: String) {
-        emit(category: category, level: .debug, message: message)
-    }
-
-    public static func error(_ category: DirectaLogCategory, _ message: String) {
-        emit(category: category, level: .error, message: message)
-    }
-
-    public static func info(_ category: DirectaLogCategory, _ message: String) {
-        emit(category: category, level: .info, message: message)
     }
 
     /** `swiftpm-testing-helper` is the process `swift test` runs every suite

@@ -1,5 +1,4 @@
 import Darwin
-import DirectaKit
 import DirectaTestSupport
 import Foundation
 import Testing

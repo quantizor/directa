@@ -29,14 +29,6 @@ import Testing
         }
     }
 
-    @Test func staticFormsMatchCategoryLoggers() {
-        withRecorder { recorder in
-            DirectaLog.info(.app, "hello")
-            DirectaLog.error(.health, "probe failed")
-            #expect(recorder.messages == ["hello", "probe failed"])
-        }
-    }
-
     @Test func resetClearsEntries() {
         withRecorder { recorder in
             DirectaLog.supervisor.info("first")

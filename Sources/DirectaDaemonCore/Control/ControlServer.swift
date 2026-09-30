@@ -2228,11 +2228,9 @@ public actor Router {
     never blocks the connection. */
 public final class ControlServer: Sendable {
     private let listener: NWListener
-    private let router: Router
     private let socketPath: String
 
     public init(router: Router, socketPath: String) throws {
-        self.router = router
         self.socketPath = socketPath
         let socketDir = (socketPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(

@@ -39,11 +39,16 @@ public struct ProcessUniqueIDs: Equatable, Hashable, Sendable {
     (`libproc.h`); only this layout is private. */
 private struct ProcUniqIdentifierInfo {
     static let flavor: Int32 = 17
+    /** periphery:ignore - these fields size the struct to the kernel's 56 bytes and fix the offsets of the ids read; proc_pidinfo flavor 17 refuses a smaller buffer */
     var executableUUID: (UInt64, UInt64) = (0, 0)
     var uniqueID: UInt64 = 0
     var parentUniqueID: UInt64 = 0
+    /** periphery:ignore - these fields size the struct to the kernel's 56 bytes and fix the offsets of the ids read; proc_pidinfo flavor 17 refuses a smaller buffer */
     var pidVersion: Int32 = 0
+    /** periphery:ignore - these fields size the struct to the kernel's 56 bytes and fix the offsets of the ids read; proc_pidinfo flavor 17 refuses a smaller buffer */
     var reserved2: UInt32 = 0
+    /** periphery:ignore - these fields size the struct to the kernel's 56 bytes and fix the offsets of the ids read; proc_pidinfo flavor 17 refuses a smaller buffer */
     var reserved3: UInt64 = 0
+    /** periphery:ignore - these fields size the struct to the kernel's 56 bytes and fix the offsets of the ids read; proc_pidinfo flavor 17 refuses a smaller buffer */
     var reserved4: UInt64 = 0
 }

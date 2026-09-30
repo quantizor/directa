@@ -12,7 +12,6 @@ import Testing
     config pins one origin. The worktree name surfaces as a display value. */
 @Suite(.serialized, .temporaryTree) struct WorktreeCoexistenceTests {
     private struct Env {
-        let fixture: String
         let main: String
         let paths: DirectaPaths
         let worktree: String
@@ -52,7 +51,6 @@ import Testing
             try Data(body.utf8).write(to: root.appending(path: "devservers.json"))
         }
         return Env(
-            fixture: fixture,
             main: main.path,
             paths: DirectaPaths(
                 dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
@@ -497,7 +495,6 @@ import Testing
             try Data(body.utf8).write(to: root.appending(path: "devservers.json"))
         }
         return Env(
-            fixture: fixture,
             main: main.path,
             paths: DirectaPaths(
                 dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),

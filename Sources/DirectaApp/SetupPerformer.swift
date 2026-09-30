@@ -9,9 +9,7 @@ enum SetupPerformer: Sendable {
     static let appBundleIdentifier = "dev.quantizor.directa.app"
 
     struct Result: Sendable {
-        var cliOnPATH: Bool
         var harnessSummaries: [String]
-        var migration: Bool
         var notes: [String]
         var relocatedToApplications: Bool
     }
@@ -222,9 +220,7 @@ enum SetupPerformer: Sendable {
         }
 
         return Result(
-            cliOnPATH: onPATH,
             harnessSummaries: harnessSummaries,
-            migration: migration,
             notes: notes,
             relocatedToApplications: relocated)
     }

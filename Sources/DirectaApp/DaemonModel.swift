@@ -86,8 +86,8 @@ final class ProjectAccessLog {
 
 /** The app's single source of truth: polls the daemon over the local socket
     (2s; polling is restart-safe and deletes the reconnect problem a push
-    subscription would carry), groups servers by project, derives the ambient
-    icon state, and posts crash notifications from the event feed. */
+    subscription would carry), groups servers by project, derives the presence
+    counts, and posts crash notifications from the event feed. */
 @Observable
 final class DaemonModel {
     var daemonReachable = false
@@ -132,27 +132,6 @@ final class DaemonModel {
             else { return (path as NSString).lastPathComponent }
             return "\(main) · \(worktree)"
         }
-    }
-
-    /** Worst phase across every server, for the menu bar glyph. */
-    enum AmbientState {
-        case attention
-        case busy
-        case quiet
-
-        init(servers: [ServerStatus]) {
-            if servers.contains(where: { $0.phase == .crashed || $0.phase == .failed || $0.phase == .unhealthy }) {
-                self = .attention
-            } else if servers.contains(where: { $0.phase == .starting || $0.phase == .stopping }) {
-                self = .busy
-            } else {
-                self = .quiet
-            }
-        }
-    }
-
-    var ambient: AmbientState {
-        AmbientState(servers: projects.flatMap(\.servers))
     }
 
     /** Presence counts for the collapsed menu bar label. */

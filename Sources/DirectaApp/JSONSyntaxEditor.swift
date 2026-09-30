@@ -225,7 +225,6 @@ struct JSONSyntaxEditor: NSViewRepresentable {
         context.coordinator.applyHighlight(to: textView)
 
         scroll.documentView = textView
-        context.coordinator.textView = textView
         return scroll
     }
 
@@ -243,7 +242,6 @@ struct JSONSyntaxEditor: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         var text: Binding<String>
-        weak var textView: NSTextView?
         private var isApplyingHighlight = false
 
         init(text: Binding<String>) {
