@@ -11,10 +11,16 @@
 # blocking call.
 #
 # Usage: scripts/test-narrow-pool.sh [swift-testing arguments, e.g. --filter X]
+#        scripts/test-narrow-pool.sh --self-test
 #   NARROW_POOL_WIDTH          pool threads to leave (default 3)
 #   NARROW_POOL_BLOCKED_SECONDS  how long a pool thread may wait before it is
 #                              reported (default 1)
 # Tests run as many at once as make test allows (Makefile, TEST_PARALLEL_WIDTH).
+# --self-test runs only the library's own checks and exits with their result:
+# a thread-churning process must survive the watcher (the watcher reads other
+# threads' memory, which a thread that exited no longer maps), and a pool
+# thread blocked on a semaphore must be reported with its waiting function.
+# Run it after editing scripts/narrow-pool/narrow-pool.c.
 #
 # How: builds scripts/narrow-pool/narrow-pool.c into .build/narrow-pool, then
 # runs each built test bundle through the toolchain's swiftpm-testing-helper
@@ -56,6 +62,33 @@ mkdir -p .build/narrow-pool
 library=$root/.build/narrow-pool/libnarrow-pool.dylib
 clang -dynamiclib -O1 -Wall -Werror -isysroot "$sdk" -o "$library" scripts/narrow-pool/narrow-pool.c || exit 1
 
+if [[ ${1:-} == --self-test ]]; then
+  churn=$root/.build/narrow-pool/self-test-thread-churn
+  blocked=$root/.build/narrow-pool/self-test-blocked-pool-thread
+  clang -O1 -Wall -Werror -isysroot "$sdk" -o "$churn" scripts/narrow-pool/self-test-thread-churn.c || exit 1
+  clang -O0 -fno-omit-frame-pointer -Wall -Werror -isysroot "$sdk" -o "$blocked" scripts/narrow-pool/self-test-blocked-pool-thread.c || exit 1
+  self_test=0
+
+  NARROW_POOL_PROCESS=${churn:t} DYLD_INSERT_LIBRARIES="$library" "$churn" 10
+  churn_status=$?
+  if (( churn_status == 0 )); then
+    echo "self-test ok: a thread-churning process survived the watcher"
+  else
+    echo "self-test FAILED: the thread-churning process exited $churn_status under the watcher (139 is a crash in the watcher's read of another thread's memory)" >&2
+    self_test=1
+  fi
+
+  blocked_log=$(NARROW_POOL_PROCESS=${blocked:t} DYLD_INSERT_LIBRARIES="$library" "$blocked" 2>&1)
+  if [[ $blocked_log == *'[narrow-pool] BLOCKED:'* && $blocked_log == *'blockThePool'* ]]; then
+    echo "self-test ok: a pool thread blocked on a semaphore was reported with its waiting function"
+  else
+    echo "self-test FAILED: no BLOCKED report naming blockThePool; the watcher printed:" >&2
+    echo "$blocked_log" >&2
+    self_test=1
+  fi
+  exit $self_test
+fi
+
 swift build --build-tests || exit 1
 bin_path=$(swift build --show-bin-path) || exit 1
 # The native build system links one directaPackageTests bundle; the default
@@ -86,6 +119,9 @@ for bundle in $bundles; do
     "$helper" --test-bundle-path "$bundle" "$@" "$bundle" --testing-library swift-testing 2>&1 | tee "$log"
   test_status=${pipestatus[1]}
   (( test_status == 0 )) || result=1
+  if (( test_status == 139 )); then
+    echo "error: the test process crashed (exit 139) in ${bundle:t}; a crash inside the narrow-pool watcher shows up as a swiftpm-testing-helper crash report in ~/Library/Logs/DiagnosticReports" >&2
+  fi
 
   if ! grep -q '^\[narrow-pool\] cooperative pool narrowed' "$log"; then
     echo "error: the pool was never narrowed for ${bundle:t} (the library did not load into the test process)" >&2

@@ -11,16 +11,19 @@
  * default QoS, so that is the class that matters here.
  *
  * Watch: every 100 ms it reads every thread's dispatch queue, run state, and
- * program counter. A cooperative-pool thread (queue label ending in
- * ".cooperative") that is not one of the parked ones and has stayed in a call
- * that waits for another event (the list is isWaitingForAnEvent: a
- * semaphore, a condition, a child process, a pipe read or poll, a sleep, a
- * Mach message) for NARROW_POOL_BLOCKED_SECONDS (1 by default) is blocking
- * the pool: it prints one "BLOCKED:" line per episode and, when
+ * program counter. A cooperative-pool thread (one serving a cooperative
+ * root queue, whatever its QoS) that is not one of the parked ones and has
+ * stayed in a call that waits for another event (the list is
+ * isWaitingForAnEvent: a semaphore, a condition, a child process, a pipe read
+ * or poll, a sleep, a Mach message) for NARROW_POOL_BLOCKED_SECONDS (1 by
+ * default) is blocking the pool: it prints one "BLOCKED:" line per episode and, when
  * NARROW_POOL_SAMPLE_DIR is set, runs /usr/bin/sample on the process into
  * that directory so the stack names the call. A thread busy on the CPU, or
  * inside a slow kernel call that is itself the work (a sysctl sweep, a file
- * stat), is load, not blocking, and is never reported.
+ * stat), is load, not blocking, and is never reported. Every read of another
+ * thread's memory (its dispatch slot, its stack) goes through
+ * mach_vm_read_overwrite, because that thread can exit and have its stack
+ * unmapped between task_threads listing it and the read.
  *
  * Blind spots: a wait shorter than the threshold is not reported however
  * often it repeats; a thread spinning in user space while waiting, or
@@ -35,6 +38,7 @@
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -61,6 +65,7 @@ typedef struct {
 
 static Tracked tracked[MAX_TRACKED];
 static int trackedCount;
+static dispatch_queue_t cooperativeQueues[6];
 static unsigned long blockedEpisodes;
 static double worstBlockedSeconds;
 
@@ -86,12 +91,26 @@ static int isParked(uint64_t thread) {
     return found;
 }
 
-/* The thread's current dispatch queue label, or NULL when it is on none (an
-   idle pool thread waiting for work is on none). */
-static const char *queueLabel(thread_identifier_info_data_t *identity) {
-    if (!identity->dispatch_qaddr) return NULL;
-    dispatch_queue_t queue = *(dispatch_queue_t *)(uintptr_t)identity->dispatch_qaddr;
-    return queue ? dispatch_queue_get_label(queue) : NULL;
+/* Copies memory another thread owns (its stack, its thread-local slots),
+   answering 0 rather than faulting when that thread exited and its stack was
+   unmapped after task_threads listed it. */
+static int readOtherThreadMemory(uintptr_t address, void *out, size_t size) {
+    mach_vm_size_t copied = 0;
+    return mach_vm_read_overwrite(mach_task_self(), address, size, (mach_vm_address_t)(uintptr_t)out, &copied)
+        == KERN_SUCCESS && copied == size;
+}
+
+/* The cooperative root queue the thread is running on, or NULL when it is on
+   none or on any other queue. The queue pointer is only compared against the
+   immortal cooperative root queues, never dereferenced, since any other queue
+   the thread names may be released while this reads it. */
+static dispatch_queue_t cooperativeQueue(thread_identifier_info_data_t *identity) {
+    dispatch_queue_t queue = NULL;
+    if (!identity->dispatch_qaddr || !readOtherThreadMemory(identity->dispatch_qaddr, &queue, sizeof queue)) return NULL;
+    for (size_t index = 0; index < sizeof cooperativeQueues / sizeof cooperativeQueues[0]; index++) {
+        if (queue && queue == cooperativeQueues[index]) return queue;
+    }
+    return NULL;
 }
 
 static int endsWith(const char *text, const char *suffix) {
@@ -131,7 +150,8 @@ static void printStack(const arm_thread_state64_t *state) {
     uintptr_t frames[40] = {pc, lr};
     int count = 2;
     while (fp && (fp & 7) == 0 && count < 40) {
-        uintptr_t *record = (uintptr_t *)fp;
+        uintptr_t record[2];
+        if (!readOtherThreadMemory(fp, record, sizeof record)) break;
         uintptr_t next = record[0], ret = record[1];
         if (!ret || next <= fp) break;
         frames[count++] = ret;
@@ -147,13 +167,17 @@ static void printStack(const arm_thread_state64_t *state) {
     }
 }
 
-static Tracked *track(uint64_t thread) {
+/* The thread's entry, else a new one, reusing a slot whose episode ended
+   (not seen blocked on the previous pass) once the table is full. */
+static Tracked *track(uint64_t thread, uint64_t pass) {
+    Tracked *ended = NULL;
     for (int index = 0; index < trackedCount; index++) {
         if (tracked[index].thread == thread) return &tracked[index];
+        if (!ended && tracked[index].lastPass + 1 < pass) ended = &tracked[index];
     }
-    if (trackedCount == MAX_TRACKED) return NULL;
-    tracked[trackedCount] = (Tracked){.lastPass = 0, .reported = 0, .since = 0, .thread = thread};
-    return &tracked[trackedCount++];
+    Tracked *entry = trackedCount < MAX_TRACKED ? &tracked[trackedCount++] : ended;
+    if (entry) *entry = (Tracked){.lastPass = 0, .reported = 0, .since = 0, .thread = thread};
+    return entry;
 }
 
 static void sampleProcess(const char *directory, unsigned long episode) {
@@ -183,10 +207,10 @@ static void *watch(void *context) {
             size = THREAD_BASIC_INFO_COUNT;
             known = known
                 && thread_info(threads[index], THREAD_BASIC_INFO, (thread_info_t)&basic, &size) == KERN_SUCCESS;
-            const char *label = known ? queueLabel(&identity) : NULL;
+            dispatch_queue_t queue = known ? cooperativeQueue(&identity) : NULL;
             arm_thread_state64_t state;
             mach_msg_type_number_t stateCount = ARM_THREAD_STATE64_COUNT;
-            int waiting = known && label && endsWith(label, ".cooperative")
+            int waiting = queue
                 && (basic.run_state == TH_STATE_WAITING || basic.run_state == TH_STATE_UNINTERRUPTIBLE)
                 && !isParked(identity.thread_id)
                 && thread_get_state(threads[index], ARM_THREAD_STATE64, (thread_state_t)&state, &stateCount)
@@ -194,7 +218,7 @@ static void *watch(void *context) {
                 && isWaitingForAnEvent(&state);
             mach_port_deallocate(mach_task_self(), threads[index]);
             if (!waiting) continue;
-            Tracked *entry = track(identity.thread_id);
+            Tracked *entry = track(identity.thread_id, pass);
             if (!entry) continue;
             if (entry->since == 0 || entry->lastPass != pass - 1) {
                 entry->reported = 0;
@@ -207,7 +231,7 @@ static void *watch(void *context) {
                 entry->reported = 1;
                 blockedEpisodes++;
                 fprintf(stderr, "[narrow-pool] BLOCKED: cooperative thread %llu has waited %.1fs on %s in:\n",
-                        (unsigned long long)identity.thread_id, seconds, label);
+                        (unsigned long long)identity.thread_id, seconds, dispatch_queue_get_label(queue));
                 printStack(&state);
                 if (sampleDirectory) sampleProcess(sampleDirectory, blockedEpisodes);
             }
@@ -236,6 +260,13 @@ __attribute__((constructor)) static void install(void) {
     if (!queue || !endsWith(dispatch_queue_get_label(queue), ".cooperative")) {
         fprintf(stderr, "[narrow-pool] error: no default-QoS cooperative queue on this system; the pool was not narrowed\n");
         exit(97);
+    }
+    static const dispatch_qos_class_t classes[] = {
+        QOS_CLASS_BACKGROUND, QOS_CLASS_DEFAULT, QOS_CLASS_USER_INITIATED, QOS_CLASS_USER_INTERACTIVE,
+        QOS_CLASS_UTILITY, 0x05 /* maintenance, which the public header does not name */,
+    };
+    for (size_t index = 0; index < sizeof classes / sizeof classes[0]; index++) {
+        cooperativeQueues[index] = dispatch_get_global_queue(classes[index], 0x4);
     }
     for (long index = 0; index < cores - width; index++) dispatch_async_f(queue, NULL, park);
     pthread_t thread;
