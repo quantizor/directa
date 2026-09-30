@@ -91,12 +91,10 @@ import Testing
             sweep and the rest of this test would prove nothing. */
         #expect(getsid(leader) == leader)
 
-        var members: [pid_t] = []
-        for _ in 0..<50 {
-            members = ProcessTree.sessionMembers(of: leader).identities.map(\.pid)
-            if !members.isEmpty { break }
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        let members: [pid_t] = try await poll(within: .seconds(5), every: .milliseconds(50)) {
+            let members = ProcessTree.sessionMembers(of: leader).identities.map(\.pid)
+            return members.isEmpty ? nil : members
+        } ?? []
         #expect(!members.isEmpty, "session sweep found no members of session \(leader)")
         #expect(members.contains(leader) == false, "the leader itself must not be returned")
     }
@@ -118,12 +116,11 @@ import Testing
         let stranger = ProcessIdentity(
             pid: leader, startMicroseconds: real.startMicroseconds,
             startSeconds: real.startSeconds - 60, uniqueID: unissuedUniqueID)
-        var found: [pid_t] = []
-        for _ in 0..<50 where found.isEmpty {
-            found = ProcessTree.liveDescendants(rootPid: leader, rootIdentity: real, snapshot: [])
+        let found: [pid_t] = try await poll(within: .seconds(5), every: .milliseconds(50)) {
+            let found = ProcessTree.liveDescendants(rootPid: leader, rootIdentity: real, snapshot: [])
                 .map(\.pid)
-            if found.isEmpty { try await Task.sleep(for: .milliseconds(50)) }
-        }
+            return found.isEmpty ? nil : found
+        } ?? []
         #expect(!found.isEmpty, "the positive control found no descendants of \(leader)")
         #expect(
             ProcessTree.liveDescendants(rootPid: leader, rootIdentity: stranger, snapshot: []).isEmpty)
@@ -230,7 +227,7 @@ import Testing
         let (readEnd, writeEnd) = try makeOutputPipe()
         defer { close(readEnd) }
         let root = try spawnBare(
-            [fixture, "--setsid-listener", "45488", "--exit-after-spawn"],
+            [fixture, "--setsid-listener", "\(TestPorts.port(488))", "--exit-after-spawn"],
             flags: POSIX_SPAWN_SETSID, stdoutFD: writeEnd)
         close(writeEnd)
         let rootIDs = ProcessUniqueIDs.read(of: root)

@@ -11,6 +11,11 @@ import Testing
     disambiguated a bind, and a third-level subdomain breaks apps whose auth
     config pins one origin. The worktree name surfaces as a display value. */
 @Suite(.serialized, .temporaryTree) struct WorktreeCoexistenceTests {
+    /** The port the coexistence fixtures declare, and the first of the three
+        the span fixture declares (`portSpan: 3`). */
+    private static let declaredPort = TestPorts.port(111)
+    private static let spanPort = TestPorts.port(200)
+
     private struct Env {
         let main: String
         let paths: DirectaPaths
@@ -39,9 +44,9 @@ import Testing
               "servers": {
                 "web": {
                   "command": ["\(fixture)", "--listen-tcp", "{port}"],
-                  "healthcheck": { "type": "tcp", "port": 45111 },
-                  "port": 45111,
-                  "url": "http://app.localhost:45111/"
+                  "healthcheck": { "type": "tcp", "port": \(Self.declaredPort) },
+                  "port": \(Self.declaredPort),
+                  "url": "http://app.localhost:\(Self.declaredPort)/"
                 }
               },
               "version": 1
@@ -78,8 +83,8 @@ import Testing
             router, .serverEnsure,
             EnsureParams(name: "web", project: env.main, timeoutSeconds: 10), EnsureResult.self)
         #expect(mainResult.server.phase == .running)
-        #expect(mainResult.server.effectivePort == 45111)
-        #expect(mainResult.server.url == "http://app.localhost:45111/")
+        #expect(mainResult.server.effectivePort == Self.declaredPort)
+        #expect(mainResult.server.url == "http://app.localhost:\(Self.declaredPort)/")
         #expect(mainResult.server.portConflict == nil)
         #expect(mainResult.server.worktree == nil)
 
@@ -87,7 +92,7 @@ import Testing
             router, .serverEnsure,
             EnsureParams(name: "web", project: env.worktree, timeoutSeconds: 10), EnsureResult.self)
         #expect(wtResult.server.phase == .running)
-        #expect(wtResult.server.effectivePort != 45111)
+        #expect(wtResult.server.effectivePort != Self.declaredPort)
         #expect(wtResult.server.portConflict?.state == .rebound)
         #expect(wtResult.server.worktree == "review")
         #expect(wtResult.server.mainProject == "main")
@@ -119,7 +124,7 @@ import Testing
         #expect(web.phase == .stopped)
         #expect(web.worktree == "review")
         #expect(web.mainProject == "main")
-        #expect(web.url == "http://app.localhost:45111/")
+        #expect(web.url == "http://app.localhost:\(Self.declaredPort)/")
     }
 
     /** The worktree checkout is answerable before anything starts, so a reader
@@ -175,7 +180,7 @@ import Testing
             router, .groupUp, GroupParams(project: env.main, timeoutSeconds: 10),
             GroupResult.self)
         #expect(mainResult.results.first?.server.phase == .running)
-        #expect(mainResult.results.first?.server.effectivePort == 45111)
+        #expect(mainResult.results.first?.server.effectivePort == Self.declaredPort)
 
         let wtResult = try await handle(
             router, .groupUp, GroupParams(project: env.worktree, timeoutSeconds: 10),
@@ -183,14 +188,14 @@ import Testing
         let web = try #require(wtResult.results.first?.server)
         #expect(web.phase == .running)
         let effective = try #require(web.effectivePort)
-        #expect(effective != 45111)
+        #expect(effective != Self.declaredPort)
         #expect(web.portConflict?.state == .rebound)
         #expect(web.worktree == "review")
         /** The url is the tell: it is built from the materialized spec, so the
             committed port here means the spawn spec was clobbered. */
         let url = try #require(web.url)
         #expect(url == "http://app.localhost:\(effective)/")
-        /** The child was told `{port}`, so a clobbered spec listens on 45111. */
+        /** The child was told `{port}`, so a clobbered spec listens on the declared port. */
         #expect(web.observedPort == nil || web.observedPort == effective)
 
         _ = try await handle(
@@ -211,7 +216,7 @@ import Testing
         let label = try #require(
             (0..<100_000).lazy.map { "review-\($0)" }.first {
                 CheckoutIdentity.siblingPortCandidate(
-                    declared: 45200, project: "\(parent)/worktrees/\($0)") == 45201
+                    declared: Self.spanPort, project: "\(parent)/worktrees/\($0)") == Self.spanPort + 1
             })
         let worktree = base.appending(path: "worktrees/\(label)")
         try await run(in: main.path, "/usr/bin/git", "init", "-b", "main")
@@ -231,11 +236,11 @@ import Testing
               "servers": {
                 "web": {
                   "command": ["\(fixture)", "--listen-tcp", "{port}"],
-                  "healthcheck": { "type": "tcp", "port": 45200 },
-                  "port": 45200,
+                  "healthcheck": { "type": "tcp", "port": \(Self.spanPort) },
+                  "port": \(Self.spanPort),
                   "portEnv": "PUBLIC_PORT",
                   "portSpan": 3,
-                  "url": "http://app.localhost:45200/"
+                  "url": "http://app.localhost:\(Self.spanPort)/"
                 }
               },
               "version": 1
@@ -253,15 +258,15 @@ import Testing
         let mainResult = try await handle(
             router, .serverEnsure,
             EnsureParams(name: "web", project: main.path, timeoutSeconds: 10), EnsureResult.self)
-        #expect(mainResult.server.effectivePort == 45200)
+        #expect(mainResult.server.effectivePort == Self.spanPort)
         let wtResult = try await handle(
             router, .serverEnsure,
             EnsureParams(name: "web", project: worktree.path, timeoutSeconds: 10), EnsureResult.self)
         let rebound = try #require(wtResult.server.effectivePort)
-        /** The first block clear of main's 45200..45202. */
-        #expect(rebound == 45203)
+        /** The first block clear of main's three ports. */
+        #expect(rebound == Self.spanPort + 3)
         #expect(await PortGuard.isListening(port: rebound))
-        #expect(await PortGuard.isListening(port: 45200))
+        #expect(await PortGuard.isListening(port: Self.spanPort))
         _ = try await handle(
             router, .serverStop, ServerTargetParams(name: "web", project: worktree.path),
             ServerResult.self)
@@ -396,7 +401,7 @@ import Testing
         that used the checkout path without a `::` terminator would treat the
         worktree as the same project and `restart` would take both down. */
     @Test func nestedWorktreeRestartLeavesTheSiblingRunning() async throws {
-        let env = try await makeNestedEnv(port: 45310)
+        let env = try await makeNestedEnv(port: TestPorts.port(310))
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.main)
         try await registry.setTrusted(project: env.worktree)

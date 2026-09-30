@@ -13,28 +13,8 @@ import Testing
     belongs to the terminal case only, or a live server's stop is recorded
     twice. */
 @Suite(.temporaryTree) struct MissingProjectTests {
-    private struct Env {
-        let paths: DirectaPaths
-        let project: String
-    }
-
-    private func makeEnv() throws -> Env {
-        let base = try TemporaryTree.directory(named: "missing-project")
-        let project = base.appending(path: "proj")
-        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
-        return Env(
-            paths: DirectaPaths(
-                dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
-            project: project.path)
-    }
-
-    private func handle<P: Codable & Sendable, R: Codable & Sendable>(
-        _ router: Router, _ method: WireMethod, _ params: P, _ expecting: R.Type
-    ) async throws -> R {
-        let line = try NDJSON.encodeLine(WireRequest(id: "t", method: method.rawValue, params: params))
-        let data = await router.handle(line: line)
-        let response = try JSONCoding.decoder().decode(WireResponse<R>.self, from: data)
-        return try #require(response.result)
+    private func makeEnv() throws -> RouterEnv {
+        try makeRouterEnv(named: "missing-project")
     }
 
     /** Never binds a port and exits only on signal, so starting it proves
@@ -49,16 +29,10 @@ import Testing
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        _ = try await handle(
-            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverStart, ServerTargetParams(name: "web", project: env.project),
             ServerResult.self)
 
-        /** Captured while the checkout still exists, matching the reasoning in
-            `LogDirCleanupTests`: `canonicalProjectPath` resolves the on-disk
-            path while it exists and falls back to a lexical resolution once it
-            does not, so querying with `env.project` after the `removeItem`
-            below could silently miss the events posted under the canonical
-            spelling recorded while the directory was still there. */
         let canonicalProject = canonicalProjectPath(env.project)
         try FileManager.default.removeItem(atPath: env.project)
         let now = Date()
@@ -68,8 +42,8 @@ import Testing
         await router.pruneMissingProjects(
             now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
 
-        let events = try await handle(
-            router, .eventsQuery, EventsQueryParams(project: canonicalProject),
+        let events = try await router.call(
+            .eventsQuery, EventsQueryParams(project: canonicalProject),
             EventsQueryResult.self)
         let stopped = events.events.filter { $0.kind == .stopped }
         #expect(stopped.count == 1)
@@ -93,8 +67,8 @@ import Testing
             launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
 
-        _ = try await handle(
-            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverStart, ServerTargetParams(name: "web", project: env.project),
             ServerResult.self)
         let canonicalProject = canonicalProjectPath(env.project)
         let id = serverID(project: canonicalProject, name: "web")
@@ -111,15 +85,8 @@ import Testing
         #expect(await registry.persistedState(serverID: id) == nil)
 
         await gate.signal(.signaled(signal: Int(SIGKILL)))
-        var stopped: [EventRecord] = []
-        for _ in 0..<100 where stopped.isEmpty {
-            stopped = try await handle(
-                router, .eventsQuery, EventsQueryParams(project: canonicalProject),
-                EventsQueryResult.self
-            ).events.filter { $0.kind == .stopped }
-            if stopped.isEmpty { try await Task.sleep(for: .milliseconds(20)) }
-        }
-        #expect(stopped.map(\.detail) == ["project path gone"])
+        let stopped = try await awaitStoppedEvents(router, project: canonicalProject)
+        #expect(stopped?.map(\.detail) == ["project path gone"])
         #expect(await registry.persistedState(serverID: id) == nil)
     }
 
@@ -139,16 +106,13 @@ import Testing
             return
         }
 
-        _ = try await handle(
-            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverStart, ServerTargetParams(name: "web", project: env.project),
             ServerResult.self)
         let canonicalProject = canonicalProjectPath(env.project)
         let stateFile = env.paths.stateFile.path
         try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: stateFile)
-        defer {
-            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: stateFile)
-            Task { await gate.signal(.signaled(signal: Int(SIGKILL))) }
-        }
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: stateFile) }
 
         try FileManager.default.removeItem(atPath: env.project)
         let now = Date()
@@ -162,6 +126,8 @@ import Testing
                 entry.level == .error && entry.message.contains(canonicalProject)
                     && entry.message.contains("could not save its retired state")
             })
+        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        #expect(try await awaitStoppedEvents(router, project: canonicalProject) != nil)
     }
 
     @Test func forgottenTerminalServerStillPostsAStoppedEvent() async throws {
@@ -174,8 +140,8 @@ import Testing
             `forgetMissingProject` finds one in `supervisors`) that never spawned
             anything, leaving it at the terminal `.stopped` phase `stop()`
             no-ops on. */
-        _ = try await handle(
-            router, .serverStatus, ProjectParams(project: env.project), ServerListResult.self)
+        _ = try await router.call(
+            .serverStatus, ProjectParams(project: env.project), ServerListResult.self)
 
         let canonicalProject = canonicalProjectPath(env.project)
         try FileManager.default.removeItem(atPath: env.project)
@@ -184,8 +150,8 @@ import Testing
         await router.pruneMissingProjects(
             now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
 
-        let events = try await handle(
-            router, .eventsQuery, EventsQueryParams(project: canonicalProject),
+        let events = try await router.call(
+            .eventsQuery, EventsQueryParams(project: canonicalProject),
             EventsQueryResult.self)
         let stopped = events.events.filter { $0.kind == .stopped }
         #expect(stopped.count == 1)
@@ -203,15 +169,10 @@ import Testing
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        _ = try await handle(
-            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverStart, ServerTargetParams(name: "web", project: env.project),
             ServerResult.self)
 
-        /** Captured while the checkout still exists, matching the reasoning in
-            `LogDirCleanupTests`: `canonicalProjectPath` resolves the on-disk
-            path while it exists and falls back to a lexical resolution once it
-            does not, so a lookup after the `removeItem` below must use this
-            spelling, not `env.project` directly. */
         let canonicalProject = canonicalProjectPath(env.project)
         let now = Date()
         try FileManager.default.removeItem(atPath: env.project)
@@ -225,8 +186,8 @@ import Testing
                 now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds)) == 0)
         #expect(await registry.project(canonicalProject) != nil)
 
-        _ = try await handle(
-            router, .serverStop, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "web", project: env.project),
             ServerResult.self)
     }
 }

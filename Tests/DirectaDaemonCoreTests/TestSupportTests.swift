@@ -1,61 +1,73 @@
 import Darwin
+import DirectaTestSupport
 import Foundation
 import Testing
 
 /** The stray reaper decides whether to SIGKILL a process, so the cases it must
-    refuse matter more than the ones it acts on. Each was checked against real
-    processes once; these pin the decision so it stays checked. */
+    refuse matter more than the ones it acts on; these pin each decision. The
+    rest pin the spawn, latch, and port-block guarantees the suites lean on. */
 @Suite struct TestSupportTests {
     private let binary = "fixture-server"
+    /** A block as a run would lease it, independent of the one this process
+        actually holds. */
+    private let block = 45000..<46000
 
-    @Test func reapsAnOrphanHoldingASuitePort() {
+    @Test func reapsAnOrphanHoldingAPortInTheLeasedBlock() {
         #expect(
             shouldReapStray(
                 command: "/Users/x/directa/.build/debug/fixture-server --listen-tcp 45411",
-                parent: 1, binaryName: binary))
+                parent: 1, binaryName: binary, ports: block))
     }
 
     /** Launched through a relative path, which is how it appears in `ps` when
-        invoked that way. Matching the absolute path missed this and the miss was
-        silent. */
+        invoked that way. */
     @Test func reapsAnOrphanInvokedThroughARelativePath() {
         #expect(
             shouldReapStray(
                 command: "./.build/debug/fixture-server --listen-tcp 45411", parent: 1,
-                binaryName: binary))
+                binaryName: binary, ports: block))
     }
 
-    /** A fixture belonging to a live run is parented by that run's test process,
-        so a second concurrent `swift test` must survive this untouched. */
+    /** A fixture with a live parent belongs to that parent. */
     @Test func refusesAFixtureWithALiveParent() {
         #expect(
             shouldReapStray(
                 command: "/Users/x/directa/.build/debug/fixture-server --listen-tcp 45411",
-                parent: 40100, binaryName: binary) == false)
+                parent: 40100, binaryName: binary, ports: block) == false)
     }
 
-    /** scripts/smoke.sh allocates outside this range and deliberately orphans a
-        fixture to prove children survive a daemon kill. Reaping that would break
-        the assertion it exists to make. */
-    @Test func refusesAnOrphanOutsideTheSuitePortRange() {
+    /** A concurrent run's block, even for an orphan: that run may be in the
+        middle of a test that orphaned it on purpose. */
+    @Test func refusesAnOrphanInAnotherRunsBlock() {
+        #expect(
+            shouldReapStray(
+                command: "/Users/x/directa/.build/debug/fixture-server --setsid-listener 46411",
+                parent: 1, binaryName: binary, ports: block) == false)
+    }
+
+    /** scripts/smoke.sh allocates outside every block and deliberately orphans
+        a fixture to prove children survive a daemon kill. Reaping that would
+        break the assertion it exists to make. */
+    @Test func refusesAnOrphanOutsideTheLeasedBlock() {
         #expect(
             shouldReapStray(
                 command: "/Users/x/directa/.build/debug/fixture-server --listen-tcp 39421",
-                parent: 1, binaryName: binary) == false)
+                parent: 1, binaryName: binary, ports: block) == false)
     }
 
     @Test func refusesAProcessThatIsNotTheFixture() {
         #expect(
-            shouldReapStray(command: "/usr/bin/node server.js --port 45411", parent: 1, binaryName: binary)
-                == false)
+            shouldReapStray(
+                command: "/usr/bin/node server.js --port 45411", parent: 1, binaryName: binary,
+                ports: block) == false)
     }
 
     /** No port at all means nothing to squat, so there is no reason to kill it. */
-    @Test func refusesAFixtureCarryingNoSuitePort() {
+    @Test func refusesAFixtureCarryingNoPort() {
         #expect(
             shouldReapStray(
                 command: "/Users/x/directa/.build/debug/fixture-server --spawn-grandchild", parent: 1,
-                binaryName: binary) == false)
+                binaryName: binary, ports: block) == false)
     }
 
     /** A bare spawn that inherits a pipe's write end keeps that pipe open for
@@ -71,24 +83,105 @@ import Testing
 
         let reader = pipe.fileHandleForReading.fileDescriptor
         var poller = pollfd(fd: reader, events: Int16(POLLIN), revents: 0)
-        let ready = poll(&poller, 1, 2000)
+        try #require(poll(&poller, 1, 2000) == 1, "the survivor still holds the pipe's write end")
         var byte: UInt8 = 0
-        #expect(ready == 1, "the survivor still holds the pipe's write end")
-        #expect(ready == 1 && read(reader, &byte, 1) == 0)
+        #expect(read(reader, &byte, 1) == 0)
     }
 
-    /** The literals, and the randomized ports `ResourceLockTests` draws, must
-        all fall inside the block; smoke.sh's two ranges must all fall outside
-        it. An earlier version of this test asserted 41000 was outside and
-        called that correct, which pinned a real gap as deliberate: the lock
-        suite was drawing from 41_000 at the time, so its fixtures were never
-        reaped. Both directions are asserted here so neither can drift alone. */
-    @Test func theSuitePortRangeCoversEverySuiteAndAvoidsSmoke() {
-        for port in [45001, 45426, 45471, 45500, 45749, 45750, 45999] {
-            #expect(TestPorts.owns(port), "\(port) is used by a suite but not reserved")
+    /** A spawning thread with SIGTERM blocked must not hand that mask to the
+        child, or the child ignores every stop. */
+    @Test func aBareSpawnTakesSIGTERMWhateverTheSpawningThreadBlocks() async throws {
+        var blockTerm = sigset_t()
+        var previous = sigset_t()
+        sigemptyset(&blockTerm)
+        sigaddset(&blockTerm, SIGTERM)
+        pthread_sigmask(SIG_BLOCK, &blockTerm, &previous)
+        let spawned = Result { try spawnSurvivor() }
+        pthread_sigmask(SIG_SETMASK, &previous, nil)
+        let survivor = try spawned.get()
+        defer { kill(survivor, SIGKILL) }
+
+        kill(survivor, SIGTERM)
+        #expect(try await awaitExit(survivor, within: .seconds(5)), "the child kept the spawning thread's mask")
+    }
+
+    /** The run's block is one of the leasable ones, and its lease is held: a
+        second lock on the same file, as a concurrent run would take, is
+        refused. */
+    @Test func thisRunHoldsTheLeaseOnItsPortBlock() throws {
+        let base = TestPorts.range.lowerBound
+        #expect(TestPorts.bases.contains(base))
+        #expect(TestPorts.range.count == TestPorts.span)
+        let descriptor = open(TestPorts.lockPath(base: base), O_RDONLY | O_CLOEXEC)
+        try #require(descriptor >= 0)
+        defer { close(descriptor) }
+        #expect(flock(descriptor, LOCK_EX | LOCK_NB) == -1)
+        #expect(errno == EWOULDBLOCK)
+    }
+
+    /** Every block any run may lease must stay clear of every range
+        scripts/smoke.sh draws from, read from the script itself so a new
+        smoke range cannot land on a unit block unnoticed. */
+    @Test func theSuitePortBlocksAvoidEverySmokeRange() throws {
+        let script = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appending(path: "scripts/smoke.sh")
+        let text = try String(contentsOf: script, encoding: .utf8)
+        let ranges = text.matches(of: #/\$\(\((\d+) \+ \(RANDOM % (\d+)\)\)\)/#).compactMap { match in
+            Int(match.1).flatMap { base in Int(match.2).map { base..<(base + $0) } }
         }
-        for port in [39000, 39499, 41000, 41501] {
-            #expect(TestPorts.owns(port) == false, "\(port) belongs to smoke.sh")
+        try #require(!ranges.isEmpty, "found no RANDOM port range in scripts/smoke.sh")
+        for range in ranges {
+            #expect(!range.overlaps(TestPorts.reserved), "smoke draws \(range), inside the unit blocks")
+        }
+    }
+
+    /** A `LaunchdJobLauncher` built anywhere but `testLaunchdJobLauncher()`
+        can carry the production label prefix, which the live daemon's
+        `doctor` and leftover-job reap would read as a real leftover. */
+    @Test func aLaunchdJobLauncherIsOnlyBuiltThroughTheTestFactory() throws {
+        let testsRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        /** Split so this line does not match itself. */
+        let construction = "LaunchdJobLauncher" + "("
+        let walker = try #require(FileManager.default.enumerator(atPath: testsRoot.path))
+        var offenders: [String] = []
+        for case let relative as String in walker
+        where relative.hasSuffix(".swift") && relative != "DirectaDaemonCoreTests/TestSupport.swift" {
+            let text = try String(contentsOf: testsRoot.appending(path: relative), encoding: .utf8)
+            for (index, line) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated()
+            where Self.constructs(construction, in: line) {
+                offenders.append("\(relative):\(index + 1)")
+            }
+        }
+        #expect(offenders == [], "build it with testLaunchdJobLauncher()")
+    }
+
+    /** A port a daemon-core suite binds is named through `TestPorts.port`,
+        because a literal in the leasable range belongs to whichever run holds
+        that block and collides with a concurrent run that leases another. */
+    @Test func noDaemonCoreSuiteNamesAPortInTheLeasableRangeByLiteral() throws {
+        let suites = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let exempt = ["TestSupport.swift", "TestSupportTests.swift"]
+        let literal = #/\b4[5-8]_?\d{3}\b/#
+        var offenders: [String] = []
+        for name in try FileManager.default.contentsOfDirectory(atPath: suites.path).sorted()
+        where name.hasSuffix(".swift") && !exempt.contains(name) {
+            let text = try String(contentsOf: suites.appending(path: name), encoding: .utf8)
+            for (index, line) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated()
+            where line.firstMatch(of: literal) != nil {
+                offenders.append("\(name):\(index + 1)")
+            }
+        }
+        #expect(offenders == [], "name the port with TestPorts.port(offset)")
+    }
+
+    /** `name` as its own identifier, so the factory's own name, which ends
+        in it, never counts. */
+    private static func constructs(_ name: String, in line: Substring) -> Bool {
+        line.ranges(of: name).contains { range in
+            guard range.lowerBound > line.startIndex else { return true }
+            let before = line[line.index(before: range.lowerBound)]
+            return !(before.isLetter || before.isNumber || before == "_")
         }
     }
 }

@@ -13,40 +13,8 @@ import Testing
     drop trust and delete logs for something still live), and must refuse a
     path directa never registered rather than silently succeeding. */
 @Suite(.temporaryTree) struct ProjectForgetTests {
-    private struct Env {
-        let paths: DirectaPaths
-        let project: String
-    }
-
-    private func makeEnv() throws -> Env {
-        let base = try TemporaryTree.directory(named: "project-forget")
-        let project = base.appending(path: "proj")
-        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
-        return Env(
-            paths: DirectaPaths(
-                dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
-            project: project.path)
-    }
-
-    private func handle<P: Codable & Sendable, R: Codable & Sendable>(
-        _ router: Router, _ method: WireMethod, _ params: P, _ expecting: R.Type
-    ) async throws -> R {
-        let line = try NDJSON.encodeLine(WireRequest(id: "t", method: method.rawValue, params: params))
-        let data = await router.handle(line: line)
-        let response = try JSONCoding.decoder().decode(WireResponse<R>.self, from: data)
-        return try #require(response.result)
-    }
-
-    /** Returns the decoded result, or the `WireError` when the daemon refused,
-        for a call expected to fail. */
-    private func send<P: Codable & Sendable, R: Codable & Sendable>(
-        _ router: Router, _ method: WireMethod, _ params: P, _ expecting: R.Type
-    ) async throws -> Result<R, WireError> {
-        let line = try NDJSON.encodeLine(WireRequest(id: "t", method: method.rawValue, params: params))
-        let data = await router.handle(line: line)
-        let response = try JSONCoding.decoder().decode(WireResponse<R>.self, from: data)
-        if response.ok, let result = response.result { return .success(result) }
-        return .failure(response.error ?? WireError(code: .internalError, message: "no result"))
+    private func makeEnv() throws -> RouterEnv {
+        try makeRouterEnv(named: "project-forget")
     }
 
     /** Never binds a port and exits only on signal, so starting it proves
@@ -67,8 +35,8 @@ import Testing
         try await registry.setTrusted(project: env.project)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        let outcome = try await send(
-            router, .projectForget, ProjectOnlyParams(project: env.project),
+        let outcome = try await router.attempt(
+            .projectForget, ProjectOnlyParams(project: env.project),
             ProjectForgetResult.self)
         guard case .failure(let error) = outcome else {
             Issue.record("project.forget acted on a project whose checkout still exists")
@@ -90,8 +58,8 @@ import Testing
         let registry = Registry(paths: env.paths)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        let outcome = try await send(
-            router, .projectForget, ProjectOnlyParams(project: env.project),
+        let outcome = try await router.attempt(
+            .projectForget, ProjectOnlyParams(project: env.project),
             ProjectForgetResult.self)
         guard case .failure(let error) = outcome else {
             Issue.record("project.forget acted on a project directa never registered")
@@ -114,24 +82,18 @@ import Testing
         let registry = Registry(paths: env.paths)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        _ = try await handle(
-            router, .serverStart, ServerTargetParams(name: "api", project: env.project),
+        _ = try await router.call(
+            .serverStart, ServerTargetParams(name: "api", project: env.project),
             ServerResult.self)
         #expect(await registry.project(env.project)?.trusted == true)
 
-        /** Captured while the checkout still exists, matching the reasoning in
-            `LogDirCleanupTests`/`MissingProjectTests`: `canonicalProjectPath`
-            resolves the on-disk spelling while the directory exists and falls
-            back to a lexical resolution once it does not, so recomputing this
-            after the `removeItem` below could disagree with the registry key
-            recorded at registration and silently look up nothing. This is also
-            exactly what a real caller sees: the `project` string a prior
-            `server.status` returned, captured before the checkout vanished. */
+        /** The `project` string a prior `server.status` returned, which is
+            what a real caller holds once the checkout is gone. */
         let canonicalProject = canonicalProjectPath(env.project)
         try FileManager.default.removeItem(atPath: env.project)
 
-        let result = try await handle(
-            router, .projectForget, ProjectOnlyParams(project: canonicalProject),
+        let result = try await router.call(
+            .projectForget, ProjectOnlyParams(project: canonicalProject),
             ProjectForgetResult.self)
         #expect(result.servers == ["api"])
 
@@ -150,30 +112,30 @@ import Testing
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
-        let started = try await handle(
-            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+        let started = try await router.call(
+            .serverStart, ServerTargetParams(name: "web", project: env.project),
             ServerResult.self)
         let pid = pid_t(try #require(started.server.pid))
         defer { if kill(pid, 0) == 0 { kill(pid, SIGKILL) } }
-        _ = try await handle(
-            router, .lockAcquire,
+        _ = try await router.call(
+            .lockAcquire,
             LockParams(holderPid: Int(getpid()), project: env.project, resource: "db"), LockResult.self)
 
         let canonicalProject = canonicalProjectPath(env.project)
         try FileManager.default.removeItem(atPath: env.project)
-        let result = try await handle(
-            router, .projectForget, ProjectOnlyParams(project: canonicalProject + "/"),
+        let result = try await router.call(
+            .projectForget, ProjectOnlyParams(project: canonicalProject + "/"),
             ProjectForgetResult.self)
 
         #expect(result.servers == ["web"])
         #expect(kill(pid, 0) != 0, "the forgotten project's server \(pid) is still running")
         #expect(await registry.project(canonicalProject) == nil)
-        let lock = try await handle(
-            router, .lockStatus, LockStatusParams(project: canonicalProject, resource: "db"),
+        let lock = try await router.call(
+            .lockStatus, LockStatusParams(project: canonicalProject, resource: "db"),
             LockStatusResult.self)
         #expect(lock.holder == nil)
-        let events = try await handle(
-            router, .eventsQuery, EventsQueryParams(project: canonicalProject), EventsQueryResult.self)
+        let events = try await router.call(
+            .eventsQuery, EventsQueryParams(project: canonicalProject), EventsQueryResult.self)
         #expect(events.events.filter { $0.kind == .stopped }.map(\.detail) == ["project path gone"])
         #expect(
             !FileManager.default.fileExists(atPath: env.paths.projectLogDir(project: canonicalProject).path))
@@ -192,8 +154,8 @@ import Testing
         try #require(recorded.hasPrefix("/private/var/"), "the temporary tree is not under /private/var: \(recorded)")
         try FileManager.default.removeItem(atPath: env.project)
 
-        let outcome = try await send(
-            router, .projectForget, ProjectOnlyParams(project: String(recorded.dropFirst("/private".count))),
+        let outcome = try await router.attempt(
+            .projectForget, ProjectOnlyParams(project: String(recorded.dropFirst("/private".count))),
             ProjectForgetResult.self)
 
         #expect((try? outcome.get()) != nil, "project.forget refused the /var spelling: \(outcome)")
@@ -212,9 +174,8 @@ import Testing
         let router = Router(
             launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
             stopTiming: StopTiming(graceSeconds: 0.3, overtimeSeconds: 0.3))
-        defer { Task { await gate.signal(.signaled(signal: Int(SIGKILL))) } }
-        _ = try await handle(
-            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverStart, ServerTargetParams(name: "web", project: env.project),
             ServerResult.self)
         let canonicalProject = canonicalProjectPath(env.project)
         let serverLog = env.paths.structuredLogFile(project: canonicalProject, server: "web")
@@ -226,22 +187,22 @@ import Testing
             now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
         /** The stop writes its reason into the server's log before it waits,
             so the sweep is suspended inside the teardown from here on. */
-        var stopping = false
-        for _ in 0..<250 where !stopping {
+        let stopping = try await eventually(within: .seconds(5)) {
             let text = (try? String(contentsOf: serverLog, encoding: .utf8)) ?? ""
-            stopping = text.contains("stopping: \(RemovalReason.projectPathGone)")
-            if !stopping { try await Task.sleep(for: .milliseconds(20)) }
+            return text.contains("stopping: \(RemovalReason.projectPathGone)")
         }
         try #require(stopping, "the sweep never began stopping the server")
-        let late = try await handle(
-            router, .projectForget, ProjectOnlyParams(project: canonicalProject), ProjectForgetResult.self)
+        let late = try await router.call(
+            .projectForget, ProjectOnlyParams(project: canonicalProject), ProjectForgetResult.self)
         #expect(await sweep == 1)
 
         #expect(late.servers.isEmpty)
-        let events = try await handle(
-            router, .eventsQuery, EventsQueryParams(project: canonicalProject), EventsQueryResult.self)
+        let events = try await router.call(
+            .eventsQuery, EventsQueryParams(project: canonicalProject), EventsQueryResult.self)
         #expect(events.events.filter { $0.kind == .unregistered }.map(\.server) == ["web"])
         #expect(await registry.project(canonicalProject) == nil)
+        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        #expect(try await awaitStoppedEvents(router, project: canonicalProject) != nil)
     }
 
     /** An ad hoc-only project (never trusted, no devservers.json at all) is
@@ -256,8 +217,8 @@ import Testing
         let canonicalProject = canonicalProjectPath(env.project)
         try FileManager.default.removeItem(atPath: env.project)
 
-        let result = try await handle(
-            router, .projectForget, ProjectOnlyParams(project: canonicalProject),
+        let result = try await router.call(
+            .projectForget, ProjectOnlyParams(project: canonicalProject),
             ProjectForgetResult.self)
         #expect(result.servers == ["web"])
 

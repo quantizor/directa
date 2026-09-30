@@ -178,9 +178,8 @@ private let fastPolicy = TelemetryCadence.Policy(
         /** The sampler thread takes its first snapshot once the scheduler
             runs it, and a stop before then leaves none, so the exit waits
             for one. */
-        let deadline = Date().addingTimeInterval(10)
-        while try snapshots(in: paths.daemonTelemetryDir).isEmpty, Date() < deadline {
-            try await Task.sleep(for: .milliseconds(10))
+        _ = try await eventually(within: .seconds(10)) {
+            try !snapshots(in: paths.daemonTelemetryDir).isEmpty
         }
         telemetry.recordExit(code: 3, reason: "test")
         /** The process-exit hook after an exit that named its code writes nothing. */
@@ -236,17 +235,15 @@ private let fastPolicy = TelemetryCadence.Policy(
         let directory = try temporaryDirectory()
         let log = TelemetryLog(directory: directory)
         let activity = DaemonActivity()
-        let stuck = activity.begin(.lsof, label: "lsof -nP -tiTCP:45999")
+        let command = "lsof -nP -tiTCP:\(TestPorts.port(999))"
+        let stuck = activity.begin(.lsof, label: command)
         defer { activity.end(stuck) }
         let sampler = TelemetrySampler(
             configuration: .init(
                 activity: activity, exitWatches: { 0 }, lanes: [], log: log, policy: fastPolicy,
                 threadLimit: { 2 }))
         sampler.start()
-        let deadline = Date().addingTimeInterval(5)
-        while try snapshots(in: directory).count < 3, Date() < deadline {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        _ = try await eventually(within: .seconds(5)) { try snapshots(in: directory).count >= 3 }
         await offPool { sampler.stop() }
         let lines = TelemetryLog.lastLines(in: directory, count: 10_000)
         let samples = try decoded(lines, entry: .snapshot, as: TelemetrySnapshot.self)
@@ -257,9 +254,9 @@ private let fastPolicy = TelemetryCadence.Policy(
         #expect(first.threadDetail?.count == first.threads?.total)
         let marks = try decoded(lines, entry: .mark, as: TelemetryMark.self)
         #expect(marks.map(\.event) == [.threadsHigh])
-        #expect(marks.first?.label?.contains("limit 2; longest in flight: lsof lsof -nP -tiTCP:45999") == true)
+        #expect(marks.first?.label?.contains("limit 2; longest in flight: lsof \(command)") == true)
         let logged = recorder.entries.filter {
-            $0.level == .error && $0.message.contains("limit 2; longest in flight: lsof lsof -nP -tiTCP:45999")
+            $0.level == .error && $0.message.contains("limit 2; longest in flight: lsof \(command)")
         }
         #expect(logged.count == 1)
     }

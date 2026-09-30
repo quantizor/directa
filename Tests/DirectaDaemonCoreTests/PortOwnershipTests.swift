@@ -54,8 +54,8 @@ import Testing
     @Test func ensureRefusesAPortAnotherProjectHolds() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
-        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: 45001))
-        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: 45001))
+        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: TestPorts.port(1)))
+        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: TestPorts.port(1)))
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
         _ = await handle(router, .serverStart, ServerTargetParams(name: "web", project: env.projectA), ServerResult.self)
@@ -68,7 +68,7 @@ import Testing
         }
         #expect(error.code == .portHeld)
         /** The message names the holding project, not a bare number. */
-        #expect(error.message.contains("45001"))
+        #expect(error.message.contains("\(TestPorts.port(1))"))
         #expect(error.message.contains(env.projectA))
         await teardown(router, env.projectA, "web")
     }
@@ -76,10 +76,10 @@ import Testing
     @Test func groupUpRefusesWhenTheDeclaredPortIsHeld() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
-        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: 45002))
+        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: TestPorts.port(2)))
         /** Checkout B brings its server up through directa up, the path that used
             to skip the pre-check entirely. */
-        try writeDevserversPort(project: env.projectB, name: "web", port: 45002)
+        try writeDevserversPort(project: env.projectB, name: "web", port: TestPorts.port(2))
         try await registry.setTrusted(project: env.projectB)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
@@ -97,7 +97,7 @@ import Testing
     @Test func aRunningTargetIsNotRefusedAgainstItself() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
-        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: 45003))
+        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: TestPorts.port(3)))
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
         _ = await handle(router, .serverStart, ServerTargetParams(name: "web", project: env.projectA), ServerResult.self)
         /** Ensuring the same already-up server must not trip the port check on its
@@ -123,13 +123,13 @@ import Testing
         holder.arguments = ["60"]
         try holder.run()
         defer { holder.terminate() }
-        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: 45004))
+        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: TestPorts.port(4)))
         let idA = serverID(project: env.projectA, name: "web")
         try await registry.updateState(serverID: idA, writer: .router) { entry in
             entry.phase = .running
             entry.pid = Int(holder.processIdentifier)
         }
-        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: 45004))
+        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: TestPorts.port(4)))
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
         /** B is the first thing this router touches, so A never becomes resident. */
         let refused = await handle(
@@ -154,18 +154,18 @@ import Testing
         holder.arguments = ["60"]
         try holder.run()
         defer { holder.terminate() }
-        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: 45020))
-        try Data(#"{"servers":{"web":{"port":45021}}}"#.utf8)
+        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: TestPorts.port(20)))
+        try Data(#"{"servers":{"web":{"port":\#(TestPorts.port(21))}}}"#.utf8)
             .write(to: LocalOverlay.overlayURL(project: env.projectA))
         try await registry.updateState(serverID: serverID(project: env.projectA, name: "web"), writer: .router) {
             entry in
             entry.phase = .running
             entry.pid = Int(holder.processIdentifier)
         }
-        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: 45021))
+        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: TestPorts.port(21)))
         let router = Router(
             launcher: SubprocessLauncher(), paths: env.paths,
-            portProbe: PortProbe { $0 == 45021 }, registry: registry)
+            portProbe: PortProbe { $0 == TestPorts.port(21) }, registry: registry)
 
         let refused = await handle(
             router, .serverEnsure, EnsureParams(name: "web", project: env.projectB, timeoutSeconds: 3),
@@ -177,7 +177,7 @@ import Testing
         #expect(error.code == .portHeld)
         #expect(
             error.message
-                == "port 45021 is held by managed server 'web' in \(canonicalProjectPath(env.projectA))")
+                == "port \(TestPorts.port(21)) is held by managed server 'web' in \(canonicalProjectPath(env.projectA))")
     }
 
     /** `why` is the command a reader reaches for after a refusal, so it has to
@@ -187,8 +187,8 @@ import Testing
     @Test func whyNamesTheHolderOfAStoppedServersPort() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
-        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: 45005))
-        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: 45005))
+        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: TestPorts.port(5)))
+        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: TestPorts.port(5)))
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
         _ = await handle(router, .serverStart, ServerTargetParams(name: "web", project: env.projectA), ServerResult.self)
 
@@ -200,7 +200,7 @@ import Testing
             return
         }
         let rootCause = try #require(why.rootCause)
-        #expect(rootCause.contains("45005"))
+        #expect(rootCause.contains("\(TestPorts.port(5))"))
         #expect(rootCause.contains(env.projectA))
         /** The holder belongs in the root cause, not only buried in evidence. */
         #expect(!rootCause.hasSuffix("not running (stopped)"))
@@ -212,8 +212,8 @@ import Testing
     @Test func statusAcrossAllProjectsAnnotatesTheHeldPort() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
-        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: 45006))
-        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: 45006))
+        try await registry.register(project: env.projectA, spec: sleeperSpec(name: "web", port: TestPorts.port(6)))
+        try await registry.register(project: env.projectB, spec: sleeperSpec(name: "web", port: TestPorts.port(6)))
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
         _ = await handle(router, .serverStart, ServerTargetParams(name: "web", project: env.projectA), ServerResult.self)
 
@@ -233,16 +233,34 @@ import Testing
         await teardown(router, env.projectA, "web")
     }
 
-    /** Waits for a phase, polling rather than sleeping a fixed span. */
+    /** The supervisor's status once `predicate` holds, or its latest status
+        when the limit passes first. */
     private func settle(
         _ supervisor: ServerSupervisor, until predicate: @Sendable (ServerStatus) -> Bool
-    ) async -> ServerStatus {
+    ) async throws -> ServerStatus {
         var status = await supervisor.status()
-        for _ in 0..<60 where !predicate(status) {
-            try? await Task.sleep(for: .milliseconds(100))
+        _ = try await eventually(within: .seconds(6), every: .milliseconds(100)) {
             status = await supervisor.status()
+            return predicate(status)
         }
         return status
+    }
+
+    /** The `web` server of `project` as the router reports it, once it is
+        `.failed` or the limit passes first; polls through the router's
+        status handler, the path every reader takes. */
+    private func failedStatus(_ router: Router, project: String) async throws -> ServerStatus? {
+        var latest: ServerStatus?
+        _ = try await eventually(within: .seconds(6), every: .milliseconds(100)) {
+            let listed = await handle(
+                router, .serverStatus, ProjectParams(name: "web", project: project),
+                ServerListResult.self)
+            if case .success(let result) = listed {
+                latest = result.servers.first
+            }
+            return latest?.phase == .failed
+        }
+        return latest
     }
 
     /** The failure that motivated this check: another project's server holds the
@@ -254,7 +272,7 @@ import Testing
             return
         }
         let env = try makeEnv()
-        let port = 45007
+        let port = TestPorts.port(7)
         let registry = Registry(paths: env.paths)
         /** The thief is another server this daemon supervises, which is what the
             real incident looked like: two projects, one port, whichever bound
@@ -266,7 +284,7 @@ import Testing
             launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectB,
             registry: registry, spec: thiefSpec)
         _ = await thief.start()
-        _ = await settle(thief) { $0.phase == .running }
+        _ = try await settle(thief) { $0.phase == .running }
 
         /** The victim never binds anything, so the only listener on the port
             belongs to the thief, yet its TCP healthcheck still passes. */
@@ -276,7 +294,7 @@ import Testing
             launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectA,
             registry: registry, spec: spec)
         _ = await supervisor.start()
-        let settled = await settle(supervisor) { $0.phase == .failed }
+        let settled = try await settle(supervisor) { $0.phase == .failed }
         #expect(settled.phase == .failed)
         let conflict = try #require(settled.portConflict)
         #expect(conflict.state == .foreign)
@@ -293,7 +311,7 @@ import Testing
         starting it again stops the old run before spawning a new one: two
         copies never run side by side, and the old run's exit never
         overwrites the new run's state. */
-    @Test(arguments: [(45011, false), (45012, true)])
+    @Test(arguments: [(TestPorts.port(11), false), (TestPorts.port(12), true)])
     func aPortFailedServerIsReallyStoppedAndRestarted(port: Int, restart: Bool) async throws {
         guard let fixture = fixtureServerExecutable() else {
             Issue.record("fixture-server is not built; run swift build")
@@ -308,7 +326,7 @@ import Testing
             launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectB,
             registry: registry, spec: thiefSpec)
         _ = await thief.start()
-        _ = await settle(thief) { $0.phase == .running }
+        _ = try await settle(thief) { $0.phase == .running }
 
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web", port: port)
         try await registry.register(project: env.projectA, spec: spec)
@@ -316,7 +334,7 @@ import Testing
             launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectA,
             registry: registry, spec: spec)
         _ = await supervisor.start()
-        let failed = await settle(supervisor) { $0.phase == .failed }
+        let failed = try await settle(supervisor) { $0.phase == .failed }
         #expect(failed.phase == .failed)
         let oldPid = try #require(failed.pid)
         defer { kill(pid_t(oldPid), SIGKILL) }
@@ -329,11 +347,7 @@ import Testing
             after = await supervisor.stop(graceSeconds: 2, reason: "test")
         }
         defer { if let pid = after.pid, pid != oldPid { kill(pid_t(pid), SIGKILL) } }
-        var gone = kill(pid_t(oldPid), 0) != 0
-        for _ in 0..<50 where !gone {
-            try await Task.sleep(for: .milliseconds(20))
-            gone = kill(pid_t(oldPid), 0) != 0
-        }
+        let gone = try await awaitExit(pid_t(oldPid), within: .seconds(5))
         #expect(gone, "the failed run \(oldPid) kept running")
         if restart {
             let newPid = try #require(after.pid)
@@ -360,7 +374,7 @@ import Testing
             return
         }
         let env = try makeEnv()
-        let port = 45013
+        let port = TestPorts.port(13)
         let registry = Registry(paths: env.paths)
         try await registry.register(
             project: env.projectA,
@@ -383,17 +397,7 @@ import Testing
             launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectB,
             registry: registry, spec: thiefSpec)
         _ = await thief.start()
-        var phase: ServerPhase?
-        for _ in 0..<60 where phase != .failed {
-            try await Task.sleep(for: .milliseconds(100))
-            let listed = await handle(
-                router, .serverStatus, ProjectParams(name: "web", project: env.projectA),
-                ServerListResult.self)
-            if case .success(let result) = listed {
-                phase = result.servers.first?.phase
-            }
-        }
-        #expect(phase == .failed)
+        #expect(try await failedStatus(router, project: env.projectA)?.phase == .failed)
         _ = await thief.stop(graceSeconds: 2, reason: "test cleanup")
 
         let canonicalProject = canonicalProjectPath(env.projectA)
@@ -403,11 +407,7 @@ import Testing
         await router.pruneMissingProjects(
             now: now.addingTimeInterval(Router.missingProjectSweepIntervalSeconds))
 
-        var gone = kill(pid_t(victim), 0) != 0
-        for _ in 0..<50 where !gone {
-            try await Task.sleep(for: .milliseconds(20))
-            gone = kill(pid_t(victim), 0) != 0
-        }
+        let gone = try await awaitExit(pid_t(victim), within: .seconds(5))
         #expect(gone, "the port-failed run \(victim) outlived its forgotten project")
         let queried = await handle(
             router, .eventsQuery, EventsQueryParams(project: canonicalProject), EventsQueryResult.self)
@@ -441,17 +441,7 @@ import Testing
             launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectB,
             registry: registry, spec: thiefSpec)
         _ = await thief.start()
-        var latest: ServerStatus?
-        for _ in 0..<60 where latest?.phase != .failed {
-            try await Task.sleep(for: .milliseconds(100))
-            let listed = await handle(
-                router, .serverStatus, ProjectParams(name: "web", project: env.projectA),
-                ServerListResult.self)
-            if case .success(let result) = listed {
-                latest = result.servers.first
-            }
-        }
-        let failed = try #require(latest)
+        let failed = try #require(try await failedStatus(router, project: env.projectA))
         #expect(failed.phase == .failed)
         #expect(failed.pid != nil)
         return (failed: failed, thief: thief)
@@ -460,7 +450,7 @@ import Testing
     /** A port-failed run is still a live process holding whatever the resource
         guards, so a pausing lock stops it and a non-pausing lock reports it as
         live, exactly like a running declarer. */
-    @Test(arguments: [(45014, true), (45015, false)])
+    @Test(arguments: [(TestPorts.port(14), true), (TestPorts.port(15), false)])
     func aLockPausesOrReportsALivePortFailedDeclarer(port: Int, pause: Bool) async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
@@ -489,11 +479,7 @@ import Testing
         if pause {
             #expect(lock.paused == ["web"])
             #expect(lock.live == nil)
-            var gone = kill(pid_t(victim), 0) != 0
-            for _ in 0..<50 where !gone {
-                try await Task.sleep(for: .milliseconds(20))
-                gone = kill(pid_t(victim), 0) != 0
-            }
+            let gone = try await awaitExit(pid_t(victim), within: .seconds(5))
             #expect(gone, "the paused port-failed run \(victim) kept running")
         } else {
             #expect(lock.paused == [])
@@ -515,7 +501,7 @@ import Testing
     @Test func ensuringADriftedServerDoesNotCallItsOwnListenerUnmanaged() async throws {
         let fixture = try #require(fixtureServerExecutable())
         let env = try makeEnv()
-        let port = 45016
+        let port = TestPorts.port(16)
         let registry = Registry(paths: env.paths)
         try await registry.register(
             project: env.projectA,
@@ -526,17 +512,7 @@ import Testing
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
         let target = ServerTargetParams(name: "web", project: env.projectA)
         _ = await handle(router, .serverStart, target, ServerResult.self)
-        var latest: ServerStatus?
-        for _ in 0..<60 where latest?.phase != .failed {
-            try await Task.sleep(for: .milliseconds(100))
-            let listed = await handle(
-                router, .serverStatus, ProjectParams(name: "web", project: env.projectA),
-                ServerListResult.self)
-            if case .success(let result) = listed {
-                latest = result.servers.first
-            }
-        }
-        let drifted = try #require(latest)
+        let drifted = try #require(try await failedStatus(router, project: env.projectA))
         #expect(drifted.phase == .failed)
         #expect(drifted.portConflict?.state == .drift)
         #expect(drifted.observedPort == port + 1)
@@ -563,8 +539,8 @@ import Testing
         a latent-conflict annotation. */
     @Test func aStatusReadKeepsALivePortFailedRunsSpawnSpec() async throws {
         let env = try makeEnv()
-        let port = 45018
-        let overridePort = 45019
+        let port = TestPorts.port(18)
+        let overridePort = TestPorts.port(19)
         let registry = Registry(paths: env.paths)
         try await registry.register(
             project: env.projectA,
@@ -603,7 +579,7 @@ import Testing
             return
         }
         let env = try makeEnv()
-        let port = 45008
+        let port = TestPorts.port(8)
         let registry = Registry(paths: env.paths)
         let spec = ServerSpec(
             command: [fixture, "--listen-tcp", String(port)], name: "web", port: port)
@@ -613,7 +589,7 @@ import Testing
         _ = await supervisor.start()
         /** The listen scan runs in its own task after health promotion, so wait
             for the scan's result rather than for `running` alone. */
-        let settled = await settle(supervisor) {
+        let settled = try await settle(supervisor) {
             ($0.phase == .running && $0.observedPort != nil) || $0.phase == .failed
         }
         #expect(settled.phase == .running)
@@ -634,7 +610,7 @@ import Testing
             return
         }
         let env = try makeEnv()
-        let port = 45009
+        let port = TestPorts.port(9)
         let registry = Registry(paths: env.paths)
         /** The inner shell exits at once, so the listener reparents away. The
             outer shell stays alive as the supervised root. */
@@ -648,7 +624,7 @@ import Testing
             launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectA,
             registry: registry, spec: spec)
         _ = await supervisor.start()
-        let settled = await settle(supervisor) {
+        let settled = try await settle(supervisor) {
             $0.phase == .failed || ($0.phase == .running && $0.portConflict != nil)
         }
         _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
@@ -668,7 +644,7 @@ import Testing
             return
         }
         let env = try makeEnv()
-        let port = 45010
+        let port = TestPorts.port(10)
         let registry = Registry(paths: env.paths)
         /** An unmanaged listener, started now. */
         let stranger = Process()
@@ -678,7 +654,7 @@ import Testing
         stranger.standardError = FileHandle.nullDevice
         try stranger.run()
         defer { stranger.terminate() }
-        try await Task.sleep(for: .milliseconds(400))
+        try #require(try await eventually(within: .seconds(10)) { await PortGuard.isListening(port: port) })
 
         /** A stale row for another project claiming that very pid, recorded an
             hour ago: the pid matches, the identity cannot. */
@@ -696,7 +672,7 @@ import Testing
             launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectA,
             registry: registry, spec: spec)
         _ = await supervisor.start()
-        let settled = await settle(supervisor) {
+        let settled = try await settle(supervisor) {
             $0.phase == .failed || ($0.phase == .running && $0.portConflict != nil)
         }
         _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
@@ -739,11 +715,7 @@ import Testing
             else { continue }
             #expect(answer == nil)
             #expect(elapsed < holderLifetime / 2, "the port lookup waited \(elapsed) for a process holding its output")
-            var gone = kill(holder, 0) != 0
-            for _ in 0..<50 where !gone {
-                try await Task.sleep(for: .milliseconds(50))
-                gone = kill(holder, 0) != 0
-            }
+            let gone = try await awaitExit(holder, within: .seconds(5))
             if !gone { kill(holder, SIGKILL) }
             #expect(gone, "the process holding the lookup's output (pid \(holder)) outlived the deadline")
             return

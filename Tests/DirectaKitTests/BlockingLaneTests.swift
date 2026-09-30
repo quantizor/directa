@@ -199,11 +199,7 @@ import os
             else { continue }
             #expect(answer == nil)
             #expect(elapsed < holderLifetime / 2, "the git read waited \(elapsed) for a process holding its output")
-            var gone = kill(holder, 0) != 0
-            for _ in 0..<50 where !gone {
-                try await Task.sleep(for: .milliseconds(50))
-                gone = kill(holder, 0) != 0
-            }
+            let gone = try await awaitExit(holder, within: .seconds(5))
             if !gone { kill(holder, SIGKILL) }
             #expect(gone, "the process holding git's output (pid \(holder)) outlived the timeout")
             return

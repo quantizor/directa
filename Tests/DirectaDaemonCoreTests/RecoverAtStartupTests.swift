@@ -256,9 +256,12 @@ private func logTexts(router: Router, project: String, name: String) async throw
         await router.recoverAtStartup()
         #expect(await registry.persistedState(serverID: staleID) == nil)
 
-        var gone = kill(survivor, 0) != 0
-        for _ in 0..<50 where !gone && recordedJustNow {
-            try await Task.sleep(for: .milliseconds(100))
+        /** A row from an earlier boot is left alone, so there is nothing to
+            wait out. */
+        let gone: Bool
+        if recordedJustNow {
+            gone = try await awaitExit(survivor, within: .seconds(5))
+        } else {
             gone = kill(survivor, 0) != 0
         }
         #expect(gone == recordedJustNow)
@@ -291,7 +294,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         defer { close(output.read) }
         let startedAt = Date()
         let root = try spawnReapedSessionLeader(
-            [fixture, "--orphan-grandchild-ignterm"], defaultSignalMask: true, stdoutFD: output.write)
+            [fixture, "--orphan-grandchild-ignterm"], stdoutFD: output.write)
         close(output.write)
         defer { if kill(root, 0) == 0 { kill(root, SIGKILL) } }
         let grandchild = try #require(readGrandchildPid(from: output.read))
@@ -307,11 +310,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
 
         /** The bounce has already sent its SIGKILL by the time recover
             returns; only launchd's reap of the orphan is left to wait for. */
-        var gone = kill(grandchild, 0) != 0
-        for _ in 0..<40 where !gone {
-            try await Task.sleep(for: .milliseconds(50))
-            gone = kill(grandchild, 0) != 0
-        }
+        let gone = try await awaitExit(grandchild, within: .seconds(5))
         #expect(gone, "descendant \(grandchild) ignoring SIGTERM survived the bounce of root \(root)")
         #expect(kill(root, 0) != 0)
     }
@@ -390,15 +389,11 @@ private func logTexts(router: Router, project: String, name: String) async throw
                 id: "start", method: WireMethod.serverStart.rawValue,
                 params: ServerTargetParams(name: "web", project: env.projectPath)))
         _ = await router.handle(line: startLine)
-        var phase: ServerPhase = .starting
-        for _ in 0..<50 {
-            let web = try await statusList(router: router, project: env.projectPath)
-                .first { $0.server == "web" }
-            phase = web?.phase ?? .starting
-            if phase == .crashed { break }
-            try await Task.sleep(for: .milliseconds(100))
+        let crashed = try await eventually(within: .seconds(5), every: .milliseconds(100)) {
+            try await statusList(router: router, project: env.projectPath)
+                .first { $0.server == "web" }?.phase == .crashed
         }
-        #expect(phase == .crashed)
+        #expect(crashed)
         let whyLine = try NDJSON.encodeLine(
             WireRequest(
                 id: "why", method: WireMethod.serverWhy.rawValue,
@@ -464,10 +459,10 @@ private func logTexts(router: Router, project: String, name: String) async throw
             .first { $0.server == "web" }
         /** Pid is unchanged: adoption attaches, it never spawns. */
         #expect(web?.pid == Int(survivor))
-        for _ in 0..<50 where web?.phase != .running {
-            try await Task.sleep(for: .milliseconds(100))
+        _ = try await eventually(within: .seconds(5), every: .milliseconds(100)) {
             web = try await statusList(router: router, project: env.projectPath)
                 .first { $0.server == "web" }
+            return web?.phase == .running
         }
         #expect(web?.phase == .running)
         #expect(web?.pid == Int(survivor))
@@ -486,9 +481,9 @@ private func logTexts(router: Router, project: String, name: String) async throw
         try handle.write(contentsOf: Data("post-adopt line\n".utf8))
         try handle.close()
         var texts: [String] = []
-        for _ in 0..<50 where !texts.contains("post-adopt line") {
-            try await Task.sleep(for: .milliseconds(100))
+        _ = try await eventually(within: .seconds(5), every: .milliseconds(100)) {
             texts = try await logTexts(router: router, project: env.projectPath, name: "web")
+            return texts.contains("post-adopt line")
         }
         #expect(texts.contains("post-adopt line"))
         #expect(!texts.contains("preexisting line"))
@@ -533,8 +528,8 @@ private func logTexts(router: Router, project: String, name: String) async throw
         #expect(recorder.listingCount == 2)
         #expect(recorder.labels.isEmpty)
         #expect(await gate.callCount == 0)
-        try await Task.sleep(for: .milliseconds(300))
-        #expect(kill(survivor, 0) == 0, "survivor \(survivor) was signaled while launchd could not be read")
+        let signaled = try await eventually(within: .milliseconds(300)) { kill(survivor, 0) != 0 }
+        #expect(!signaled, "survivor \(survivor) was signaled while launchd could not be read")
         let row = await registry.persistedState(serverID: id)
         #expect(row?.pid == Int(survivor))
         #expect(row?.phase == .running)
@@ -599,7 +594,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
             {
               "web": {
                 "command": ["/bin/sh", "-c", "sleep 30"],
-                "port": 45480,
+                "port": \(TestPorts.port(480)),
                 "portSpan": 4
               }
             }
@@ -634,11 +629,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         #expect(
             events.filter { $0.kind == .crashed }.map(\.detail)
                 == [DaemonRestartDetail.orphanBounced(pid: survivor)])
-        var gone = kill(survivor, 0) != 0
-        for _ in 0..<50 where !gone {
-            try await Task.sleep(for: .milliseconds(50))
-            gone = kill(survivor, 0) != 0
-        }
+        let gone = try await awaitExit(survivor, within: .seconds(5))
         #expect(gone, "survivor \(survivor) with an unresolvable claim was left running")
     }
 
@@ -691,11 +682,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
             })
         #expect(
             events.contains { $0.kind == .started && ($0.detail ?? "").contains("adopted pid") } == false)
-        var reaped = false
-        for _ in 0..<50 where !reaped {
-            if kill(survivor, 0) != 0 { reaped = true; break }
-            try await Task.sleep(for: .milliseconds(100))
-        }
+        let reaped = try await awaitExit(survivor, within: .seconds(5))
         #expect(reaped, "unwatchable survivor \(survivor) was left running beside its replacement")
         await stopServer(router: router, project: env.projectPath, name: "web")
     }
@@ -754,13 +741,10 @@ private func logTexts(router: Router, project: String, name: String) async throw
         #expect(
             events.contains { $0.kind == .started && ($0.detail ?? "").contains("adopted pid") } == false)
         /** `bounceOrphan` runs to its SIGKILL inside `recoverAtStartup`, so a
-            bounce would already have landed; this only waits out the reap. */
-        var gone = kill(survivor, 0) != 0
-        for _ in 0..<20 where !gone {
-            try await Task.sleep(for: .milliseconds(50))
-            gone = kill(survivor, 0) != 0
-        }
-        #expect(!gone, "recycled-pid stand-in \(survivor) was signaled")
+            bounce would already have landed; the wait watches a full window
+            for the reap a bounce would cause. */
+        let signaled = try await awaitExit(survivor, within: .seconds(1))
+        #expect(!signaled, "recycled-pid stand-in \(survivor) was signaled")
         await stopServer(router: router, project: env.projectPath, name: "web")
     }
 
@@ -815,11 +799,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
 
         /** `bounceOrphan` runs to its SIGKILL inside `recoverAtStartup`, so
             only the reaping of a signaled process is left to wait for. */
-        var gone = kill(survivor, 0) != 0
-        for _ in 0..<20 where !gone {
-            try await Task.sleep(for: .milliseconds(50))
-            gone = kill(survivor, 0) != 0
-        }
+        let gone = try await awaitExit(survivor, within: recordedJustNow ? .seconds(5) : .seconds(1))
         #expect(gone == recordedJustNow)
         let events = try await eventsList(router: router, project: env.projectPath)
         #expect(
@@ -864,11 +844,7 @@ private func logTexts(router: Router, project: String, name: String) async throw
         let events = try await eventsList(router: router, project: env.projectPath)
         #expect(
             events.contains { $0.kind == .crashed && ($0.detail ?? "").hasPrefix("daemon-restart") })
-        var reaped = false
-        for _ in 0..<50 where !reaped {
-            if kill(orphan, 0) != 0 { reaped = true; break }
-            try await Task.sleep(for: .milliseconds(100))
-        }
+        let reaped = try await awaitExit(orphan, within: .seconds(5))
         #expect(reaped, "orphan pid \(orphan) survived the bounce")
         await stopServer(router: router, project: env.projectPath, name: "web")
     }

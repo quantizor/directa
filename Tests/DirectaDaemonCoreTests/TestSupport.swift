@@ -7,12 +7,16 @@ import os
 
 @testable import DirectaDaemonCore
 
-/** Shared test support. The fixture-server lookup lived in six copies that had
-    already drifted apart (one checked existence rather than executability, and
-    looked in one location instead of two), so a suite could fail to find a
-    binary its neighbour found. */
+/** Shared support for the daemon-core suites: raw spawns (`spawnBare` and
+    its wrappers), daemon-specific polling (`awaitPhase`; the generic waits
+    live in Tests/DirectaTestSupport/Polling.swift), a Router over scratch
+    paths (`makeRouterEnv`, `Router.call`/`attempt`), one-shot latches, fake
+    launchers, the per-run port block (`TestPorts`), and the fixture-server
+    lookup with its stray reaper. */
 
-/** Every `LaunchdJobLauncher` a test constructs passes this instead of the
+// MARK: - Launchd jobs
+
+/** Every `LaunchdJobLauncher` a test runs carries this prefix instead of the
     production `LaunchdJobs.childLabelPrefix`, so a job bootstrapped under
     test is never matched by `LaunchdJobs.parseChildJobs`: the live daemon's
     `doctor` and leftover-job reap both read the real gui domain through that
@@ -29,17 +33,32 @@ let testLaunchdJobLabelPrefix = "dev.quantizor.directa.test-job."
     own, which the walk would then find and a stop would signal. */
 let unissuedUniqueID = UInt64.max
 
+/** The one way a test builds a `LaunchdJobLauncher`;
+    `aLaunchdJobLauncherIsOnlyBuiltThroughTheTestFactory` fails any other
+    construction under Tests. */
+func testLaunchdJobLauncher() -> LaunchdJobLauncher {
+    LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix)
+}
+
+// MARK: - Raw spawns
+
 /** The one raw `posix_spawn` for tests that need spawn attributes Foundation's
-    `Process` cannot set (a new session, a signal mask, a Darwin SPI). The
-    child inherits no descriptor but stdin, stdout, and stderr, each on
-    /dev/null unless `stdoutFD` names the descriptor its stdout is duplicated
-    from (`POSIX_SPAWN_CLOEXEC_DEFAULT`, the flag `swift-subprocess` passes on
-    every spawn): a plain `posix_spawn` copies every descriptor the
-    test process has open at that instant, including the write end of any
-    pipe a concurrent test is draining, and that reader then waits for this
-    child to exit rather than for the process it started. `flags` joins the
-    close-on-exec default; `configure` sets any other attribute. The caller
-    owns reaping. */
+    `Process` cannot set (a new session, a Darwin SPI). The child inherits no
+    descriptor but stdin, stdout, and stderr, each on /dev/null unless
+    `stdoutFD` names the descriptor its stdout is duplicated from
+    (`POSIX_SPAWN_CLOEXEC_DEFAULT`, the flag `swift-subprocess` passes on
+    every spawn): a plain `posix_spawn` copies every descriptor the test
+    process has open at that instant, including the write end of any pipe a
+    concurrent test is draining, and that reader then waits for this child to
+    exit rather than for the process it started.
+
+    The child's signal mask is emptied and every disposition reset to default
+    (`POSIX_SPAWN_SETSIGMASK` / `POSIX_SPAWN_SETSIGDEF`, the same pair
+    `swift-subprocess` passes): the test runner's threads can have SIGTERM
+    blocked, and a child inheriting that mask never notices a stop's SIGTERM,
+    so a teardown test would pass or fail on which pool thread spawned it.
+    `flags` joins these defaults; `configure` sets any other attribute. The
+    caller owns reaping. */
 func spawnBare(
     _ argv: [String], flags: Int32 = 0, stdoutFD: Int32? = nil,
     configure: (inout posix_spawnattr_t?) throws -> Void = { _ in }
@@ -47,7 +66,14 @@ func spawnBare(
     var attr: posix_spawnattr_t?
     posix_spawnattr_init(&attr)
     defer { posix_spawnattr_destroy(&attr) }
-    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | flags))
+    posix_spawnattr_setflags(
+        &attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF | flags))
+    var noSignals = sigset_t()
+    var allSignals = sigset_t()
+    sigemptyset(&noSignals)
+    sigfillset(&allSignals)
+    posix_spawnattr_setsigmask(&attr, &noSignals)
+    posix_spawnattr_setsigdefault(&attr, &allSignals)
     try configure(&attr)
 
     var actions: posix_spawn_file_actions_t?
@@ -73,6 +99,30 @@ func spawnBare(
     return pid
 }
 
+/** `argv`'s whole stdout, read to end of file, with the child reaped by
+    `waitpid` rather than Foundation's `Process`, whose `waitUntilExit` spins a
+    run loop on the calling cooperative thread. Blocks its caller, so it is for
+    synchronous setup only (the stray reaper's `ps`); async code goes through
+    `TestProcess`. */
+func captureOutput(_ argv: [String]) throws -> String {
+    let output = try makeOutputPipe()
+    defer { close(output.read) }
+    let spawned = Result { try spawnBare(argv, stdoutFD: output.write) }
+    close(output.write)
+    let pid = try spawned.get()
+    var data = Data()
+    var buffer = [UInt8](repeating: 0, count: 65536)
+    while true {
+        let count = read(output.read, &buffer, buffer.count)
+        if count < 0, errno == EINTR { continue }
+        guard count > 0 else { break }
+        data.append(contentsOf: buffer.prefix(count))
+    }
+    var status: Int32 = 0
+    while waitpid(pid, &status, 0) == -1, errno == EINTR {}
+    return String(decoding: data, as: UTF8.self)
+}
+
 /** Spawns a bare, throwaway long-lived process to stand in for "a server pid a
     prior daemon recorded", independent of any supervisor or registry (a test
     that adopts it owns the only bookkeeping). `POSIX_SPAWN_SETSID` makes the
@@ -87,33 +137,20 @@ func spawnSurvivor() throws -> pid_t {
 
 /** `argv` as a session leader nothing supervises, reaped the moment it exits,
     its stdout on `stdoutFD` when given (as `spawnBare`). The caller owns
-    killing it. `defaultSignalMask` clears the signal mask the child would
-    otherwise inherit from the spawning test thread, which blocks SIGTERM, so
-    a SIGTERM reaches the child the way it reaches a real server. */
-func spawnReapedSessionLeader(
-    _ argv: [String], defaultSignalMask: Bool = false, stdoutFD: Int32? = nil
-) throws -> pid_t {
-    let pid = try spawnBare(
-        argv, flags: POSIX_SPAWN_SETSID | (defaultSignalMask ? POSIX_SPAWN_SETSIGMASK : 0),
-        stdoutFD: stdoutFD
-    ) { attr in
-        guard defaultSignalMask else { return }
-        var empty = sigset_t()
-        sigemptyset(&empty)
-        posix_spawnattr_setsigmask(&attr, &empty)
-    }
+    killing it. */
+func spawnReapedSessionLeader(_ argv: [String], stdoutFD: Int32? = nil) throws -> pid_t {
+    let pid = try spawnBare(argv, flags: POSIX_SPAWN_SETSID, stdoutFD: stdoutFD)
     /** `swift-subprocess` reaps its own children as part of awaiting their
         termination status; a bare `posix_spawn` here has no one else doing
         that. Without a reaper, a test's `kill(pid, 0)` liveness check can
         never observe the teardown it exists to prove: a zombie still answers
         that call with success until something calls `waitpid` on it. */
-    let spawned = pid
     let reaper = Thread {
         var reapedStatus: Int32 = 0
-        waitpid(spawned, &reapedStatus, 0)
+        waitpid(pid, &reapedStatus, 0)
     }
     reaper.start()
-    return spawned
+    return pid
 }
 
 /** A pipe for a spawned root's stdout: the test reads the read end, passes
@@ -128,18 +165,27 @@ func makeOutputPipe() throws -> (read: Int32, write: Int32) {
 
 /** The pid a fixture's `--setsid-listener` prints, read from `fd`. Stops at
     that line rather than end of file, since the listener keeps the same
-    stdout open for as long as it lives; nil if every writer closes first. */
-func readSetsidListenerPid(from fd: Int32) -> pid_t? {
-    let pattern = #"setsid listener pid (\d+)\n"#
+    stdout open for as long as it lives; nil if every writer closes first or
+    nothing arrives within `within`, so a listener that holds stdout open
+    without printing fails the test rather than hanging it. */
+func readSetsidListenerPid(from fd: Int32, within limit: Duration = .seconds(10)) -> pid_t? {
+    let pattern = #/setsid listener pid (\d+)\n/#
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: limit)
     var text = ""
     var buffer = [UInt8](repeating: 0, count: 4096)
-    while text.range(of: pattern, options: .regularExpression) == nil {
+    while true {
+        if let match = text.firstMatch(of: pattern) { return pid_t(match.1) }
+        let remaining = clock.now.duration(to: deadline)
+        guard remaining > .zero else { return nil }
+        let (seconds, attoseconds) = remaining.components
+        let milliseconds = Int32(clamping: seconds * 1000 + attoseconds / 1_000_000_000_000_000)
+        var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        guard poll(&poller, 1, max(1, milliseconds)) > 0 else { return nil }
         let count = read(fd, &buffer, buffer.count)
         guard count > 0 else { return nil }
         text += String(decoding: buffer.prefix(count), as: UTF8.self)
     }
-    guard let match = text.range(of: pattern, options: .regularExpression) else { return nil }
-    return text[match].split(whereSeparator: \.isWhitespace).last.flatMap { pid_t($0) }
 }
 
 /** `readSetsidListenerPid` from async code: the read blocks until the
@@ -149,21 +195,148 @@ func readSetsidListenerPid(from fd: Int32) async -> pid_t? {
     await offPool { readSetsidListenerPid(from: fd) }
 }
 
-/** Resolves once `signal(_:)` is called (or immediately, if it already was),
-    so a test controls exactly when a fake adopted child "exits" without tying
-    that to a real process death. */
+// MARK: - Polling
+
+/** The supervisor's status once its phase is `phase`, or its latest status
+    when `limit` elapses first, so the caller's own `#expect` names what it
+    saw. */
+func awaitPhase(
+    _ supervisor: ServerSupervisor, _ phase: ServerPhase, within limit: Duration = .seconds(5)
+) async throws -> ServerStatus {
+    var latest = await supervisor.status()
+    _ = try await eventually(within: limit) {
+        latest = await supervisor.status()
+        return latest.phase == phase
+    }
+    return latest
+}
+
+/** The pid a fixture printed as a whole `<label> pid <n>` line (`grandchild`,
+    `setsid listener`) into the file at `url`, once it appears within
+    `limit`; a line still being written does not count. */
+func printedPid(_ label: String, in url: URL, within limit: Duration = .seconds(5)) async throws -> pid_t? {
+    let marker = "\(label) pid "
+    return try await poll(within: limit) {
+        let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        guard let range = text.range(of: marker) else { return nil }
+        let rest = text[range.upperBound...]
+        let digits = rest.prefix { $0.isNumber }
+        guard rest.dropFirst(digits.count).first == "\n" else { return nil }
+        return pid_t(digits)
+    }
+}
+
+// MARK: - Router over scratch paths
+
+/** A data and logs root plus one project directory, all inside the current
+    test's `TemporaryTree`. */
+struct RouterEnv {
+    let paths: DirectaPaths
+    /** A real directory: a spawned child chdirs into it. */
+    let project: String
+}
+
+func makeRouterEnv(named name: String, project: String = "proj") throws -> RouterEnv {
+    let base = try TemporaryTree.directory(named: name)
+    let projectURL = base.appending(path: project)
+    try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+    return RouterEnv(
+        paths: DirectaPaths(dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
+        project: projectURL.path)
+}
+
+extension Router {
+    /** The decoded response to one wire request, exactly as a client reads it. */
+    func response<P: Codable & Sendable, R: Codable & Sendable>(
+        _ method: WireMethod, _ params: P, _: R.Type = R.self
+    ) async throws -> WireResponse<R> {
+        let line = try NDJSON.encodeLine(WireRequest(id: "t", method: method.rawValue, params: params))
+        let data = await handle(line: line)
+        return try JSONCoding.decoder().decode(WireResponse<R>.self, from: data)
+    }
+
+    /** The result of a request expected to succeed; a refusal throws its
+        `WireError`, so the failing test names the daemon's own reason. */
+    func call<P: Codable & Sendable, R: Codable & Sendable>(
+        _ method: WireMethod, _ params: P, _ expecting: R.Type = R.self
+    ) async throws -> R {
+        try await attempt(method, params, expecting).get()
+    }
+
+    /** The result, or the `WireError` the daemon refused with, for a request
+        that may fail. */
+    func attempt<P: Codable & Sendable, R: Codable & Sendable>(
+        _ method: WireMethod, _ params: P, _ expecting: R.Type = R.self
+    ) async throws -> Result<R, WireError> {
+        let decoded = try await response(method, params, expecting)
+        if decoded.ok, let result = decoded.result { return .success(result) }
+        return .failure(decoded.error ?? WireError(code: .internalError, message: "no result"))
+    }
+}
+
+/** The `stopped` events recorded for `project` once one carries `detail`
+    (any, when nil), or nil when none does within `limit`. A supervisor the
+    router already dropped posts this event after its last log write and has
+    its state write refused, so awaiting it is how a test whose stop gave up
+    makes sure nothing writes into its tree after it returns. */
+func awaitStoppedEvents(
+    _ router: Router, project: String, detail: String? = nil, within limit: Duration = .seconds(5)
+) async throws -> [EventRecord]? {
+    try await poll(within: limit) {
+        let stopped = try await router.call(
+            .eventsQuery, EventsQueryParams(project: project), EventsQueryResult.self
+        ).events.filter { $0.kind == .stopped }
+        return stopped.contains { detail == nil || $0.detail == detail } ? stopped : nil
+    }
+}
+
+// MARK: - Latches
+
+/** A one-shot latch: `wait` suspends until `open`, then every waiter, and
+    every later `wait`, gets the opened value. A second `open` is ignored. */
+actor Latch<Value: Sendable> {
+    private var value: Value?
+    private var waiters: [CheckedContinuation<Value, Never>] = []
+
+    func open(_ value: Value) {
+        guard self.value == nil else { return }
+        self.value = value
+        let pending = waiters
+        waiters = []
+        for waiter in pending { waiter.resume(returning: value) }
+    }
+
+    func wait() async -> Value {
+        if let value { return value }
+        return await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+extension Latch where Value == Void {
+    func open() { open(()) }
+}
+
+/** Holds a launcher's spawn report until the test opens it. */
+typealias SpawnGate = Latch<Void>
+
+/** Resolves `outcome()` once `signal(_:)` is called (or immediately, if it
+    already was), so a test controls exactly when a fake child "exits" without
+    tying that to a real process death. Counts calls so a test can tell
+    "waiting on the exit" apart from "never asked". */
 actor AdoptGate {
     private(set) var callCount = 0
+    private let called = Latch<Void>()
     private var continuation: CheckedContinuation<ProcessOutcome, Never>?
     private var pending: ProcessOutcome?
 
     func outcome() async -> ProcessOutcome {
         callCount += 1
+        await called.open()
         if let pending { return pending }
         return await withCheckedContinuation { continuation = $0 }
     }
 
-    func signal(_ outcome: ProcessOutcome) {
+    func signal(_ outcome: ProcessOutcome) async {
         if let continuation {
             continuation.resume(returning: outcome)
             self.continuation = nil
@@ -171,16 +344,21 @@ actor AdoptGate {
             pending = outcome
         }
     }
+
+    /** Returns once `outcome()` has been called at least once. */
+    func awaitFirstCall() async {
+        await called.wait()
+    }
 }
 
-/** `run` delegates to a real launcher so the bounce+respawn fallback still
-    spawns for real; `adopt` is fully test-controlled through `gate`, which is
-    what lets a test observe "adopted, not yet exited" independent of the real
-    process the adopted pid names. */
-struct FakeAdoptLauncher: ProcessLauncher {
-    let gate: AdoptGate
-    private let inner: any ProcessLauncher = SubprocessLauncher()
+// MARK: - Fake launchers
 
+/** A fake whose `run` is a real spawn through `inner`. */
+protocol ForwardsRun: ProcessLauncher {
+    var inner: any ProcessLauncher { get }
+}
+
+extension ForwardsRun {
     func run(
         argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
         onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
@@ -190,6 +368,26 @@ struct FakeAdoptLauncher: ProcessLauncher {
             argv: argv, capture: capture, cwd: cwd, environment: environment,
             onExitedBeforeWatch: onExitedBeforeWatch, onSpawn: onSpawn)
     }
+}
+
+/** A fake that refuses every adoption, so recovery bounces instead. */
+protocol NeverAdopts: ProcessLauncher {}
+
+extension NeverAdopts {
+    func prepareAdopt(pid: pid_t) -> Bool { false }
+
+    func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
+        .spawnFailed(SpawnError(message: "\(Self.self) never adopts"))
+    }
+}
+
+/** `run` spawns for real so the bounce+respawn fallback still has something
+    to start; `adopt` is fully test-controlled through `gate`, which is what
+    lets a test observe "adopted, not yet exited" independent of the real
+    process the adopted pid names. */
+struct FakeAdoptLauncher: ForwardsRun {
+    let gate: AdoptGate
+    let inner: any ProcessLauncher = SubprocessLauncher()
 
     func prepareAdopt(pid: pid_t) -> Bool { true }
 
@@ -203,21 +401,11 @@ struct FakeAdoptLauncher: ProcessLauncher {
     `prepareAdopt` refuses every pid, while `run` spawns for real so the
     bounce+respawn fallback has something to start. Counts `prepareAdopt`
     calls so a test can tell "refused" apart from "never asked". */
-final class UnwatchableAdoptLauncher: ProcessLauncher {
-    private let inner: any ProcessLauncher = SubprocessLauncher()
+final class UnwatchableAdoptLauncher: ForwardsRun {
+    let inner: any ProcessLauncher = SubprocessLauncher()
     private let prepareCalls = OSAllocatedUnfairLock(initialState: 0)
 
     var prepareCallCount: Int { prepareCalls.withLock { $0 } }
-
-    func run(
-        argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
-        onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
-        onSpawn: @escaping @Sendable (pid_t) async -> Void
-    ) async -> ProcessOutcome {
-        await inner.run(
-            argv: argv, capture: capture, cwd: cwd, environment: environment,
-            onExitedBeforeWatch: onExitedBeforeWatch, onSpawn: onSpawn)
-    }
 
     func prepareAdopt(pid: pid_t) -> Bool {
         prepareCalls.withLock { $0 += 1 }
@@ -232,13 +420,26 @@ final class UnwatchableAdoptLauncher: ProcessLauncher {
 
 /** The launchd shape of a command that exits before its exit watch is armed,
     without a live launchd job: writes `stderrText` to the capture, reports
-    `pid` through `onExitedBeforeWatch` (never `onSpawn`), and returns the
-    status-unknown outcome `LaunchdJobLauncher` reports for that case. A nil
-    `pid` is the job launchd never showed a pid for. The narrow path never
-    signals the pid, and a non-nil one here is past the kernel's pid range
-    so it could not reach a live process even if it did. */
-struct ExitedBeforeWatchLauncher: ProcessLauncher {
-    let pid: pid_t?
+    the pid `reported` names through `onExitedBeforeWatch` (never `onSpawn`),
+    and returns the status-unknown outcome `LaunchdJobLauncher` reports for
+    that case. The narrow path never signals the pid, and neither case can
+    name a live process even if it did. */
+struct ExitedBeforeWatchLauncher: NeverAdopts {
+    enum ReportedPid: CaseIterable, Sendable {
+        /** Past the kernel's pid range, so no process can have it. */
+        case beyondThePidRange
+        /** The job launchd never showed a pid for. */
+        case neverShown
+
+        var pid: pid_t? {
+            switch self {
+            case .beyondThePidRange: Int32.max
+            case .neverShown: nil
+            }
+        }
+    }
+
+    let reported: ReportedPid
     let stderrText: String
 
     func run(
@@ -251,14 +452,8 @@ struct ExitedBeforeWatchLauncher: ProcessLauncher {
         guard written == bytes.count else {
             return .spawnFailed(SpawnError(message: "could not write the fake child's stderr"))
         }
-        await onExitedBeforeWatch(pid)
+        await onExitedBeforeWatch(reported.pid)
         return .exitedStatusUnknown
-    }
-
-    func prepareAdopt(pid: pid_t) -> Bool { false }
-
-    func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
-        .spawnFailed(SpawnError(message: "ExitedBeforeWatchLauncher never adopts"))
     }
 }
 
@@ -270,7 +465,7 @@ struct ExitedBeforeWatchLauncher: ProcessLauncher {
     without a real multi-second sleep or a race against how fast a flood
     drains. `spawnRoot` picks the real process `run` reports, a long-lived
     session leader by default. */
-struct StuckRunLauncher: ProcessLauncher {
+struct StuckRunLauncher: NeverAdopts {
     let gate: AdoptGate
     var spawnRoot: @Sendable () throws -> pid_t = spawnSurvivor
 
@@ -279,35 +474,14 @@ struct StuckRunLauncher: ProcessLauncher {
         onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
         onSpawn: @escaping @Sendable (pid_t) async -> Void
     ) async -> ProcessOutcome {
-        guard let pid = try? spawnRoot() else {
-            return .spawnFailed(SpawnError(message: "the stuck run's root failed to spawn"))
+        let pid: pid_t
+        do {
+            pid = try spawnRoot()
+        } catch {
+            return .spawnFailed(SpawnError(message: "the stuck run's root failed to spawn: \(error)"))
         }
         await onSpawn(pid)
         return await gate.outcome()
-    }
-
-    func prepareAdopt(pid: pid_t) -> Bool { false }
-
-    func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
-        .spawnFailed(SpawnError(message: "StuckRunLauncher never adopts"))
-    }
-}
-
-/** A one-way latch: `wait` suspends until `open`, and returns at once after. */
-actor SpawnGate {
-    private var isOpen = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func open() {
-        isOpen = true
-        let pending = waiters
-        waiters = []
-        for waiter in pending { waiter.resume() }
-    }
-
-    func wait() async {
-        guard !isOpen else { return }
-        await withCheckedContinuation { waiters.append($0) }
     }
 }
 
@@ -316,7 +490,7 @@ actor SpawnGate {
     `onSpawn` is held behind `gate`, so the supervisor sits in `.starting` with
     no pid. Records every spawned pid so a test can check (and clean up) the
     process itself. */
-final class DelayedSpawnLauncher: ProcessLauncher {
+final class DelayedSpawnLauncher: NeverAdopts {
     let gate: SpawnGate
     private let inner: any ProcessLauncher = SubprocessLauncher()
     private let spawned = OSAllocatedUnfairLock(initialState: [pid_t]())
@@ -342,30 +516,59 @@ final class DelayedSpawnLauncher: ProcessLauncher {
             })
     }
 
-    func prepareAdopt(pid: pid_t) -> Bool { false }
-
-    func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
-        .spawnFailed(SpawnError(message: "DelayedSpawnLauncher never adopts"))
+    /** The first pid `run` spawned, once it has, within `limit`. */
+    func firstPid(within limit: Duration) async throws -> pid_t? {
+        try await poll(within: limit) { pids.first }
     }
 }
 
-/** Ports the unit suites allocate from. Reserved as a block so the stray reaper
-    below can tell this suite's leftovers from any other directa process on the
-    machine, and so a new test picks its port from a documented range instead of
-    guessing at a free number. */
-enum TestPorts {
-    /** Wide enough to cover the suites that draw a random port as well as the
-        hand-assigned literals. It first stopped at 45500, which left
-        `ResourceLockTests` outside it at 41_000 and 42_000: those fixtures went
-        unreaped, and worse, they shared a range with `scripts/smoke.sh`, which
-        draws its project-phase ports from 41000 too. Widening to reach them
-        would have pointed the reaper at smoke's fixtures, so the suites moved
-        in here instead. Anything added below must stay clear of smoke's 39000
-        and 41000 ranges. */
-    static let range = 45000..<46000
+// MARK: - Ports
 
-    static func owns(_ port: Int) -> Bool { range.contains(port) }
+/** The block of ports this test process binds. Two `swift test` runs at once
+    (two worktrees, or a run beside a debugger session) would otherwise bind
+    the same literal ports and fail each other with `port-held`, so each run
+    leases one block of `span` ports under an exclusive `flock` on a per-block
+    file in /tmp (machine-wide, like the ports themselves) and holds it for
+    the life of the process; the kernel drops the lock when the process
+    exits, however it exits. A run finding every block leased waits for one
+    to free. Every block stays clear of each range scripts/smoke.sh draws
+    from, which `theSuitePortBlocksAvoidEverySmokeRange` checks against the
+    script itself. A test names its port as an offset into the block
+    (`TestPorts.port(111)`), never as an absolute number. */
+enum TestPorts {
+    static let bases = [45000, 46000, 47000, 48000]
+    static let span = 1000
+
+    /** Leased on first use. */
+    static let range: Range<Int> = lease()
+
+    /** Every port any run may lease, for the checks against smoke's ranges. */
+    static var reserved: Range<Int> {
+        (bases.min() ?? 0)..<((bases.max() ?? 0) + span)
+    }
+
+    static func port(_ offset: Int) -> Int { range.lowerBound + offset }
+
+    static func lockPath(base: Int) -> String { "/tmp/directa-test-ports-\(base).lock" }
+
+    private static func lease() -> Range<Int> {
+        while true {
+            for base in bases {
+                let descriptor = open(lockPath(base: base), O_RDONLY | O_CREAT | O_CLOEXEC, 0o644)
+                guard descriptor >= 0 else { continue }
+                if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+                    /** Held open for the life of the process; closing it
+                        would release the lease. */
+                    return base..<(base + span)
+                }
+                close(descriptor)
+            }
+            usleep(100_000)
+        }
+    }
 }
+
+// MARK: - Fixture server
 
 /** Path to the built fixture-server, or nil when it has not been built.
 
@@ -400,35 +603,35 @@ private let strayFixturesReaped: Bool = {
     return true
 }()
 
-/** Kills fixture-servers left holding a unit-suite port by a run that was
-    interrupted before it could stop them.
+/** Kills fixture-servers left holding a port in this run's leased block by a
+    run that was interrupted before it could stop them.
 
     A supervised child outliving its daemon is deliberate product behavior, not
     a leak, so the cleanup belongs to whoever spawned it. When a run is killed
-    part way that owner is gone, and the next run fails somewhere unrelated with
-    `port-held` naming a pid nothing is tracking. That cost this suite two runs
-    before it was worth automating.
+    part way that owner is gone, and the next run to lease the block fails
+    somewhere unrelated with `port-held` naming a pid nothing is tracking.
 
-    Two conditions, both required, keep this from reaching a process it does not
-    own. The parent must be gone (`ppid == 1`): a fixture belonging to a live run
-    is parented by that run's test process, so a second concurrent `swift test`
-    is untouched. And the command line must name a port this suite reserves,
-    which is what keeps it away from `scripts/smoke.sh`, whose fixtures use their
-    own ranges and are deliberately orphaned by its daemon-kill assertions. */
+    Two conditions, both required, keep this from reaping a process it does
+    not own. The command line must name a port in the block this process
+    leased, and no other live run can be using a block this process holds the
+    lease on; smoke.sh's fixtures use their own ranges and are deliberately
+    orphaned by its daemon-kill assertions. And the parent must be gone
+    (`ppid == 1`), so a process some live parent still owns is left to it. */
 private func reapStrayFixtureServers() {
     guard let binary = fixtureServerBinaryPath() else { return }
     let name = (binary as NSString).lastPathComponent
     var killed: [pid_t] = []
     for candidate in runningProcesses()
-    where shouldReapStray(command: candidate.command, parent: candidate.parent, binaryName: name) {
+    where shouldReapStray(
+        command: candidate.command, parent: candidate.parent, binaryName: name, ports: TestPorts.range)
+    {
         kill(candidate.pid, SIGKILL)
         killed.append(candidate.pid)
     }
     /** Waits for the kernel to actually tear them down. SIGKILL returns
-        immediately but the listening socket outlives the call by a moment, and a
-        suite that spawned straight afterwards raced it and failed with
-        `port-held` naming a pid this had just killed: a cleanup that does not
-        wait for its own effect is only half a cleanup. */
+        immediately but the listening socket outlives the call by a moment, and
+        a suite spawning straight afterwards would race it and fail with
+        `port-held` naming a pid this had just killed. */
     for _ in 0..<100 where !killed.isEmpty {
         killed = killed.filter { kill($0, 0) == 0 }
         if killed.isEmpty { break }
@@ -437,15 +640,15 @@ private func reapStrayFixtureServers() {
 }
 
 /** The decision on its own, so both halves are testable without spawning
-    anything: the two it must kill and, more importantly, the two it must not. */
-func shouldReapStray(command: String, parent: pid_t, binaryName: String) -> Bool {
-    /** Matched by name rather than by absolute path. A fixture launched through
-        a relative path appears in `ps` exactly as invoked, so a full-path match
-        silently skipped it, and a cleanup that quietly skips its target is
-        indistinguishable from one that works. */
+    anything: the ones it must kill and, more importantly, the ones it must
+    not. */
+func shouldReapStray(command: String, parent: pid_t, binaryName: String, ports: Range<Int>) -> Bool {
+    /** Matched by name rather than by absolute path: a fixture launched
+        through a relative path appears in `ps` exactly as invoked, so a
+        full-path match would skip it without a sound. */
     guard command.contains(binaryName) else { return false }
     guard parent == 1 else { return false }
-    return command.split(separator: " ").compactMap { Int($0) }.contains(where: TestPorts.owns)
+    return command.split(separator: " ").compactMap { Int($0) }.contains(where: ports.contains)
 }
 
 private struct RunningProcess {
@@ -455,17 +658,13 @@ private struct RunningProcess {
 }
 
 /** `ps` rather than the sysctl sweep in DirectaDaemonCore, because the full
-    command line is the thing being matched and `kinfo_proc` does not carry it. */
+    command line is the thing being matched and `kinfo_proc` does not carry it.
+    A bare spawn reaped with `waitpid` rather than Foundation's `Process`,
+    whose `waitUntilExit` spins a run loop on whichever cooperative thread
+    first asks for the fixture. An empty list when `ps` cannot run, which only
+    means nothing is reaped. */
 private func runningProcesses() -> [RunningProcess] {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/bin/ps")
-    process.arguments = ["-A", "-o", "pid=,ppid=,command="]
-    let pipe = Pipe()
-    process.standardOutput = pipe
-    guard (try? process.run()) != nil else { return [] }
-    let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
-    process.waitUntilExit()
-    guard let text = String(data: data, encoding: .utf8) else { return [] }
+    guard let text = try? captureOutput(["/bin/ps", "-A", "-o", "pid=,ppid=,command="]) else { return [] }
     return text.split(separator: "\n").compactMap { line in
         let fields = line.split(separator: " ", omittingEmptySubsequences: true)
         guard fields.count >= 3, let pid = pid_t(fields[0]), let parent = pid_t(fields[1])

@@ -71,7 +71,8 @@ let package = Package(
             swiftSettings: strictCore
         ),
         /** Test-only helpers shared by every test target (the scoped temporary
-            tree). Depended on by test targets alone, so no product links it. */
+            tree, work that blocks off the cooperative pool, bounded polling).
+            Depended on by test targets alone, so no product links it. */
         .target(
             name: "DirectaTestSupport",
             path: "Tests/DirectaTestSupport",

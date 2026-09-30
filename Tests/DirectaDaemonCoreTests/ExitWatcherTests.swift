@@ -6,23 +6,6 @@ import Testing
 
 @testable import DirectaDaemonCore
 
-/** A `spawnBare` child with its signal mask and dispositions reset to default
-    (`POSIX_SPAWN_SETSIGMASK` / `POSIX_SPAWN_SETSIGDEF` with an empty mask and
-    a full default-set), the same pair `swift-subprocess` passes on every spawn
-    (`Subprocess+Darwin.swift`): the `swift test` runner blocks `SIGTERM` in its
-    own mask, which a bare `posix_spawn` otherwise inherits unchanged, so a
-    child spawned without this reset never notices `kill(pid, SIGTERM)`. */
-private func spawnWithDefaultSignals(_ argv: [String]) throws -> pid_t {
-    try spawnBare(argv, flags: POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF) { attr in
-        var noSignals = sigset_t()
-        var allSignals = sigset_t()
-        sigemptyset(&noSignals)
-        sigfillset(&allSignals)
-        posix_spawnattr_setsigmask(&attr, &noSignals)
-        posix_spawnattr_setsigdefault(&attr, &allSignals)
-    }
-}
-
 /** Spawns a bare throwaway child and reaps it on a dedicated background
     thread, exactly like `TestSupport.spawnSurvivor`'s reaper (a bare
     `posix_spawn` has no one else reaping it, and an unreaped exit leaves a
@@ -34,7 +17,7 @@ private func spawnWithDefaultSignals(_ argv: [String]) throws -> pid_t {
     (both read the same kernel-captured exit status independently), which a
     throwaway probe confirmed is safe in either order. */
 private func spawnAndReap(_ argv: [String]) throws -> (pid: pid_t, exited: DispatchSemaphore) {
-    let spawned = try spawnWithDefaultSignals(argv)
+    let spawned = try spawnBare(argv)
     let exited = DispatchSemaphore(value: 0)
     let reaper = Thread {
         var reapedStatus: Int32 = 0
@@ -53,7 +36,7 @@ private func spawnAndReap(_ argv: [String]) throws -> (pid: pid_t, exited: Dispa
     Each `waitpid` call names its own pid, never `-1`, so this can never reap a
     child another concurrently-running test's own reaper is waiting on. */
 private func spawnManyWithOneReaper(_ argv: [String], count: Int) throws -> [pid_t] {
-    let pids = try (0..<count).map { _ in try spawnWithDefaultSignals(argv) }
+    let pids = try (0..<count).map { _ in try spawnBare(argv) }
     let reaper = Thread {
         for pid in pids {
             var status: Int32 = 0

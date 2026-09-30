@@ -61,7 +61,7 @@ import Testing
     }
 
     @Test func simultaneousEnsuresProduceOneProcess() async throws {
-        let env = try env(port: 45471)
+        let env = try env(port: TestPorts.port(471))
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.project)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
@@ -105,7 +105,7 @@ import Testing
         start through to a pid, then reports the port as listening. That
         listener is the server's own run, so the second start joins it. */
     @Test func aRunSpawnedWhileThePreCheckProbesIsTheServersOwn() async throws {
-        let port = 45473
+        let port = TestPorts.port(473)
         let base = try TemporaryTree.directory(named: "concurrent")
         let project = base.appending(path: "proj")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
@@ -155,7 +155,8 @@ import Testing
         written up in BACKLOG.md with its reproduction rather than committed as
         a test that takes the suite down with it. */
     @Test func repeatedEnsuresNeverLeaveASecondListener() async throws {
-        let env = try env(port: 45472)
+        let port = TestPorts.port(472)
+        let env = try env(port: port)
         let registry = Registry(paths: env.paths)
         try await registry.setTrusted(project: env.project)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
@@ -170,12 +171,10 @@ import Testing
 
         /** Asks the port itself rather than the daemon, because the daemon's own
             view is exactly what a leaked process would be missing from. */
-        var free = false
-        for _ in 0..<50 where !free {
-            free = !LoopbackProbe.isListening(port: 45472)
-            if !free { try await Task.sleep(for: .milliseconds(100)) }
+        let free = try await eventually(within: .seconds(5), every: .milliseconds(100)) {
+            await !PortGuard.isListening(port: port)
         }
-        #expect(free, "port 45472 is still held after every server was stopped")
+        #expect(free, "port \(port) is still held after every server was stopped")
     }
 }
 

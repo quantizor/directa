@@ -6,19 +6,8 @@ import os
 
 @testable import DirectaDaemonCore
 
-private struct TestEnv {
-    let paths: DirectaPaths
-    /** A real directory: the child chdirs into it, so it must exist. */
-    let projectPath: String
-}
-
-private func makeEnv() throws -> TestEnv {
-    let base = try TemporaryTree.directory(named: "sup")
-    let project = base.appending(path: "proj")
-    try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
-    return TestEnv(
-        paths: DirectaPaths(dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
-        projectPath: project.path)
+private func makeEnv() throws -> RouterEnv {
+    try makeRouterEnv(named: "sup")
 }
 
 @Suite(.temporaryTree) struct SupervisorTests {
@@ -29,16 +18,17 @@ private func makeEnv() throws -> TestEnv {
         let spec = ServerSpec(
             command: ["/bin/sh", "-c", "echo started; sleep 30"], name: "web")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         let started = await supervisor.start()
         /** start() settles at spawn; health promotion to `running` follows. */
         #expect(started.phase == .starting)
         #expect(started.pid != nil)
-        try await Task.sleep(for: .milliseconds(300))
-        let spool = paths.structuredLogFile(project: env.projectPath, server: "web")
-        let contents = try String(contentsOf: spool, encoding: .utf8)
-        #expect(contents.contains("started"))
+        let spool = paths.structuredLogFile(project: env.project, server: "web")
+        #expect(
+            try await eventually(within: .seconds(3)) {
+                ((try? String(contentsOf: spool, encoding: .utf8)) ?? "").contains("started")
+            })
         let stopped = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
         #expect(stopped.phase == .stopped)
         #expect(stopped.pid == nil)
@@ -53,7 +43,7 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: ["/nonexistent/binary-xyz"], name: "bad")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         let status = await supervisor.start()
         #expect(status.phase == .failed)
@@ -66,9 +56,9 @@ private func makeEnv() throws -> TestEnv {
         let paths = env.paths
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
-        let id = serverID(project: env.projectPath, name: "web")
+        let id = serverID(project: env.project, name: "web")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         _ = await supervisor.start()
         /** Start records the intent to come back after a reboot. */
@@ -83,9 +73,9 @@ private func makeEnv() throws -> TestEnv {
         let paths = env.paths
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
-        let id = serverID(project: env.projectPath, name: "web")
+        let id = serverID(project: env.project, name: "web")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         _ = await supervisor.start()
         _ = await supervisor.stop(
@@ -109,12 +99,12 @@ private func makeEnv() throws -> TestEnv {
         let paths = env.paths
         let registry = Registry(paths: paths)
         let fixture = try #require(fixtureServerExecutable())
-        let port = 45480
+        let port = TestPorts.port(480)
         let spec = ServerSpec(
             command: [fixture, "--flood", "--listen-tcp", "\(port)"],
             healthcheck: HealthCheckSpec(port: port, type: .tcp), name: "flood", port: port)
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         let started = await supervisor.start()
         let outcome = await supervisor.wait(for: .healthy, timeoutSeconds: 5)
@@ -122,10 +112,7 @@ private func makeEnv() throws -> TestEnv {
 
         async let stopped: ServerStatus = supervisor.stop(
             graceSeconds: 2, deliberate: false, reason: "test")
-        /** A head start so stop() has set `.stopping` and sent SIGTERM before
-            ensure() observes it. */
-        try await Task.sleep(for: .milliseconds(50))
-        #expect(await supervisor.status().phase == .stopping)
+        #expect(try await awaitPhase(supervisor, .stopping, within: .seconds(2)).phase == .stopping)
 
         let ensured = await supervisor.ensure(timeoutSeconds: 5)
         #expect(ensured.server.phase == .running)
@@ -142,12 +129,12 @@ private func makeEnv() throws -> TestEnv {
         let paths = env.paths
         let registry = Registry(paths: paths)
         let fixture = try #require(fixtureServerExecutable())
-        let port = 45481
+        let port = TestPorts.port(481)
         let spec = ServerSpec(
             command: [fixture, "--flood", "--listen-tcp", "\(port)"],
             healthcheck: HealthCheckSpec(port: port, type: .tcp), name: "flood", port: port)
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         let started = await supervisor.start()
         let outcome = await supervisor.wait(for: .healthy, timeoutSeconds: 5)
@@ -155,8 +142,7 @@ private func makeEnv() throws -> TestEnv {
 
         async let stopped: ServerStatus = supervisor.stop(
             graceSeconds: 2, deliberate: false, reason: "test")
-        try await Task.sleep(for: .milliseconds(50))
-        #expect(await supervisor.status().phase == .stopping)
+        #expect(try await awaitPhase(supervisor, .stopping, within: .seconds(2)).phase == .stopping)
 
         let restarted = await supervisor.start()
         #expect(restarted.pid != started.pid)
@@ -180,7 +166,7 @@ private func makeEnv() throws -> TestEnv {
         let spec = ServerSpec(command: ["/bin/true"], name: "stuck")
         let gate = AdoptGate()
         let supervisor = ServerSupervisor(
-            launcher: StuckRunLauncher(gate: gate), paths: paths, projectPath: env.projectPath,
+            launcher: StuckRunLauncher(gate: gate), paths: paths, projectPath: env.project,
             registry: registry, spec: spec,
             stopTiming: StopTiming(graceSeconds: StopTiming.standard.graceSeconds, overtimeSeconds: 0.2))
         let started = await supervisor.start()
@@ -195,11 +181,7 @@ private func makeEnv() throws -> TestEnv {
         /** Let the fake `run()` resolve now, so recordOutcome can actually
             finish and nothing is left suspended past the test. */
         await gate.signal(.signaled(signal: Int(SIGKILL)))
-        var cleared = false
-        for _ in 0..<50 where !cleared {
-            cleared = await supervisor.status().phase != .stopping
-            if !cleared { try await Task.sleep(for: .milliseconds(100)) }
-        }
+        let cleared = try await eventually(within: .seconds(5)) { await supervisor.status().phase != .stopping }
         #expect(cleared, "server never left .stopping after the bounded wait gave up")
     }
 
@@ -217,13 +199,13 @@ private func makeEnv() throws -> TestEnv {
         let env = try makeEnv()
         let gate = AdoptGate()
         let supervisor = ServerSupervisor(
-            launcher: StuckRunLauncher(gate: gate), paths: env.paths, projectPath: env.projectPath,
+            launcher: StuckRunLauncher(gate: gate), paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "stuck"),
             stopTiming: StopTiming(graceSeconds: StopTiming.standard.graceSeconds, overtimeSeconds: 0.1))
         #expect(await supervisor.start().pid != nil)
 
         async let stopped = supervisor.stop(graceSeconds: 0.05, reason: "test")
-        #expect(try await waitForPhase(supervisor, .stopping).phase == .stopping)
+        #expect(try await awaitPhase(supervisor, .stopping, within: .seconds(1)).phase == .stopping)
         let valveOpened = OSAllocatedUnfairLock(initialState: false)
         let safetyValve = Task {
             try? await Task.sleep(for: .seconds(10))
@@ -241,7 +223,10 @@ private func makeEnv() throws -> TestEnv {
         safetyValve.cancel()
         await safetyValve.value
         _ = await stopped
-        #expect(try await waitForPhase(supervisor, .stopped).phase == .stopped)
+        /** The released run's recordOutcome writes the log, the event, and the
+            state row before the phase leaves `.stopping`; returning earlier
+            leaves it writing into a tree the trait is already removing. */
+        #expect(try await awaitPhase(supervisor, .stopped, within: .seconds(5)).phase == .stopped)
     }
 
     /** An `ensure()` that first waits out a stop spends only what is left of
@@ -257,10 +242,10 @@ private func makeEnv() throws -> TestEnv {
     @Test func ensureAfterAStopClearsSpendsOnlyTheRemainingTimeout() async throws {
         let env = try makeEnv()
         let gate = AdoptGate()
-        let port = 45483
+        let port = TestPorts.port(483)
         let supervisor = ServerSupervisor(
             launcher: StuckRunLauncher(gate: gate), paths: env.paths, prober: NeverHealthyProber(),
-            projectPath: env.projectPath, registry: Registry(paths: env.paths),
+            projectPath: env.project, registry: Registry(paths: env.paths),
             spec: ServerSpec(
                 command: ["/bin/true"], healthcheck: HealthCheckSpec(port: port, type: .tcp),
                 name: "stuck", port: port),
@@ -269,7 +254,7 @@ private func makeEnv() throws -> TestEnv {
         #expect(first.pid != nil)
 
         async let stopped = supervisor.stop(graceSeconds: 0.05, reason: "test")
-        #expect(try await waitForPhase(supervisor, .stopping).phase == .stopping)
+        #expect(try await awaitPhase(supervisor, .stopping, within: .seconds(1)).phase == .stopping)
         let timeout = Duration.seconds(3)
         let releasedAt = OSAllocatedUnfairLock<ContinuousClock.Instant?>(initialState: nil)
         let release = Task {
@@ -299,7 +284,7 @@ private func makeEnv() throws -> TestEnv {
         async let cleanup = supervisor.stop(graceSeconds: 0.05, reason: "test cleanup")
         await gate.signal(.signaled(signal: Int(SIGKILL)))
         _ = await cleanup
-        #expect(try await waitForPhase(supervisor, .stopped).phase == .stopped)
+        #expect(try await awaitPhase(supervisor, .stopped, within: .seconds(5)).phase == .stopped)
     }
 
     /** Two self-exits in the stall window (nonzero, bounded lifetime, never
@@ -315,17 +300,12 @@ private func makeEnv() throws -> TestEnv {
             command: [fixture, "--exit-after", "2.5", "--code", "1"], name: "auth-stall")
         let bounds = (minSeconds: 1, maxSeconds: 300)
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec, stallBounds: bounds)
-        let id = serverID(project: env.projectPath, name: "auth-stall")
+        let id = serverID(project: env.project, name: "auth-stall")
 
         func awaitCrashed() async throws -> ServerStatus {
-            var status = await supervisor.status()
-            for _ in 0..<80 where status.phase != .crashed {
-                try await Task.sleep(for: .milliseconds(100))
-                status = await supervisor.status()
-            }
-            return status
+            try await awaitPhase(supervisor, .crashed, within: .seconds(8))
         }
 
         _ = await supervisor.start()
@@ -341,7 +321,7 @@ private func makeEnv() throws -> TestEnv {
 
         /** The classification survives a daemon restart through the state file. */
         let rehydrated = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec, stallBounds: bounds)
         #expect(await rehydrated.status().blockedOn == "interactive-auth")
 
@@ -374,38 +354,17 @@ private func makeEnv() throws -> TestEnv {
             command: [fixture, "--orphan-grandchild-ignterm", "--exit-after", "0.5", "--code", "1"],
             name: "ignorer")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         _ = await supervisor.start()
-        var status = await supervisor.status()
-        for _ in 0..<50 where status.phase != .crashed {
-            try await Task.sleep(for: .milliseconds(100))
-            status = await supervisor.status()
-        }
-        #expect(status.phase == .crashed)
+        #expect(try await awaitPhase(supervisor, .crashed).phase == .crashed)
 
-        let spool = paths.spoolOutFile(project: env.projectPath, server: "ignorer")
-        var grandchildPid: pid_t?
-        for _ in 0..<30 {
-            let contents = (try? String(contentsOf: spool, encoding: .utf8)) ?? ""
-            if let line = contents.split(separator: "\n").first(where: { $0.contains("grandchild pid") }),
-                let pid = pid_t(line.split(separator: " ").last.map(String.init) ?? "")
-            {
-                grandchildPid = pid
-                break
-            }
-            try await Task.sleep(for: .milliseconds(100))
-        }
-        let pid = try #require(grandchildPid)
+        let spool = paths.spoolOutFile(project: env.project, server: "ignorer")
+        let pid = try #require(try await printedPid("grandchild", in: spool, within: .seconds(3)))
         /** This grandchild ignores SIGTERM, so its death is itself the proof the
             SIGKILL pass ran. Polled rather than checked at one instant: the
-            pass fires on the product's own grace timer after the phase turns,
-            and a fixed sleep raced that timer under load. */
-        var reaped = false
-        for _ in 0..<100 where !reaped {
-            if kill(pid, 0) != 0 { reaped = true; break }
-            try await Task.sleep(for: .milliseconds(50))
-        }
+            pass fires on the product's own grace timer after the phase turns. */
+        let reaped = try await awaitExit(pid, within: .seconds(5))
         #expect(
             reaped,
             "grandchild \(pid) survived the crash escalation (pgid \(getpgid(pid)), state \(processState(of: pid)))")
@@ -418,19 +377,14 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: ["/bin/sh", "-c", "exit 3"], name: "flaky")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         _ = await supervisor.start()
-        /** The exit lands asynchronously; poll briefly for the phase transition. */
-        var status = await supervisor.status()
-        for _ in 0..<50 where status.phase != .crashed {
-            try await Task.sleep(for: .milliseconds(100))
-            status = await supervisor.status()
-        }
+        let status = try await awaitPhase(supervisor, .crashed)
         #expect(status.phase == .crashed)
         #expect(status.lastExit?.code == 3)
         /** Forensics survive into the persisted state file. */
-        let persisted = await registry.persistedState(serverID: serverID(project: env.projectPath, name: "flaky"))
+        let persisted = await registry.persistedState(serverID: serverID(project: env.project, name: "flaky"))
         #expect(persisted?.lastExit?.code == 3)
     }
 
@@ -445,16 +399,16 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let events = EventStore(url: paths.eventsFile)
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
-        let id = serverID(project: env.projectPath, name: "web")
+        let id = serverID(project: env.project, name: "web")
         let supervisor = ServerSupervisor(
             events: events, launcher: SubprocessLauncher(), paths: paths,
-            projectPath: env.projectPath, registry: registry, spec: spec)
+            projectPath: env.project, registry: registry, spec: spec)
         let started = await supervisor.start()
         let pid = try #require(started.pid)
         #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
 
         kill(pid_t(pid), SIGTERM)
-        let status = try await waitForPhase(supervisor, .stopped)
+        let status = try await awaitPhase(supervisor, .stopped)
         #expect(status.phase == .stopped)
         #expect(status.lastExit?.signal == Int(SIGTERM))
 
@@ -466,7 +420,7 @@ private func makeEnv() throws -> TestEnv {
 
         /** Queried unfiltered: the supervisor canonicalizes projectPath at
             construction (`/private/var` vs `/var` on a symlinked temp dir), so
-            filtering on env.projectPath's raw spelling would silently match
+            filtering on env.project's raw spelling would silently match
             nothing; this EventStore is this test's own temp file regardless. */
         let posted = await events.query()
         let stoppedEvent = try #require(posted.last { $0.kind == .stopped })
@@ -481,13 +435,13 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         let started = await supervisor.start()
         let pid = try #require(started.pid)
 
         kill(pid_t(pid), SIGKILL)
-        let status = try await waitForPhase(supervisor, .crashed)
+        let status = try await awaitPhase(supervisor, .crashed)
         #expect(status.phase == .crashed)
         #expect(status.lastExit?.signal == Int(SIGKILL))
     }
@@ -501,10 +455,10 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let events = EventStore(url: paths.eventsFile)
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
-        let id = serverID(project: env.projectPath, name: "web")
+        let id = serverID(project: env.project, name: "web")
         let supervisor = ServerSupervisor(
             events: events, launcher: SubprocessLauncher(), paths: paths,
-            projectPath: env.projectPath, registry: registry, spec: spec)
+            projectPath: env.project, registry: registry, spec: spec)
         _ = await supervisor.start()
         let stopped = await supervisor.stop(
             graceSeconds: 2, deliberate: true, reason: "requested by stop")
@@ -530,35 +484,19 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: [fixture, "--spawn-grandchild"], name: "composite")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         let started = await supervisor.start()
         let root = try #require(started.pid)
-        var grandchild: pid_t?
-        for _ in 0..<40 {
-            let spool =
-                (try? String(
-                    contentsOf: paths.structuredLogFile(
-                        project: env.projectPath, server: "composite"),
-                    encoding: .utf8)) ?? ""
-            if let match = spool.range(of: #"grandchild pid (\d+)"#, options: .regularExpression) {
-                grandchild = String(spool[match]).split(separator: " ").last.flatMap { pid_t($0) }
-                break
-            }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        let child = try #require(grandchild)
+        let log = paths.structuredLogFile(project: env.project, server: "composite")
+        let child = try #require(try await printedPid("grandchild", in: log, within: .seconds(2)))
         #expect(kill(child, 0) == 0)
 
         kill(pid_t(root), SIGTERM)
-        let status = try await waitForPhase(supervisor, .stopped, tries: 80)
+        let status = try await awaitPhase(supervisor, .stopped, within: .seconds(8))
         #expect(status.phase == .stopped)
 
-        var reaped = false
-        for _ in 0..<100 where !reaped {
-            if kill(child, 0) != 0 { reaped = true; break }
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        let reaped = try await awaitExit(child, within: .seconds(5))
         if !reaped { kill(child, SIGKILL) }
         #expect(reaped, "grandchild \(child) survived an externally SIGTERM'd root")
     }
@@ -572,44 +510,21 @@ private func makeEnv() throws -> TestEnv {
             command: [fixture, "--spawn-grandchild", "--exit-after", "0.6", "--code", "1"],
             name: "composite")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         let started = await supervisor.start()
         #expect(started.pid != nil)
-        var grandchild: pid_t?
-        for _ in 0..<40 {
-            let spool =
-                (try? String(
-                    contentsOf: paths.structuredLogFile(
-                        project: env.projectPath, server: "composite"),
-                    encoding: .utf8)) ?? ""
-            if let match = spool.range(of: #"grandchild pid (\d+)"#, options: .regularExpression) {
-                let line = String(spool[match])
-                grandchild = line.split(separator: " ").last.flatMap { pid_t($0) }
-                break
-            }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        let child = try #require(grandchild)
+        let log = paths.structuredLogFile(project: env.project, server: "composite")
+        let child = try #require(try await printedPid("grandchild", in: log, within: .seconds(2)))
         #expect(kill(child, 0) == 0)
-        let crashed = try await waitForPhase(supervisor, .crashed, tries: 80)
+        let crashed = try await awaitPhase(supervisor, .crashed, within: .seconds(8))
         #expect(crashed.phase == .crashed)
-        /** The descendant sweep runs after the phase turns, so poll for the
-            outcome rather than sleeping a fixed slice: under load that fixed
-            wait expires before the sweep lands and fails a working teardown. */
-        var reaped = false
-        for _ in 0..<100 where !reaped {
-            if kill(child, 0) != 0 {
-                reaped = true
-                break
-            }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        /** A bare verdict here cost several sessions: "Expectation failed:
-            reaped" says a descendant survived but not which one, whose child it
-            was, or what group it was in, which are the three facts that separate
-            a missed snapshot from a group-kill that could never have reached
-            it. */
+        /** The descendant sweep runs after the phase turns, so the outcome is
+            polled rather than checked at one instant. */
+        let reaped = try await awaitExit(child, within: .seconds(5))
+        /** The message names the survivor's group, parent, and state: the
+            facts that separate a missed snapshot from a group-kill that could
+            never have reached it. */
         #expect(
             reaped,
             """
@@ -633,23 +548,12 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: [fixture, "--orphan-grandchild"], name: "web")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         let started = await supervisor.start()
         let root = pid_t(exactly: try #require(started.pid))
-        var grandchild: pid_t?
-        for _ in 0..<40 {
-            let spool =
-                (try? String(
-                    contentsOf: paths.structuredLogFile(project: env.projectPath, server: "web"),
-                    encoding: .utf8)) ?? ""
-            if let match = spool.range(of: #"grandchild pid (\d+)"#, options: .regularExpression) {
-                grandchild = String(spool[match]).split(separator: " ").last.flatMap { pid_t($0) }
-                break
-            }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        let child = try #require(grandchild)
+        let log = paths.structuredLogFile(project: env.project, server: "web")
+        let child = try #require(try await printedPid("grandchild", in: log, within: .seconds(2)))
         #expect(kill(child, 0) == 0)
         /** The precondition that makes this a session-only case: the sleep is no
             longer a parent-chain descendant of the root, so only a session sweep
@@ -659,14 +563,7 @@ private func makeEnv() throws -> TestEnv {
         }
         let stopped = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
         #expect(stopped.phase == .stopped)
-        var reaped = false
-        for _ in 0..<100 where !reaped {
-            if kill(child, 0) != 0 {
-                reaped = true
-                break
-            }
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        let reaped = try await awaitExit(child, within: .seconds(5))
         #expect(
             reaped,
             "orphaned session grandchild \(child) survived directa stop (state: \(processState(of: child)))")
@@ -691,7 +588,7 @@ private func makeEnv() throws -> TestEnv {
             own, so a regression cannot hang the suite, only slow this case. */
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 2"], name: "web")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         for _ in 0..<4 {
             await withTaskGroup(of: Void.self) { group in
@@ -720,7 +617,7 @@ private func makeEnv() throws -> TestEnv {
         let env = try makeEnv()
         let gate = AdoptGate()
         let supervisor = ServerSupervisor(
-            launcher: StuckRunLauncher(gate: gate), paths: env.paths, projectPath: env.projectPath,
+            launcher: StuckRunLauncher(gate: gate), paths: env.paths, projectPath: env.project,
             readIdentity: { pid in
                 ProcessTree.identity(of: pid).map {
                     ProcessIdentity(
@@ -739,7 +636,7 @@ private func makeEnv() throws -> TestEnv {
 
         kill(root, SIGKILL)
         await gate.signal(.signaled(signal: Int(SIGKILL)))
-        #expect(try await waitForPhase(supervisor, .stopped).phase == .stopped)
+        #expect(try await awaitPhase(supervisor, .stopped).phase == .stopped)
     }
 
     /** The grace window belongs to every process the SIGTERM reached, not only
@@ -750,7 +647,7 @@ private func makeEnv() throws -> TestEnv {
         prevented. */
     @Test func stopGivesADescendantItsGraceAfterTheRootExits() async throws {
         let env = try makeEnv()
-        let marker = URL(fileURLWithPath: env.projectPath).appending(path: "cleaned")
+        let marker = URL(fileURLWithPath: env.project).appending(path: "cleaned")
         let spec = ServerSpec(
             command: [
                 "/bin/sh", "-c",
@@ -758,15 +655,14 @@ private func makeEnv() throws -> TestEnv {
             ],
             name: "slow-worker")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths), spec: spec)
         #expect(await supervisor.start().pid != nil)
         /** The subshell writes `ready` once its trap is installed. */
-        let ready = URL(fileURLWithPath: env.projectPath).appending(path: "ready")
-        for _ in 0..<250 where !FileManager.default.fileExists(atPath: ready.path) {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        try #require(FileManager.default.fileExists(atPath: ready.path), "the worker never installed its trap")
+        let ready = URL(fileURLWithPath: env.project).appending(path: "ready")
+        try #require(
+            try await eventually(within: .seconds(5)) { FileManager.default.fileExists(atPath: ready.path) },
+            "the worker never installed its trap")
 
         let stopped = await supervisor.stop(graceSeconds: 4, reason: "test")
         #expect(stopped.phase == .stopped)
@@ -785,8 +681,8 @@ private func makeEnv() throws -> TestEnv {
     @Test func aListenerThatLeftTheRootsParentChainIsStillTheServersPort() async throws {
         let fixture = try #require(fixtureServerExecutable())
         let env = try makeEnv()
-        let port = 45_490
-        let healthPort = 45_491
+        let port = TestPorts.port(490)
+        let healthPort = TestPorts.port(491)
         let spec = ServerSpec(
             command: [
                 "/bin/sh", "-c",
@@ -795,42 +691,32 @@ private func makeEnv() throws -> TestEnv {
             healthcheck: HealthCheckSpec(intervalMs: 200, port: healthPort, type: .tcp),
             name: "daemonizer", port: port)
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths), spec: spec)
         let root = try #require(await supervisor.start().pid.flatMap { pid_t(exactly: $0) })
-        let spool = env.paths.spoolOutFile(project: env.projectPath, server: "daemonizer")
-        var listener: pid_t?
-        for _ in 0..<100 where listener == nil {
-            let text = (try? String(contentsOf: spool, encoding: .utf8)) ?? ""
-            if let match = text.range(of: #"setsid listener pid (\d+)"#, options: .regularExpression) {
-                listener = String(text[match]).split(separator: " ").last.flatMap { pid_t($0) }
-            }
-            if listener == nil { try await Task.sleep(for: .milliseconds(20)) }
-        }
-        let worker = try #require(listener, "the fixture never reported its setsid listener")
+        let spool = env.paths.spoolOutFile(project: env.project, server: "daemonizer")
+        let worker = try #require(
+            try await printedPid("setsid listener", in: spool, within: .seconds(2)),
+            "the fixture never reported its setsid listener")
         defer { kill(worker, SIGKILL) }
         /** Several descendant refreshes while the listener's parent still
             parents it, then that parent goes. */
         try await Task.sleep(for: .seconds(1))
         let parent = try #require(ProcessTree.descendants(of: root).pids.first { $0 != worker })
         kill(parent, SIGKILL)
-        for _ in 0..<100 where ProcessTree.descendants(of: root).pids.contains(worker) {
-            try await Task.sleep(for: .milliseconds(20))
-        }
         /** The premise: the listener is no longer in the root's parent chain. */
-        #expect(!ProcessTree.descendants(of: root).pids.contains(worker))
+        #expect(try await eventually(within: .seconds(2)) { !ProcessTree.descendants(of: root).pids.contains(worker) })
         #expect(await supervisor.status().phase == .starting)
 
         let health = try spawnReapedSessionLeader([fixture, "--listen-tcp", "\(healthPort)"])
         defer { kill(health, SIGKILL) }
-        #expect(try await waitForPhase(supervisor, .running, tries: 50).phase == .running)
-        var status = await supervisor.status()
-        for _ in 0..<50 where status.observedPort == nil && status.portConflict == nil {
-            try await Task.sleep(for: .milliseconds(50))
-            status = await supervisor.status()
+        #expect(try await awaitPhase(supervisor, .running).phase == .running)
+        let status = try await poll(within: .seconds(3)) {
+            let current = await supervisor.status()
+            return current.observedPort == nil && current.portConflict == nil ? nil : current
         }
-        #expect(status.observedPort == port)
-        #expect(status.portConflict == nil)
+        #expect(status?.observedPort == port)
+        #expect(status?.portConflict == nil)
         _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
     }
 
@@ -845,32 +731,15 @@ private func makeEnv() throws -> TestEnv {
     }
 
     private func shell(_ argv: [String]) -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: argv[0])
-        process.arguments = Array(argv.dropFirst())
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        guard (try? process.run()) != nil else { return "" }
-        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
-        process.waitUntilExit()
-        return String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        (try? captureOutput(argv))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    /** The same teardown guarantee, with the timing that used to decide it made
-        explicit instead of left to machine load.
-
-        Foundation's `Process` puts its child in a NEW process group, so the
-        crash path's group-directed kill provably cannot reach a grandchild and
-        the descendant snapshot is the only thing that can. That snapshot was
-        taken once at spawn and once 100ms later, and for a server with no
-        healthcheck the first health probe (which also refreshes it) waits out a
-        two second stabilization window. A grandchild appearing in between was
-        therefore in no snapshot at all, and a crash orphaned it permanently.
-
-        `crashKillsSessionGrandchild` above spawns its grandchild immediately and
-        so usually wins that race, which is exactly why it failed only under
-        load. This one spawns at 400ms and loses it every time. */
+    /** The same teardown guarantee with the timing made explicit. Foundation's
+        `Process` puts its child in a new process group, so the crash path's
+        group-directed kill cannot reach this grandchild and only a descendant
+        source can. It appears 400ms after spawn, past the early snapshot and
+        before a server with no healthcheck gets its first probe, so only the
+        starting-window refresh (or a later source) records it. */
     @Test func crashKillsAGrandchildSpawnedAfterTheEarlySnapshot() async throws {
         let fixture = try #require(fixtureServerExecutable())
         let env = try makeEnv()
@@ -883,40 +752,25 @@ private func makeEnv() throws -> TestEnv {
             ],
             name: "late")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         #expect(await supervisor.start().pid != nil)
 
-        var grandchild: pid_t?
-        for _ in 0..<60 where grandchild == nil {
-            let log =
-                (try? String(
-                    contentsOf: paths.structuredLogFile(project: env.projectPath, server: "late"),
-                    encoding: .utf8)) ?? ""
-            if let match = log.range(of: #"grandchild pid (\d+)"#, options: .regularExpression) {
-                grandchild = String(log[match]).split(separator: " ").last.flatMap { pid_t($0) }
-            }
-            if grandchild == nil { try await Task.sleep(for: .milliseconds(50)) }
-        }
-        let child = try #require(grandchild, "fixture never reported a grandchild pid")
+        let child = try #require(
+            try await printedPid(
+                "grandchild", in: paths.structuredLogFile(project: env.project, server: "late"),
+                within: .seconds(3)),
+            "fixture never reported a grandchild pid")
         /** The premise, asserted rather than assumed: if this ever spawned into
             the root's group, the group kill would cover it and this test would
             be proving nothing. */
         #expect(getpgid(child) == child)
 
-        let crashed = try await waitForPhase(supervisor, .crashed, tries: 80)
+        let crashed = try await awaitPhase(supervisor, .crashed, within: .seconds(8))
         #expect(crashed.phase == .crashed)
 
-        var reaped = false
-        for _ in 0..<100 where !reaped {
-            if kill(child, 0) != 0 { reaped = true; break }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        if !reaped {
-            /** Names the survivor and its parent, so a failure carries the
-                evidence rather than only the verdict. */
-            kill(child, SIGKILL)
-        }
+        let reaped = try await awaitExit(child, within: .seconds(5))
+        if !reaped { kill(child, SIGKILL) }
         #expect(reaped, "grandchild \(child) survived the crash teardown (pgid \(getpgid(child)))")
     }
 
@@ -933,41 +787,25 @@ private func makeEnv() throws -> TestEnv {
         let gate = SpawnGate()
         let launcher = DelayedSpawnLauncher(gate: gate)
         let supervisor = ServerSupervisor(
-            launcher: launcher, paths: env.paths, projectPath: env.projectPath,
+            launcher: launcher, paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths),
             spec: ServerSpec(
                 command: [fixture, "--spawn-grandchild", "--exit-after", "0.2", "--code", "1"],
                 name: "late-pid"))
 
         async let started = supervisor.start()
-        for _ in 0..<100 where launcher.pids.isEmpty {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        let root = try #require(launcher.pids.first)
-        let spool = env.paths.spoolOutFile(project: env.projectPath, server: "late-pid")
-        var grandchild: pid_t?
-        for _ in 0..<100 where grandchild == nil {
-            let text = (try? String(contentsOf: spool, encoding: .utf8)) ?? ""
-            if let match = text.range(of: #"grandchild pid (\d+)"#, options: .regularExpression) {
-                grandchild = String(text[match]).split(separator: " ").last.flatMap { pid_t($0) }
-            }
-            if grandchild == nil { try await Task.sleep(for: .milliseconds(20)) }
-        }
-        let child = try #require(grandchild, "fixture never reported a grandchild pid")
+        let root = try #require(try await launcher.firstPid(within: .seconds(2)))
+        let spool = env.paths.spoolOutFile(project: env.project, server: "late-pid")
+        let child = try #require(
+            try await printedPid("grandchild", in: spool, within: .seconds(2)),
+            "fixture never reported a grandchild pid")
         defer { kill(child, SIGKILL) }
-        for _ in 0..<250 where getsid(root) != -1 {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        try #require(getsid(root) == -1, "root \(root) never exited")
+        try #require(try await eventually(within: .seconds(5)) { getsid(root) == -1 }, "root \(root) never exited")
 
         await gate.open()
         _ = await started
-        #expect(try await waitForPhase(supervisor, .crashed, tries: 80).phase == .crashed)
-        var reaped = false
-        for _ in 0..<100 where !reaped {
-            if kill(child, 0) != 0 { reaped = true; break }
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        #expect(try await awaitPhase(supervisor, .crashed, within: .seconds(8)).phase == .crashed)
+        let reaped = try await awaitExit(child, within: .seconds(5))
         #expect(
             reaped,
             "grandchild \(child) survived a crash whose pid arrived after the root exited (pgid \(getpgid(child)))")
@@ -987,7 +825,7 @@ private func makeEnv() throws -> TestEnv {
         let fixture = try #require(fixtureServerExecutable())
         let env = try makeEnv()
         let gate = AdoptGate()
-        let port = 45_487
+        let port = TestPorts.port(487)
         let (readEnd, writeEnd) = try makeOutputPipe()
         defer { close(readEnd) }
         let launcher = StuckRunLauncher(
@@ -997,7 +835,7 @@ private func makeEnv() throws -> TestEnv {
                     [fixture, "--setsid-listener", "\(port)"], stdoutFD: writeEnd)
             })
         let supervisor = ServerSupervisor(
-            launcher: launcher, paths: env.paths, projectPath: env.projectPath,
+            launcher: launcher, paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths),
             spec: ServerSpec(command: ["/bin/true"], name: "setsid"))
         let root = try #require(await supervisor.start().pid.flatMap { pid_t(exactly: $0) })
@@ -1011,19 +849,12 @@ private func makeEnv() throws -> TestEnv {
         #expect(getsid(child) == child)
         try await Task.sleep(for: .milliseconds(600))
         kill(root, SIGKILL)
-        for _ in 0..<250 where getsid(root) != -1 {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        try #require(getsid(root) == -1, "root \(root) never exited")
+        try #require(try await eventually(within: .seconds(5)) { getsid(root) == -1 }, "root \(root) never exited")
         try await Task.sleep(for: .milliseconds(600))
 
         await gate.signal(.exited(code: 1))
-        #expect(try await waitForPhase(supervisor, .crashed, tries: 80).phase == .crashed)
-        var reaped = false
-        for _ in 0..<100 where !reaped {
-            if kill(child, 0) != 0 { reaped = true; break }
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        #expect(try await awaitPhase(supervisor, .crashed, within: .seconds(8)).phase == .crashed)
+        let reaped = try await awaitExit(child, within: .seconds(5))
         #expect(reaped, "setsid listener \(child) survived a crash its snapshot had recorded")
     }
 
@@ -1045,13 +876,13 @@ private func makeEnv() throws -> TestEnv {
             spawnRoot: {
                 try spawnReapedSessionLeader(
                     [
-                        fixture, "--setsid-listener", "45489", "--grandchild-after", "0.5",
+                        fixture, "--setsid-listener", "\(TestPorts.port(489))", "--grandchild-after", "0.5",
                         "--exit-after-spawn", "--code", "1",
                     ],
                     stdoutFD: writeEnd)
             })
         let supervisor = ServerSupervisor(
-            launcher: launcher, paths: env.paths, projectPath: env.projectPath,
+            launcher: launcher, paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths),
             spec: ServerSpec(command: ["/bin/true"], name: "late-setsid"))
         let root = try #require(await supervisor.start().pid.flatMap { pid_t(exactly: $0) })
@@ -1059,34 +890,15 @@ private func makeEnv() throws -> TestEnv {
         let child = try #require(
             await readSetsidListenerPid(from: readEnd), "root \(root) never spawned its setsid listener")
         defer { kill(child, SIGKILL) }
-        for _ in 0..<250 where getsid(root) != -1 {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        try #require(getsid(root) == -1, "root \(root) never exited")
+        try #require(try await eventually(within: .seconds(5)) { getsid(root) == -1 }, "root \(root) never exited")
         /** The premise: a session of its own, alive after the root is gone. */
         #expect(getsid(child) == child)
         #expect(kill(child, 0) == 0)
 
         await gate.signal(.exited(code: 1))
-        #expect(try await waitForPhase(supervisor, .crashed, tries: 80).phase == .crashed)
-        var reaped = false
-        for _ in 0..<100 where !reaped {
-            if kill(child, 0) != 0 { reaped = true; break }
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        #expect(try await awaitPhase(supervisor, .crashed, within: .seconds(8)).phase == .crashed)
+        let reaped = try await awaitExit(child, within: .seconds(5))
         #expect(reaped, "setsid child \(child) outlived a crash (ppid \(parentPid(of: child)))")
-    }
-
-    /** Poll the supervisor until it reaches `phase` or the budget runs out. */
-    private func waitForPhase(
-        _ supervisor: ServerSupervisor, _ phase: ServerPhase, tries: Int = 50
-    ) async throws -> ServerStatus {
-        var status = await supervisor.status()
-        for _ in 0..<tries where status.phase != phase {
-            try await Task.sleep(for: .milliseconds(100))
-            status = await supervisor.status()
-        }
-        return status
     }
 
     @Test func crashCapturesErrorLineTally() async throws {
@@ -1096,17 +908,17 @@ private func makeEnv() throws -> TestEnv {
         let spec = ServerSpec(
             command: ["/bin/sh", "-c", "echo boom >&2; echo bang >&2; exit 1"], name: "noisy")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         _ = await supervisor.start()
-        let status = try await waitForPhase(supervisor, .crashed)
+        let status = try await awaitPhase(supervisor, .crashed)
         #expect(status.phase == .crashed)
         /** Two stderr lines this run: directa's own count, not the lines. */
         #expect(status.errorSummary?.count == 2)
         #expect(status.errorSummary.map { $0.lastAt >= $0.firstAt } == true)
         /** And it survives into the state file for a post-restart read. */
         let persisted = await registry.persistedState(
-            serverID: serverID(project: env.projectPath, name: "noisy"))
+            serverID: serverID(project: env.project, name: "noisy"))
         #expect(persisted?.errorSummary?.count == 2)
     }
 
@@ -1119,10 +931,10 @@ private func makeEnv() throws -> TestEnv {
         let spec = ServerSpec(
             command: ["/bin/sh", "-c", "echo once >&2; exit 1"], name: "cycle")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         _ = await supervisor.start()
-        let crashed = try await waitForPhase(supervisor, .crashed)
+        let crashed = try await awaitPhase(supervisor, .crashed)
         #expect(crashed.errorSummary?.count == 1)
         await supervisor.updateSpec(ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "cycle"))
         _ = await supervisor.start()
@@ -1134,7 +946,7 @@ private func makeEnv() throws -> TestEnv {
     @Test func errorSummaryRehydratesFromStateFile() async throws {
         let env = try makeEnv()
         let paths = env.paths
-        let id = serverID(project: env.projectPath, name: "web")
+        let id = serverID(project: env.project, name: "web")
         /** A prior daemon left a crashed row with a tally; a fresh supervisor for
             the same server surfaces it without re-running anything. */
         let seed = Registry(paths: paths)
@@ -1147,7 +959,7 @@ private func makeEnv() throws -> TestEnv {
         }
         let registry = Registry(paths: paths)
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web"))
         let status = await supervisor.status()
         #expect(status.phase == .crashed)
@@ -1163,8 +975,8 @@ private func makeEnv() throws -> TestEnv {
     @Test func statusCachesTheLogTailAfterRehydrate() async throws {
         let env = try makeEnv()
         let paths = env.paths
-        let id = serverID(project: env.projectPath, name: "web")
-        let logURL = paths.structuredLogFile(project: env.projectPath, server: "web")
+        let id = serverID(project: env.project, name: "web")
+        let logURL = paths.structuredLogFile(project: env.project, server: "web")
         let seedLog = LogStore(currentURL: logURL)
         await seedLog.append(stream: .out, text: "rehydrate-marker-original")
         let seed = Registry(paths: paths)
@@ -1173,7 +985,7 @@ private func makeEnv() throws -> TestEnv {
         }
         let registry = Registry(paths: paths)
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web"))
         let first = await supervisor.status()
         #expect(first.phase == .crashed)
@@ -1192,7 +1004,7 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "solo")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         async let a = supervisor.start()
         async let b = supervisor.start()
@@ -1210,8 +1022,8 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
         let supervisor = ServerSupervisor(
-            launcher: LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix), paths: paths,
-            projectPath: env.projectPath,
+            launcher: testLaunchdJobLauncher(), paths: paths,
+            projectPath: env.project,
             registry: registry, spec: spec)
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
@@ -1224,7 +1036,7 @@ private func makeEnv() throws -> TestEnv {
         #expect(status.pid == Int(survivor))
         #expect((status.uptimeSec ?? 0) >= 495)
         let persisted = await registry.persistedState(
-            serverID: serverID(project: env.projectPath, name: "web"))
+            serverID: serverID(project: env.project, name: "web"))
         #expect(persisted?.startedAt == priorStartedAt)
         _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
     }
@@ -1241,8 +1053,8 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
         let supervisor = ServerSupervisor(
-            launcher: LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix), paths: paths,
-            projectPath: env.projectPath,
+            launcher: testLaunchdJobLauncher(), paths: paths,
+            projectPath: env.project,
             registry: registry, spec: spec)
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
@@ -1254,7 +1066,7 @@ private func makeEnv() throws -> TestEnv {
         let status = await supervisor.status()
         let afterStatus = Date()
         let startedAt = try #require(
-            await registry.persistedState(serverID: serverID(project: env.projectPath, name: "web"))?.startedAt)
+            await registry.persistedState(serverID: serverID(project: env.project, name: "web"))?.startedAt)
         #expect((beforeAdopt...afterStatus).contains(startedAt))
         let uptime = try #require(status.uptimeSec)
         #expect((0...Int(afterStatus.timeIntervalSince(beforeAdopt))).contains(uptime))
@@ -1274,7 +1086,7 @@ private func makeEnv() throws -> TestEnv {
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
         let gate = AdoptGate()
         let supervisor = ServerSupervisor(
-            launcher: FakeAdoptLauncher(gate: gate), paths: paths, projectPath: env.projectPath,
+            launcher: FakeAdoptLauncher(gate: gate), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
@@ -1285,11 +1097,8 @@ private func makeEnv() throws -> TestEnv {
         let adopted = await supervisor.status()
         #expect(adopted.phase == .starting)
         #expect(adopted.pid == Int(survivor))
-        /** The exit-watch task's first `await` races this assertion; poll
-            briefly rather than asserting the instant `adopt()` returns. */
-        for _ in 0..<50 where await gate.callCount == 0 {
-            try await Task.sleep(for: .milliseconds(20))
-        }
+        /** The exit-watch task's first `await` races `adopt()` returning. */
+        await gate.awaitFirstCall()
         #expect(await gate.callCount == 1)
         /** The real process is untouched; only the exit-watch fake fires. */
         #expect(kill(survivor, 0) == 0)
@@ -1298,12 +1107,12 @@ private func makeEnv() throws -> TestEnv {
             externalSIGTERMLandsStoppedWithTheSignalNamedAsExternal for that), so
             it uses the one signal that stays `crashed` regardless of who sent it. */
         await gate.signal(.signaled(signal: Int(SIGKILL)))
-        let crashed = try await waitForPhase(supervisor, .crashed)
+        let crashed = try await awaitPhase(supervisor, .crashed)
         #expect(crashed.phase == .crashed)
         #expect(crashed.lastExit?.signal == Int(SIGKILL))
         #expect(crashed.pid == nil)
         let persisted = await registry.persistedState(
-            serverID: serverID(project: env.projectPath, name: "web"))
+            serverID: serverID(project: env.project, name: "web"))
         #expect(persisted?.phase == .crashed)
         #expect(persisted?.lastExit?.signal == Int(SIGKILL))
     }
@@ -1319,11 +1128,11 @@ private func makeEnv() throws -> TestEnv {
         let spec = ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web")
         let launcher = UnwatchableAdoptLauncher()
         let supervisor = ServerSupervisor(
-            launcher: launcher, paths: paths, projectPath: env.projectPath,
+            launcher: launcher, paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
-        let spool = paths.spoolOutFile(project: env.projectPath, server: "web")
+        let spool = paths.spoolOutFile(project: env.project, server: "web")
         try FileManager.default.createDirectory(
             at: spool.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data().write(to: spool)
@@ -1338,16 +1147,18 @@ private func makeEnv() throws -> TestEnv {
         #expect(status.pid == nil)
         #expect(
             await registry.persistedState(
-                serverID: serverID(project: env.projectPath, name: "web")) == nil)
+                serverID: serverID(project: env.project, name: "web")) == nil)
 
         let handle = try FileHandle(forWritingTo: spool)
         try handle.seekToEnd()
         try handle.write(contentsOf: Data("written after a refused adopt\n".utf8))
         try handle.close()
         /** A running tailer polls the spool well inside this window. */
-        try await Task.sleep(for: .milliseconds(500))
+        let ingested = try await eventually(within: .milliseconds(500)) {
+            await !supervisor.logQuery(LogQueryOptions(streams: [.out, .sys])).lines.isEmpty
+        }
         let lines = await supervisor.logQuery(LogQueryOptions(streams: [.out, .sys])).lines
-        #expect(lines.isEmpty, "log after a refused adopt: \(lines.map(\.text))")
+        #expect(!ingested, "log after a refused adopt: \(lines.map(\.text))")
     }
 
     /** A stop that lands while `adopt` is still recording the run (its pid is
@@ -1362,50 +1173,29 @@ private func makeEnv() throws -> TestEnv {
         let gate = AdoptGate()
         let launcher = StopOnPrepareLauncher(gate: gate)
         let supervisor = ServerSupervisor(
-            launcher: launcher, paths: env.paths, projectPath: env.projectPath,
+            launcher: launcher, paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "web"))
         let stopTask = OSAllocatedUnfairLock<Task<ServerStatus, Never>?>(initialState: nil)
         launcher.onPrepare {
             stopTask.withLock { $0 = Task { await supervisor.stop(graceSeconds: 3, reason: "test") } }
         }
-        let marker = URL(fileURLWithPath: env.projectPath).appending(path: "cleaned")
-        let ready = URL(fileURLWithPath: env.projectPath).appending(path: "ready")
-        /** The runner blocks SIGTERM in its own mask, which a bare spawn
-            inherits, so the survivor resets its mask and dispositions the way
-            every real launcher does, or it would never see the stop's SIGTERM. */
-        let survivor = try spawnBare(
-            [
-                "/bin/sh", "-c",
-                "trap 'sleep 0.5; echo done > \"\(marker.path)\"; exit 0' TERM; : > \"\(ready.path)\"; while :; do sleep 0.1; done",
-            ],
-            flags: POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF
-        ) { attributes in
-            var none = sigset_t()
-            var all = sigset_t()
-            sigemptyset(&none)
-            sigfillset(&all)
-            posix_spawnattr_setsigmask(&attributes, &none)
-            posix_spawnattr_setsigdefault(&attributes, &all)
-        }
-        let reaper = Thread {
-            var status: Int32 = 0
-            waitpid(survivor, &status, 0)
-        }
-        reaper.start()
+        let marker = URL(fileURLWithPath: env.project).appending(path: "cleaned")
+        let ready = URL(fileURLWithPath: env.project).appending(path: "ready")
+        let survivor = try spawnReapedSessionLeader([
+            "/bin/sh", "-c",
+            "trap 'sleep 0.5; echo done > \"\(marker.path)\"; exit 0' TERM; : > \"\(ready.path)\"; while :; do sleep 0.1; done",
+        ])
         defer { kill(survivor, SIGKILL) }
         /** The survivor writes `ready` once its trap is installed. */
-        for _ in 0..<250 where !FileManager.default.fileExists(atPath: ready.path) {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        try #require(FileManager.default.fileExists(atPath: ready.path), "the survivor never installed its trap")
+        try #require(
+            try await eventually(within: .seconds(5)) { FileManager.default.fileExists(atPath: ready.path) },
+            "the survivor never installed its trap")
 
         #expect(
             await supervisor.adopt(
                 pid: survivor, label: "dev.quantizor.directa.job.adopt-stop", boundPort: nil,
                 startedAt: nil))
-        for _ in 0..<100 where kill(survivor, 0) == 0 {
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        #expect(try await awaitExit(survivor, within: .seconds(5)))
         await gate.signal(.signaled(signal: Int(SIGTERM)))
         let stop = try #require(stopTask.withLock { $0 })
         #expect(await stop.value.phase == .stopped)
@@ -1423,7 +1213,7 @@ private func makeEnv() throws -> TestEnv {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
         let supervisor = ServerSupervisor(
-            launcher: ExitsAtOnceAdoptLauncher(), paths: env.paths, projectPath: env.projectPath,
+            launcher: ExitsAtOnceAdoptLauncher(), paths: env.paths, projectPath: env.project,
             registry: registry, spec: ServerSpec(command: ["/bin/true"], name: "web"))
         let survivor = try spawnSurvivor()
         defer { kill(survivor, SIGKILL) }
@@ -1432,11 +1222,11 @@ private func makeEnv() throws -> TestEnv {
             await supervisor.adopt(
                 pid: survivor, label: "dev.quantizor.directa.job.instant", boundPort: nil,
                 startedAt: nil))
-        let crashed = try await waitForPhase(supervisor, .crashed)
+        let crashed = try await awaitPhase(supervisor, .crashed)
         #expect(crashed.phase == .crashed)
         #expect(crashed.pid == nil)
         let persisted = await registry.persistedState(
-            serverID: serverID(project: env.projectPath, name: "web"))
+            serverID: serverID(project: env.project, name: "web"))
         #expect(persisted?.phase == .crashed)
         #expect(persisted?.pid == nil)
     }
@@ -1459,27 +1249,18 @@ private func makeEnv() throws -> TestEnv {
             without stopping it, exactly as a jetsam SIGKILL of the daemon would
             leave it. */
         let priorDaemon = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: spec)
         let started = await priorDaemon.start()
         let root = try #require(started.pid.flatMap { pid_t(exactly: $0) })
-        var grandchild: pid_t?
-        for _ in 0..<40 {
-            let spool =
-                (try? String(
-                    contentsOf: paths.structuredLogFile(project: env.projectPath, server: "web"),
-                    encoding: .utf8)) ?? ""
-            if let match = spool.range(of: #"grandchild pid (\d+)"#, options: .regularExpression) {
-                grandchild = String(spool[match]).split(separator: " ").last.flatMap { pid_t($0) }
-                break
-            }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        let child = try #require(grandchild)
+        let child = try #require(
+            try await printedPid(
+                "grandchild", in: paths.structuredLogFile(project: env.project, server: "web"),
+                within: .seconds(2)))
         #expect(kill(child, 0) == 0)
         let supervisor = ServerSupervisor(
-            launcher: LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix), paths: paths,
-            projectPath: env.projectPath,
+            launcher: testLaunchdJobLauncher(), paths: paths,
+            projectPath: env.project,
             registry: registry, spec: spec)
         #expect(
             await supervisor.adopt(
@@ -1498,13 +1279,9 @@ private func makeEnv() throws -> TestEnv {
             drains its tailers and writes its log and state row into this
             test's tree. It sets its phase only after those writes, so waiting
             for the phase keeps them from landing after the tree is removed. */
-        let priorEnded = try await waitForPhase(priorDaemon, .stopped, tries: 80)
+        let priorEnded = try await awaitPhase(priorDaemon, .stopped, within: .seconds(8))
         #expect(priorEnded.phase == .stopped)
-        var reaped = false
-        for _ in 0..<100 where !reaped {
-            if kill(child, 0) != 0 { reaped = true; break }
-            try await Task.sleep(for: .milliseconds(50))
-        }
+        let reaped = try await awaitExit(child, within: .seconds(5))
         #expect(
             reaped,
             "grandchild \(child) survived group teardown after adopt (state: \(processState(of: child)))")
@@ -1524,18 +1301,18 @@ private func makeEnv() throws -> TestEnv {
         let registry = Registry(paths: paths)
         let spec = ServerSpec(command: ["/bin/sh", "-c", "echo boom >&2; exit 7"], name: "web")
         let supervisor = ServerSupervisor(
-            launcher: LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix), paths: paths,
-            projectPath: env.projectPath,
+            launcher: testLaunchdJobLauncher(), paths: paths,
+            projectPath: env.project,
             registry: registry, spec: spec)
         _ = await supervisor.start()
-        let status = try await waitForPhase(supervisor, .crashed)
+        let status = try await awaitPhase(supervisor, .crashed)
         #expect(status.phase == .crashed)
         switch (status.lastExit?.code, status.lastExit?.signal) {
         case (7, nil), (nil, nil): break
         default: Issue.record("expected exit 7 or an unknown exit, got \(String(describing: status.lastExit))")
         }
         let spool = try String(
-            contentsOf: paths.structuredLogFile(project: env.projectPath, server: "web"),
+            contentsOf: paths.structuredLogFile(project: env.project, server: "web"),
             encoding: .utf8)
         #expect(spool.contains("boom"))
     }
@@ -1544,24 +1321,26 @@ private func makeEnv() throws -> TestEnv {
         supervised, so it must not become boot intent: otherwise every later
         daemon launch starts it again. Its output still reaches the log, and
         the phase still reads crashed so `why` has something to explain. */
-    @Test(arguments: [nil, Int32.max] as [pid_t?])
-    func exitBeforeWatchDrainsOutputWithoutRecordingBootIntent(pid: pid_t?) async throws {
+    @Test(arguments: ExitedBeforeWatchLauncher.ReportedPid.allCases)
+    func exitBeforeWatchDrainsOutputWithoutRecordingBootIntent(reported: ExitedBeforeWatchLauncher.ReportedPid)
+        async throws
+    {
         let env = try makeEnv()
         let paths = env.paths
         let registry = Registry(paths: paths)
         let supervisor = ServerSupervisor(
-            launcher: ExitedBeforeWatchLauncher(pid: pid, stderrText: "boom before watch\n"),
+            launcher: ExitedBeforeWatchLauncher(reported: reported, stderrText: "boom before watch\n"),
             paths: paths,
-            projectPath: env.projectPath, registry: registry,
+            projectPath: env.project, registry: registry,
             spec: ServerSpec(command: ["/bin/sh", "-c", "exit 1"], name: "web"))
         _ = await supervisor.start()
-        let status = try await waitForPhase(supervisor, .crashed)
+        let status = try await awaitPhase(supervisor, .crashed)
         #expect(status.phase == .crashed)
         #expect(status.pid == nil)
         #expect(status.lastExit?.code == nil)
         #expect(status.lastExit?.signal == nil)
         let persisted = await registry.persistedState(
-            serverID: serverID(project: env.projectPath, name: "web"))
+            serverID: serverID(project: env.project, name: "web"))
         #expect(persisted?.phase == .crashed)
         #expect(persisted?.resumeOnBoot == nil)
         let errLines = await supervisor.logQuery(LogQueryOptions(streams: [.err])).lines
@@ -1575,18 +1354,18 @@ private func makeEnv() throws -> TestEnv {
         let env = try makeEnv()
         let paths = env.paths
         let registry = Registry(paths: paths)
-        let id = serverID(project: env.projectPath, name: "web")
+        let id = serverID(project: env.project, name: "web")
         try await registry.updateState(serverID: id, writer: .router) { entry in
             entry.phase = .stopped
             entry.resumeOnBoot = true
         }
         let supervisor = ServerSupervisor(
-            launcher: ExitedBeforeWatchLauncher(pid: nil, stderrText: "boom before watch\n"),
+            launcher: ExitedBeforeWatchLauncher(reported: .neverShown, stderrText: "boom before watch\n"),
             paths: paths,
-            projectPath: env.projectPath, registry: registry,
+            projectPath: env.project, registry: registry,
             spec: ServerSpec(command: ["/bin/sh", "-c", "exit 1"], name: "web"))
         _ = await supervisor.start()
-        #expect(try await waitForPhase(supervisor, .crashed).phase == .crashed)
+        #expect(try await awaitPhase(supervisor, .crashed).phase == .crashed)
         let persisted = await registry.persistedState(serverID: id)
         #expect(persisted?.phase == .crashed)
         #expect(persisted?.lastExit != nil)
@@ -1603,14 +1382,14 @@ private func makeEnv() throws -> TestEnv {
         let gate = AdoptGate()
         await gate.signal(.exited(code: 1))
         let supervisor = ServerSupervisor(
-            launcher: StuckRunLauncher(gate: gate), paths: paths, projectPath: env.projectPath,
+            launcher: StuckRunLauncher(gate: gate), paths: paths, projectPath: env.project,
             registry: registry, spec: ServerSpec(command: ["/bin/true"], name: "web"))
         let started = await supervisor.start()
         defer { if let pid = started.pid { kill(pid_t(pid), SIGKILL) } }
-        let status = try await waitForPhase(supervisor, .crashed)
+        let status = try await awaitPhase(supervisor, .crashed)
         #expect(status.lastExit?.code == 1)
         let persisted = await registry.persistedState(
-            serverID: serverID(project: env.projectPath, name: "web"))
+            serverID: serverID(project: env.project, name: "web"))
         #expect(persisted?.phase == .crashed)
         #expect(persisted?.resumeOnBoot == true)
     }
@@ -1622,20 +1401,20 @@ private func makeEnv() throws -> TestEnv {
         let paths = env.paths
         let registry = Registry(paths: paths)
         let gate = AdoptGate()
-        let port = 45482
+        let port = TestPorts.port(482)
         let supervisor = ServerSupervisor(
             launcher: StuckRunLauncher(gate: gate), paths: paths, prober: AlwaysHealthyProber(),
-            projectPath: env.projectPath, registry: registry,
+            projectPath: env.project, registry: registry,
             spec: ServerSpec(
                 command: ["/bin/true"], healthcheck: HealthCheckSpec(port: port, type: .tcp),
                 name: "web", port: port))
         let started = await supervisor.start()
         defer { if let pid = started.pid { kill(pid_t(pid), SIGKILL) } }
-        #expect(try await waitForPhase(supervisor, .running).phase == .running)
+        #expect(try await awaitPhase(supervisor, .running).phase == .running)
         await gate.signal(.exited(code: 1))
-        #expect(try await waitForPhase(supervisor, .crashed).phase == .crashed)
+        #expect(try await awaitPhase(supervisor, .crashed).phase == .crashed)
         let persisted = await registry.persistedState(
-            serverID: serverID(project: env.projectPath, name: "web"))
+            serverID: serverID(project: env.project, name: "web"))
         #expect(persisted?.resumeOnBoot == true)
     }
 
@@ -1650,9 +1429,9 @@ private func makeEnv() throws -> TestEnv {
         let paths = env.paths
         let registry = Registry(paths: paths)
         let gate = AdoptGate()
-        let id = serverID(project: env.projectPath, name: "stuck")
+        let id = serverID(project: env.project, name: "stuck")
         let supervisor = ServerSupervisor(
-            launcher: StuckRunLauncher(gate: gate), paths: paths, projectPath: env.projectPath,
+            launcher: StuckRunLauncher(gate: gate), paths: paths, projectPath: env.project,
             registry: registry, spec: ServerSpec(command: ["/bin/true"], name: "stuck"),
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
         #expect(await supervisor.start().pid != nil)
@@ -1662,7 +1441,7 @@ private func makeEnv() throws -> TestEnv {
         try await registry.updateState(serverID: id, writer: .router) { $0 = PersistedServerState(phase: .stopped) }
 
         await gate.signal(.signaled(signal: Int(SIGKILL)))
-        let settled = try await waitForPhase(supervisor, .stopped)
+        let settled = try await awaitPhase(supervisor, .stopped)
         #expect(settled.phase == .stopped)
         #expect(settled.lastExit?.signal == Int(SIGKILL))
         let persisted = await registry.persistedState(serverID: id)
@@ -1678,9 +1457,9 @@ private func makeEnv() throws -> TestEnv {
         let env = try makeEnv()
         let paths = env.paths
         let registry = Registry(paths: paths)
-        let id = serverID(project: env.projectPath, name: "web")
+        let id = serverID(project: env.project, name: "web")
         let supervisor = ServerSupervisor(
-            launcher: SubprocessLauncher(), paths: paths, projectPath: env.projectPath,
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
             registry: registry, spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web"))
         _ = await supervisor.start()
         #expect(await supervisor.stopForRemoval(reason: "unregistered") == .stopped)
@@ -1698,14 +1477,14 @@ private func makeEnv() throws -> TestEnv {
         let env = try makeEnv()
         let gate = AdoptGate()
         let supervisor = ServerSupervisor(
-            launcher: StuckRunLauncher(gate: gate), paths: env.paths, projectPath: env.projectPath,
+            launcher: StuckRunLauncher(gate: gate), paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "web"),
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 5))
         #expect(await supervisor.start().pid != nil)
         #expect(await gate.callCount == 1)
 
         async let restartStop = supervisor.stop(deliberate: false, reason: "requested by restart")
-        #expect(try await waitForPhase(supervisor, .stopping).phase == .stopping)
+        #expect(try await awaitPhase(supervisor, .stopping).phase == .stopping)
         async let removal = supervisor.stopForRemoval(reason: "unregistered")
         /** Lets the removal join the stop in flight; the assertions below hold
             for either order. */
@@ -1732,17 +1511,15 @@ private func makeEnv() throws -> TestEnv {
         let env = try makeEnv()
         let gate = AdoptGate()
         let supervisor = ServerSupervisor(
-            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, projectPath: env.projectPath,
+            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths), spec: ServerSpec(command: ["/bin/true"], name: "web"))
         #expect(await supervisor.stopForRemoval(reason: "unregistered") == .alreadyTerminal)
         let survivor = try spawnSurvivor()
-        defer {
-            kill(survivor, SIGKILL)
-            Task { await gate.signal(.exitedStatusUnknown) }
-        }
+        defer { kill(survivor, SIGKILL) }
         let adopted = await supervisor.adopt(
             pid: survivor, label: "dev.quantizor.directa.job.removed", boundPort: nil, startedAt: nil)
         #expect(adopted == false)
+        #expect(await gate.callCount == 0)
         #expect(await supervisor.status().pid == nil)
         #expect(await supervisor.status().phase == .stopped)
     }
@@ -1757,16 +1534,13 @@ private func makeEnv() throws -> TestEnv {
         let gate = SpawnGate()
         let launcher = DelayedSpawnLauncher(gate: gate)
         let supervisor = ServerSupervisor(
-            launcher: launcher, paths: env.paths, projectPath: env.projectPath,
+            launcher: launcher, paths: env.paths, projectPath: env.project,
             registry: Registry(paths: env.paths),
             spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web"))
         defer { for pid in launcher.pids { kill(pid, SIGKILL) } }
 
         async let started = supervisor.start()
-        for _ in 0..<100 where launcher.pids.isEmpty {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        let child = try #require(launcher.pids.first)
+        let child = try #require(try await launcher.firstPid(within: .seconds(2)))
         let pending = await supervisor.status()
         #expect(pending.phase == .starting)
         #expect(pending.pid == nil)
@@ -1782,12 +1556,8 @@ private func makeEnv() throws -> TestEnv {
         let settled = await supervisor.status()
         #expect(settled.phase == .stopped)
         #expect(settled.pid == nil)
-        var gone = kill(child, 0) != 0
-        for _ in 0..<50 where !gone {
-            try await Task.sleep(for: .milliseconds(20))
-            gone = kill(child, 0) != 0
-        }
-        #expect(gone, "pid \(child) kept running after a stop that reported stopped")
+        #expect(
+            try await awaitExit(child, within: .seconds(1)), "pid \(child) kept running after a stop that reported stopped")
     }
 
     /** A removal whose stop gives up while the launcher has not reported a
@@ -1800,30 +1570,23 @@ private func makeEnv() throws -> TestEnv {
         let gate = SpawnGate()
         let launcher = DelayedSpawnLauncher(gate: gate)
         let registry = Registry(paths: env.paths)
-        let id = serverID(project: env.projectPath, name: "web")
+        let id = serverID(project: env.project, name: "web")
         let supervisor = ServerSupervisor(
-            launcher: launcher, paths: env.paths, projectPath: env.projectPath,
+            launcher: launcher, paths: env.paths, projectPath: env.project,
             registry: registry, spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web"),
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
         defer { for pid in launcher.pids { kill(pid, SIGKILL) } }
 
         async let started = supervisor.start()
-        for _ in 0..<100 where launcher.pids.isEmpty {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        let child = try #require(launcher.pids.first)
+        let child = try #require(try await launcher.firstPid(within: .seconds(2)))
         #expect(await supervisor.stopForRemoval(reason: "unregistered") == .gaveUp)
         #expect(await supervisor.status().phase == .starting)
 
         await gate.open()
         _ = await started
-        var gone = kill(child, 0) != 0
-        for _ in 0..<100 where !gone {
-            try await Task.sleep(for: .milliseconds(20))
-            gone = kill(child, 0) != 0
-        }
-        #expect(gone, "pid \(child) kept running after its supervisor was removed")
-        let settled = try await waitForPhase(supervisor, .stopped)
+        #expect(
+            try await awaitExit(child, within: .seconds(2)), "pid \(child) kept running after its supervisor was removed")
+        let settled = try await awaitPhase(supervisor, .stopped)
         #expect(settled.phase == .stopped)
         #expect(settled.pid == nil)
         #expect(await registry.persistedState(serverID: id) == nil)
@@ -1917,7 +1680,7 @@ private struct NeverHealthyProber: HealthProber {
     @Test func retiredWriterIsIgnoredButRemoveStateStillDeletes() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
-        let id = serverID(project: env.projectPath, name: "web")
+        let id = serverID(project: env.project, name: "web")
         let retired = UUID()
         try await registry.updateState(serverID: id, writer: .supervisor(retired)) { entry in
             entry.phase = .running
@@ -1949,7 +1712,7 @@ private struct NeverHealthyProber: HealthProber {
     @Test func otherWritersStillPersistForARetiredID() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
-        let id = serverID(project: env.projectPath, name: "web")
+        let id = serverID(project: env.project, name: "web")
         try await registry.retireState(
             serverID: id, final: PersistedServerState(phase: .stopped), writer: UUID())
         try await registry.removeState(serverID: id)
@@ -1975,7 +1738,7 @@ private struct NeverHealthyProber: HealthProber {
     @Test func retiredWriterMatchesEitherSpellingOfTheProject() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
-        let canonical = canonicalProjectPath(env.projectPath)
+        let canonical = canonicalProjectPath(env.project)
         let lexical = canonical.hasPrefix("/private/") ? String(canonical.dropFirst("/private".count)) : canonical
         let retired = UUID()
         try await registry.retireState(

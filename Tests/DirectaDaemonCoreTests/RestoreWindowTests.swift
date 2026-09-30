@@ -14,44 +14,27 @@ import Testing
     The daemon now accepts during restore and says which of the two it is. */
 @Suite(.temporaryTree) struct RestoreWindowTests {
     private func makeRouter() throws -> (router: Router, project: String) {
-        let base = try TemporaryTree.directory(named: "restore")
-        let project = base.appending(path: "proj")
-        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let env = try makeRouterEnv(named: "restore")
         try Data(#"{"servers":{},"version":1}"#.utf8).write(
-            to: project.appending(path: "devservers.json"))
-        let paths = DirectaPaths(
-            dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs"))
-        try FileManager.default.createDirectory(at: paths.dataDir, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: paths.logsDir, withIntermediateDirectories: true)
+            to: URL(fileURLWithPath: env.project).appending(path: "devservers.json"))
+        try FileManager.default.createDirectory(at: env.paths.dataDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: env.paths.logsDir, withIntermediateDirectories: true)
         return (
             router: Router(
-                launcher: SubprocessLauncher(), paths: paths, registry: Registry(paths: paths)),
-            project: project.path
+                launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths)),
+            project: env.project
         )
     }
 
-    private func send<P: Codable & Sendable>(
-        _ router: Router, method: WireMethod, params: P
-    ) async throws -> WireResponse<WireEmpty> {
-        let line = try NDJSON.encodeLine(
-            WireRequest(id: "t", method: method.rawValue, params: params))
-        return try JSONCoding.decoder().decode(
-            WireResponse<WireEmpty>.self, from: await router.handle(line: line))
-    }
-
     private func info(_ router: Router) async throws -> DaemonInfo {
-        let line = try NDJSON.encodeLine(
-            WireRequest(id: "t", method: WireMethod.daemonInfo.rawValue, params: WireEmpty()))
-        let response = try JSONCoding.decoder().decode(
-            WireResponse<DaemonInfo>.self, from: await router.handle(line: line))
-        return try #require(response.result)
+        try await router.call(.daemonInfo, WireEmpty(), DaemonInfo.self)
     }
 
     @Test func workDuringRestoreIsRefusedWithAReasonAndNotSilence() async throws {
         let (router, project) = try makeRouter()
         await router.setRestoring(true)
 
-        let response = try await send(router, method: .serverStatus, params: ProjectParams(project: project))
+        let response = try await router.response(.serverStatus, ProjectParams(project: project), WireEmpty.self)
         #expect(response.ok == false)
         let error = try #require(response.error)
         #expect(error.code == .daemonStarting)
@@ -100,7 +83,7 @@ import Testing
         await router.recoverAtStartup()
         await router.setRestoring(false)
 
-        let response = try await send(router, method: .serverStatus, params: ProjectParams(project: project))
+        let response = try await router.response(.serverStatus, ProjectParams(project: project), WireEmpty.self)
         #expect(response.ok == true)
     }
 }

@@ -54,8 +54,12 @@ private func startDB(router: Router, project: String) async throws {
         router: router, method: .serverStart,
         params: ServerTargetParams(name: "db", project: project),
         expecting: ServerResult.self)
-    /** Give spawn a beat so phase is active for pause detection. */
-    try await Task.sleep(for: .milliseconds(200))
+    /** Pause detection acts on a live phase. */
+    let live = try await eventually(within: .seconds(5), every: .milliseconds(20)) {
+        let phase = try await phaseOf(router: router, project: project, name: "db")
+        return [.starting, .running].contains(phase)
+    }
+    #expect(live, "db never reached a live phase")
 }
 
 private func phaseOf(router: Router, project: String, name: String) async throws -> ServerPhase {
@@ -394,11 +398,10 @@ private func phaseOf(router: Router, project: String, name: String) async throws
     @Test func rapidAcquireReleaseNeverLeavesCrashed() async throws {
         let fixture = try #require(fixtureServerPath())
         let env = try makeLockEnv()
-        /** Inside the block TestPorts reserves. At 41_000 these fixtures were
-            outside it, so a failure here leaked one that nothing reaped, and
-            they collided with scripts/smoke.sh, which draws its project-phase
-            ports from that same range. */
-        let port = 45_500 + Int.random(in: 0..<250)
+        /** Inside the block TestPorts leases, so a failure here leaves a
+            fixture the next run's reaper finds, and clear of scripts/smoke.sh,
+            which draws its project-phase ports from elsewhere. */
+        let port = TestPorts.port(500 + Int.random(in: 0..<250))
         let body = """
         {
           "servers": {
@@ -469,7 +472,7 @@ private func phaseOf(router: Router, project: String, name: String) async throws
     @Test func rapidAcquireReleaseWithGrandchildNeverLeavesCrashed() async throws {
         let fixture = try #require(fixtureServerPath())
         let env = try makeLockEnv()
-        let port = 45_750 + Int.random(in: 0..<250)
+        let port = TestPorts.port(750 + Int.random(in: 0..<250))
         let body = """
         {
           "servers": {

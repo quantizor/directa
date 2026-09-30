@@ -17,45 +17,9 @@ import Testing
     trusted through its committed devservers.json, must never delete logs a
     live, merely un-registered, supervisor is still writing to. */
 @Suite(.temporaryTree) struct LogDirCleanupTests {
-    private struct Env {
-        let paths: DirectaPaths
-        let project: String
-    }
-
-    private func makeEnv() throws -> Env {
-        let base = try TemporaryTree.directory(named: "logdir")
-        let project = base.appending(path: "proj")
-        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
-        return Env(
-            paths: DirectaPaths(
-                dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
-            project: project.path)
-    }
-
     private static func isRefused(_ result: LogsRemoveOrphanResult?) -> Bool {
         if case .refused = result?.outcome { return true }
         return false
-    }
-
-    private func handle<P: Codable & Sendable, R: Codable & Sendable>(
-        _ router: Router, _ method: WireMethod, _ params: P, _ expecting: R.Type
-    ) async throws -> R {
-        let line = try NDJSON.encodeLine(WireRequest(id: "t", method: method.rawValue, params: params))
-        let data = await router.handle(line: line)
-        let response = try JSONCoding.decoder().decode(WireResponse<R>.self, from: data)
-        return try #require(response.result)
-    }
-
-    /** Returns the decoded result, or the `WireError` when the daemon refused,
-        for a call expected to fail. */
-    private func send<P: Codable & Sendable, R: Codable & Sendable>(
-        _ router: Router, _ method: WireMethod, _ params: P, _ expecting: R.Type
-    ) async throws -> Result<R, WireError> {
-        let line = try NDJSON.encodeLine(WireRequest(id: "t", method: method.rawValue, params: params))
-        let data = await router.handle(line: line)
-        let response = try JSONCoding.decoder().decode(WireResponse<R>.self, from: data)
-        if response.ok, let result = response.result { return .success(result) }
-        return .failure(response.error ?? WireError(code: .internalError, message: "no result"))
     }
 
     /** Plants a real file under a server's log directory so removal is proven
@@ -73,14 +37,14 @@ import Testing
     }
 
     @Test func unregisteringTheLastServerRemovesTheProjectLogDirectory() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         try plantLogFile(paths: env.paths, project: env.project, server: "web")
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        _ = try await handle(
-            router, .serverUnregister, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverUnregister, ServerTargetParams(name: "web", project: env.project),
             WireEmpty.self)
 
         #expect(
@@ -96,7 +60,7 @@ import Testing
         autonomous restore refuse "api" outright, and would orphan its log
         directory while "api" still holds a resident, log-writing supervisor. */
     @Test func unregisteringTheLastAdHocServerOnATrustedConfigProjectKeepsTrust() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         try Data(
             #"{"servers":{"api":{"command":["/bin/sh","-c","sleep 60"]}},"version":1}"#.utf8
         ).write(to: URL(fileURLWithPath: env.project).appending(path: "devservers.json"))
@@ -105,11 +69,11 @@ import Testing
         try plantLogFile(paths: env.paths, project: env.project, server: "web")
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        _ = try await handle(
-            router, .serverStart, ServerTargetParams(name: "api", project: env.project),
+        _ = try await router.call(
+            .serverStart, ServerTargetParams(name: "api", project: env.project),
             ServerResult.self)
-        _ = try await handle(
-            router, .serverUnregister, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverUnregister, ServerTargetParams(name: "web", project: env.project),
             WireEmpty.self)
 
         let entry = try #require(await registry.project(env.project))
@@ -120,8 +84,8 @@ import Testing
             FileManager.default.fileExists(
                 atPath: env.paths.projectLogDir(project: env.project).path))
 
-        _ = try await handle(
-            router, .serverStop, ServerTargetParams(name: "api", project: env.project),
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "api", project: env.project),
             ServerResult.self)
     }
 
@@ -132,21 +96,21 @@ import Testing
         zero ad hoc servers at all, purely through a committed server having
         been started once). */
     @Test func unregisteringAnUnknownNameOnATrustedConfigOnlyProjectIsRefused() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         try Data(
             #"{"servers":{"api":{"command":["/bin/sh","-c","sleep 60"]}},"version":1}"#.utf8
         ).write(to: URL(fileURLWithPath: env.project).appending(path: "devservers.json"))
         let registry = Registry(paths: env.paths)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        _ = try await handle(
-            router, .serverStart, ServerTargetParams(name: "api", project: env.project),
+        _ = try await router.call(
+            .serverStart, ServerTargetParams(name: "api", project: env.project),
             ServerResult.self)
         try plantLogFile(paths: env.paths, project: env.project, server: "api")
         #expect(await registry.project(env.project)?.trusted == true)
 
-        let outcome = try await send(
-            router, .serverUnregister, ServerTargetParams(name: "ghost", project: env.project),
+        let outcome = try await router.attempt(
+            .serverUnregister, ServerTargetParams(name: "ghost", project: env.project),
             WireEmpty.self)
         guard case .failure(let error) = outcome else {
             Issue.record("unregister accepted a name that was never registered ad hoc")
@@ -159,8 +123,8 @@ import Testing
             FileManager.default.fileExists(
                 atPath: env.paths.projectLogDir(project: env.project).path))
 
-        _ = try await handle(
-            router, .serverStop, ServerTargetParams(name: "api", project: env.project),
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "api", project: env.project),
             ServerResult.self)
     }
 
@@ -170,19 +134,19 @@ import Testing
         directory. `serverUnregister` must stop it through the normal stop
         path first and wait for it to actually exit before dropping anything. */
     @Test func unregisteringARunningServerStopsItFirst() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        let started = try await handle(
-            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+        let started = try await router.call(
+            .serverStart, ServerTargetParams(name: "web", project: env.project),
             ServerResult.self)
         let pid = try #require(started.server.pid)
         #expect(kill(pid_t(pid), 0) == 0)
 
-        _ = try await handle(
-            router, .serverUnregister, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverUnregister, ServerTargetParams(name: "web", project: env.project),
             WireEmpty.self)
 
         #expect(kill(pid_t(pid), 0) != 0)
@@ -195,8 +159,8 @@ import Testing
             serverID: serverID(project: env.project, name: "web"))
         #expect(persisted?.phase == .stopped)
         #expect(persisted?.resumeOnBoot == nil)
-        let events = try await handle(
-            router, .eventsQuery, EventsQueryParams(project: env.project), EventsQueryResult.self)
+        let events = try await router.call(
+            .eventsQuery, EventsQueryParams(project: env.project), EventsQueryResult.self)
         #expect(events.events.filter { $0.kind == .stopped }.map(\.detail) == ["unregistered"])
         #expect(events.events.filter { $0.kind == .unregistered }.count == 1)
     }
@@ -209,7 +173,7 @@ import Testing
         that finally lands afterward cannot write it back. `lastExit` is the
         marker a late write would leave. */
     @Test func unregisteringAServerWhoseStopHangsRetiresItsStateRow() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         try Data(
             #"{"servers":{"web":{"command":["/bin/sh","-c","sleep 60"]}},"version":1}"#.utf8
         ).write(to: URL(fileURLWithPath: env.project).appending(path: "devservers.json"))
@@ -222,16 +186,16 @@ import Testing
         let id = serverID(project: env.project, name: "web")
         let canonicalID = serverID(project: canonicalProjectPath(env.project), name: "web")
 
-        let started = try await handle(
-            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+        let started = try await router.call(
+            .serverStart, ServerTargetParams(name: "web", project: env.project),
             ServerResult.self)
         let pid = try #require(started.server.pid)
         let running = try #require(await registry.persistedState(serverID: id))
         #expect(running.resumeOnBoot == true)
         let startedAt = try #require(running.startedAt)
 
-        _ = try await handle(
-            router, .serverUnregister, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverUnregister, ServerTargetParams(name: "web", project: env.project),
             WireEmpty.self)
         let retired = try #require(await registry.persistedState(serverID: id))
         #expect(retired.phase == .stopped)
@@ -246,14 +210,14 @@ import Testing
         #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == nil)
 
         await gate.signal(.signaled(signal: Int(SIGKILL)))
-        try await awaitStoppedEvent(router: router, project: env.project, detail: "unregistered")
+        #expect(try await awaitStoppedEvents(router, project: env.project, detail: "unregistered") != nil)
         let row = await registry.persistedState(serverID: id)
         #expect(row?.phase == .stopped)
         #expect(row?.pid == pid)
         #expect(row?.resumeOnBoot == nil)
         #expect(row?.lastExit == nil)
-        let events = try await handle(
-            router, .eventsQuery, EventsQueryParams(project: env.project), EventsQueryResult.self)
+        let events = try await router.call(
+            .eventsQuery, EventsQueryParams(project: env.project), EventsQueryResult.self)
         #expect(events.events.filter { $0.kind == .unregistered }.count == 1)
     }
 
@@ -261,7 +225,7 @@ import Testing
         leaves the project's log directory in place: the process may still be
         writing there. Doctor's leftover-log finding covers it later. */
     @Test func unregisterKeepsTheLogDirectoryWhenTheStopHangs() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         let gate = AdoptGate()
@@ -269,15 +233,16 @@ import Testing
             launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
             stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
         let target = ServerTargetParams(name: "web", project: env.project)
-        defer { Task { await gate.signal(.signaled(signal: Int(SIGKILL))) } }
 
-        _ = try await handle(router, .serverStart, target, ServerResult.self)
+        _ = try await router.call(.serverStart, target, ServerResult.self)
         let logDir = env.paths.projectLogDir(project: env.project).path
         #expect(FileManager.default.fileExists(atPath: logDir))
-        _ = try await handle(router, .serverUnregister, target, WireEmpty.self)
+        _ = try await router.call(.serverUnregister, target, WireEmpty.self)
 
         #expect(await registry.project(env.project) == nil)
         #expect(FileManager.default.fileExists(atPath: logDir))
+        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        #expect(try await awaitStoppedEvents(router, project: env.project, detail: "unregistered") != nil)
     }
 
     /** An unregister that lands while a restart's stop is still in flight: the
@@ -285,7 +250,7 @@ import Testing
         and must not spawn there (nothing would ever supervise that run), and
         the row must carry no boot intent afterward. */
     @Test func unregisteringDuringARestartSpawnsNothingAndLeavesNoBootIntent() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         let gate = AdoptGate()
@@ -295,24 +260,20 @@ import Testing
         let id = serverID(project: env.project, name: "web")
         let target = ServerTargetParams(name: "web", project: env.project)
 
-        _ = try await handle(router, .serverStart, target, ServerResult.self)
+        _ = try await router.call(.serverStart, target, ServerResult.self)
         #expect(await gate.callCount == 1)
         #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == true)
 
-        async let restart = send(
-            router, .serverRestart,
-            RestartParams(names: ["web"], project: env.project, timeoutSeconds: 3),
+        async let restart = router.attempt(
+            .serverRestart, RestartParams(names: ["web"], project: env.project, timeoutSeconds: 3),
             GroupResult.self)
-        var phase: ServerPhase?
-        for _ in 0..<100 where phase != .stopping {
-            phase = try await handle(
-                router, .serverStatus, ProjectParams(name: "web", project: env.project),
-                ServerListResult.self
-            ).servers.first?.phase
-            if phase != .stopping { try await Task.sleep(for: .milliseconds(10)) }
+        let stopping = try await eventually(within: .seconds(1)) {
+            try await router.call(
+                .serverStatus, ProjectParams(name: "web", project: env.project), ServerListResult.self
+            ).servers.first?.phase == .stopping
         }
-        #expect(phase == .stopping)
-        _ = try await handle(router, .serverUnregister, target, WireEmpty.self)
+        #expect(stopping)
+        _ = try await router.call(.serverUnregister, target, WireEmpty.self)
         await gate.signal(.signaled(signal: Int(SIGKILL)))
         let restarted = try await restart
         if case .success(let group) = restarted {
@@ -328,7 +289,7 @@ import Testing
         so the name cannot come back on the next launch through a committed
         devservers.json entry of the same name. */
     @Test func unregisterClearsBootIntentWithNoResidentSupervisor() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         let id = serverID(project: env.project, name: "web")
@@ -338,8 +299,8 @@ import Testing
         }
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        _ = try await handle(
-            router, .serverUnregister, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverUnregister, ServerTargetParams(name: "web", project: env.project),
             WireEmpty.self)
 
         let row = try #require(await registry.persistedState(serverID: id))
@@ -352,7 +313,7 @@ import Testing
         pid and boot intent persist, or a later daemon restart would leave it
         unsupervised. */
     @Test func reRegisteringAfterAHungUnregisterPersistsTheNewRun() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         let gate = AdoptGate()
@@ -362,22 +323,22 @@ import Testing
         let id = serverID(project: env.project, name: "web")
         let target = ServerTargetParams(name: "web", project: env.project)
 
-        _ = try await handle(router, .serverStart, target, ServerResult.self)
-        _ = try await handle(router, .serverUnregister, target, WireEmpty.self)
+        _ = try await router.call(.serverStart, target, ServerResult.self)
+        _ = try await router.call(.serverUnregister, target, WireEmpty.self)
         #expect(await registry.persistedState(serverID: id)?.resumeOnBoot == nil)
 
-        _ = try await handle(
-            router, .serverRegister, RegisterParams(project: env.project, spec: sleeperSpec(name: "web")),
+        _ = try await router.call(
+            .serverRegister, RegisterParams(project: env.project, spec: sleeperSpec(name: "web")),
             ServerResult.self)
         await gate.signal(.signaled(signal: Int(SIGKILL)))
-        let restarted = try await handle(router, .serverStart, target, ServerResult.self)
+        let restarted = try await router.call(.serverStart, target, ServerResult.self)
         let pid = try #require(restarted.server.pid)
         defer { kill(pid_t(pid), SIGKILL) }
 
         let row = try #require(await registry.persistedState(serverID: id))
         #expect(row.pid == pid)
         #expect(row.resumeOnBoot == true)
-        _ = try await send(router, .serverStop, target, ServerResult.self)
+        _ = try await router.attempt(.serverStop, target, ServerResult.self)
     }
 
     /** A retirement that cannot be saved (state.json refuses the write) is
@@ -385,7 +346,7 @@ import Testing
         retirement already holds in memory, so the late exit of the dropped
         supervisor still cannot put boot intent back. */
     @Test func unregisterCompletesWhenTheRetirementCannotBeSaved() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         let gate = AdoptGate()
@@ -399,13 +360,13 @@ import Testing
             return
         }
 
-        let started = try await handle(router, .serverStart, target, ServerResult.self)
+        let started = try await router.call(.serverStart, target, ServerResult.self)
         let pid = try #require(started.server.pid)
         let stateFile = env.paths.stateFile.path
         try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: stateFile)
         defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: stateFile) }
 
-        let result = try await send(router, .serverUnregister, target, WireEmpty.self)
+        let result = try await router.attempt(.serverUnregister, target, WireEmpty.self)
         if case .failure(let error) = result {
             Issue.record("unregister failed: \(error.message)")
         }
@@ -417,23 +378,11 @@ import Testing
             })
 
         await gate.signal(.signaled(signal: Int(SIGKILL)))
-        try await awaitStoppedEvent(router: router, project: env.project, detail: "unregistered")
+        #expect(try await awaitStoppedEvents(router, project: env.project, detail: "unregistered") != nil)
         let row = try #require(await registry.persistedState(serverID: id))
         #expect(row.resumeOnBoot == nil)
         #expect(row.pid == pid)
         #expect(row.lastExit == nil)
-    }
-
-    /** Polls until the late `recordOutcome` has posted its `stopped` event,
-        the last thing it does before its (abandoned) state write. */
-    private func awaitStoppedEvent(router: Router, project: String, detail: String) async throws {
-        for _ in 0..<100 {
-            let events = try await handle(
-                router, .eventsQuery, EventsQueryParams(project: project), EventsQueryResult.self)
-            if events.events.contains(where: { $0.kind == .stopped && $0.detail == detail }) { return }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        Issue.record("no stopped event with detail '\(detail)' after the gate opened")
     }
 
     /** A log directory removal that fails (a permission error, here, from a
@@ -441,7 +390,7 @@ import Testing
         directory for doctor's orphan-log-dir finding to catch, but logs the
         failure at error level so it is not lost entirely. */
     @Test func unregisterLogsAFailedLogDirectoryRemovalRatherThanSwallowingIt() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         try plantLogFile(paths: env.paths, project: env.project, server: "web")
@@ -459,8 +408,8 @@ import Testing
             return
         }
 
-        _ = try await handle(
-            router, .serverUnregister, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverUnregister, ServerTargetParams(name: "web", project: env.project),
             WireEmpty.self)
 
         #expect(
@@ -475,17 +424,12 @@ import Testing
     }
 
     @Test func missingProjectSweepRemovesTheProjectLogDirectory() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         try plantLogFile(paths: env.paths, project: env.project, server: "web")
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
 
-        /** Captured while the checkout still exists: `canonicalProjectPath`
-            resolves the on-disk case and symlinks of a path that exists, and
-            falls back to a lexical resolution once it does not, so recomputing
-            this after the `removeItem` below would silently check a different
-            (never-created) directory instead of the one `plantLogFile` wrote to. */
         let logDir = env.paths.projectLogDir(project: env.project).path
         try FileManager.default.removeItem(atPath: env.project)
         let now = Date()
@@ -502,7 +446,7 @@ import Testing
         own log directory removal: a permission error must not vanish
         silently. */
     @Test func missingProjectSweepLogsAFailedLogDirectoryRemovalRatherThanSwallowingIt() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         try plantLogFile(paths: env.paths, project: env.project, server: "web")
@@ -542,7 +486,7 @@ import Testing
     /** `logs.removeOrphan` removes a directa-named directory no project claims,
         with its files. */
     @Test func removeOrphanDeletesAnUnclaimedDirectory() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let router = Router(
             launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths))
         let gone = URL(fileURLWithPath: env.project).deletingLastPathComponent()
@@ -550,8 +494,8 @@ import Testing
         try plantLogFile(paths: env.paths, project: gone, server: "web")
         let name = DirectaPaths.projectLogDirName(project: gone)
 
-        let result = try await handle(
-            router, .logsRemoveOrphan, LogsRemoveOrphanParams(directory: name),
+        let result = try await router.call(
+            .logsRemoveOrphan, LogsRemoveOrphanParams(directory: name),
             LogsRemoveOrphanResult.self)
 
         #expect(
@@ -563,15 +507,15 @@ import Testing
 
     /** A registered project claims its directory even with no supervisor. */
     @Test func removeOrphanRefusesARegisteredProjectsDirectory() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
         try plantLogFile(paths: env.paths, project: env.project, server: "web")
         let name = DirectaPaths.projectLogDirName(project: env.project)
 
-        let result = try await handle(
-            router, .logsRemoveOrphan, LogsRemoveOrphanParams(directory: name),
+        let result = try await router.call(
+            .logsRemoveOrphan, LogsRemoveOrphanParams(directory: name),
             LogsRemoveOrphanResult.self)
 
         #expect(result.outcome == .refused(reason: OrphanProjectLogs.Refusal.claimed.reason, remedy: nil))
@@ -584,7 +528,7 @@ import Testing
         reaches outside it is refused and nothing is touched. */
     @Test(arguments: ["../data", "..", "", "gone-aaaaaaaa/../../data", "/tmp"])
     func removeOrphanRefusesANameThatLeavesTheLogsDir(name: String) async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let router = Router(
             launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths))
         try FileManager.default.createDirectory(
@@ -593,8 +537,8 @@ import Testing
         let kept = env.paths.dataDir.appending(path: "registry.json")
         try Data("keep".utf8).write(to: kept)
 
-        let result = try await handle(
-            router, .logsRemoveOrphan, LogsRemoveOrphanParams(directory: name),
+        let result = try await router.call(
+            .logsRemoveOrphan, LogsRemoveOrphanParams(directory: name),
             LogsRemoveOrphanResult.self)
 
         #expect(Self.isRefused(result))
@@ -606,18 +550,18 @@ import Testing
         by the time the daemon checks, so the removal is refused and the live
         run's spool files stay. */
     @Test func removeOrphanAfterAStartKeepsTheLiveRunsDirectory() async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let router = Router(
             launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths))
-        _ = try await handle(
-            router, .serverRegister,
+        _ = try await router.call(
+            .serverRegister,
             RegisterParams(project: env.project, spec: sleeperSpec(name: "web")), ServerResult.self)
-        _ = try await handle(
-            router, .serverStart, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverStart, ServerTargetParams(name: "web", project: env.project),
             ServerResult.self)
 
-        let result = try await handle(
-            router, .logsRemoveOrphan,
+        let result = try await router.call(
+            .logsRemoveOrphan,
             LogsRemoveOrphanParams(directory: DirectaPaths.projectLogDirName(project: env.project)),
             LogsRemoveOrphanResult.self)
 
@@ -625,8 +569,8 @@ import Testing
         #expect(
             FileManager.default.fileExists(
                 atPath: env.paths.spoolOutFile(project: env.project, server: "web").path))
-        _ = try await handle(
-            router, .serverStop, ServerTargetParams(name: "web", project: env.project),
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "web", project: env.project),
             ServerResult.self)
     }
 
@@ -650,7 +594,7 @@ import Testing
     func removeOrphanAtAnyPointOfAFirstStartNeverDeletesTheLiveRunsDirectory(
         point: RemovalPoint
     ) async throws {
-        let env = try makeEnv()
+        let env = try makeRouterEnv(named: "logdir")
         let gate = SpawnGate()
         let launcher = DelayedSpawnLauncher(gate: gate)
         let router = Router(launcher: launcher, paths: env.paths, registry: Registry(paths: env.paths))
@@ -663,26 +607,24 @@ import Testing
         var removed: LogsRemoveOrphanResult?
 
         if point == .beforeRegister {
-            removed = try await handle(router, .logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
+            removed = try await router.call(.logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
         }
-        _ = try await handle(
-            router, .serverRegister, RegisterParams(project: project, spec: spec), ServerResult.self)
+        _ = try await router.call(
+            .serverRegister, RegisterParams(project: project, spec: spec), ServerResult.self)
         if point == .afterRegister {
-            removed = try await handle(router, .logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
+            removed = try await router.call(.logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
         }
         if point != .duringSpawn { await gate.open() }
-        async let started = handle(router, .serverStart, target, ServerResult.self)
+        async let started = router.call(.serverStart, target, ServerResult.self)
         if point == .duringSpawn {
-            for _ in 0..<100 where launcher.pids.isEmpty {
-                try await Task.sleep(for: .milliseconds(20))
-            }
-            try #require(!launcher.pids.isEmpty, "the held spawn never produced a process")
-            removed = try await handle(router, .logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
+            try #require(
+                try await launcher.firstPid(within: .seconds(2)) != nil, "the held spawn never produced a process")
+            removed = try await router.call(.logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
             await gate.open()
         }
         let run = try await started
         if point == .afterStart {
-            removed = try await handle(router, .logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
+            removed = try await router.call(.logsRemoveOrphan, removeOrphan, LogsRemoveOrphanResult.self)
         }
 
         if point == .beforeRegister {
@@ -694,6 +636,6 @@ import Testing
         #expect(
             FileManager.default.fileExists(
                 atPath: env.paths.spoolOutFile(project: project, server: "web").path))
-        _ = try await handle(router, .serverStop, target, ServerResult.self)
+        _ = try await router.call(.serverStop, target, ServerResult.self)
     }
 }

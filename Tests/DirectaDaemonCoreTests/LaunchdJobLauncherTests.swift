@@ -20,7 +20,7 @@ struct LaunchdJobLauncherTests {
             close(errFD)
         }
         let spawned = OSAllocatedUnfairLock(initialState: pid_t(0))
-        let outcome = await LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix).run(
+        let outcome = await testLaunchdJobLauncher().run(
             argv: ["/bin/sleep", "8"],
             capture: SpawnCapture(
                 stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),
@@ -68,7 +68,7 @@ struct LaunchdJobLauncherTests {
             close(outFD)
             close(errFD)
         }
-        let outcome = await LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix).run(
+        let outcome = await testLaunchdJobLauncher().run(
             argv: ["/bin/sh", "-c", "sleep 0.3; exit 3"],
             capture: SpawnCapture(
                 stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),
@@ -113,7 +113,7 @@ struct LaunchdJobLauncherTests {
             close(errFD)
         }
         let callbacks = OSAllocatedUnfairLock(initialState: [String]())
-        let outcome = await LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix).run(
+        let outcome = await testLaunchdJobLauncher().run(
             argv: ["/bin/sh", "-c", "exit 7"],
             capture: SpawnCapture(
                 stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),
@@ -154,7 +154,7 @@ struct LaunchdJobLauncherTests {
         }
         let missing = "/nonexistent/directa-typo-\(UUID().uuidString)"
         let exitedBeforeWatch = OSAllocatedUnfairLock(initialState: false)
-        let outcome = await LaunchdJobLauncher(labelPrefix: testLaunchdJobLabelPrefix).run(
+        let outcome = await testLaunchdJobLauncher().run(
             argv: [missing, "--port", "3000"],
             capture: SpawnCapture(
                 stderrFD: errFD, stderrPath: errURL.path, stdoutFD: outFD, stdoutPath: outURL.path),

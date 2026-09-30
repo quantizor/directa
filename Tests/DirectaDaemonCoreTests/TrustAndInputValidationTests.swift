@@ -10,31 +10,8 @@ import Testing
     cannot drop a devservers.json at a path directa does not track, and an explicit
     start records the trust that boot restore later requires. */
 @Suite(.serialized, .temporaryTree) struct TrustAndInputValidationTests {
-    private struct Env {
-        let paths: DirectaPaths
-        let project: String
-    }
-
-    private func makeEnv() throws -> Env {
-        let base = try TemporaryTree.directory(named: "trust")
-        let project = base.appending(path: "proj")
-        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
-        return Env(
-            paths: DirectaPaths(
-                dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
-            project: project.path)
-    }
-
-    /** Returns the decoded result, or the WireError when the daemon refused. */
-    private func send<P: Codable & Sendable, R: Codable & Sendable>(
-        _ router: Router, _ method: WireMethod, _ params: P, _ expecting: R.Type
-    ) async throws -> Result<R, WireError> {
-        let line = try NDJSON.encodeLine(
-            WireRequest(id: "t", method: method.rawValue, params: params))
-        let data = await router.handle(line: line)
-        let response = try JSONCoding.decoder().decode(WireResponse<R>.self, from: data)
-        if response.ok, let result = response.result { return .success(result) }
-        return .failure(response.error ?? WireError(code: .internalError, message: "no result"))
+    private func makeEnv() throws -> RouterEnv {
+        try makeRouterEnv(named: "trust")
     }
 
     /** A non-finite or astronomically large timeout arriving over the wire is
@@ -55,8 +32,8 @@ import Testing
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
-        let outcome = try await send(
-            router, .serverRegister,
+        let outcome = try await router.attempt(
+            .serverRegister,
             RegisterParams(
                 project: env.project,
                 spec: ServerSpec(command: [], name: "web", port: 70000)),
@@ -73,8 +50,8 @@ import Testing
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
-        let outcome = try await send(
-            router, .serverRegister,
+        let outcome = try await router.attempt(
+            .serverRegister,
             RegisterParams(
                 project: env.project,
                 spec: ServerSpec(command: ["bun", "dev"], name: "web", port: 3000)),
@@ -94,7 +71,7 @@ import Testing
             LogsQueryParams(head: 1, name: "ghost", project: env.project, tail: 1),
             LogsQueryParams(name: "ghost", project: env.project, tail: -1),
         ] {
-            let outcome = try await send(router, .logsQuery, params, LogsQueryResult.self)
+            let outcome = try await router.attempt(.logsQuery, params, LogsQueryResult.self)
             guard case .failure(let error) = outcome else {
                 Issue.record("logs.query accepted \(params)")
                 continue
@@ -112,8 +89,8 @@ import Testing
         let router = Router(
             launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths))
         for project in [env.project, nil] {
-            let outcome = try await send(
-                router, .eventsQuery, EventsQueryParams(project: project, tail: -1), EventsQueryResult.self)
+            let outcome = try await router.attempt(
+                .eventsQuery, EventsQueryParams(project: project, tail: -1), EventsQueryResult.self)
             guard case .failure(let error) = outcome else {
                 Issue.record("events.query accepted tail -1 for project \(project ?? "(all)")")
                 continue
@@ -121,8 +98,8 @@ import Testing
             #expect(error.code == .usage)
             #expect(error.hint == "send tail as 0 or more")
         }
-        let zero = try await send(
-            router, .eventsQuery, EventsQueryParams(project: env.project, tail: 0), EventsQueryResult.self)
+        let zero = try await router.attempt(
+            .eventsQuery, EventsQueryParams(project: env.project, tail: 0), EventsQueryResult.self)
         #expect((try? zero.get())?.events == [])
     }
 
@@ -132,8 +109,8 @@ import Testing
         let env = try makeEnv()
         let router = Router(
             launcher: SubprocessLauncher(), paths: env.paths, registry: Registry(paths: env.paths))
-        _ = try await send(
-            router, .serverRegister,
+        _ = try await router.attempt(
+            .serverRegister,
             RegisterParams(project: env.project, spec: ServerSpec(command: ["bun", "dev"], name: "web")),
             ServerResult.self
         ).get()
@@ -147,8 +124,8 @@ import Testing
             LogRecord(at: at, stream: .out, text: "GET /"),
         ]
         try Data(records.map { $0.formatted() + "\n" }.joined().utf8).write(to: log)
-        let result = try await send(
-            router, .logsQuery,
+        let result = try await router.attempt(
+            .logsQuery,
             LogsQueryParams(
                 after: LogCursor(at: at, count: 1), maxLineCharacters: 5, name: "web", project: env.project,
                 tailByStream: LogStreamCounts(out: 1)),
@@ -159,8 +136,8 @@ import Testing
                 == LogsQueryResult(
                     cursor: LogCursor(at: at, count: 3), lines: [LogRecord(at: at, stream: .out, text: "GET /")],
                     totals: LogStreamTotals(err: 0, mark: 0, out: 2, sys: 0)))
-        let truncated = try await send(
-            router, .logsQuery,
+        let truncated = try await router.attempt(
+            .logsQuery,
             LogsQueryParams(head: 1, maxLineCharacters: 5, name: "web", project: env.project, streams: [.out]),
             LogsQueryResult.self
         ).get()
@@ -175,8 +152,8 @@ import Testing
         let body = """
             {"servers":{"web":{"command":["bun","dev"]}},"version":1}
             """
-        let outcome = try await send(
-            router, .projectWriteConfig,
+        let outcome = try await router.attempt(
+            .projectWriteConfig,
             WriteConfigParams(baselineHash: "", content: body, project: stranger.path),
             CheckResult.self)
         guard case .failure(let error) = outcome else {
@@ -200,8 +177,8 @@ import Testing
         let body = """
             {"servers":{"web":{"command":["bun","dev"]}},"version":1}
             """
-        let outcome = try await send(
-            router, .projectWriteConfig,
+        let outcome = try await router.attempt(
+            .projectWriteConfig,
             WriteConfigParams(baselineHash: "", content: body, project: env.project),
             CheckResult.self)
         #expect((try? outcome.get()) != nil)
@@ -220,18 +197,15 @@ import Testing
         let registry = Registry(paths: env.paths)
         #expect(await registry.isTrusted(project: env.project) == false)
         let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
-        let outcome = try await send(
-            router, .serverStart,
+        let outcome = try await router.attempt(
+            .serverStart,
             ServerTargetParams(name: "web", project: env.project),
             ServerResult.self)
         #expect((try? outcome.get()) != nil)
         /** The explicit start IS the approval: trust is now recorded, which is
             what lets boot restore bring this server back next time. */
         #expect(await registry.isTrusted(project: env.project) == true)
-        let stop = try NDJSON.encodeLine(
-            WireRequest(
-                id: "s", method: WireMethod.serverStop.rawValue,
-                params: ServerTargetParams(name: "web", project: env.project)))
-        _ = await router.handle(line: stop)
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "web", project: env.project), ServerResult.self)
     }
 }

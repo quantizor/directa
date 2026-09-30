@@ -164,7 +164,11 @@ private func tempDir() throws -> URL {
         /** Binary junk must not break the pipeline. */
         try handle.write(contentsOf: Data([0xFF, 0xFE, 0x80] + Array("tail\n".utf8)))
         try handle.close()
-        try await Task.sleep(for: .milliseconds(200))
+        /** Lines ingest in order, so the last one landing means all did. */
+        let ingested = try await eventually(within: .seconds(5), every: .milliseconds(20)) {
+            await store.query(LogQueryOptions(streams: [.out])).contains { $0.text.hasSuffix("tail") }
+        }
+        #expect(ingested, "the tailer never ingested the last line")
         await tailer.stop()
         let records = await store.query(LogQueryOptions(streams: [.out]))
         let texts = records.map(\.text)
@@ -386,9 +390,8 @@ private func tempDir() throws -> URL {
             stream: .out, url: spool)
         await tailer.start()
         let floodBytes: Int64 = 2 * 1024 * 1024
-        let deadline = ContinuousClock.now + .seconds(20)
-        while try spoolSizes(spool).apparent < floodBytes, ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(20))
+        _ = try await eventually(within: .seconds(20), every: .milliseconds(20)) {
+            try spoolSizes(spool).apparent >= floodBytes
         }
         /** Measured mid-flood, while a drain never reaches end of file. The
             tailer answers between chunks, so its read point can lead its last
@@ -419,8 +422,8 @@ private func tempDir() throws -> URL {
         #expect(newest == [rawTail])
 
         kill(child, SIGCONT)
-        while try spoolSizes(spool).apparent <= stopped.apparent, ContinuousClock.now < deadline {
-            try await Task.sleep(for: .milliseconds(20))
+        _ = try await eventually(within: .seconds(20), every: .milliseconds(20)) {
+            try spoolSizes(spool).apparent > stopped.apparent
         }
         #expect(kill(child, 0) == 0)
         #expect(try spoolSizes(spool).apparent > stopped.apparent)
