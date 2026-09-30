@@ -33,7 +33,14 @@ import Foundation
     --ignore-sigterm       install SIG_IGN for SIGTERM (escalation verification)
     --emit-binary          write raw non-UTF8 bytes into stdout once
     --err-lines N          write N lines to stderr at startup (error-tally fixture)
-    --flood                write lines as fast as possible
+    --flood                write lines as fast as possible, only while the
+                           process that started this one lives: a flood exits
+                           when that process exits, or at once if it is gone
+                           before the watch is armed (ppid already 1), so a
+                           test run killed part way never leaves one burning
+                           a core under launchd. No other mode is tied to its
+                           parent, since the teardown fixtures exist to
+                           outlive theirs
     --print-file PATH      print `config: <first line>` of PATH once at startup,
                            which is how a watch test proves the RESTARTED process
                            read the new file rather than only that a pid changed
@@ -256,11 +263,30 @@ if let exitAfter {
     }
 }
 
-var heartbeat = 0
-while true {
-    heartbeat += 1
-    print("heartbeat \(heartbeat)")
-    if !flood {
-        usleep(200_000)
+/** Checked again after arming, since a parent that exits before the source
+    registers is never reported. A released source stops watching, so the
+    heartbeat loop below holds it. */
+let floodOwnerWatch: DispatchSourceProcess? = {
+    guard flood else { return nil }
+    let owner = getppid()
+    if owner > 1 {
+        let source = DispatchSource.makeProcessSource(identifier: owner, eventMask: .exit, queue: .global())
+        source.setEventHandler { _exit(0) }
+        source.resume()
+        if getppid() == owner { return source }
+    }
+    FileHandle.standardError.write(
+        Data("fixture-server: --flood runs only while the process that started it lives, and that process has exited\n".utf8))
+    exit(0)
+}()
+
+withExtendedLifetime(floodOwnerWatch) {
+    var heartbeat = 0
+    while true {
+        heartbeat += 1
+        print("heartbeat \(heartbeat)")
+        if !flood {
+            usleep(200_000)
+        }
     }
 }

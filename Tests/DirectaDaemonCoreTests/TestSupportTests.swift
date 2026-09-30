@@ -234,6 +234,67 @@ import os
         #expect(try await awaitExit(listener, within: .seconds(5)), "the listener kept the spawning thread's mask")
     }
 
+    /** A `/bin/sh` that starts the fixture (with `flags`, output discarded)
+        in the background, prints its pid, then runs `afterwards`; returns the
+        shell's pid and the fixture's. The caller owns killing both. */
+    private func startFixtureFromAShell(
+        flags: String, afterwards: String
+    ) async throws -> (shell: pid_t, fixture: pid_t) {
+        let fixture = try #require(fixtureServerExecutable())
+        let (readEnd, writeEnd) = try makeOutputPipe()
+        defer { close(readEnd) }
+        let shell = try spawnReapedSessionLeader(
+            ["/bin/sh", "-c", "\"$0\" \(flags) >/dev/null 2>&1 & echo \"started pid $!\"; \(afterwards)", fixture],
+            stdoutFD: writeEnd)
+        close(writeEnd)
+        let started = await readPrintedPid("started", from: readEnd)
+        guard let started else {
+            kill(shell, SIGKILL)
+            throw NSError(
+                domain: "directa.test", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "the shell never printed the fixture's pid"])
+        }
+        return (shell, started)
+    }
+
+    /** A flood burns a core, so it must not outlive the process that started
+        it: a test run killed part way would leave one behind under launchd. */
+    @Test func aFloodFixtureExitsWithTheProcessThatStartedIt() async throws {
+        let (shell, flood) = try await startFixtureFromAShell(flags: "--flood", afterwards: "exec sleep 30")
+        defer {
+            kill(shell, SIGKILL)
+            kill(flood, SIGKILL)
+        }
+
+        kill(shell, SIGKILL)
+        #expect(try await awaitExit(flood, within: .seconds(5)), "the flood kept running after its starter was killed")
+    }
+
+    /** A starter that is gone before the fixture arms its watch is never
+        reported to the watch, so the fixture checks for that itself. */
+    @Test func aFloodFixtureWhoseStarterIsAlreadyGoneExits() async throws {
+        let (shell, flood) = try await startFixtureFromAShell(flags: "--flood", afterwards: "exit 0")
+        defer {
+            kill(shell, SIGKILL)
+            kill(flood, SIGKILL)
+        }
+
+        #expect(try await awaitExit(flood, within: .seconds(5)), "the flood kept running with no process that started it")
+    }
+
+    /** The teardown fixtures exist to outlive their parents, so only a flood
+        is tied to its starter. */
+    @Test func aHeartbeatFixtureOutlivesTheProcessThatStartedIt() async throws {
+        let (shell, heartbeat) = try await startFixtureFromAShell(flags: "", afterwards: "exec sleep 30")
+        defer {
+            kill(shell, SIGKILL)
+            kill(heartbeat, SIGKILL)
+        }
+
+        kill(shell, SIGKILL)
+        #expect(!(try await eventually(within: .seconds(1)) { kill(heartbeat, 0) != 0 }))
+    }
+
     /** The fixture keeps its stdout open and keeps printing after the pid
         line, so the read stops at that line, not at end of file. */
     @Test func aPrintedPidIsTakenFromItsWholeLineAmongOtherOutput() async throws {
