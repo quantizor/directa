@@ -119,6 +119,18 @@ import Testing
         #expect(LaunchdAdmin.capturedPath(from: .exited(status: 0, output: "\n")) == LaunchdAdmin.pathFloor)
     }
 
+    /** Every caller of `isAgentLoaded` acts on "not loaded" by registering or
+        replacing the agent, so a print killed at its deadline (launchd slow,
+        the job still there) reads as loaded; only an answer of no job, or a
+        launchctl that would not start, reads as not loaded. */
+    @Test func aPrintThatNeverAnsweredReadsAsLoaded() {
+        #expect(LaunchdAdmin.agentLoaded(from: .exited(status: 0, output: "state = running\n")))
+        #expect(LaunchdAdmin.agentLoaded(from: .timedOut(partialOutput: "")))
+        #expect(LaunchdAdmin.agentLoaded(from: .outputLimitExceeded(partialOutput: "state = running\n")))
+        #expect(!LaunchdAdmin.agentLoaded(from: .exited(status: 113, output: "Could not find service")))
+        #expect(!LaunchdAdmin.agentLoaded(from: .failedToRun("no such file")))
+    }
+
     /** A child that exits while a process it started still holds the output
         open ends at the deadline rather than waiting on that process. The
         call is timed on the thread that makes it, so a busy pool delaying the

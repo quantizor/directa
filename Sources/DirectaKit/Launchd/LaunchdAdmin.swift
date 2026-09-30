@@ -54,9 +54,25 @@ public enum LaunchdAdmin {
         return shell("/usr/bin/open", [action.urlString])
     }
 
-    /** True when launchd currently has our agent in the gui domain. */
+    /** True when launchd currently has our agent in the gui domain, or when
+        launchd did not answer in time: a job that exists behind a slow launchd
+        is not one to reinstall or replace. */
     public static func isAgentLoaded() async -> Bool {
-        await shell("/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(label)"]).status == 0
+        agentLoaded(
+            from: await shellOutcome("/bin/launchctl", ["print", "\(LaunchdJobs.guiDomain)/\(label)"]))
+    }
+
+    /** What a `launchctl print` of the agent says about whether it is loaded:
+        a clean exit is loaded and a nonzero exit or a launchctl that could
+        not start is not. A print killed at its deadline or at the output cap
+        is unanswered, which reads as loaded, since every caller acts on
+        "not loaded" by registering or replacing the agent. */
+    static func agentLoaded(from outcome: ShellOutcome) -> Bool {
+        switch outcome {
+        case .exited(let status, _): status == 0
+        case .failedToRun: false
+        case .outputLimitExceeded, .timedOut: true
+        }
     }
 
     /** Wait until launchd drops the agent after an unregister, then idle so BTM
