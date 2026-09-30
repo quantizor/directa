@@ -312,7 +312,9 @@ private func logTexts(router: Router, project: String, name: String) async throw
             returns; only launchd's reap of the orphan is left to wait for. */
         let gone = try await awaitExit(grandchild, within: .seconds(5))
         #expect(gone, "descendant \(grandchild) ignoring SIGTERM survived the bounce of root \(root)")
-        #expect(kill(root, 0) != 0)
+        /** The root answers `kill(root, 0)` as a zombie until the spawn
+            helper's reaper collects it, which can trail the bounce. */
+        #expect(try await awaitExit(root, within: .seconds(5)))
     }
 
     /** A stopped row under a deleted name (no resume intent) is still pruned. */

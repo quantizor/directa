@@ -1274,7 +1274,10 @@ private func makeEnv() throws -> RouterEnv {
         #expect(!ProcessTree.descendants(of: root).identities.contains { $0.pid == child })
         let stopped = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
         #expect(stopped.phase == .stopped)
-        #expect(kill(root, 0) != 0)
+        /** The root is the abandoned supervisor's own child, so it lingers as
+            a zombie, still answering `kill(root, 0)`, until that supervisor's
+            run task reaps it, which a loaded machine can delay past the stop. */
+        #expect(try await awaitExit(root, within: .seconds(5)))
         /** The abandoned supervisor still awaits the root it spawned, so the
             stop above ends that run for it too, and its recordOutcome then
             drains its tailers and writes its log and state row into this
