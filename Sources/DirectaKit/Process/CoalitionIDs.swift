@@ -28,18 +28,20 @@ public struct CoalitionIDs: Equatable, Hashable, Sendable {
     }
 }
 
-/** xnu `struct proc_pidcoalitioninfo` for flavor 20. Not in the public SDK.
-    Field order is the kernel's `coalition_id[COALITION_NUM_TYPES]` (resource
-    then jetsam) plus reserved words, not alphabetical. `proc_pidinfo` itself
-    comes from Darwin (`libproc.h`); only this layout is private. */
+/** xnu `struct proc_pidcoalitioninfo` for flavor 20, 40 bytes. Not in the
+    public SDK. Field order is the kernel's `coalition_id[COALITION_NUM_TYPES]`
+    (resource then jetsam) plus reserved words, not alphabetical. `proc_pidinfo`
+    itself comes from Darwin (`libproc.h`); only this layout is private. The
+    reserved words stay: `proc_pidinfo` refuses a buffer smaller than the
+    kernel's. */
 private struct ProcPIDCoalitionInfo {
     static let flavor: Int32 = 20
     var resource: UInt64 = 0
     var jetsam: UInt64 = 0
-    /** periphery:ignore - the reserved fields size the struct to the kernel's 40 bytes; proc_pidinfo flavor 20 refuses a smaller buffer */
+    /* periphery:ignore - kernel layout */
     var reserved1: UInt64 = 0
-    /** periphery:ignore - the reserved fields size the struct to the kernel's 40 bytes; proc_pidinfo flavor 20 refuses a smaller buffer */
+    /* periphery:ignore - kernel layout */
     var reserved2: UInt64 = 0
-    /** periphery:ignore - the reserved fields size the struct to the kernel's 40 bytes; proc_pidinfo flavor 20 refuses a smaller buffer */
+    /* periphery:ignore - kernel layout */
     var reserved3: UInt64 = 0
 }

@@ -36,19 +36,21 @@ public struct ProcessUniqueIDs: Equatable, Hashable, Sendable {
     public SDK. Field order is the kernel's (executable UUID, unique id, parent
     unique id, pid version, reserved words), not alphabetical, because this
     struct is the kernel's byte layout. `proc_pidinfo` itself comes from Darwin
-    (`libproc.h`); only this layout is private. */
+    (`libproc.h`); only this layout is private. The fields never read stay:
+    `proc_pidinfo` refuses a buffer smaller than the kernel's, and they fix the
+    offsets of the ids that are read. */
 private struct ProcUniqIdentifierInfo {
     static let flavor: Int32 = 17
-    /** periphery:ignore - these fields size the struct to the kernel's 56 bytes and fix the offsets of the ids read; proc_pidinfo flavor 17 refuses a smaller buffer */
+    /* periphery:ignore - kernel layout */
     var executableUUID: (UInt64, UInt64) = (0, 0)
     var uniqueID: UInt64 = 0
     var parentUniqueID: UInt64 = 0
-    /** periphery:ignore - these fields size the struct to the kernel's 56 bytes and fix the offsets of the ids read; proc_pidinfo flavor 17 refuses a smaller buffer */
+    /* periphery:ignore - kernel layout */
     var pidVersion: Int32 = 0
-    /** periphery:ignore - these fields size the struct to the kernel's 56 bytes and fix the offsets of the ids read; proc_pidinfo flavor 17 refuses a smaller buffer */
+    /* periphery:ignore - kernel layout */
     var reserved2: UInt32 = 0
-    /** periphery:ignore - these fields size the struct to the kernel's 56 bytes and fix the offsets of the ids read; proc_pidinfo flavor 17 refuses a smaller buffer */
+    /* periphery:ignore - kernel layout */
     var reserved3: UInt64 = 0
-    /** periphery:ignore - these fields size the struct to the kernel's 56 bytes and fix the offsets of the ids read; proc_pidinfo flavor 17 refuses a smaller buffer */
+    /* periphery:ignore - kernel layout */
     var reserved4: UInt64 = 0
 }

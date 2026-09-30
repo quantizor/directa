@@ -583,8 +583,10 @@ public enum LaunchdAdmin {
         }
     }
 
-    /** The async form of `shellOutcome`, on `BlockingLane.system`. */
-    /** periphery:ignore - the async overload makes an async caller that forgets await fail to compile instead of blocking a cooperative-pool thread */
+    /** The async form of `shellOutcome`, on `BlockingLane.system`. Kept with no
+        caller: its presence makes an async caller that forgets `await` fail to
+        compile instead of blocking a cooperative-pool thread. */
+    /* periphery:ignore - compile-time guard */
     public static func shellOutcome(
         _ path: String, _ arguments: [String], environment: [String: String]? = nil,
         includeStderr: Bool = true, timeoutSeconds: Double? = nil

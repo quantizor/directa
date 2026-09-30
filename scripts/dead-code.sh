@@ -18,8 +18,8 @@
 #
 # A finding is a candidate, not a delete order: check what the code does first.
 # Code the index cannot see a use for (a C struct's padding fields, a strong
-# reference held only to keep an object alive) carries its own
-# `/** periphery:ignore - <reason> */` comment.
+# reference held only to keep an object alive) states why in its doc comment
+# and carries its own plain `/* periphery:ignore - <short reason> */` comment.
 set -euo pipefail
 
 PERIPHERY_VERSION=3.8.0

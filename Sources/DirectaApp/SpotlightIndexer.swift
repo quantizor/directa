@@ -37,7 +37,9 @@ enum SpotlightIndexer {
     /** Named index so Spotlight can batch; default() forbids batching. */
     nonisolated private static let index = CSSearchableIndex(name: "directa-servers")
 
-    /** periphery:ignore - an NSUserActivity must stay strongly referenced after becomeCurrent() or it is invalidated and the Spotlight donation disappears */
+    /** Held only to keep the donated activity alive: an NSUserActivity released
+        after becomeCurrent() is invalidated and its Spotlight donation disappears. */
+    /* periphery:ignore - held for its lifetime */
     private static var currentActivity: NSUserActivity?
 
     static func sync(projects: [DaemonModel.ProjectGroup]) {
