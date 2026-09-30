@@ -2,6 +2,9 @@ import Darwin
 import DirectaTestSupport
 import Foundation
 import Testing
+import os
+
+@testable import DirectaDaemonCore
 
 /** The stray reaper decides whether to SIGKILL a process, so the cases it must
     refuse matter more than the ones it acts on; these pin each decision. The
@@ -103,6 +106,52 @@ import Testing
 
         kill(survivor, SIGTERM)
         #expect(try await awaitExit(survivor, within: .seconds(5)), "the child kept the spawning thread's mask")
+    }
+
+    /** A gate signalled while a caller waits stays open: every later
+        `outcome()` returns the same value at once rather than suspending with
+        nothing left to resume it. */
+    @Test func anAdoptGateSignalledUnderAWaiterStaysOpen() async throws {
+        let gate = AdoptGate()
+        let first = Task { await gate.outcome() }
+        try #require(try await eventually(within: .seconds(5)) { await gate.callCount == 1 })
+        await gate.signal(.exited(code: 3))
+        #expect(Self.exitCode(await first.value) == 3)
+
+        /** Unstructured, so a second call that never returns fails this test
+            instead of hanging the run on a task group's implicit join. */
+        let second = OSAllocatedUnfairLock<Int?>(initialState: nil)
+        Task {
+            let code = Self.exitCode(await gate.outcome())
+            second.withLock { $0 = code }
+        }
+        let answered = try await eventually(within: .seconds(2)) { second.withLock { $0 } != nil }
+        #expect(answered, "a second outcome() after the signal never returned")
+        #expect(second.withLock { $0 } == 3)
+    }
+
+    /** Every caller waiting when the gate is signalled is resumed, not only
+        the latest one. */
+    @Test func anAdoptGateSignalledUnderTwoWaitersResumesBoth() async throws {
+        let gate = AdoptGate()
+        let codes = OSAllocatedUnfairLock(initialState: [Int]())
+        for _ in 0..<2 {
+            Task {
+                if let code = Self.exitCode(await gate.outcome()) {
+                    codes.withLock { $0.append(code) }
+                }
+            }
+        }
+        try #require(try await eventually(within: .seconds(5)) { await gate.callCount == 2 })
+        await gate.signal(.exited(code: 4))
+        let resumed = try await eventually(within: .seconds(2)) { codes.withLock { $0.count } == 2 }
+        #expect(resumed, "\(codes.withLock { $0.count }) of 2 waiters resumed after the signal")
+        #expect(codes.withLock { $0 } == [4, 4])
+    }
+
+    private static func exitCode(_ outcome: ProcessOutcome) -> Int? {
+        guard case .exited(let code) = outcome else { return nil }
+        return code
     }
 
     /** The run's block is one of the leasable ones, and its lease is held: a

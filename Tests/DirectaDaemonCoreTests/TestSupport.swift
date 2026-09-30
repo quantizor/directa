@@ -319,30 +319,23 @@ extension Latch where Value == Void {
 /** Holds a launcher's spawn report until the test opens it. */
 typealias SpawnGate = Latch<Void>
 
-/** Resolves `outcome()` once `signal(_:)` is called (or immediately, if it
-    already was), so a test controls exactly when a fake child "exits" without
+/** Resolves every `outcome()` once `signal(_:)` is called (at once, for a call
+    made after), so a test controls exactly when a fake child "exits" without
     tying that to a real process death. Counts calls so a test can tell
     "waiting on the exit" apart from "never asked". */
 actor AdoptGate {
     private(set) var callCount = 0
     private let called = Latch<Void>()
-    private var continuation: CheckedContinuation<ProcessOutcome, Never>?
-    private var pending: ProcessOutcome?
+    private let exit = Latch<ProcessOutcome>()
 
     func outcome() async -> ProcessOutcome {
         callCount += 1
         await called.open()
-        if let pending { return pending }
-        return await withCheckedContinuation { continuation = $0 }
+        return await exit.wait()
     }
 
     func signal(_ outcome: ProcessOutcome) async {
-        if let continuation {
-            continuation.resume(returning: outcome)
-            self.continuation = nil
-        } else {
-            pending = outcome
-        }
+        await exit.open(outcome)
     }
 
     /** Returns once `outcome()` has been called at least once. */
@@ -464,10 +457,15 @@ struct ExitedBeforeWatchLauncher: NeverAdopts {
     never told," which is what lets a bounded wait for that outcome be tested
     without a real multi-second sleep or a race against how fast a flood
     drains. `spawnRoot` picks the real process `run` reports, a long-lived
-    session leader by default. */
+    session leader by default. A gate stays open once signalled, so a test
+    where a stop clears and a fresh run begins names `laterRunsGate`: every
+    run after the first waits on it instead, and stays stuck until the test
+    signals it. */
 struct StuckRunLauncher: NeverAdopts {
     let gate: AdoptGate
+    var laterRunsGate: AdoptGate?
     var spawnRoot: @Sendable () throws -> pid_t = spawnSurvivor
+    let runs = OSAllocatedUnfairLock(initialState: 0)
 
     func run(
         argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
@@ -481,7 +479,11 @@ struct StuckRunLauncher: NeverAdopts {
             return .spawnFailed(SpawnError(message: "the stuck run's root failed to spawn: \(error)"))
         }
         await onSpawn(pid)
-        return await gate.outcome()
+        let run = runs.withLock { count in
+            count += 1
+            return count
+        }
+        return await (run > 1 ? laterRunsGate ?? gate : gate).outcome()
     }
 }
 

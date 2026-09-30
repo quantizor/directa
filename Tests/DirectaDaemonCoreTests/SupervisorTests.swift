@@ -242,9 +242,10 @@ private func makeEnv() throws -> RouterEnv {
     @Test func ensureAfterAStopClearsSpendsOnlyTheRemainingTimeout() async throws {
         let env = try makeEnv()
         let gate = AdoptGate()
+        let freshRunGate = AdoptGate()
         let port = TestPorts.port(483)
         let supervisor = ServerSupervisor(
-            launcher: StuckRunLauncher(gate: gate), paths: env.paths, prober: NeverHealthyProber(),
+            launcher: StuckRunLauncher(gate: gate, laterRunsGate: freshRunGate), paths: env.paths, prober: NeverHealthyProber(),
             projectPath: env.project, registry: Registry(paths: env.paths),
             spec: ServerSpec(
                 command: ["/bin/true"], healthcheck: HealthCheckSpec(port: port, type: .tcp),
@@ -278,11 +279,11 @@ private func makeEnv() throws -> RouterEnv {
             "ensure took \(waited), a full \(timeout) past the stop clearing at \(releasedAfter)")
 
         _ = await stopped
-        /** The fresh run's survivor dies to this stop's SIGKILL; the gate's
-            second signal lets its fake `run()` return, and the wait for
+        /** The fresh run's survivor dies to this stop's SIGKILL; the fresh
+            run's gate lets its fake `run()` return, and the wait for
             `.stopped` keeps the run's last write inside the test. */
         async let cleanup = supervisor.stop(graceSeconds: 0.05, reason: "test cleanup")
-        await gate.signal(.signaled(signal: Int(SIGKILL)))
+        await freshRunGate.signal(.signaled(signal: Int(SIGKILL)))
         _ = await cleanup
         #expect(try await awaitPhase(supervisor, .stopped, within: .seconds(5)).phase == .stopped)
     }
