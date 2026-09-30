@@ -190,6 +190,23 @@ import os
         #expect(errno == EWOULDBLOCK)
     }
 
+    /** A test with two checkouts of one repository gets the second as a real
+        directory beside the first, in the same scratch tree as the router's
+        data and logs roots. */
+    @Test(.temporaryTree) func aSiblingProjectIsARealDirectoryBesideTheFirst() throws {
+        let env = try makeRouterEnv(named: "sibling", project: "first")
+        let second = try env.sibling(named: "second")
+        let base = URL(fileURLWithPath: env.project).deletingLastPathComponent()
+
+        var isDirectory: ObjCBool = false
+        #expect(FileManager.default.fileExists(atPath: second, isDirectory: &isDirectory))
+        #expect(isDirectory.boolValue)
+        #expect(second == base.appending(path: "second").path)
+        #expect(env.project == base.appending(path: "first").path)
+        #expect(env.paths.dataDir == base.appending(path: "data"))
+        #expect(env.paths.logsDir == base.appending(path: "logs"))
+    }
+
     /** Every block any run may lease must stay clear of every range
         scripts/smoke.sh draws from, read from the script itself so a new
         smoke range cannot land on a unit block unnoticed. */

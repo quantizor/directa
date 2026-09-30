@@ -228,21 +228,34 @@ func printedPid(_ label: String, in url: URL, within limit: Duration = .seconds(
 
 // MARK: - Router over scratch paths
 
+extension DirectaPaths {
+    /** A data and logs root side by side inside `base`. */
+    static func scratch(in base: URL) -> DirectaPaths {
+        DirectaPaths(dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs"))
+    }
+}
+
 /** A data and logs root plus one project directory, all inside the current
     test's `TemporaryTree`. */
 struct RouterEnv {
     let paths: DirectaPaths
     /** A real directory: a spawned child chdirs into it. */
     let project: String
+
+    /** A second real directory named `name` beside `project`, for a test that
+        needs two checkouts of one repository. */
+    func sibling(named name: String) throws -> String {
+        let url = URL(fileURLWithPath: project).deletingLastPathComponent().appending(path: name)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url.path
+    }
 }
 
 func makeRouterEnv(named name: String, project: String = "proj") throws -> RouterEnv {
     let base = try TemporaryTree.directory(named: name)
     let projectURL = base.appending(path: project)
     try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
-    return RouterEnv(
-        paths: DirectaPaths(dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs")),
-        project: projectURL.path)
+    return RouterEnv(paths: .scratch(in: base), project: projectURL.path)
 }
 
 extension Router {
