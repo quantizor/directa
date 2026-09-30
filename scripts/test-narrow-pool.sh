@@ -50,33 +50,48 @@ library=$root/.build/narrow-pool/libnarrow-pool.dylib
 clang -dynamiclib -O1 -Wall -Werror -isysroot "$sdk" -o "$library" scripts/narrow-pool/narrow-pool.c || exit 1
 
 swift build --build-tests || exit 1
-bundle="$(swift build --show-bin-path)/directaPackageTests.xctest/Contents/MacOS/directaPackageTests"
-[[ -x $bundle ]] || { echo "error: no test bundle at $bundle after the build" >&2; exit 1 }
+bin_path=$(swift build --show-bin-path) || exit 1
+# The native build system links one directaPackageTests bundle; the default
+# Swift Build engine writes one bundle per test target.
+bundles=()
+if [[ -d $bin_path/directaPackageTests.xctest ]]; then
+  bundles=("$bin_path/directaPackageTests.xctest/Contents/MacOS/directaPackageTests")
+else
+  for packaged in "$bin_path"/*Tests.xctest(N); do
+    bundles+=("$packaged/Contents/MacOS/${packaged:t:r}")
+  done
+fi
+(( ${#bundles} > 0 )) || { echo "error: no test bundle under $bin_path after the build" >&2; exit 1 }
 
 run=$(mktemp -d "$(getconf DARWIN_USER_TEMP_DIR)directa-narrow.XXXXXX") || exit 1
 temp_root=$(mktemp -d "$(getconf DARWIN_USER_TEMP_DIR)directa-run.XXXXXX") || exit 1
-log=$run/run.log
 
-DYLD_FRAMEWORK_PATH="$platform/Developer/Library/Frameworks:$platform/Developer/Library/PrivateFrameworks" \
-DYLD_LIBRARY_PATH="$platform/Developer/usr/lib" \
-DYLD_INSERT_LIBRARIES="$library" \
-NARROW_POOL_SAMPLE_DIR="$run" \
-DIRECTA_TEST_TEMP_ROOT="$temp_root" \
-  "$helper" --test-bundle-path "$bundle" "$@" "$bundle" --testing-library swift-testing 2>&1 | tee "$log"
-test_status=${pipestatus[1]}
+result=0
+for bundle in $bundles; do
+  [[ -x $bundle ]] || { echo "error: no test bundle at $bundle after the build" >&2; result=1; continue }
+  log=$run/${bundle:t}.log
+
+  DYLD_FRAMEWORK_PATH="$platform/Developer/Library/Frameworks:$platform/Developer/Library/PrivateFrameworks" \
+  DYLD_LIBRARY_PATH="$platform/Developer/usr/lib" \
+  DYLD_INSERT_LIBRARIES="$library" \
+  NARROW_POOL_SAMPLE_DIR="$run" \
+  DIRECTA_TEST_TEMP_ROOT="$temp_root" \
+    "$helper" --test-bundle-path "$bundle" "$@" "$bundle" --testing-library swift-testing 2>&1 | tee "$log"
+  test_status=${pipestatus[1]}
+  (( test_status == 0 )) || result=1
+
+  if ! grep -q '^\[narrow-pool\] cooperative pool narrowed' "$log"; then
+    echo "error: the pool was never narrowed for ${bundle:t} (the library did not load into the test process)" >&2
+    result=1
+  fi
+  if grep -q '^\[narrow-pool\] BLOCKED:' "$log"; then
+    echo "--- blocked pool threads in ${bundle:t}, demangled ---" >&2
+    grep '^\[narrow-pool\]' "$log" | xcrun swift-demangle --simplified >&2
+    echo "error: a cooperative-pool thread was blocked; the stacks above, and full samples in $run/blocked-*.txt" >&2
+    echo "fix: move the blocking call off the pool (a BlockingLane in product code, offPool in a test; Tests/DirectaTestSupport/OffPool.swift)" >&2
+    result=1
+  fi
+  echo "run log: $log"
+done
 rm -rf "$temp_root"
-
-result=$test_status
-if ! grep -q '^\[narrow-pool\] cooperative pool narrowed' "$log"; then
-  echo "error: the pool was never narrowed (the library did not load into the test process)" >&2
-  result=1
-fi
-if grep -q '^\[narrow-pool\] BLOCKED:' "$log"; then
-  echo "--- blocked pool threads, demangled ---" >&2
-  grep '^\[narrow-pool\]' "$log" | xcrun swift-demangle --simplified >&2
-  echo "error: a cooperative-pool thread was blocked; the stacks above, and full samples in $run/blocked-*.txt" >&2
-  echo "fix: move the blocking call off the pool (a BlockingLane in product code, offPool in a test; Tests/DirectaTestSupport/OffPool.swift)" >&2
-  result=1
-fi
-echo "run log: $log"
 exit $result
