@@ -90,8 +90,6 @@ final class ProjectAccessLog {
     icon state, and posts crash notifications from the event feed. */
 @Observable
 final class DaemonModel {
-    /** Bumped on system theme change so the baked menu bar label re-renders. */
-    var appearanceTick = 0
     var daemonReachable = false
     /** True while the daemon answers but is still bringing supervised servers
         back, which is a busy daemon rather than a missing one. */
@@ -206,14 +204,6 @@ final class DaemonModel {
     func start() {
         guard pollTask == nil else { return }
         requestNotificationPermission()
-        DistributedNotificationCenter.default().addObserver(
-            forName: Notification.Name("AppleInterfaceThemeChangedNotification"),
-            object: nil, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                self?.appearanceTick += 1
-            }
-        }
         /** Launch-time registration runs behind the same in-flight flag and
             cooldown as recovery. Left outside them, the 2s poll sees the socket
             still silent inside launchd's respawn throttle and fires a second

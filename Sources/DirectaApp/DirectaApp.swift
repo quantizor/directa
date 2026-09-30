@@ -588,6 +588,10 @@ struct MenuContent: View {
             .padding(.vertical, 8)
         }
         .frame(width: 340)
+        /** Opaque, not the panel's default glass: whatever sits behind the
+            popover bled through and washed out the server rows. */
+        .background(Color(nsColor: .windowBackgroundColor), ignoresSafeAreaEdges: .all)
+        .background(SystemAppearancePin())
         .onAppear {
             keyNav.daemon = model
             keyNav.installIfNeeded()
@@ -1248,7 +1252,7 @@ struct SortOrderMenu: View {
                 .background {
                     let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
                     shape
-                        .fill(.ultraThinMaterial)
+                        .fill(Color(nsColor: .controlBackgroundColor))
                         .overlay(
                             shape.strokeBorder(
                                 Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.5))
@@ -1302,7 +1306,7 @@ struct FilterBox: View {
         .background {
             let shape = RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
             shape
-                .fill(.ultraThinMaterial)
+                .fill(Color(nsColor: .controlBackgroundColor))
                 .overlay(
                     shape.strokeBorder(
                         Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.5))
@@ -1355,3 +1359,31 @@ enum FuzzyMatcher {
 }
 
 
+
+/** Pins the hosting window to the system Light/Dark setting. A MenuBarExtra
+    panel otherwise takes the menu bar's appearance, which follows the wallpaper
+    behind the bar, so a dark-mode user on a bright wallpaper got a light popover.
+    NSApp.effectiveAppearance tracks the system setting because the app never
+    sets NSApp.appearance. */
+struct SystemAppearancePin: NSViewRepresentable {
+    func makeNSView(context: Context) -> PinView { PinView() }
+
+    func updateNSView(_ nsView: PinView, context: Context) {}
+
+    final class PinView: NSView {
+        private var observation: NSKeyValueObservation?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil else {
+                observation = nil
+                return
+            }
+            observation = NSApp.observe(\.effectiveAppearance, options: [.initial]) { [weak self] app, _ in
+                MainActor.assumeIsolated {
+                    self?.window?.appearance = app.effectiveAppearance
+                }
+            }
+        }
+    }
+}
