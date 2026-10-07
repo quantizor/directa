@@ -1052,7 +1052,9 @@ struct HookCommand: AsyncParsableCommand {
         abstract: "Agent-harness session hooks.",
         subcommands: [
             HookInstall.self, HookUninstall.self, HookAntigravitySessionStart.self,
-            HookClaudeSessionStart.self, HookCursorSessionStart.self, HookGrokSessionStart.self,
+            HookAntigravityPostInvocation.self, HookClaudeSessionStart.self, HookClaudePostTool.self,
+            HookCursorSessionStart.self, HookCursorPostTool.self, HookGrokPostTool.self,
+            HookGrokSessionStart.self,
         ]
     )
 }
@@ -1073,7 +1075,7 @@ struct HookInstall: AsyncParsableCommand {
 
     @Option(
         help:
-            "Harness to install for: \(harnessAdapters.map(\.name).joined(separator: ", ")) (default: every harness detected on this machine)."
+            "Harness to install for: \(harnessAdapters().map(\.name).joined(separator: ", ")) (default: every harness detected on this machine)."
     )
     var harness: String?
 
@@ -1121,7 +1123,7 @@ struct HookInstall: AsyncParsableCommand {
 
     func run() async throws {
         let targets: Targets
-        switch Self.resolveTargets(harness: harness, adapters: harnessAdapters) {
+        switch Self.resolveTargets(harness: harness, adapters: harnessAdapters()) {
         case .failure(let error):
             CLIRunner.fail(error, json: global.json)
         case .success(let resolved):
@@ -1170,20 +1172,20 @@ struct HookUninstall: AsyncParsableCommand {
 
     /** Omitted means every harness, so a plain `hook uninstall` cleans up
         wherever directa wrote a hook rather than only the default one. */
-    @Option(help: "Harness to remove from: \(harnessAdapters.map(\.name).joined(separator: ", ")) (default: all).")
+    @Option(help: "Harness to remove from: \(harnessAdapters().map(\.name).joined(separator: ", ")) (default: all).")
     var harness: String?
 
     func run() async throws {
         let adapters: [any HarnessAdapter]
         if let harness {
-            switch HarnessBatch.adapter(named: harness, in: harnessAdapters, verb: .uninstall) {
+            switch HarnessBatch.adapter(named: harness, in: harnessAdapters(), verb: .uninstall) {
             case .failure(let error):
                 CLIRunner.fail(error, json: global.json)
             case .success(let adapter):
                 adapters = [adapter]
             }
         } else {
-            adapters = harnessAdapters
+            adapters = harnessAdapters()
         }
         let result = HarnessBatch.run(adapters) { try $0.uninstall() }
         if let failure = result.failure(verb: .uninstall) {
@@ -1193,205 +1195,164 @@ struct HookUninstall: AsyncParsableCommand {
     }
 }
 
-/** What one `hook install` or `hook uninstall` pass over several harnesses
-    did. The pass collects rather than aborts: a refusal from one harness must
-    not discard the others' work, since their files are already rewritten by
-    the time it lands, so every adapter runs and the report names both what
-    succeeded and what failed. */
-struct HarnessBatchResult {
-    struct Failure: Equatable {
-        var message: String
-        var name: String
-    }
-
-    var failures: [Failure] = []
-    /** Names of the adapters whose action returned, in order. */
-    var succeeded: [String] = []
-    var summaries: [String] = []
-
-    /** The failure the command exits with when any adapter failed, or nil. */
-    func failure(verb: HarnessBatch.Verb) -> WireError? {
-        guard !failures.isEmpty else { return nil }
-        var message = "hook \(verb.rawValue) finished with errors"
-        if !succeeded.isEmpty {
-            message += "; \(verb.pastTense) \(succeeded.joined(separator: ", "))"
-        }
-        message +=
-            ". Failed: " + failures.map { "\($0.name) (\($0.message))" }.joined(separator: "; ")
-        message += " Fix each cause and rerun directa hook \(verb.rawValue)."
-        return WireError(code: .internalError, hint: "run: directa hook \(verb.rawValue)", message: message)
-    }
-}
-
-/** The pieces `hook install` and `hook uninstall` share. */
-enum HarnessBatch {
-    enum Verb: String {
-        case install
-        case uninstall
-
-        /** How the failure report names what succeeded ("installed claude"). */
-        var pastTense: String {
-            switch self {
-            case .install: "installed"
-            case .uninstall: "removed from"
-            }
-        }
-    }
-
-    /** The adapter an explicit `--harness` names, or the usage error listing
-        the supported names. */
-    static func adapter(
-        named name: String, in adapters: [any HarnessAdapter], verb: Verb
-    ) -> Result<any HarnessAdapter, WireError> {
-        if let adapter = adapters.first(where: { $0.name == name }) { return .success(adapter) }
-        let supported = adapters.map(\.name).joined(separator: ", ")
-        let guide = verb == .install ? "; adding one: CONTRIBUTING.md" : ""
-        return .failure(
-            WireError(
-                code: .usage,
-                hint: "run: directa hook \(verb.rawValue) --harness <name>",
-                message: "unknown harness '\(name)' (supported: \(supported)\(guide))"))
-    }
-
-    /** Runs `action` on every adapter, collecting each summary or failure. */
-    static func run(
-        _ adapters: [any HarnessAdapter], _ action: (any HarnessAdapter) throws -> String
-    ) -> HarnessBatchResult {
-        var result = HarnessBatchResult()
-        for adapter in adapters {
-            do {
-                result.summaries.append(try action(adapter))
-                result.succeeded.append(adapter.name)
-            } catch let error as WireError {
-                result.failures.append(HarnessBatchResult.Failure(message: error.message, name: adapter.name))
-            } catch {
-                result.failures.append(
-                    HarnessBatchResult.Failure(message: String(describing: error), name: adapter.name))
-            }
-        }
-        return result
-    }
-}
-
-/** Invoked by Antigravity's PreInvocation hook. Reads the hook's stdin JSON for
-    the workspace directory, emits {"injectSteps": [{"ephemeralMessage": ...}]}
-    on the first model call only (HookPayloadGate), and always exits 0 quickly. */
+/** One session hook. The command name is what the harness runs. The body asks
+    `HookSpeak` and writes the envelope this harness reads. */
 struct HookAntigravitySessionStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "antigravity-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let payload = HookPayload.parse(CLIRunner.stdinData())
-        /** Decided before any project lookup: every model call after the
-            first answers empty, so it costs one stdin parse and nothing more. */
-        guard HookPayloadGate.antigravityHookShouldEmit(payload),
-            let text = await HookContext.render(
-                project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
-                harness: .antigravity)
-        else {
-            HookOutput.write(HookOutput.Antigravity(injectSteps: []))
-            return
-        }
-        HookOutput.write(HookOutput.Antigravity(injectSteps: [.init(ephemeralMessage: text)]))
+        try await deliverAntigravity(continueOnNewErrors: false)
     }
 }
 
-/** Invoked by Claude Code's SessionStart hook. Reads the hook's stdin JSON for
-    the session cwd, emits hookSpecificOutput.additionalContext, and always exits
-    0 quickly: a session start must never stall or fail on directa's account.
-    Silent when Cursor runs it (HookPayloadGate), since Cursor's own hook
-    already carries the block. */
+struct HookAntigravityPostInvocation: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "antigravity-post-invocation", shouldDisplay: false)
+
+    func run() async throws {
+        try await deliverAntigravity(continueOnNewErrors: true)
+    }
+}
+
 struct HookClaudeSessionStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "claude-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let payload = HookPayload.parse(CLIRunner.stdinData())
-        guard
-            HookPayloadGate.claudeHookShouldEmit(
-                payload, cursorHookInstalled: { CursorAdapter().hookState().isLive }),
-            let text = await HookContext.render(
-                project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
-                harness: .claude)
-        else { return }
-        HookOutput.write(
-            HookOutput.AdditionalContext(
-                hookSpecificOutput: .init(additionalContext: text, hookEventName: "SessionStart")))
+        try await deliverClaude(event: "SessionStart", boundary: true)
     }
 }
 
-/** Invoked by Cursor's sessionStart hook. Emits {additional_context} (Cursor's
-    snake_case schema). Same silence / exit-0 guarantees as the Claude hook. */
+struct HookClaudePostTool: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "claude-post-tool", shouldDisplay: false)
+
+    func run() async throws {
+        try await deliverClaude(event: "PostToolUse", boundary: false)
+    }
+}
+
 struct HookCursorSessionStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "cursor-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let payload = HookPayload.parse(CLIRunner.stdinData())
-        guard
-            let text = await HookContext.render(
-                project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
-                harness: .cursor)
-        else { return }
-        HookOutput.write(HookOutput.Cursor(additionalContext: text))
+        try await deliverCursor(boundary: true)
     }
 }
 
-/** Invoked by Grok Build's PreToolUse and UserPromptSubmit hooks. Emits
-    hookSpecificOutput.additionalContext on PreToolUse (the path Grok delivers).
-    UserPromptSubmit only marks the turn. SessionStart and Stop are silent, so a
-    leftover registration cannot stall the session or continue the turn. Same
-    silence / exit-0 guarantees as the Claude hook. */
+struct HookCursorPostTool: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "cursor-post-tool", shouldDisplay: false)
+
+    func run() async throws {
+        try await deliverCursor(boundary: false)
+    }
+}
+
+struct HookGrokPostTool: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "grok-post-tool", shouldDisplay: false)
+
+    func run() async throws {
+        try await deliverGrok()
+    }
+}
+
+/** Older installs still call this. It answers the same way as `grok-post-tool`. */
 struct HookGrokSessionStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "grok-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let env = ProcessInfo.processInfo.environment
-        let event = GrokHookEvent.parse(env["GROK_HOOK_EVENT"])
-        guard event != .leftover else { return }
-
-        if event == .unspecified {
-            let stdin = CLIRunner.stdinData()
-            _ = await emit(stdin: stdin)
-            return
-        }
-
-        let directory = GrokTurnGate.directory(environment: env)
-        let key = GrokTurnGate.sessionKey(env["GROK_SESSION_ID"])
-        var state = GrokTurnGate.load(sessionKey: key, directory: directory)
-        let action = GrokSessionHook.action(for: event, state: &state)
-        switch action {
-        case .silent:
-            return
-        case .silentPersist:
-            GrokTurnGate.save(state, sessionKey: key, directory: directory)
-            return
-        case .emitUnmarked, .emitAndMark:
-            break
-        }
-
-        let stdin = CLIRunner.stdinData()
-        guard await emit(stdin: stdin) else { return }
-        if action == .emitAndMark {
-            GrokSessionHook.markEmitted(&state)
-            GrokTurnGate.save(state, sessionKey: key, directory: directory)
-        }
+        try await deliverGrok()
     }
+}
 
-    /** Returns false when there is nothing to say, so the caller can skip the mark. */
-    private func emit(stdin: Data) async -> Bool {
-        guard
-            let text = await HookContext.render(
-                project: GlobalOptions.resolveProject(
-                    from: HookSessionCwd.resolve(HookPayload.parse(stdin))),
-                harness: .grok)
-        else { return false }
-        HookOutput.write(
-            HookOutput.AdditionalContext(
-                hookSpecificOutput: .init(additionalContext: text, hookEventName: "PreToolUse")))
-        return true
-    }
+private func deliverAntigravity(continueOnNewErrors: Bool) async throws {
+    let payload = HookPayload.parse(CLIRunner.stdinData())
+    let environment = ProcessInfo.processInfo.environment
+    var pull = false
+    await HookSpeak.deliver(
+        project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
+        harness: .antigravity,
+        fileKey: AntigravityAdapter.conversationFileKey(payload: payload),
+        environment: environment,
+        boundary: {
+            continueOnNewErrors
+                ? false
+                : AntigravityAdapter.isBoundary(
+                    payload: payload, prior: $0?.antigravity?.lastInitialNumSteps)
+        },
+        amend: { record, answer, boundary in
+            pull = AntigravityAdapter.note(
+                &record, payload: payload, newErrorLines: answer.newErrorLines, boundary: boundary,
+                continueOnNewErrors: continueOnNewErrors)
+        },
+        write: { answer in
+            let steps = answer.text.map { [HookOutput.Antigravity.Step(ephemeralMessage: $0)] } ?? []
+            HookOutput.write(
+                HookOutput.Antigravity(
+                    injectSteps: steps, terminationBehavior: pull ? "force_continue" : nil))
+        })
+}
+
+private func deliverClaude(event: String, boundary: Bool) async throws {
+    let payload = HookPayload.parse(CLIRunner.stdinData())
+    let environment = ProcessInfo.processInfo.environment
+    guard
+        HookPayloadGate.claudeHookShouldEmit(
+            payload, cursorHookInstalled: { CursorAdapter().hookState().isLive })
+    else { return }
+    await HookSpeak.deliver(
+        project: GlobalOptions.resolveProject(
+            from: HookSessionCwd.resolve(payload, environment: environment)),
+        harness: .claude,
+        fileKey: ClaudeCodeAdapter.conversationFileKey(payload: payload, environment: environment),
+        environment: environment,
+        boundary: { _ in boundary },
+        write: { answer in
+            guard let text = answer.text else { return }
+            HookOutput.write(
+                HookOutput.AdditionalContext(
+                    hookSpecificOutput: .init(additionalContext: text, hookEventName: event)))
+        })
+}
+
+private func deliverCursor(boundary: Bool) async throws {
+    let payload = HookPayload.parse(CLIRunner.stdinData())
+    let environment = ProcessInfo.processInfo.environment
+    await HookSpeak.deliver(
+        project: GlobalOptions.resolveProject(
+            from: HookSessionCwd.resolve(payload, environment: environment)),
+        harness: .cursor,
+        fileKey: CursorAdapter.conversationFileKey(payload: payload),
+        environment: environment,
+        boundary: { _ in boundary },
+        write: { answer in
+            guard let text = answer.text else { return }
+            HookOutput.write(HookOutput.Cursor(additionalContext: text))
+        })
+}
+
+private func deliverGrok() async throws {
+    let environment = ProcessInfo.processInfo.environment
+    guard GrokHookEvent.parse(environment["GROK_HOOK_EVENT"]).deliversContext else { return }
+    let payload = HookPayload.parse(CLIRunner.stdinData())
+    await HookSpeak.deliver(
+        project: GlobalOptions.resolveProject(
+            from: HookSessionCwd.resolve(payload, environment: environment)),
+        harness: .grok,
+        fileKey: GrokAdapter.conversationFileKey(payload: payload, environment: environment),
+        environment: environment,
+        boundary: { _ in false },
+        write: { answer in
+            guard let text = answer.text else { return }
+            HookOutput.write(
+                HookOutput.AdditionalContext(
+                    hookSpecificOutput: .init(additionalContext: text, hookEventName: "PostToolUse")))
+        })
 }
 
 /** Statusline helper: reads the harness's statusline stdin JSON, prints one
@@ -2147,7 +2108,7 @@ struct Doctor: AsyncParsableCommand {
         /** Harness hooks: report only, never repair. directa does not edit a file
             the user owns, so a drifted hook is surfaced with the exact command to
             fix it and nothing more. */
-        for adapter in harnessAdapters {
+        for adapter in harnessAdapters() {
             switch adapter.hookState() {
             case .harnessAbsent:
                 break
@@ -2273,7 +2234,7 @@ struct Uninstall: AsyncParsableCommand {
         if !agentOnly { actions.append("unregistered Start at Login") }
 
         if !agentOnly {
-            for adapter in harnessAdapters {
+            for adapter in harnessAdapters() {
                 if let summary = try? adapter.uninstall() { actions.append(summary) }
             }
             /** Only the copies directa installed, at `~/.local/bin`. A Homebrew

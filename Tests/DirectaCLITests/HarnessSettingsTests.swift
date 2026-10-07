@@ -1,5 +1,5 @@
-import DirectaKit
 import DirectaTestSupport
+@testable import DirectaKit
 import Foundation
 import Testing
 import os
@@ -304,7 +304,7 @@ import os
                 #expect(groups?.first?["matcher"] == nil)
                 let handlers = groups?.first?["hooks"] as? [[String: Any]]
                 #expect(handlers?.first?["timeout"] as? Int == 10)
-                #expect((handlers?.first?["command"] as? String)?.hasSuffix(" hook grok-session-start") == true)
+                #expect((handlers?.first?["command"] as? String)?.hasSuffix(" hook grok-post-tool") == true)
             }
             #expect(hooks?["SessionStart"] == nil)
             #expect(hooks?["SessionEnd"] == nil)
@@ -384,8 +384,7 @@ import os
             ]
             try adapter.writeSettings([
                 "hooks": [
-                    "PreToolUse": [["hooks": [oldHandler]]],
-                    "UserPromptSubmit": [["hooks": [oldHandler]]],
+                    "PostToolUse": [["hooks": [oldHandler]]],
                 ]
             ])
             let newPath = dir.appending(path: "bin/directa").path
@@ -435,7 +434,7 @@ import os
             let adapter = GrokAdapter(settingsURLOverride: settings)
             let cliPath = dir.appending(path: "bin/directa").path
             let handler: [String: Any] = [
-                "command": "\(cliPath) hook grok-session-start", "type": "command",
+                "command": "\(cliPath) hook grok-post-tool", "type": "command",
             ]
             var events: [String: Any] = [:]
             for event in GrokAdapter.registeredEvents {
@@ -485,28 +484,28 @@ import os
                 let commands =
                     ((hooks?[event] as? [[String: Any]])?.first?["hooks"] as? [[String: Any]])?
                     .compactMap { $0["command"] as? String } ?? []
-                #expect(commands.contains("\(cliPath) hook grok-session-start"))
+                #expect(commands.contains("\(cliPath) hook grok-post-tool"))
             }
             #expect(hooks?["SessionStart"] == nil)
         }
     }
 
-    @Test func grokHookStateRequiresBothPreToolUseAndUserPromptSubmit() throws {
+    @Test func grokHookStateRequiresPostToolUse() throws {
         try inScratchDir { dir in
             let settings = dir.appending(path: "hooks/directa.json")
             try FileManager.default.createDirectory(
                 at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
             let adapter = GrokAdapter(settingsURLOverride: settings)
-            let command = "\(dir.appending(path: "bin/directa").path) hook grok-session-start"
+            let legacy = "\(dir.appending(path: "bin/directa").path) hook grok-session-start"
+            let command = "\(dir.appending(path: "bin/directa").path) hook grok-post-tool"
+            let legacyGroup: [[String: Any]] = [["hooks": [["command": legacy, "type": "command"]]]]
             let group: [[String: Any]] = [["hooks": [["command": command, "type": "command"]]]]
-            try adapter.writeSettings(["hooks": ["PreToolUse": group]])
+            try adapter.writeSettings(["hooks": ["PreToolUse": legacyGroup]])
             #expect(adapter.hookState() == .notInstalled)
-            try adapter.writeSettings(["hooks": ["UserPromptSubmit": group]])
-            #expect(adapter.hookState() == .notInstalled)
-            try adapter.writeSettings(["hooks": ["PreToolUse": group, "UserPromptSubmit": group]])
+            try adapter.writeSettings(["hooks": ["PostToolUse": group]])
             if case .installed = adapter.hookState() {
             } else {
-                Issue.record("expected both events to read as installed")
+                Issue.record("expected PostToolUse to read as installed")
             }
         }
     }
@@ -518,7 +517,7 @@ import os
         #expect(GrokHookEvent.parse(nil) == .unspecified)
         #expect(GrokHookEvent.parse("session_start") == .leftover)
         #expect(GrokHookEvent.parse("stop") == .leftover)
-        #expect(GrokHookEvent.parse("post_tool_use") == .leftover)
+        #expect(GrokHookEvent.parse("post_tool_use") == .postToolUse)
     }
 
     /** Payload shapes copied from the vendor docs: Claude Code's SessionStart
@@ -572,34 +571,31 @@ import os
                 }))
     }
 
-    /** PreInvocation input copied from antigravity.google/docs/hooks (the
-        example carries `invocationNum: 3`), with the number varied. */
-    @Test(arguments: [
-        (0, true), (1, false), (3, false),
-    ])
-    func antigravityHookEmitsOnlyOnTheFirstModelCall(invocation: Int, emits: Bool) {
-        let payload = """
-            {"invocationNum": \(invocation), "initialNumSteps": 10, \
-            "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587", \
-            "workspacePaths": ["/workspace/project"], \
-            "transcriptPath": "~/.gemini/antigravity/brain/ec33ebf9-0cba-4100-8142-c61503f6c587/.system_generated/logs/transcript.jsonl", \
-            "artifactDirectoryPath": "~/.gemini/antigravity/brain/ec33ebf9-0cba-4100-8142-c61503f6c587", \
-            "modelName": "gemini-3.6-flash-medium"}
-            """
-        #expect(HookPayloadGate.antigravityHookShouldEmit(HookPayload.parse(Data(payload.utf8))) == emits)
+    /** The call number restarts every message, so the step count is what
+        decides a boundary. A missing count is one past the stored count. */
+    @Test func antigravityBoundaryFollowsTheStepCountNotTheCallNumber() {
+        let first = HookPayload.parse(Data(#"{"invocationNum":3,"initialNumSteps":0}"#.utf8))
+        #expect(AntigravityAdapter.isBoundary(payload: first, prior: nil))
+        let later = HookPayload.parse(Data(#"{"invocationNum":0,"initialNumSteps":5}"#.utf8))
+        #expect(!AntigravityAdapter.isBoundary(payload: later, prior: 0))
+        #expect(AntigravityAdapter.notedSteps(payload: later, prior: 0) == 5)
+        let omitted = HookPayload.parse(Data(#"{"invocationNum":1}"#.utf8))
+        #expect(AntigravityAdapter.notedSteps(payload: omitted, prior: 5) == 6)
+        #expect(!AntigravityAdapter.isBoundary(payload: omitted, prior: 5))
+        let compacted = HookPayload.parse(Data(#"{"initialNumSteps":2}"#.utf8))
+        #expect(AntigravityAdapter.isBoundary(payload: compacted, prior: 6))
+        let garbage = HookPayload.parse(Data("garbage".utf8))
+        #expect(AntigravityAdapter.isBoundary(payload: garbage, prior: nil))
     }
 
-    @Test(arguments: [
-        #"{"workspacePaths":["/p"]}"#, #"{"invocationNum":"2"}"#, #"{"invocationNum":null}"#, "", "garbage",
-        #"{"invocationNum":true}"#, #"{"invocationNum":false}"#, "[0]", #"{"invocationNum":0.5}"#,
-    ])
-    func antigravityHookEmitsWhenTheInvocationNumberIsMissingOrUnreadable(payload: String) {
-        #expect(HookPayloadGate.antigravityHookShouldEmit(HookPayload.parse(Data(payload.utf8))))
-    }
-
-    @Test(arguments: [#"{"invocationNum":1.5}"#, #"{"invocationNum":-1}"#, #"{"invocationNum":1e3}"#])
-    func antigravityHookIsSilentForAnyNumberPastTheFirstCall(payload: String) {
-        #expect(!HookPayloadGate.antigravityHookShouldEmit(HookPayload.parse(Data(payload.utf8))))
+    @Test func sessionKeyStaysInsideOnePathComponent() {
+        #expect(HookSnapshotStore.sessionKey(nil) == HookSnapshotStore.fallbackKey)
+        #expect(HookSnapshotStore.sessionKey("..") == HookSnapshotStore.fallbackKey)
+        #expect(HookSnapshotStore.sessionKey("ok-id_1.2") == "ok-id_1.2")
+        #expect(!HookSnapshotStore.sessionKey("../../etc/passwd").contains("/"))
+        let long = String(repeating: "a", count: 200)
+        #expect(HookSnapshotStore.sessionKey(long).count == HookSnapshotStore.maxKeyLength)
+        #expect(HookSnapshotStore.fileKey(scope: "antigravity", session: "..") == "antigravity-nosession")
     }
 
     /** One wrong-typed field reads as absent without costing the others. */
@@ -628,87 +624,6 @@ import os
                     hookSpecificOutput: .init(additionalContext: "a/b", hookEventName: "SessionStart")))
                 == #"{"hookSpecificOutput":{"additionalContext":"a/b","hookEventName":"SessionStart"}}"#)
         #expect(try text(HookOutput.Cursor(additionalContext: "a/b")) == #"{"additional_context":"a/b"}"#)
-    }
-
-    @Test func grokSessionHookActionMatrix() {
-        var state = GrokSessionHook.TurnState(emittedThisTurn: false, turn: 0)
-        #expect(GrokSessionHook.action(for: .leftover, state: &state) == .silent)
-        #expect(state.turn == 0)
-        #expect(GrokSessionHook.action(for: .unspecified, state: &state) == .emitUnmarked)
-        #expect(state.emittedThisTurn == false)
-
-        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .emitAndMark)
-        #expect(state.emittedThisTurn == false)
-        GrokSessionHook.markEmitted(&state)
-        #expect(state.emittedThisTurn == true)
-        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .silent)
-
-        #expect(GrokSessionHook.action(for: .userPromptSubmit, state: &state) == .silentPersist)
-        #expect(state.turn == 1)
-        #expect(state.emittedThisTurn == false)
-        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .emitAndMark)
-        GrokSessionHook.markEmitted(&state)
-        #expect(state.emittedThisTurn == true)
-        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .silent)
-
-        #expect(GrokSessionHook.action(for: .userPromptSubmit, state: &state) == .silentPersist)
-        #expect(state.turn == 2)
-        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .emitAndMark)
-        GrokSessionHook.markEmitted(&state)
-        #expect(state.emittedThisTurn == true)
-    }
-
-    @Test func grokTurnGateSessionKeySanitizes() {
-        #expect(GrokTurnGate.sessionKey(nil) == GrokTurnGate.fallbackKey)
-        #expect(GrokTurnGate.sessionKey("") == GrokTurnGate.fallbackKey)
-        #expect(GrokTurnGate.sessionKey("ok-id_1.2") == "ok-id_1.2")
-        #expect(GrokTurnGate.sessionKey(".") == GrokTurnGate.fallbackKey)
-        #expect(GrokTurnGate.sessionKey("..") == GrokTurnGate.fallbackKey)
-        #expect(!GrokTurnGate.sessionKey("../../etc/passwd").contains("/"))
-        let long = String(repeating: "a", count: 200)
-        #expect(GrokTurnGate.sessionKey(long).count == GrokTurnGate.maxKeyLength)
-    }
-
-    @Test func grokTurnGateRoundTripsState() throws {
-        try inScratchDir { dir in
-            let stateDir = dir.appending(path: "state")
-            let original = GrokSessionHook.TurnState(emittedThisTurn: true, turn: 3)
-            GrokTurnGate.save(original, sessionKey: "sess1", directory: stateDir)
-            #expect(GrokTurnGate.load(sessionKey: "sess1", directory: stateDir) == original)
-            let missing = GrokTurnGate.load(sessionKey: "other", directory: stateDir)
-            #expect(missing == GrokSessionHook.TurnState(emittedThisTurn: false, turn: 0))
-        }
-    }
-
-    /** The CLI persist protocol: UPS save is immediate; PreToolUse marks only
-        after a successful emit. Dropping either save would make the next
-        PreToolUse of the same turn emit again. */
-    @Test func grokTurnGateDiskProtocolSkipsASecondPreToolUseOfTheSameTurn() throws {
-        try inScratchDir { dir in
-            let stateDir = dir.appending(path: "state")
-            let key = "sess-disk"
-            var state = GrokTurnGate.load(sessionKey: key, directory: stateDir)
-            #expect(GrokSessionHook.action(for: .userPromptSubmit, state: &state) == .silentPersist)
-            GrokTurnGate.save(state, sessionKey: key, directory: stateDir)
-
-            state = GrokTurnGate.load(sessionKey: key, directory: stateDir)
-            #expect(state.turn == 1)
-            #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .emitAndMark)
-            GrokSessionHook.markEmitted(&state)
-            GrokTurnGate.save(state, sessionKey: key, directory: stateDir)
-
-            state = GrokTurnGate.load(sessionKey: key, directory: stateDir)
-            #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .silent)
-        }
-    }
-
-    @Test func grokTurnGateDirectoryHonorsOverride() {
-        let override = "/tmp/directa-grok-test-dir"
-        #expect(
-            GrokTurnGate.directory(environment: ["DIRECTA_GROK_HOOK_STATE_DIR": override]).path
-                == override)
-        let fromTmp = GrokTurnGate.directory(environment: ["TMPDIR": "/tmp/custom-tmp"])
-        #expect(fromTmp.lastPathComponent == GrokTurnGate.stateDirName)
     }
 
     @Test func grokInstallStripsALeftoverStopHook() throws {
@@ -759,7 +674,7 @@ import os
             let adapter = GrokAdapter(settingsURLOverride: settings)
             let cliPath = dir.appending(path: "bin/directa").path
             let handler: [String: Any] = [
-                "command": "\(cliPath) hook grok-session-start", "type": "command",
+                "command": "\(cliPath) hook grok-post-tool", "type": "command",
             ]
             var events: [String: Any] = [
                 "Stop": [
@@ -790,10 +705,12 @@ import os
             let adapter = GrokAdapter(settingsURLOverride: settings)
             let cliPath = dir.appending(path: "bin/directa").path
             let handler: [String: Any] = [
-                "command": "\(cliPath) hook grok-session-start", "type": "command",
+                "command": "\(cliPath) hook grok-post-tool", "type": "command",
             ]
             var events: [String: Any] = [
-                "SessionStart": [["hooks": [handler]]]
+                "SessionStart": [[
+                    "hooks": [["command": "\(cliPath) hook grok-session-start", "type": "command"]]
+                ]]
             ]
             for event in GrokAdapter.registeredEvents {
                 events[event] = [["hooks": [handler]]]

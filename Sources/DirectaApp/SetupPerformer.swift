@@ -90,7 +90,7 @@ enum SetupPerformer: Sendable {
             stampExists: stamp != nil,
             launchAgentExists: FileManager.default.fileExists(
                 atPath: LaunchdAdmin.plistURL.path))
-        let offers = SetupPlanner.harnessOffers(installedCLIPath: cliURL.path)
+        let offers = SetupPlanner.harnessOffers()
         return Presentation(
             cliOwnedByBrew: owner.isHomebrew,
             installAppToApplications: outside,

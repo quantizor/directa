@@ -157,71 +157,23 @@ public enum SetupPlanner {
         installedCLIExists || stampExists || launchAgentExists
     }
 
-    /** Detect agent harnesses and whether their hooks still need installing. */
+    /** Detect agent harnesses and whether their hooks still need installing.
+        A hook counts as installed when the adapter's `hookState()` is
+        `.installed`, including one whose recorded path is gone. */
     public static func harnessOffers(
-        home: URL = FileManager.default.homeDirectoryForCurrentUser,
-        installedCLIPath: String
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> [HarnessOffer] {
-        var offers: [HarnessOffer] = []
-        let antigravityDir = home.appending(path: ".gemini")
-        if FileManager.default.fileExists(atPath: antigravityDir.path) {
-            let installed = HookPresence.antigravityHookInstalled(
-                settingsURL: antigravityDir.appending(path: "config/hooks.json"),
-                expectedCLIPath: installedCLIPath)
-            offers.append(
-                HarnessOffer(
-                    alreadyInstalled: installed,
-                    defaultChecked: !installed,
-                    displayName: "Antigravity",
-                    harness: "antigravity"))
-        }
-        let claudeDir = home.appending(path: ".claude")
-        if FileManager.default.fileExists(atPath: claudeDir.path) {
-            let installed = HookPresence.claudeHookInstalled(
-                settingsURL: claudeDir.appending(path: "settings.json"),
-                expectedCLIPath: installedCLIPath)
-            offers.append(
-                HarnessOffer(
-                    alreadyInstalled: installed,
-                    defaultChecked: !installed,
-                    displayName: "Claude Code",
-                    harness: "claude"))
-        }
-        let cursorDir = home.appending(path: ".cursor")
-        if FileManager.default.fileExists(atPath: cursorDir.path) {
-            let installed = HookPresence.cursorHookInstalled(
-                settingsURL: cursorDir.appending(path: "hooks.json"),
-                expectedCLIPath: installedCLIPath)
-            offers.append(
-                HarnessOffer(
-                    alreadyInstalled: installed,
-                    defaultChecked: !installed,
-                    displayName: "Cursor",
-                    harness: "cursor"))
-        }
-        let grokDir = home.appending(path: ".grok")
-        if FileManager.default.fileExists(atPath: grokDir.path) {
-            let installed = HookPresence.grokHookInstalled(
-                settingsURL: grokDir.appending(path: "hooks/directa.json"),
-                expectedCLIPath: installedCLIPath)
-            offers.append(
-                HarnessOffer(
-                    alreadyInstalled: installed,
-                    defaultChecked: !installed,
-                    displayName: "Grok Build",
-                    harness: "grok"))
-        }
-        let opencodeDir = OpenCodeWiring.configDirectory(home: home)
-        if FileManager.default.fileExists(atPath: opencodeDir.path) {
-            let installed = HookPresence.opencodeHookInstalled(home: home)
-            offers.append(
-                HarnessOffer(
-                    alreadyInstalled: installed,
-                    defaultChecked: !installed,
-                    displayName: "OpenCode",
-                    harness: "opencode"))
-        }
-        return offers.sorted { $0.harness < $1.harness }
+        harnessAdapters(inHome: home)
+            .filter(\.harnessPresent)
+            .map { adapter in
+                let state = adapter.hookState()
+                return HarnessOffer(
+                    alreadyInstalled: state.isConfigured,
+                    defaultChecked: !state.isConfigured,
+                    displayName: adapter.displayName,
+                    harness: adapter.name)
+            }
+            .sorted { $0.harness < $1.harness }
     }
 
     /** What to tell someone whose shell cannot find `directa`. Carries the whole
@@ -371,98 +323,17 @@ public struct HarnessOffer: Equatable, Sendable {
     }
 }
 
-/** Lightweight read of harness settings to decide checkbox defaults. Mirrors the
-    CLI adapters' "already installed" checks without writing. */
-enum HookPresence {
-    static func antigravityHookInstalled(settingsURL: URL, expectedCLIPath: String) -> Bool {
-        guard let data = try? Data(contentsOf: settingsURL),
-            let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return false }
-        let expected = "\(expectedCLIPath) hook antigravity-session-start"
-        for (_, value) in settings {
-            guard let hookGroup = value as? [String: Any],
-                let preInvocation = hookGroup["PreInvocation"] as? [[String: Any]]
-            else { continue }
-            for handler in preInvocation {
-                let command = handler["command"] as? String ?? ""
-                if command == expected || command.contains("directa hook antigravity-session-start") {
-                    return true
-                }
-            }
-        }
-        return false
-    }
-
-    static func claudeHookInstalled(settingsURL: URL, expectedCLIPath: String) -> Bool {
-        guard let data = try? Data(contentsOf: settingsURL),
-            let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let hooks = settings["hooks"] as? [String: Any],
-            let sessionStart = hooks["SessionStart"] as? [[String: Any]]
-        else { return false }
-        let expected = "\(expectedCLIPath) hook claude-session-start"
-        return sessionStart.contains { entry in
-            ((entry["hooks"] as? [[String: Any]]) ?? []).contains { hook in
-                let command = hook["command"] as? String ?? ""
-                return command == expected || command.contains("directa hook claude-session-start")
-            }
-        }
-    }
-
-    static func cursorHookInstalled(settingsURL: URL, expectedCLIPath: String) -> Bool {
-        guard let data = try? Data(contentsOf: settingsURL),
-            let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let hooks = settings["hooks"] as? [String: Any],
-            let sessionStart = hooks["sessionStart"] as? [[String: Any]]
-        else { return false }
-        let expected = "\(expectedCLIPath) hook cursor-session-start"
-        return sessionStart.contains { entry in
-            let command = entry["command"] as? String ?? ""
-            return command == expected || command.contains("directa hook cursor-session-start")
-        }
-    }
-
-    static func grokHookInstalled(settingsURL: URL, expectedCLIPath: String) -> Bool {
-        guard let data = try? Data(contentsOf: settingsURL),
-            let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let hooks = settings["hooks"] as? [String: Any]
-        else { return false }
-        let expected = "\(expectedCLIPath)\(GrokWiring.commandSuffix)"
-        func present(_ event: String) -> Bool {
-            for group in (hooks[event] as? [[String: Any]]) ?? [] {
-                for hook in (group["hooks"] as? [[String: Any]]) ?? [] {
-                    let command = hook["command"] as? String ?? ""
-                    if command == expected || command.contains("directa\(GrokWiring.commandSuffix)") {
-                        return true
-                    }
-                }
-            }
-            return false
-        }
-        /** PreToolUse is the injection Grok delivers; UserPromptSubmit is the
-            per-turn gate. SessionStart-only is the old install and does not count. */
-        return GrokWiring.registeredEvents.allSatisfy { present($0) }
-    }
-
-    /** OpenCode's wiring is not a command in a hooks file: it is the managed
-        instructions file plus the `instructions` entry in the global config
-        that references it, so "installed" means both. Which array is effective
-        is OpenCodeWiring's merge rule, the same one the CLI adapter applies. */
-    static func opencodeHookInstalled(home: URL) -> Bool {
-        let managed = OpenCodeWiring.managedFileURL(inHome: home)
-        let entry = OpenCodeWiring.instructionsEntry(forManagedFileAt: managed)
-        guard FileManager.default.fileExists(atPath: managed.path),
-            let effective = OpenCodeWiring.effectiveInstructions(
-                inDirectory: OpenCodeWiring.configDirectory(home: home))
-        else { return false }
-        return effective.entries.contains(entry)
-    }
-}
-
-/** Events and command suffix the Grok adapter writes and the setup presence
-    check reads. One home so doctor and the setup panel cannot disagree. */
+/** Events and command suffix the Grok adapter writes. One home so doctor and
+    the setup panel, which both ask that adapter, cannot disagree. */
 public enum GrokWiring {
-    public static let commandSuffix = " hook grok-session-start"
-    public static let registeredEvents = ["PreToolUse", "UserPromptSubmit"]
+    public static let commandSuffix = " hook grok-post-tool"
+    /** The command `hook install` used to write. Stripped on the next install. */
+    public static let legacyCommandSuffix = " hook grok-session-start"
+    public static let registeredEvents = ["PostToolUse"]
+
+    public static func isOurCommand(_ command: String) -> Bool {
+        command.contains("directa\(commandSuffix)") || command.contains("directa\(legacyCommandSuffix)")
+    }
 }
 
 /** The on-disk contract OpenCode's own config loader defines, the one home for

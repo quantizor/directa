@@ -131,7 +131,10 @@ struct SetupPlannerTests {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .split(separator: ":").map(String.init))
         }
-        let interactive = try await pathFrom(["-ilc", "echo $PATH"])
+        /** `+m` turns monitor mode off. An interactive zsh (`-i`) enables job
+            control, and with no terminal that suspends the shell on SIGTTIN
+            before it can print PATH. */
+        let interactive = try await pathFrom(["+m", "-ilc", "echo $PATH"])
         withKnownIssue("no .zshrc on this machine, so there is nothing to miss", isIntermittent: true) {
             try #require(FileManager.default.fileExists(atPath: "\(home)/.zshrc"))
         }
@@ -184,30 +187,33 @@ struct SetupPlannerTests {
             at: home.appending(path: ".config/opencode"), withIntermediateDirectories: true)
 
         let cliPath = home.appending(path: ".local/bin/directa").path
-        let offersFresh = SetupPlanner.harnessOffers(home: home, installedCLIPath: cliPath)
+        let offersFresh = SetupPlanner.harnessOffers(home: home)
         #expect(
             offersFresh.map(\.harness)
                 == ["antigravity", "claude", "cursor", "grok", "opencode"])
+        #expect(
+            offersFresh.map(\.displayName)
+                == ["Antigravity", "Claude Code", "Cursor", "Grok Build", "OpenCode"])
         #expect(offersFresh.allSatisfy { $0.defaultChecked && !$0.alreadyInstalled })
 
         let antigravitySettings = """
-            {"directa":{"PreInvocation":[{"command":"\(cliPath) hook antigravity-session-start","type":"command"}]}}
+            {"directa":{"PostInvocation":[{"command":"\(cliPath) hook antigravity-post-invocation","type":"command"}],"PreInvocation":[{"command":"\(cliPath) hook antigravity-session-start","type":"command"}]}}
             """
         try FileManager.default.createDirectory(
             at: home.appending(path: ".gemini/config"), withIntermediateDirectories: true)
         try Data(antigravitySettings.utf8).write(
             to: home.appending(path: ".gemini/config/hooks.json"))
         let claudeSettings = """
-            {"hooks":{"SessionStart":[{"hooks":[{"command":"\(cliPath) hook claude-session-start","type":"command"}],"matcher":"startup|resume|clear|compact"}]}}
+            {"hooks":{"PostToolUse":[{"hooks":[{"command":"\(cliPath) hook claude-post-tool","type":"command"}],"matcher":"*"}],"SessionStart":[{"hooks":[{"command":"\(cliPath) hook claude-session-start","type":"command"}],"matcher":"startup|resume|clear|compact"}]}}
             """
         try Data(claudeSettings.utf8).write(
             to: home.appending(path: ".claude/settings.json"))
         let cursorSettings = """
-            {"hooks":{"sessionStart":[{"command":"\(cliPath) hook cursor-session-start"}]},"version":1}
+            {"hooks":{"postToolUse":[{"command":"\(cliPath) hook cursor-post-tool"}],"sessionStart":[{"command":"\(cliPath) hook cursor-session-start"}]},"version":1}
             """
         try Data(cursorSettings.utf8).write(to: home.appending(path: ".cursor/hooks.json"))
         let grokSettings = """
-            {"hooks":{"PreToolUse":[{"hooks":[{"command":"\(cliPath) hook grok-session-start","type":"command"}]}],"UserPromptSubmit":[{"hooks":[{"command":"\(cliPath) hook grok-session-start","type":"command"}]}]}}
+            {"hooks":{"PostToolUse":[{"hooks":[{"command":"\(cliPath) hook grok-post-tool","type":"command"}]}]}}
             """
         try FileManager.default.createDirectory(
             at: home.appending(path: ".grok/hooks"), withIntermediateDirectories: true)
@@ -222,7 +228,7 @@ struct SetupPlannerTests {
             to: home.appending(path: ".config/opencode/opencode.json"))
         try Data("x\n".utf8).write(to: home.appending(path: ".config/opencode/directa.md"))
 
-        let offersInstalled = SetupPlanner.harnessOffers(home: home, installedCLIPath: cliPath)
+        let offersInstalled = SetupPlanner.harnessOffers(home: home)
         #expect(offersInstalled.count == 5)
         #expect(offersInstalled.allSatisfy { $0.alreadyInstalled && !$0.defaultChecked })
     }
@@ -238,7 +244,8 @@ struct SetupPlannerTests {
             {"hooks":{"SessionStart":[{"hooks":[{"command":"\(cliPath) hook grok-session-start","type":"command"}]}]}}
             """.utf8
         ).write(to: settings)
-        #expect(HookPresence.grokHookInstalled(settingsURL: settings, expectedCLIPath: cliPath) == false)
+        let adapter = GrokAdapter(settingsURLOverride: settings)
+        #expect(adapter.hookState() == .notInstalled)
     }
 
     @Test func stampRoundTrip() throws {
