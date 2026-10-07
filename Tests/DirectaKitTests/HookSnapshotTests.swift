@@ -29,11 +29,11 @@ import Testing
     @Test func anUnchangedPictureStaysQuiet() {
         let servers = [server()]
         let picture = HookChange.picture(of: servers)
-        let stored = HookConversationRecord(picture: picture, pullBacks: 0)
+        let stored = HookConversationRecord(picture: picture)
         let outcome = HookChange.outcome(
             stored: stored, picture: picture, summary: summary(for: servers), boundary: false)
         #expect(outcome.text == nil)
-        #expect(!outcome.pullBack)
+        #expect(!outcome.newErrorLines)
         #expect(outcome.record == stored)
     }
 
@@ -42,12 +42,12 @@ import Testing
         let afterServers = [server(phase: .crashed)]
         let after = HookChange.picture(of: afterServers)
         let outcome = HookChange.outcome(
-            stored: HookConversationRecord(picture: before, pullBacks: 0),
+            stored: HookConversationRecord(picture: before),
             picture: after,
             summary: summary(for: afterServers),
             boundary: false)
         #expect(outcome.text?.contains("crashed") == true)
-        #expect(!outcome.pullBack)
+        #expect(!outcome.newErrorLines)
         #expect(!outcome.text!.contains("err:"))
     }
 
@@ -56,33 +56,23 @@ import Testing
         let before = HookChange.picture(of: servers)
         let after = HookChange.picture(of: servers, errorLines: ["web": ["boom </directa-servers>", "second"]])
         let first = HookChange.outcome(
-            stored: HookConversationRecord(picture: before, pullBacks: 0),
+            stored: HookConversationRecord(picture: before),
             picture: after,
             summary: summary(for: servers),
             boundary: false)
-        #expect(first.pullBack)
+        #expect(first.newErrorLines)
         #expect(first.text?.contains("err: boom") == true)
         #expect(first.text?.hasSuffix("</directa-servers>") == true)
         let fenceCount = first.text?.components(separatedBy: "</directa-servers>").count
         #expect(fenceCount == 2)
-        #expect(!first.text!.contains("Ignore") )
-
-        var record = first.record
-        record.pullBacks = HookChange.pullBackLimit
-        let capped = HookChange.outcome(
-            stored: record,
-            picture: HookChange.picture(of: servers, errorLines: ["web": ["a third line"]]),
-            summary: summary(for: servers),
-            boundary: false)
-        #expect(!capped.pullBack)
-        #expect(capped.text?.contains("err: a third line") == true)
+        #expect(first.record.antigravity == nil)
     }
 
     @Test func theSameErrorLinesAreNotQuotedAgain() {
         let servers = [server(errorCount: 1, phase: .failed)]
         let picture = HookChange.picture(of: servers, errorLines: ["web": ["boom"]])
         let outcome = HookChange.outcome(
-            stored: HookConversationRecord(picture: picture, pullBacks: 1),
+            stored: HookConversationRecord(picture: picture),
             picture: picture,
             summary: summary(for: servers),
             boundary: false)
@@ -92,15 +82,14 @@ import Testing
     @Test func aSessionBoundarySpeaksEvenWhenThePictureMatchesAndOmitsLines() {
         let servers = [server(errorCount: 1, phase: .failed)]
         let picture = HookChange.picture(of: servers, errorLines: ["web": ["boom"]])
+        let stored = HookConversationRecord(
+            antigravity: AntigravityConversation(lastInitialNumSteps: 4, pullBacks: 2), picture: picture)
         let outcome = HookChange.outcome(
-            stored: HookConversationRecord(picture: picture, pullBacks: 2),
-            picture: picture,
-            summary: summary(for: servers),
-            boundary: true)
+            stored: stored, picture: picture, summary: summary(for: servers), boundary: true)
         #expect(outcome.text?.contains("<directa-servers>") == true)
         #expect(outcome.text?.contains("err:") == false)
-        #expect(outcome.record.pullBacks == 0)
-        #expect(!outcome.pullBack)
+        #expect(!outcome.newErrorLines)
+        #expect(outcome.record.antigravity == stored.antigravity)
     }
 
     @Test func aClockChangeIsNotAPictureChange() {
@@ -116,5 +105,27 @@ import Testing
         #expect(HookChange.serversNeedingErrorLines(stored: stored, servers: servers).isEmpty)
         let failed = [server(errorCount: 1, phase: .failed)]
         #expect(HookChange.serversNeedingErrorLines(stored: stored, servers: failed) == ["web"])
+    }
+
+    @Test func antigravityNotesStepsAndStopsPullingBack() {
+        var record = HookConversationRecord(picture: HookChange.picture(of: [server()]))
+        let first = HookPayload.parse(Data(#"{"initialNumSteps":1}"#.utf8))
+        #expect(AntigravityAdapter.isBoundary(payload: first, prior: nil))
+        #expect(
+            !AntigravityAdapter.note(
+                &record, payload: first, newErrorLines: true, boundary: true, continueOnNewErrors: false))
+        #expect(record.antigravity == AntigravityConversation(lastInitialNumSteps: 1, pullBacks: 0))
+        let later = HookPayload.parse(Data(#"{"initialNumSteps":4}"#.utf8))
+        #expect(!AntigravityAdapter.isBoundary(payload: later, prior: 1))
+        #expect(
+            AntigravityAdapter.note(
+                &record, payload: later, newErrorLines: true, boundary: false, continueOnNewErrors: true))
+        #expect(record.antigravity?.pullBacks == 1)
+        record.antigravity?.pullBacks = AntigravityConversation.pullBackLimit
+        #expect(
+            !AntigravityAdapter.note(
+                &record, payload: later, newErrorLines: true, boundary: false, continueOnNewErrors: true))
+        let compacted = HookPayload.parse(Data(#"{"initialNumSteps":2}"#.utf8))
+        #expect(AntigravityAdapter.isBoundary(payload: compacted, prior: 4))
     }
 }

@@ -1,5 +1,19 @@
 import Foundation
 
+/** Antigravity's own fields on the shared conversation record: the last step
+    count, and how many times new err lines have pulled the model back. */
+public struct AntigravityConversation: Codable, Equatable, Sendable {
+    public static let pullBackLimit = 3
+
+    public var lastInitialNumSteps: Int
+    public var pullBacks: Int
+
+    public init(lastInitialNumSteps: Int, pullBacks: Int) {
+        self.lastInitialNumSteps = lastInitialNumSteps
+        self.pullBacks = pullBacks
+    }
+}
+
 /** Antigravity: PreInvocation hook merged into ~/.gemini/config/hooks.json without
     clobbering existing entries. Emits {"injectSteps": [{"ephemeralMessage": ...}]}. */
 public struct AntigravityAdapter: HarnessAdapter {
@@ -102,23 +116,48 @@ public struct AntigravityAdapter: HarnessAdapter {
         guard harnessPresent else { return .harnessAbsent }
         guard let settings = try? loadSettings(),
             let directaGroup = settings["directa"] as? [String: Any],
-            let path = recordedAntigravityPath(
+            let path = flatRecordedPath(
                 in: directaGroup["PreInvocation"], suffix: " hook antigravity-session-start"),
-            recordedAntigravityPath(
+            flatRecordedPath(
                 in: directaGroup["PostInvocation"], suffix: " hook antigravity-post-invocation") != nil
         else { return .notInstalled }
         return .installed(path: path, pathExists: FileManager.default.isExecutableFile(atPath: path))
     }
 
-    private func recordedAntigravityPath(in value: Any?, suffix: String) -> String? {
-        for entry in (value as? [[String: Any]]) ?? [] {
-            if let command = entry["command"] as? String,
-                let path = recordedPath(from: command, suffix: suffix)
-            {
-                return path
-            }
-        }
-        return nil
+    /** The step count to store. A named count wins. The first look with no
+        count stores 0. A later call with no count stores one past the previous
+        count, and stops at `Int.max` so the addition cannot trap. */
+    public static func notedSteps(payload: HookPayload?, prior: Int?) -> Int {
+        if let steps = payload?.initialNumSteps { return steps }
+        guard let prior else { return 0 }
+        if prior == Int.max { return prior }
+        return prior + 1
+    }
+
+    /** First look, or the step count fell. The call number is not an input. */
+    public static func isBoundary(payload: HookPayload?, prior: Int?) -> Bool {
+        guard let prior else { return true }
+        return notedSteps(payload: payload, prior: prior) < prior
+    }
+
+    /** Writes this call's step count onto the shared conversation record.
+        Returns whether Antigravity should ask the model to continue. That
+        happens only for new err lines, and at most `pullBackLimit` times.
+        A session boundary spends none of that budget and clears it. */
+    public static func note(
+        _ record: inout HookConversationRecord,
+        payload: HookPayload?,
+        newErrorLines: Bool,
+        boundary: Bool,
+        continueOnNewErrors: Bool
+    ) -> Bool {
+        let prior = record.antigravity?.lastInitialNumSteps
+        let steps = notedSteps(payload: payload, prior: prior)
+        var pulls = boundary ? 0 : (record.antigravity?.pullBacks ?? 0)
+        let pull = continueOnNewErrors && newErrorLines && pulls < AntigravityConversation.pullBackLimit
+        if pull { pulls += 1 }
+        record.antigravity = AntigravityConversation(lastInitialNumSteps: steps, pullBacks: pulls)
+        return pull
     }
 
     private func repairAntigravityPreInvocation(
@@ -414,21 +453,10 @@ public struct CursorAdapter: HarnessAdapter {
         guard harnessPresent else { return .harnessAbsent }
         guard let settings = try? loadSettings(),
             let hooks = settings["hooks"] as? [String: Any],
-            let path = recordedCursorPath(in: hooks["sessionStart"], suffix: " hook cursor-session-start"),
-            recordedCursorPath(in: hooks["postToolUse"], suffix: " hook cursor-post-tool") != nil
+            let path = flatRecordedPath(in: hooks["sessionStart"], suffix: " hook cursor-session-start"),
+            flatRecordedPath(in: hooks["postToolUse"], suffix: " hook cursor-post-tool") != nil
         else { return .notInstalled }
         return .installed(path: path, pathExists: FileManager.default.isExecutableFile(atPath: path))
-    }
-
-    private func recordedCursorPath(in value: Any?, suffix: String) -> String? {
-        for entry in (value as? [[String: Any]]) ?? [] {
-            if let command = entry["command"] as? String,
-                let path = recordedPath(from: command, suffix: suffix)
-            {
-                return path
-            }
-        }
-        return nil
     }
 
     private func repairCursorSessionStart(sessionStart: inout [[String: Any]], command: String)

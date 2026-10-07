@@ -59,28 +59,28 @@ public struct HookServerPicture: Codable, Equatable, Sendable {
     }
 }
 
-/** One conversation's last picture and how many times Antigravity has been
-    pulled back to look at new error lines. */
+/** One conversation's last picture. A harness may hang its own fields off
+    `antigravity`. The compare does not read them. */
 public struct HookConversationRecord: Codable, Equatable, Sendable {
+    public var antigravity: AntigravityConversation?
     public var picture: HookServerPicture
-    public var pullBacks: Int
 
-    public init(picture: HookServerPicture, pullBacks: Int) {
+    public init(antigravity: AntigravityConversation? = nil, picture: HookServerPicture) {
+        self.antigravity = antigravity
         self.picture = picture
-        self.pullBacks = pullBacks
     }
 }
 
 /** What one hook invocation should write. `text` nil means say nothing.
-    `pullBack` means new err lines were included and the continuation budget
-    remains. The caller decides whether its harness can act on that. */
+    `newErrorLines` means the text quotes err lines this conversation had not
+    been shown. The caller decides what its harness does with that. */
 public struct HookChangeOutcome: Equatable, Sendable {
-    public var pullBack: Bool
+    public var newErrorLines: Bool
     public var record: HookConversationRecord
     public var text: String?
 
-    public init(pullBack: Bool, record: HookConversationRecord, text: String?) {
-        self.pullBack = pullBack
+    public init(newErrorLines: Bool, record: HookConversationRecord, text: String?) {
+        self.newErrorLines = newErrorLines
         self.record = record
         self.text = text
     }
@@ -99,8 +99,6 @@ public enum HookErrorText {
 
 /** Compare a fresh status list with the picture this conversation already saw. */
 public enum HookChange {
-    public static let pullBackLimit = 3
-
     /** Servers whose err tail is worth a log read: a crashed, failed, or
         unhealthy server, or one whose err-line count moved. A healthy server
         whose count is unchanged is left out. */
@@ -138,11 +136,10 @@ public enum HookChange {
         return HookServerPicture(rows: rows.sorted { $0.name < $1.name })
     }
 
-    /** `boundary` is a session start or a compaction: paste the summary even
-        when the picture matches, and do not quote err lines. Any other call
-        pastes only when the picture differs, and quotes err lines that were
-        not in the stored picture. A pull-back happens only for those new
-        lines, and only until `pullBackLimit`. */
+    /** `boundary` pastes the summary even when the picture matches, and does
+        not quote err lines. Any other call pastes only when the picture
+        differs, and quotes err lines that were not stored. Harness fields on
+        the stored record are copied onto the result. The caller updates them. */
     public static func outcome(
         stored: HookConversationRecord?,
         picture: HookServerPicture,
@@ -150,19 +147,17 @@ public enum HookChange {
         boundary: Bool
     ) -> HookChangeOutcome {
         if let stored, stored.picture == picture, !boundary {
-            return HookChangeOutcome(pullBack: false, record: stored, text: nil)
+            return HookChangeOutcome(newErrorLines: false, record: stored, text: nil)
         }
         let fresh = newErrorLines(stored: stored?.picture, current: picture)
         var text = summary
         if !boundary, !fresh.isEmpty, let summary {
             text = insertingErrorLines(fresh, into: summary)
         }
-        let pulls = boundary ? 0 : (stored?.pullBacks ?? 0)
-        let pullBack = !boundary && !fresh.isEmpty && summary != nil && pulls < pullBackLimit
-        let record = HookConversationRecord(
-            picture: picture, pullBacks: pullBack ? pulls + 1 : pulls)
-        let speak = boundary ? summary != nil : text != nil && (stored?.picture != picture)
-        return HookChangeOutcome(pullBack: pullBack, record: record, text: speak ? text : nil)
+        let quotes = !boundary && !fresh.isEmpty && summary != nil
+        let record = HookConversationRecord(antigravity: stored?.antigravity, picture: picture)
+        let speak = boundary ? summary != nil : text != nil
+        return HookChangeOutcome(newErrorLines: quotes, record: record, text: speak ? text : nil)
     }
 
     /** Err lines to quote: non-empty, and not the lines already stored for
@@ -206,12 +201,25 @@ public enum HookSnapshotStore {
         return URL(fileURLWithPath: tmp).appending(path: directoryName)
     }
 
+    public static let fallbackKey = "nosession"
+    public static let maxKeyLength = 128
+
+    /** A conversation id becomes one path component. Anything outside the
+        filename alphabet is dropped, the result is capped, and an empty result
+        or a relative component (`.` / `..`) shares the `nosession` file rather
+        than escaping the directory. */
+    public static func sessionKey(_ raw: String?) -> String {
+        let trimmed = (raw ?? "").replacing(/[^A-Za-z0-9._-]/) { _ in "" }
+        let sliced = String(trimmed.prefix(maxKeyLength))
+        if sliced.isEmpty || sliced == "." || sliced == ".." { return fallbackKey }
+        return sliced
+    }
+
     /** `scope` keeps two callers that share a missing session id from writing
-        the same file. The caller picks both pieces. The id is sanitized the
-        same way as every other session file. */
+        the same file. The caller picks both pieces. The session id is sanitized
+        once. `scope` is a fixed harness slug. */
     public static func fileKey(scope: String, session: String?) -> String {
-        let id = AntigravitySessionGate.sessionKey(session)
-        return AntigravitySessionGate.sessionKey("\(scope)-\(id)")
+        "\(scope)-\(sessionKey(session))"
     }
 
     public static func load(fileKey: String, directory: URL) -> HookConversationRecord? {

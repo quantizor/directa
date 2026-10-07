@@ -99,6 +99,18 @@ extension HarnessAdapter {
         return String(command.dropLast(suffix.count))
     }
 
+    /** First directa command in a flat hook list (`[{command}]`), or nil. */
+    func flatRecordedPath(in value: Any?, suffix: String) -> String? {
+        for entry in (value as? [[String: Any]]) ?? [] {
+            if let command = entry["command"] as? String,
+                let path = recordedPath(from: command, suffix: suffix)
+            {
+                return path
+            }
+        }
+        return nil
+    }
+
     func writeSettings(_ settings: [String: Any]) throws {
         let data = try JSONSerialization.data(
             withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])

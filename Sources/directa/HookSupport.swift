@@ -73,57 +73,72 @@ enum HookContext {
     }
 }
 
-/** Asks the daemon, compares the picture, and stores it. The caller supplies
-    the conversation file key and whether this event is a session boundary.
-    A failed status read stores nothing. */
+/** Asks the daemon, compares the picture, and stores it. `boundary` is read
+    from the record already on disk. `amend` may update harness fields on that
+    record before it is saved, including when the picture did not change.
+    A failed status read stores nothing and writes an empty answer. */
 enum HookSpeak {
     struct Answer: Equatable {
-        var pullBack: Bool
+        var newErrorLines: Bool
         var text: String?
     }
 
-    static func speak(
+    static func deliver(
         project: String,
         harness: AgentContext.Harness,
         fileKey: String,
         environment: [String: String],
-        boundary: Bool
-    ) async -> Answer {
+        boundary: (HookConversationRecord?) -> Bool,
+        amend: ((inout HookConversationRecord, Answer, Bool) -> Void)? = nil,
+        write: (Answer) -> Void
+    ) async {
         let directory = HookSnapshotStore.directory(environment: environment)
         let stored = HookSnapshotStore.load(fileKey: fileKey, directory: directory)
+        let isBoundary = boundary(stored)
         guard let list = await HookContext.status(project: project) else {
-            return Answer(pullBack: false, text: nil)
+            write(Answer(newErrorLines: false, text: nil))
+            return
         }
+        let lines = await errorLines(project: project, list: list, stored: stored, boundary: isBoundary)
+        let picture = HookChange.picture(of: list.servers, errorLines: lines)
+        let outcome = HookChange.outcome(
+            stored: stored, picture: picture,
+            summary: AgentContext.render(list: list, harness: harness), boundary: isBoundary)
+        var record = outcome.record
+        let answer = Answer(newErrorLines: outcome.newErrorLines, text: outcome.text)
+        amend?(&record, answer, isBoundary)
+        if record != stored {
+            HookSnapshotStore.save(record, fileKey: fileKey, directory: directory)
+        }
+        write(answer)
+    }
+
+    private static func errorLines(
+        project: String, list: ServerListResult, stored: HookConversationRecord?, boundary: Bool
+    ) async -> [String: [String]] {
         var lines: [String: [String]] = [:]
-        if boundary {
+        if boundary || list.trusted != true {
             for server in list.servers {
                 if let previous = stored?.picture.row(server.server)?.errorLines {
                     lines[server.server] = previous
                 }
             }
-        } else if list.trusted == true {
-            let needed = Set(
-                HookChange.serversNeedingErrorLines(stored: stored?.picture, servers: list.servers))
-            for server in list.servers {
-                if needed.contains(server.server) {
-                    if let fetched = await HookContext.errorLines(project: project, server: server.server) {
-                        lines[server.server] = fetched
-                    } else if let previous = stored?.picture.row(server.server)?.errorLines {
-                        lines[server.server] = previous
-                    }
+            return lines
+        }
+        let needed = Set(
+            HookChange.serversNeedingErrorLines(stored: stored?.picture, servers: list.servers))
+        for server in list.servers {
+            if needed.contains(server.server) {
+                if let fetched = await HookContext.errorLines(project: project, server: server.server) {
+                    lines[server.server] = fetched
                 } else if let previous = stored?.picture.row(server.server)?.errorLines {
                     lines[server.server] = previous
                 }
+            } else if let previous = stored?.picture.row(server.server)?.errorLines {
+                lines[server.server] = previous
             }
         }
-        let picture = HookChange.picture(of: list.servers, errorLines: lines)
-        let summary = AgentContext.render(list: list, harness: harness)
-        let outcome = HookChange.outcome(
-            stored: stored, picture: picture, summary: summary, boundary: boundary)
-        if outcome.record != stored {
-            HookSnapshotStore.save(outcome.record, fileKey: fileKey, directory: directory)
-        }
-        return Answer(pullBack: outcome.pullBack, text: outcome.text)
+        return lines
     }
 }
 
