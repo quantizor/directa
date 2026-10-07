@@ -987,14 +987,24 @@ REAL_CACHE_AFTER="$(stat -f %m "$REAL_CACHE" 2>/dev/null || echo absent)"
   || fail "doctor touched the real update cache $REAL_CACHE ($REAL_CACHE_BEFORE -> $REAL_CACHE_AFTER)"
 pass "doctor --fix removes the leftover through the daemon, keeps the claimed dir, and leaves the real data dir alone"
 
-# Antigravity's PreInvocation hook fires before every model call; only the
-# first (invocationNum 0) carries the context block.
+# Antigravity's PreInvocation hook fires before every model call, and
+# invocationNum restarts at 0 on each message. The block is injected once per
+# conversation, and again when initialNumSteps drops. The record stays inside
+# this run's work directory.
 "$DIRECTA" trust --json > /dev/null
-FIRST_CALL="$(printf '{"invocationNum":0,"workspacePaths":["%s"]}' "$PROJECT" | "$DIRECTA" hook antigravity-session-start)"
-grep -q '"ephemeralMessage"' <<<"$FIRST_CALL" || fail "antigravity hook was silent on the first model call: $FIRST_CALL"
-LATER_CALL="$(printf '{"invocationNum":1,"workspacePaths":["%s"]}' "$PROJECT" | "$DIRECTA" hook antigravity-session-start)"
-[[ "$LATER_CALL" == '{"injectSteps":[]}' ]] || fail "antigravity hook spoke on a later model call: $LATER_CALL"
-pass "antigravity hook injects context on the first model call only"
+AG_STATE="$WORK/ag-hook"
+ag_hook() {
+  DIRECTA_ANTIGRAVITY_HOOK_STATE_DIR="$AG_STATE" "$DIRECTA" hook antigravity-session-start
+}
+FIRST_CALL="$(printf '{"conversationId":"smoke","invocationNum":0,"initialNumSteps":0,"workspacePaths":["%s"]}' "$PROJECT" | ag_hook)"
+grep -q '"ephemeralMessage"' <<<"$FIRST_CALL" || fail "antigravity hook was silent on the first message: $FIRST_CALL"
+TOOL_CALL="$(printf '{"conversationId":"smoke","invocationNum":1,"initialNumSteps":0,"workspacePaths":["%s"]}' "$PROJECT" | ag_hook)"
+[[ "$TOOL_CALL" == '{"injectSteps":[]}' ]] || fail "antigravity hook spoke on a later model call: $TOOL_CALL"
+NEXT_TURN="$(printf '{"conversationId":"smoke","invocationNum":0,"initialNumSteps":5,"workspacePaths":["%s"]}' "$PROJECT" | ag_hook)"
+[[ "$NEXT_TURN" == '{"injectSteps":[]}' ]] || fail "antigravity hook repeated the block on the next message: $NEXT_TURN"
+COMPACTED="$(printf '{"conversationId":"smoke","invocationNum":0,"initialNumSteps":2,"workspacePaths":["%s"]}' "$PROJECT" | ag_hook)"
+grep -q '"ephemeralMessage"' <<<"$COMPACTED" || fail "antigravity hook was silent after the step count dropped: $COMPACTED"
+pass "antigravity hook injects context once per conversation and again after compaction"
 
 # Bundle advertises the custom URL scheme and ships CLI + daemon for first-run.
 # Ad-hoc on purpose: the gate asserts layout and never installs this bundle, so
