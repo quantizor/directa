@@ -58,23 +58,34 @@ import os
         #expect(lane.pressure() == LanePressure(name: "pressure", oldestQueuedSeconds: 0, queued: 0, running: 0, width: 1))
         let entered = DispatchSemaphore(value: 0)
         let gate = DispatchSemaphore(value: 0)
-        let calls = (0..<3).map { index in
-            Task.detached {
-                await lane.run {
-                    entered.signal()
-                    gate.wait()
-                    return index
-                }
+        let running = Task.detached {
+            await lane.run { () -> Int in
+                entered.signal()
+                gate.wait()
+                return 0
             }
         }
+        let queued = OSAllocatedUnfairLock<[Task<Int, Never>]>(initialState: [])
         let observed = await offPool { () -> LanePressure? in
             defer { for _ in 0..<3 { gate.signal() } }
             let deadline = Date().addingTimeInterval(60)
             guard entered.wait(timeout: .now() + 60) == .success else { return nil }
+            queued.withLock { held in
+                held = (1..<3).map { index in
+                    Task.detached {
+                        await lane.run { () -> Int in
+                            entered.signal()
+                            gate.wait()
+                            return index
+                        }
+                    }
+                }
+            }
             while lane.pressure().queued < 2, Date() < deadline { usleep(2_000) }
             usleep(200_000)
             return lane.pressure()
         }
+        let calls = [running] + queued.withLock { $0 }
         var results: [Int] = []
         for call in calls {
             results.append(await call.value)
@@ -88,7 +99,13 @@ import os
             the lane reads idle a moment after the last result, not at once. */
         let idle = LanePressure(name: "pressure", oldestQueuedSeconds: 0, queued: 0, running: 0, width: 1)
         #expect(try await eventually(within: .seconds(2)) { lane.pressure() == idle })
-        #expect(heard.withLock { $0 } == ["pressure true", "pressure true"])
+        /** The two queued jobs waited past the bound. The job that was already
+            running can also report when the drainer thread was scheduled late:
+            its wait is measured at dequeue, and that thread is started with
+            `DispatchQueue.async`. A short wait is still a failure. */
+        let reports = heard.withLock { $0 }
+        #expect(reports.allSatisfy { $0 == "pressure true" })
+        #expect((2...3).contains(reports.count))
         activity.setObserver(nil)
     }
 

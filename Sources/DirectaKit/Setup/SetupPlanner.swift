@@ -326,8 +326,14 @@ public struct HarnessOffer: Equatable, Sendable {
 /** Events and command suffix the Grok adapter writes. One home so doctor and
     the setup panel, which both ask that adapter, cannot disagree. */
 public enum GrokWiring {
-    public static let commandSuffix = " hook grok-session-start"
-    public static let registeredEvents = ["PreToolUse", "UserPromptSubmit"]
+    public static let commandSuffix = " hook grok-post-tool"
+    /** The command `hook install` used to write. Stripped on the next install. */
+    public static let legacyCommandSuffix = " hook grok-session-start"
+    public static let registeredEvents = ["PostToolUse"]
+
+    public static func isOurCommand(_ command: String) -> Bool {
+        command.contains("directa\(commandSuffix)") || command.contains("directa\(legacyCommandSuffix)")
+    }
 }
 
 /** The on-disk contract OpenCode's own config loader defines, the one home for

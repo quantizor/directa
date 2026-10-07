@@ -49,13 +49,81 @@ enum CLISelf {
     free: a session start must stay fast, must never bootstrap the daemon, and
     stays silent when the daemon is unreachable. */
 enum HookContext {
-    static func render(project: String, harness: AgentContext.Harness) async -> String? {
+    static func status(project: String) async -> ServerListResult? {
         let client = CLIRunner.client()
-        guard
-            let list = try? await client.request(
-                .serverStatus, params: ProjectParams(project: project), expecting: ServerListResult.self)
-        else { return nil }
+        return try? await client.request(
+            .serverStatus, params: ProjectParams(project: project), expecting: ServerListResult.self)
+    }
+
+    static func render(project: String, harness: AgentContext.Harness) async -> String? {
+        guard let list = await status(project: project) else { return nil }
         return AgentContext.render(list: list, harness: harness)
+    }
+
+    /** Nil when the log read itself failed. An empty array is a real tail. */
+    static func errorLines(project: String, server: String) async -> [String]? {
+        let client = CLIRunner.client()
+        let params = LogsQueryParams(
+            name: server, project: project, streams: [.err], tail: HookErrorText.lineLimit)
+        guard
+            let result = try? await client.request(
+                .logsQuery, params: params, expecting: LogsQueryResult.self)
+        else { return nil }
+        return result.lines.map(\.text)
+    }
+}
+
+/** Asks the daemon, compares the picture, and stores it. The caller supplies
+    the conversation file key and whether this event is a session boundary.
+    A failed status read stores nothing. */
+enum HookSpeak {
+    struct Answer: Equatable {
+        var pullBack: Bool
+        var text: String?
+    }
+
+    static func speak(
+        project: String,
+        harness: AgentContext.Harness,
+        fileKey: String,
+        environment: [String: String],
+        boundary: Bool
+    ) async -> Answer {
+        let directory = HookSnapshotStore.directory(environment: environment)
+        let stored = HookSnapshotStore.load(fileKey: fileKey, directory: directory)
+        guard let list = await HookContext.status(project: project) else {
+            return Answer(pullBack: false, text: nil)
+        }
+        var lines: [String: [String]] = [:]
+        if boundary {
+            for server in list.servers {
+                if let previous = stored?.picture.row(server.server)?.errorLines {
+                    lines[server.server] = previous
+                }
+            }
+        } else if list.trusted == true {
+            let needed = Set(
+                HookChange.serversNeedingErrorLines(stored: stored?.picture, servers: list.servers))
+            for server in list.servers {
+                if needed.contains(server.server) {
+                    if let fetched = await HookContext.errorLines(project: project, server: server.server) {
+                        lines[server.server] = fetched
+                    } else if let previous = stored?.picture.row(server.server)?.errorLines {
+                        lines[server.server] = previous
+                    }
+                } else if let previous = stored?.picture.row(server.server)?.errorLines {
+                    lines[server.server] = previous
+                }
+            }
+        }
+        let picture = HookChange.picture(of: list.servers, errorLines: lines)
+        let summary = AgentContext.render(list: list, harness: harness)
+        let outcome = HookChange.outcome(
+            stored: stored, picture: picture, summary: summary, boundary: boundary)
+        if outcome.record != stored {
+            HookSnapshotStore.save(outcome.record, fileKey: fileKey, directory: directory)
+        }
+        return Answer(pullBack: outcome.pullBack, text: outcome.text)
     }
 }
 

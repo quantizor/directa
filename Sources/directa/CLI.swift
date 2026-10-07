@@ -1052,7 +1052,9 @@ struct HookCommand: AsyncParsableCommand {
         abstract: "Agent-harness session hooks.",
         subcommands: [
             HookInstall.self, HookUninstall.self, HookAntigravitySessionStart.self,
-            HookClaudeSessionStart.self, HookCursorSessionStart.self, HookGrokSessionStart.self,
+            HookAntigravityPostInvocation.self, HookClaudeSessionStart.self, HookClaudePostTool.self,
+            HookCursorSessionStart.self, HookCursorPostTool.self, HookGrokPostTool.self,
+            HookGrokSessionStart.self,
         ]
     )
 }
@@ -1205,19 +1207,41 @@ struct HookAntigravitySessionStart: AsyncParsableCommand {
 
     func run() async throws {
         let payload = HookPayload.parse(CLIRunner.stdinData())
-        let directory = AntigravitySessionGate.directory(
-            environment: ProcessInfo.processInfo.environment)
-        guard
-            HookPayloadGate.antigravityHookDecision(payload: payload, stateDir: directory) == .emit
-        else {
-            HookOutput.write(HookOutput.Antigravity(injectSteps: []))
-            return
-        }
-        let text = await HookContext.render(
+        let environment = ProcessInfo.processInfo.environment
+        let boundary =
+            HookPayloadGate.antigravityHookDecision(
+                payload: payload,
+                stateDir: AntigravitySessionGate.directory(environment: environment)) == .emit
+        let answer = await HookSpeak.speak(
             project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
-            harness: .antigravity)
-        let steps = text.map { [HookOutput.Antigravity.Step(ephemeralMessage: $0)] } ?? []
+            harness: .antigravity,
+            fileKey: AntigravityAdapter.conversationFileKey(payload: payload),
+            environment: environment,
+            boundary: boundary)
+        let steps = answer.text.map { [HookOutput.Antigravity.Step(ephemeralMessage: $0)] } ?? []
         HookOutput.write(HookOutput.Antigravity(injectSteps: steps))
+    }
+}
+
+/** Antigravity's PostInvocation. Same picture check. New err lines set
+    `terminationBehavior` so the model gets a turn to deal with them. */
+struct HookAntigravityPostInvocation: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "antigravity-post-invocation", shouldDisplay: false)
+
+    func run() async throws {
+        let payload = HookPayload.parse(CLIRunner.stdinData())
+        let environment = ProcessInfo.processInfo.environment
+        let answer = await HookSpeak.speak(
+            project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
+            harness: .antigravity,
+            fileKey: AntigravityAdapter.conversationFileKey(payload: payload),
+            environment: environment,
+            boundary: false)
+        let steps = answer.text.map { [HookOutput.Antigravity.Step(ephemeralMessage: $0)] } ?? []
+        HookOutput.write(
+            HookOutput.Antigravity(
+                injectSteps: steps, terminationBehavior: answer.pullBack ? "force_continue" : nil))
     }
 }
 
@@ -1232,16 +1256,46 @@ struct HookClaudeSessionStart: AsyncParsableCommand {
 
     func run() async throws {
         let payload = HookPayload.parse(CLIRunner.stdinData())
+        let environment = ProcessInfo.processInfo.environment
         guard
             HookPayloadGate.claudeHookShouldEmit(
-                payload, cursorHookInstalled: { CursorAdapter().hookState().isLive }),
-            let text = await HookContext.render(
-                project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
-                harness: .claude)
+                payload, cursorHookInstalled: { CursorAdapter().hookState().isLive })
         else { return }
+        let answer = await HookSpeak.speak(
+            project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload, environment: environment)),
+            harness: .claude,
+            fileKey: ClaudeCodeAdapter.conversationFileKey(payload: payload, environment: environment),
+            environment: environment,
+            boundary: true)
+        guard let text = answer.text else { return }
         HookOutput.write(
             HookOutput.AdditionalContext(
                 hookSpecificOutput: .init(additionalContext: text, hookEventName: "SessionStart")))
+    }
+}
+
+/** Claude Code's PostToolUse. Pastes only when the server picture changed. */
+struct HookClaudePostTool: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "claude-post-tool", shouldDisplay: false)
+
+    func run() async throws {
+        let payload = HookPayload.parse(CLIRunner.stdinData())
+        let environment = ProcessInfo.processInfo.environment
+        guard
+            HookPayloadGate.claudeHookShouldEmit(
+                payload, cursorHookInstalled: { CursorAdapter().hookState().isLive })
+        else { return }
+        let answer = await HookSpeak.speak(
+            project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload, environment: environment)),
+            harness: .claude,
+            fileKey: ClaudeCodeAdapter.conversationFileKey(payload: payload, environment: environment),
+            environment: environment,
+            boundary: false)
+        guard let text = answer.text else { return }
+        HookOutput.write(
+            HookOutput.AdditionalContext(
+                hookSpecificOutput: .init(additionalContext: text, hookEventName: "PostToolUse")))
     }
 }
 
@@ -1253,70 +1307,78 @@ struct HookCursorSessionStart: AsyncParsableCommand {
 
     func run() async throws {
         let payload = HookPayload.parse(CLIRunner.stdinData())
-        guard
-            let text = await HookContext.render(
-                project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
-                harness: .cursor)
-        else { return }
+        let environment = ProcessInfo.processInfo.environment
+        let answer = await HookSpeak.speak(
+            project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload, environment: environment)),
+            harness: .cursor,
+            fileKey: CursorAdapter.conversationFileKey(payload: payload),
+            environment: environment,
+            boundary: true)
+        guard let text = answer.text else { return }
         HookOutput.write(HookOutput.Cursor(additionalContext: text))
     }
 }
 
-/** Invoked by Grok Build's PreToolUse and UserPromptSubmit hooks. Emits
-    hookSpecificOutput.additionalContext on PreToolUse (the path Grok delivers).
-    UserPromptSubmit only marks the turn. SessionStart and Stop are silent, so a
-    leftover registration cannot stall the session or continue the turn. Same
-    silence / exit-0 guarantees as the Claude hook. */
+/** Cursor's postToolUse. Pastes only when the server picture changed. */
+struct HookCursorPostTool: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "cursor-post-tool", shouldDisplay: false)
+
+    func run() async throws {
+        let payload = HookPayload.parse(CLIRunner.stdinData())
+        let environment = ProcessInfo.processInfo.environment
+        let answer = await HookSpeak.speak(
+            project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload, environment: environment)),
+            harness: .cursor,
+            fileKey: CursorAdapter.conversationFileKey(payload: payload),
+            environment: environment,
+            boundary: false)
+        guard let text = answer.text else { return }
+        HookOutput.write(HookOutput.Cursor(additionalContext: text))
+    }
+}
+
+/** Grok Build's PostToolUse. SessionStart and Stop stay silent: Grok discards
+    the first and a Stop answer continues the turn. */
+struct HookGrokPostTool: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "grok-post-tool", shouldDisplay: false)
+
+    func run() async throws {
+        try await grokPostTool()
+    }
+}
+
+/** Older installs still call this. It answers the same way as `grok-post-tool`. */
 struct HookGrokSessionStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "grok-session-start", shouldDisplay: false)
 
     func run() async throws {
-        let env = ProcessInfo.processInfo.environment
-        let event = GrokHookEvent.parse(env["GROK_HOOK_EVENT"])
-        guard event != .leftover else { return }
-
-        if event == .unspecified {
-            let stdin = CLIRunner.stdinData()
-            _ = await emit(stdin: stdin)
-            return
-        }
-
-        let directory = GrokTurnGate.directory(environment: env)
-        let key = GrokTurnGate.sessionKey(env["GROK_SESSION_ID"])
-        var state = GrokTurnGate.load(sessionKey: key, directory: directory)
-        let action = GrokSessionHook.action(for: event, state: &state)
-        switch action {
-        case .silent:
-            return
-        case .silentPersist:
-            GrokTurnGate.save(state, sessionKey: key, directory: directory)
-            return
-        case .emitUnmarked, .emitAndMark:
-            break
-        }
-
-        let stdin = CLIRunner.stdinData()
-        guard await emit(stdin: stdin) else { return }
-        if action == .emitAndMark {
-            GrokSessionHook.markEmitted(&state)
-            GrokTurnGate.save(state, sessionKey: key, directory: directory)
-        }
+        try await grokPostTool()
     }
+}
 
-    /** Returns false when there is nothing to say, so the caller can skip the mark. */
-    private func emit(stdin: Data) async -> Bool {
-        guard
-            let text = await HookContext.render(
-                project: GlobalOptions.resolveProject(
-                    from: HookSessionCwd.resolve(HookPayload.parse(stdin))),
-                harness: .grok)
-        else { return false }
-        HookOutput.write(
-            HookOutput.AdditionalContext(
-                hookSpecificOutput: .init(additionalContext: text, hookEventName: "PreToolUse")))
-        return true
+private func grokPostTool() async throws {
+    let environment = ProcessInfo.processInfo.environment
+    let event = GrokHookEvent.parse(environment["GROK_HOOK_EVENT"])
+    switch event {
+    case .postToolUse, .preToolUse, .unspecified:
+        break
+    case .leftover, .userPromptSubmit:
+        return
     }
+    let payload = HookPayload.parse(CLIRunner.stdinData())
+    let answer = await HookSpeak.speak(
+        project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload, environment: environment)),
+        harness: .grok,
+        fileKey: GrokAdapter.conversationFileKey(payload: payload, environment: environment),
+        environment: environment,
+        boundary: false)
+    guard let text = answer.text else { return }
+    HookOutput.write(
+        HookOutput.AdditionalContext(
+            hookSpecificOutput: .init(additionalContext: text, hookEventName: "PostToolUse")))
 }
 
 /** Statusline helper: reads the harness's statusline stdin JSON, prints one

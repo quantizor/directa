@@ -18,6 +18,12 @@ public struct AntigravityAdapter: HarnessAdapter {
         self.settingsURLOverride = settingsURLOverride
     }
 
+    /** The conversation file for this harness. The id is the one Antigravity
+        sends. The scope keeps it off another harness's file. */
+    public static func conversationFileKey(payload: HookPayload?) -> String {
+        HookSnapshotStore.fileKey(scope: "antigravity", session: payload?.conversationId)
+    }
+
     public var harnessPresent: Bool {
         let parent = settingsURL.deletingLastPathComponent()
         if FileManager.default.fileExists(atPath: parent.path) { return true }
@@ -31,28 +37,27 @@ public struct AntigravityAdapter: HarnessAdapter {
 
     public func install(cliPath: String) throws -> String {
         let command = "\(cliPath) hook antigravity-session-start"
+        let post = "\(cliPath) hook antigravity-post-invocation"
         var settings = try loadSettings()
         var directaGroup = settings["directa"] as? [String: Any] ?? [:]
         var preInvocation = directaGroup["PreInvocation"] as? [[String: Any]] ?? []
-        if let repaired = repairAntigravityPreInvocation(
-            preInvocation: &preInvocation, command: command)
-        {
+        let repaired = repairAntigravityPreInvocation(preInvocation: &preInvocation, command: command)
+        let sessionPresent = preInvocation.contains { ($0["command"] as? String) == command }
+        if !sessionPresent { preInvocation.append(["command": command, "type": "command"]) }
+        var postInvocation = directaGroup["PostInvocation"] as? [[String: Any]] ?? []
+        let postPresent = postInvocation.contains { ($0["command"] as? String) == post }
+        if !postPresent { postInvocation.append(["command": post, "type": "command"]) }
+        if repaired != nil || !sessionPresent || !postPresent {
+            directaGroup["PostInvocation"] = postInvocation
             directaGroup["PreInvocation"] = preInvocation
             settings["directa"] = directaGroup
             try writeSettings(settings)
-            return repaired
         }
-        let alreadyInstalled = preInvocation.contains { entry in
-            (entry["command"] as? String) == command
+        if let repaired { return repaired }
+        if !sessionPresent || !postPresent {
+            return "Antigravity PreInvocation hook installed in \(settingsURL.path)"
         }
-        if alreadyInstalled {
-            return "Antigravity PreInvocation hook already installed (\(settingsURL.path))"
-        }
-        preInvocation.append(["command": command, "type": "command"])
-        directaGroup["PreInvocation"] = preInvocation
-        settings["directa"] = directaGroup
-        try writeSettings(settings)
-        return "Antigravity PreInvocation hook installed in \(settingsURL.path)"
+        return "Antigravity PreInvocation hook already installed (\(settingsURL.path))"
     }
 
     public func uninstall() throws -> String {
@@ -66,13 +71,23 @@ public struct AntigravityAdapter: HarnessAdapter {
         preInvocation.removeAll { entry in
             ((entry["command"] as? String) ?? "").contains("directa hook antigravity-session-start")
         }
-        guard preInvocation.count != before else {
+        var postInvocation = directaGroup["PostInvocation"] as? [[String: Any]] ?? []
+        let postBefore = postInvocation.count
+        postInvocation.removeAll { entry in
+            ((entry["command"] as? String) ?? "").contains("directa hook antigravity-post-invocation")
+        }
+        guard preInvocation.count != before || postInvocation.count != postBefore else {
             return "Antigravity hook not present (\(settingsURL.path))"
         }
         if preInvocation.isEmpty {
             directaGroup.removeValue(forKey: "PreInvocation")
         } else {
             directaGroup["PreInvocation"] = preInvocation
+        }
+        if postInvocation.isEmpty {
+            directaGroup.removeValue(forKey: "PostInvocation")
+        } else {
+            directaGroup["PostInvocation"] = postInvocation
         }
         if directaGroup.isEmpty {
             settings.removeValue(forKey: "directa")
@@ -85,20 +100,25 @@ public struct AntigravityAdapter: HarnessAdapter {
 
     public func hookState() -> HarnessHookState {
         guard harnessPresent else { return .harnessAbsent }
-        let suffix = " hook antigravity-session-start"
         guard let settings = try? loadSettings(),
             let directaGroup = settings["directa"] as? [String: Any],
-            let preInvocation = directaGroup["PreInvocation"] as? [[String: Any]]
+            let path = recordedAntigravityPath(
+                in: directaGroup["PreInvocation"], suffix: " hook antigravity-session-start"),
+            recordedAntigravityPath(
+                in: directaGroup["PostInvocation"], suffix: " hook antigravity-post-invocation") != nil
         else { return .notInstalled }
-        for entry in preInvocation {
+        return .installed(path: path, pathExists: FileManager.default.isExecutableFile(atPath: path))
+    }
+
+    private func recordedAntigravityPath(in value: Any?, suffix: String) -> String? {
+        for entry in (value as? [[String: Any]]) ?? [] {
             if let command = entry["command"] as? String,
                 let path = recordedPath(from: command, suffix: suffix)
             {
-                return .installed(
-                    path: path, pathExists: FileManager.default.isExecutableFile(atPath: path))
+                return path
             }
         }
-        return .notInstalled
+        return nil
     }
 
     private func repairAntigravityPreInvocation(
@@ -137,37 +157,44 @@ public struct ClaudeCodeAdapter: HarnessAdapter {
         self.settingsURLOverride = settingsURLOverride
     }
 
+    public static func conversationFileKey(payload: HookPayload?, environment: [String: String]) -> String {
+        HookSnapshotStore.fileKey(
+            scope: "claude", session: payload?.sessionId ?? environment["CLAUDE_CODE_SESSION_ID"])
+    }
+
     public var settingsURL: URL {
         settingsURLOverride ?? home.appending(path: ".claude/settings.json")
     }
 
     public func install(cliPath: String) throws -> String {
         let command = "\(cliPath) hook claude-session-start"
+        let post = "\(cliPath) hook claude-post-tool"
         var settings = try loadSettings()
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
         var sessionStart = hooks["SessionStart"] as? [[String: Any]] ?? []
-        if let repaired = repairClaudeSessionStart(sessionStart: &sessionStart, command: command) {
-            hooks["SessionStart"] = sessionStart
-            settings["hooks"] = hooks
-            try writeSettings(settings)
-            return repaired
-        }
-        let alreadyInstalled = sessionStart.contains { entry in
+        let repaired = repairClaudeSessionStart(sessionStart: &sessionStart, command: command)
+        let sessionPresent = sessionStart.contains { entry in
             ((entry["hooks"] as? [[String: Any]]) ?? []).contains { hook in
                 (hook["command"] as? String) == command
             }
         }
-        if alreadyInstalled {
-            return "Claude Code SessionStart hook already installed (\(settingsURL.path))"
+        if !sessionPresent {
+            sessionStart.append([
+                "hooks": [["command": command, "type": "command"]],
+                "matcher": "startup|resume|clear|compact",
+            ])
         }
-        sessionStart.append([
-            "hooks": [["command": command, "type": "command"]],
-            "matcher": "startup|resume|clear|compact",
-        ])
-        hooks["SessionStart"] = sessionStart
-        settings["hooks"] = hooks
-        try writeSettings(settings)
-        return "Claude Code SessionStart hook installed (matcher startup|resume|clear|compact) in \(settingsURL.path)"
+        let postAdded = ensureClaudePostTool(&hooks, command: post)
+        if repaired != nil || !sessionPresent || postAdded {
+            hooks["SessionStart"] = sessionStart
+            settings["hooks"] = hooks
+            try writeSettings(settings)
+        }
+        if let repaired { return repaired }
+        if !sessionPresent || postAdded {
+            return "Claude Code SessionStart hook installed (matcher startup|resume|clear|compact) in \(settingsURL.path)"
+        }
+        return "Claude Code SessionStart hook already installed (\(settingsURL.path))"
     }
 
     public func uninstall() throws -> String {
@@ -182,7 +209,9 @@ public struct ClaudeCodeAdapter: HarnessAdapter {
             guard var entryHooks = entry["hooks"] as? [[String: Any]] else { return entry }
             let before = entryHooks.count
             entryHooks.removeAll { hook in
-                ((hook["command"] as? String) ?? "").contains("directa hook claude-session-start")
+                let command = (hook["command"] as? String) ?? ""
+                return command.contains("directa hook claude-session-start")
+                    || command.contains("directa hook claude-post-tool")
             }
             if entryHooks.count != before { removed = true }
             /** An entry left with no hooks held only directa's, so drop it whole
@@ -200,6 +229,25 @@ public struct ClaudeCodeAdapter: HarnessAdapter {
         } else {
             hooks["SessionStart"] = sessionStart
         }
+        if var postTool = hooks["PostToolUse"] as? [[String: Any]] {
+            postTool = postTool.compactMap { entry in
+                guard var entryHooks = entry["hooks"] as? [[String: Any]] else { return entry }
+                let before = entryHooks.count
+                entryHooks.removeAll { hook in
+                    ((hook["command"] as? String) ?? "").contains("directa hook claude-post-tool")
+                }
+                if entryHooks.count != before { removed = true }
+                if entryHooks.isEmpty { return nil }
+                var updated = entry
+                updated["hooks"] = entryHooks
+                return updated
+            }
+            if postTool.isEmpty {
+                hooks.removeValue(forKey: "PostToolUse")
+            } else {
+                hooks["PostToolUse"] = postTool
+            }
+        }
         if hooks.isEmpty {
             settings.removeValue(forKey: "hooks")
         } else {
@@ -211,22 +259,41 @@ public struct ClaudeCodeAdapter: HarnessAdapter {
 
     public func hookState() -> HarnessHookState {
         guard harnessPresent else { return .harnessAbsent }
-        let suffix = " hook claude-session-start"
         guard let settings = try? loadSettings(),
             let hooks = settings["hooks"] as? [String: Any],
-            let sessionStart = hooks["SessionStart"] as? [[String: Any]]
+            let path = recordedClaudePath(in: hooks["SessionStart"], suffix: " hook claude-session-start"),
+            recordedClaudePath(in: hooks["PostToolUse"], suffix: " hook claude-post-tool") != nil
         else { return .notInstalled }
-        for entry in sessionStart {
+        return .installed(path: path, pathExists: FileManager.default.isExecutableFile(atPath: path))
+    }
+
+    private func recordedClaudePath(in value: Any?, suffix: String) -> String? {
+        for entry in (value as? [[String: Any]]) ?? [] {
             for hook in (entry["hooks"] as? [[String: Any]]) ?? [] {
                 if let command = hook["command"] as? String,
                     let path = recordedPath(from: command, suffix: suffix)
                 {
-                    return .installed(
-                        path: path, pathExists: FileManager.default.isExecutableFile(atPath: path))
+                    return path
                 }
             }
         }
-        return .notInstalled
+        return nil
+    }
+
+    private func ensureClaudePostTool(_ hooks: inout [String: Any], command: String) -> Bool {
+        var groups = hooks["PostToolUse"] as? [[String: Any]] ?? []
+        let present = groups.contains { entry in
+            ((entry["hooks"] as? [[String: Any]]) ?? []).contains { hook in
+                (hook["command"] as? String) == command
+            }
+        }
+        if present { return false }
+        groups.append([
+            "hooks": [["command": command, "type": "command"]],
+            "matcher": "*",
+        ])
+        hooks["PostToolUse"] = groups
+        return true
     }
 
     /** Rewrite a prior install whose command path no longer resolves (e.g. a
@@ -270,33 +337,38 @@ public struct CursorAdapter: HarnessAdapter {
         self.settingsURLOverride = settingsURLOverride
     }
 
+    public static func conversationFileKey(payload: HookPayload?) -> String {
+        HookSnapshotStore.fileKey(scope: "cursor", session: payload?.cursorConversationId)
+    }
+
     public var settingsURL: URL {
         settingsURLOverride ?? home.appending(path: ".cursor/hooks.json")
     }
 
     public func install(cliPath: String) throws -> String {
         let command = "\(cliPath) hook cursor-session-start"
+        let post = "\(cliPath) hook cursor-post-tool"
         var settings = try loadSettings()
         if settings["version"] == nil { settings["version"] = 1 }
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
         var sessionStart = hooks["sessionStart"] as? [[String: Any]] ?? []
-        if let repaired = repairCursorSessionStart(sessionStart: &sessionStart, command: command) {
+        let repaired = repairCursorSessionStart(sessionStart: &sessionStart, command: command)
+        let sessionPresent = sessionStart.contains { ($0["command"] as? String) == command }
+        if !sessionPresent { sessionStart.append(["command": command]) }
+        var postTool = hooks["postToolUse"] as? [[String: Any]] ?? []
+        let postPresent = postTool.contains { ($0["command"] as? String) == post }
+        if !postPresent { postTool.append(["command": post]) }
+        if repaired != nil || !sessionPresent || !postPresent {
+            hooks["postToolUse"] = postTool
             hooks["sessionStart"] = sessionStart
             settings["hooks"] = hooks
             try writeSettings(settings)
-            return repaired
         }
-        let alreadyInstalled = sessionStart.contains { entry in
-            (entry["command"] as? String) == command
+        if let repaired { return repaired }
+        if !sessionPresent || !postPresent {
+            return "Cursor sessionStart hook installed in \(settingsURL.path)"
         }
-        if alreadyInstalled {
-            return "Cursor sessionStart hook already installed (\(settingsURL.path))"
-        }
-        sessionStart.append(["command": command])
-        hooks["sessionStart"] = sessionStart
-        settings["hooks"] = hooks
-        try writeSettings(settings)
-        return "Cursor sessionStart hook installed in \(settingsURL.path)"
+        return "Cursor sessionStart hook already installed (\(settingsURL.path))"
     }
 
     public func uninstall() throws -> String {
@@ -310,13 +382,23 @@ public struct CursorAdapter: HarnessAdapter {
         sessionStart.removeAll { entry in
             ((entry["command"] as? String) ?? "").contains("directa hook cursor-session-start")
         }
-        guard sessionStart.count != before else {
+        var postTool = hooks["postToolUse"] as? [[String: Any]] ?? []
+        let postBefore = postTool.count
+        postTool.removeAll { entry in
+            ((entry["command"] as? String) ?? "").contains("directa hook cursor-post-tool")
+        }
+        guard sessionStart.count != before || postTool.count != postBefore else {
             return "Cursor sessionStart hook not present (\(settingsURL.path))"
         }
         if sessionStart.isEmpty {
             hooks.removeValue(forKey: "sessionStart")
         } else {
             hooks["sessionStart"] = sessionStart
+        }
+        if postTool.isEmpty {
+            hooks.removeValue(forKey: "postToolUse")
+        } else {
+            hooks["postToolUse"] = postTool
         }
         if hooks.isEmpty {
             settings.removeValue(forKey: "hooks")
@@ -330,20 +412,23 @@ public struct CursorAdapter: HarnessAdapter {
 
     public func hookState() -> HarnessHookState {
         guard harnessPresent else { return .harnessAbsent }
-        let suffix = " hook cursor-session-start"
         guard let settings = try? loadSettings(),
             let hooks = settings["hooks"] as? [String: Any],
-            let sessionStart = hooks["sessionStart"] as? [[String: Any]]
+            let path = recordedCursorPath(in: hooks["sessionStart"], suffix: " hook cursor-session-start"),
+            recordedCursorPath(in: hooks["postToolUse"], suffix: " hook cursor-post-tool") != nil
         else { return .notInstalled }
-        for entry in sessionStart {
+        return .installed(path: path, pathExists: FileManager.default.isExecutableFile(atPath: path))
+    }
+
+    private func recordedCursorPath(in value: Any?, suffix: String) -> String? {
+        for entry in (value as? [[String: Any]]) ?? [] {
             if let command = entry["command"] as? String,
                 let path = recordedPath(from: command, suffix: suffix)
             {
-                return .installed(
-                    path: path, pathExists: FileManager.default.isExecutableFile(atPath: path))
+                return path
             }
         }
-        return .notInstalled
+        return nil
     }
 
     private func repairCursorSessionStart(sessionStart: inout [[String: Any]], command: String)
@@ -423,6 +508,11 @@ public struct GrokAdapter: HarnessAdapter {
         if FileManager.default.fileExists(atPath: parent.path) { return true }
         let grandparent = parent.deletingLastPathComponent()
         return FileManager.default.fileExists(atPath: grandparent.path)
+    }
+
+    public static func conversationFileKey(payload: HookPayload?, environment: [String: String]) -> String {
+        HookSnapshotStore.fileKey(
+            scope: "grok", session: environment["GROK_SESSION_ID"] ?? payload?.sessionId)
     }
 
     public var settingsURL: URL {
@@ -538,7 +628,7 @@ public struct GrokAdapter: HarnessAdapter {
                 guard var entryHooks = groups[i]["hooks"] as? [[String: Any]] else { continue }
                 for j in entryHooks.indices {
                     guard let existing = entryHooks[j]["command"] as? String,
-                        existing.contains("directa\(GrokWiring.commandSuffix)"),
+                        GrokWiring.isOurCommand(existing),
                         existing != command
                     else { continue }
                     entryHooks[j]["command"] = command
@@ -563,14 +653,13 @@ public struct GrokAdapter: HarnessAdapter {
 
     private func removeDirectaHandlers(from hooks: inout [String: Any], events: [String]) -> Bool {
         var removed = false
-        let needle = "directa\(GrokWiring.commandSuffix)"
         for event in events {
             guard var groups = hooks[event] as? [[String: Any]] else { continue }
             groups = groups.compactMap { group in
                 guard var entryHooks = group["hooks"] as? [[String: Any]] else { return group }
                 let before = entryHooks.count
                 entryHooks.removeAll { hook in
-                    ((hook["command"] as? String) ?? "").contains(needle)
+                    GrokWiring.isOurCommand((hook["command"] as? String) ?? "")
                 }
                 if entryHooks.count != before { removed = true }
                 if entryHooks.isEmpty { return nil }

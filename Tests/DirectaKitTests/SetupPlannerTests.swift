@@ -197,23 +197,23 @@ struct SetupPlannerTests {
         #expect(offersFresh.allSatisfy { $0.defaultChecked && !$0.alreadyInstalled })
 
         let antigravitySettings = """
-            {"directa":{"PreInvocation":[{"command":"\(cliPath) hook antigravity-session-start","type":"command"}]}}
+            {"directa":{"PostInvocation":[{"command":"\(cliPath) hook antigravity-post-invocation","type":"command"}],"PreInvocation":[{"command":"\(cliPath) hook antigravity-session-start","type":"command"}]}}
             """
         try FileManager.default.createDirectory(
             at: home.appending(path: ".gemini/config"), withIntermediateDirectories: true)
         try Data(antigravitySettings.utf8).write(
             to: home.appending(path: ".gemini/config/hooks.json"))
         let claudeSettings = """
-            {"hooks":{"SessionStart":[{"hooks":[{"command":"\(cliPath) hook claude-session-start","type":"command"}],"matcher":"startup|resume|clear|compact"}]}}
+            {"hooks":{"PostToolUse":[{"hooks":[{"command":"\(cliPath) hook claude-post-tool","type":"command"}],"matcher":"*"}],"SessionStart":[{"hooks":[{"command":"\(cliPath) hook claude-session-start","type":"command"}],"matcher":"startup|resume|clear|compact"}]}}
             """
         try Data(claudeSettings.utf8).write(
             to: home.appending(path: ".claude/settings.json"))
         let cursorSettings = """
-            {"hooks":{"sessionStart":[{"command":"\(cliPath) hook cursor-session-start"}]},"version":1}
+            {"hooks":{"postToolUse":[{"command":"\(cliPath) hook cursor-post-tool"}],"sessionStart":[{"command":"\(cliPath) hook cursor-session-start"}]},"version":1}
             """
         try Data(cursorSettings.utf8).write(to: home.appending(path: ".cursor/hooks.json"))
         let grokSettings = """
-            {"hooks":{"PreToolUse":[{"hooks":[{"command":"\(cliPath) hook grok-session-start","type":"command"}]}],"UserPromptSubmit":[{"hooks":[{"command":"\(cliPath) hook grok-session-start","type":"command"}]}]}}
+            {"hooks":{"PostToolUse":[{"hooks":[{"command":"\(cliPath) hook grok-post-tool","type":"command"}]}]}}
             """
         try FileManager.default.createDirectory(
             at: home.appending(path: ".grok/hooks"), withIntermediateDirectories: true)
