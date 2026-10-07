@@ -198,10 +198,9 @@ struct SettingsView: View {
     }
 
     private func refreshOffers() {
-        let cliPath = owner.cliPath.path
         Task { @MainActor in
             offers = await Task.detached(priority: .userInitiated) {
-                SetupPlanner.harnessOffers(installedCLIPath: cliPath)
+                SetupPlanner.harnessOffers()
             }.value
         }
     }

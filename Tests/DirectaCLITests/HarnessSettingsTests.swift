@@ -1,5 +1,5 @@
-import DirectaKit
 import DirectaTestSupport
+@testable import DirectaKit
 import Foundation
 import Testing
 import os
@@ -573,11 +573,15 @@ import os
     }
 
     /** PreInvocation input copied from antigravity.google/docs/hooks (the
-        example carries `invocationNum: 3`), with the number varied. */
+        example carries `invocationNum: 3`), with the number varied. A call
+        numbered 0 is the start of a message. A call numbered 1 or higher is a
+        later call of that message and does not touch the conversation record. */
     @Test(arguments: [
-        (0, true), (1, false), (3, false),
+        (0, AntigravityHookDecision.emit), (1, AntigravityHookDecision.silent),
+        (3, AntigravityHookDecision.silent),
     ])
-    func antigravityHookEmitsOnlyOnTheFirstModelCall(invocation: Int, emits: Bool) {
+    func antigravityHookEmitsOnlyOnTheFirstModelCall(invocation: Int, decision: AntigravityHookDecision) throws {
+        let stateDir = try TemporaryTree.directory(named: "ag-call").appending(path: "missing")
         let payload = """
             {"invocationNum": \(invocation), "initialNumSteps": 10, \
             "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587", \
@@ -586,20 +590,137 @@ import os
             "artifactDirectoryPath": "~/.gemini/antigravity/brain/ec33ebf9-0cba-4100-8142-c61503f6c587", \
             "modelName": "gemini-3.6-flash-medium"}
             """
-        #expect(HookPayloadGate.antigravityHookShouldEmit(HookPayload.parse(Data(payload.utf8))) == emits)
+        #expect(
+            HookPayloadGate.antigravityHookDecision(
+                payload: HookPayload.parse(Data(payload.utf8)), stateDir: stateDir) == decision)
+        if decision == .silent {
+            #expect(!FileManager.default.fileExists(atPath: stateDir.path))
+        }
     }
 
+    /** A missing or unreadable call number is not a later call, and neither is
+        a negative number: Antigravity's counter only moves up from 0 within a
+        message. Each case gets a fresh directory, so the shared fallback
+        conversation cannot suppress the next case. */
     @Test(arguments: [
         #"{"workspacePaths":["/p"]}"#, #"{"invocationNum":"2"}"#, #"{"invocationNum":null}"#, "", "garbage",
         #"{"invocationNum":true}"#, #"{"invocationNum":false}"#, "[0]", #"{"invocationNum":0.5}"#,
+        #"{"invocationNum":-1}"#,
     ])
-    func antigravityHookEmitsWhenTheInvocationNumberIsMissingOrUnreadable(payload: String) {
-        #expect(HookPayloadGate.antigravityHookShouldEmit(HookPayload.parse(Data(payload.utf8))))
+    func antigravityHookEmitsWhenTheInvocationNumberIsMissingOrUnreadable(payload: String) throws {
+        let stateDir = try TemporaryTree.directory(named: "ag-unreadable")
+        #expect(
+            HookPayloadGate.antigravityHookDecision(
+                payload: HookPayload.parse(Data(payload.utf8)), stateDir: stateDir) == .emit)
     }
 
-    @Test(arguments: [#"{"invocationNum":1.5}"#, #"{"invocationNum":-1}"#, #"{"invocationNum":1e3}"#])
-    func antigravityHookIsSilentForAnyNumberPastTheFirstCall(payload: String) {
-        #expect(!HookPayloadGate.antigravityHookShouldEmit(HookPayload.parse(Data(payload.utf8))))
+    @Test(arguments: [#"{"invocationNum":1.5}"#, #"{"invocationNum":1e3}"#])
+    func antigravityHookIsSilentForAnyNumberPastTheFirstCall(payload: String) throws {
+        let stateDir = try TemporaryTree.directory(named: "ag-later").appending(path: "missing")
+        #expect(
+            HookPayloadGate.antigravityHookDecision(
+                payload: HookPayload.parse(Data(payload.utf8)), stateDir: stateDir) == .silent)
+        #expect(!FileManager.default.fileExists(atPath: stateDir.path))
+    }
+
+    @Test func antigravitySessionEmitsOnFirstTurnOnly() throws {
+        let stateDir = try TemporaryTree.directory(named: "ag-first")
+        let payload = HookPayload.parse(
+            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":0}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: payload, stateDir: stateDir) == .emit)
+        #expect(
+            AntigravitySessionGate.load(sessionKey: "conv-a", directory: stateDir)
+                == AntigravitySessionState(lastInitialNumSteps: 0))
+    }
+
+    /** A later message of the same conversation stays quiet and advances the
+        recorded step count. A different conversation still speaks. A message
+        that omits the step count counts as one past the record, not as a reset. */
+    @Test func antigravitySessionSuppressesSubsequentTurns() throws {
+        let stateDir = try TemporaryTree.directory(named: "ag-next")
+        let first = HookPayload.parse(
+            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":0}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: first, stateDir: stateDir) == .emit)
+        let second = HookPayload.parse(
+            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":5}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: second, stateDir: stateDir) == .silent)
+        #expect(
+            AntigravitySessionGate.load(sessionKey: "conv-a", directory: stateDir)
+                == AntigravitySessionState(lastInitialNumSteps: 5))
+        let other = HookPayload.parse(
+            Data(#"{"conversationId":"conv-b","invocationNum":0,"initialNumSteps":0}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: other, stateDir: stateDir) == .emit)
+        let omitted = HookPayload.parse(
+            Data(#"{"conversationId":"conv-a","invocationNum":0}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: omitted, stateDir: stateDir) == .silent)
+        #expect(
+            AntigravitySessionGate.load(sessionKey: "conv-a", directory: stateDir)
+                == AntigravitySessionState(lastInitialNumSteps: 6))
+    }
+
+    @Test func antigravityMidTurnToolCallsAreSilentWithoutDiskAccess() throws {
+        let stateDir = try TemporaryTree.directory(named: "ag-mid").appending(path: "missing")
+        let payload = HookPayload.parse(
+            Data(#"{"conversationId":"conv-a","invocationNum":1,"initialNumSteps":0}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: payload, stateDir: stateDir) == .silent)
+        #expect(!FileManager.default.fileExists(atPath: stateDir.path))
+    }
+
+    @Test func antigravityCompactionReEmitsWhenStepCountDrops() throws {
+        let stateDir = try TemporaryTree.directory(named: "ag-compact")
+        let first = HookPayload.parse(
+            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":5}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: first, stateDir: stateDir) == .emit)
+        let held = HookPayload.parse(
+            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":5}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: held, stateDir: stateDir) == .silent)
+        let compacted = HookPayload.parse(
+            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":2}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: compacted, stateDir: stateDir) == .emit)
+        #expect(
+            AntigravitySessionGate.load(sessionKey: "conv-a", directory: stateDir)
+                == AntigravitySessionState(lastInitialNumSteps: 2))
+        let after = HookPayload.parse(
+            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":4}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: after, stateDir: stateDir) == .silent)
+    }
+
+    /** No conversation id shares one file, so the second such message stays
+        quiet. The first still speaks. */
+    @Test func antigravityFallbackOnMissingConversationId() throws {
+        let stateDir = try TemporaryTree.directory(named: "ag-nosession")
+        let first = HookPayload.parse(Data(#"{"invocationNum":0,"initialNumSteps":0}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: first, stateDir: stateDir) == .emit)
+        #expect(
+            AntigravitySessionGate.load(
+                sessionKey: AntigravitySessionGate.fallbackKey, directory: stateDir)
+                == AntigravitySessionState(lastInitialNumSteps: 0))
+        let second = HookPayload.parse(Data(#"{"invocationNum":0,"initialNumSteps":3}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: second, stateDir: stateDir) == .silent)
+        let named = HookPayload.parse(
+            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":0}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: named, stateDir: stateDir) == .emit)
+    }
+
+    @Test func antigravitySessionKeySanitization() throws {
+        #expect(AntigravitySessionGate.sessionKey(nil) == AntigravitySessionGate.fallbackKey)
+        #expect(AntigravitySessionGate.sessionKey("") == AntigravitySessionGate.fallbackKey)
+        #expect(AntigravitySessionGate.sessionKey("ok-id_1.2") == "ok-id_1.2")
+        #expect(AntigravitySessionGate.sessionKey(".") == AntigravitySessionGate.fallbackKey)
+        #expect(AntigravitySessionGate.sessionKey("..") == AntigravitySessionGate.fallbackKey)
+        #expect(!AntigravitySessionGate.sessionKey("../../etc/passwd").contains("/"))
+        let long = String(repeating: "a", count: 200)
+        #expect(AntigravitySessionGate.sessionKey(long).count == AntigravitySessionGate.maxKeyLength)
+
+        let stateDir = try TemporaryTree.directory(named: "ag-key")
+        let payload = HookPayload.parse(
+            Data(#"{"conversationId":"..","invocationNum":0,"initialNumSteps":1}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: payload, stateDir: stateDir) == .emit)
+        #expect(
+            FileManager.default.fileExists(
+                atPath: stateDir.appending(path: AntigravitySessionGate.fallbackKey).path))
+        let escaped = stateDir.deletingLastPathComponent().appending(path: AntigravitySessionGate.fallbackKey)
+        #expect(!FileManager.default.fileExists(atPath: escaped.path))
     }
 
     /** One wrong-typed field reads as absent without costing the others. */

@@ -1073,7 +1073,7 @@ struct HookInstall: AsyncParsableCommand {
 
     @Option(
         help:
-            "Harness to install for: \(harnessAdapters.map(\.name).joined(separator: ", ")) (default: every harness detected on this machine)."
+            "Harness to install for: \(harnessAdapters().map(\.name).joined(separator: ", ")) (default: every harness detected on this machine)."
     )
     var harness: String?
 
@@ -1121,7 +1121,7 @@ struct HookInstall: AsyncParsableCommand {
 
     func run() async throws {
         let targets: Targets
-        switch Self.resolveTargets(harness: harness, adapters: harnessAdapters) {
+        switch Self.resolveTargets(harness: harness, adapters: harnessAdapters()) {
         case .failure(let error):
             CLIRunner.fail(error, json: global.json)
         case .success(let resolved):
@@ -1170,20 +1170,20 @@ struct HookUninstall: AsyncParsableCommand {
 
     /** Omitted means every harness, so a plain `hook uninstall` cleans up
         wherever directa wrote a hook rather than only the default one. */
-    @Option(help: "Harness to remove from: \(harnessAdapters.map(\.name).joined(separator: ", ")) (default: all).")
+    @Option(help: "Harness to remove from: \(harnessAdapters().map(\.name).joined(separator: ", ")) (default: all).")
     var harness: String?
 
     func run() async throws {
         let adapters: [any HarnessAdapter]
         if let harness {
-            switch HarnessBatch.adapter(named: harness, in: harnessAdapters, verb: .uninstall) {
+            switch HarnessBatch.adapter(named: harness, in: harnessAdapters(), verb: .uninstall) {
             case .failure(let error):
                 CLIRunner.fail(error, json: global.json)
             case .success(let adapter):
                 adapters = [adapter]
             }
         } else {
-            adapters = harnessAdapters
+            adapters = harnessAdapters()
         }
         let result = HarnessBatch.run(adapters) { try $0.uninstall() }
         if let failure = result.failure(verb: .uninstall) {
@@ -1193,106 +1193,31 @@ struct HookUninstall: AsyncParsableCommand {
     }
 }
 
-/** What one `hook install` or `hook uninstall` pass over several harnesses
-    did. The pass collects rather than aborts: a refusal from one harness must
-    not discard the others' work, since their files are already rewritten by
-    the time it lands, so every adapter runs and the report names both what
-    succeeded and what failed. */
-struct HarnessBatchResult {
-    struct Failure: Equatable {
-        var message: String
-        var name: String
-    }
-
-    var failures: [Failure] = []
-    /** Names of the adapters whose action returned, in order. */
-    var succeeded: [String] = []
-    var summaries: [String] = []
-
-    /** The failure the command exits with when any adapter failed, or nil. */
-    func failure(verb: HarnessBatch.Verb) -> WireError? {
-        guard !failures.isEmpty else { return nil }
-        var message = "hook \(verb.rawValue) finished with errors"
-        if !succeeded.isEmpty {
-            message += "; \(verb.pastTense) \(succeeded.joined(separator: ", "))"
-        }
-        message +=
-            ". Failed: " + failures.map { "\($0.name) (\($0.message))" }.joined(separator: "; ")
-        message += " Fix each cause and rerun directa hook \(verb.rawValue)."
-        return WireError(code: .internalError, hint: "run: directa hook \(verb.rawValue)", message: message)
-    }
-}
-
-/** The pieces `hook install` and `hook uninstall` share. */
-enum HarnessBatch {
-    enum Verb: String {
-        case install
-        case uninstall
-
-        /** How the failure report names what succeeded ("installed claude"). */
-        var pastTense: String {
-            switch self {
-            case .install: "installed"
-            case .uninstall: "removed from"
-            }
-        }
-    }
-
-    /** The adapter an explicit `--harness` names, or the usage error listing
-        the supported names. */
-    static func adapter(
-        named name: String, in adapters: [any HarnessAdapter], verb: Verb
-    ) -> Result<any HarnessAdapter, WireError> {
-        if let adapter = adapters.first(where: { $0.name == name }) { return .success(adapter) }
-        let supported = adapters.map(\.name).joined(separator: ", ")
-        let guide = verb == .install ? "; adding one: CONTRIBUTING.md" : ""
-        return .failure(
-            WireError(
-                code: .usage,
-                hint: "run: directa hook \(verb.rawValue) --harness <name>",
-                message: "unknown harness '\(name)' (supported: \(supported)\(guide))"))
-    }
-
-    /** Runs `action` on every adapter, collecting each summary or failure. */
-    static func run(
-        _ adapters: [any HarnessAdapter], _ action: (any HarnessAdapter) throws -> String
-    ) -> HarnessBatchResult {
-        var result = HarnessBatchResult()
-        for adapter in adapters {
-            do {
-                result.summaries.append(try action(adapter))
-                result.succeeded.append(adapter.name)
-            } catch let error as WireError {
-                result.failures.append(HarnessBatchResult.Failure(message: error.message, name: adapter.name))
-            } catch {
-                result.failures.append(
-                    HarnessBatchResult.Failure(message: String(describing: error), name: adapter.name))
-            }
-        }
-        return result
-    }
-}
-
 /** Invoked by Antigravity's PreInvocation hook. Reads the hook's stdin JSON for
-    the workspace directory, emits {"injectSteps": [{"ephemeralMessage": ...}]}
-    on the first model call only (HookPayloadGate), and always exits 0 quickly. */
+    the workspace directory. Injects the context block once per conversation and
+    again when the harness shortens it (HookPayloadGate), and always exits 0
+    quickly. The conversation record is written before the render, so a project
+    with nothing to say does not ask the daemon on the next message. A later
+    model call of the same message answers empty without reading that record. */
 struct HookAntigravitySessionStart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "antigravity-session-start", shouldDisplay: false)
 
     func run() async throws {
         let payload = HookPayload.parse(CLIRunner.stdinData())
-        /** Decided before any project lookup: every model call after the
-            first answers empty, so it costs one stdin parse and nothing more. */
-        guard HookPayloadGate.antigravityHookShouldEmit(payload),
-            let text = await HookContext.render(
-                project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
-                harness: .antigravity)
+        let directory = AntigravitySessionGate.directory(
+            environment: ProcessInfo.processInfo.environment)
+        guard
+            HookPayloadGate.antigravityHookDecision(payload: payload, stateDir: directory) == .emit
         else {
             HookOutput.write(HookOutput.Antigravity(injectSteps: []))
             return
         }
-        HookOutput.write(HookOutput.Antigravity(injectSteps: [.init(ephemeralMessage: text)]))
+        let text = await HookContext.render(
+            project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
+            harness: .antigravity)
+        let steps = text.map { [HookOutput.Antigravity.Step(ephemeralMessage: $0)] } ?? []
+        HookOutput.write(HookOutput.Antigravity(injectSteps: steps))
     }
 }
 
@@ -2147,7 +2072,7 @@ struct Doctor: AsyncParsableCommand {
         /** Harness hooks: report only, never repair. directa does not edit a file
             the user owns, so a drifted hook is surfaced with the exact command to
             fix it and nothing more. */
-        for adapter in harnessAdapters {
+        for adapter in harnessAdapters() {
             switch adapter.hookState() {
             case .harnessAbsent:
                 break
@@ -2273,7 +2198,7 @@ struct Uninstall: AsyncParsableCommand {
         if !agentOnly { actions.append("unregistered Start at Login") }
 
         if !agentOnly {
-            for adapter in harnessAdapters {
+            for adapter in harnessAdapters() {
                 if let summary = try? adapter.uninstall() { actions.append(summary) }
             }
             /** Only the copies directa installed, at `~/.local/bin`. A Homebrew
