@@ -4,12 +4,14 @@ import Foundation
     PascalCase event names; the env value is snake_case. */
 public enum GrokHookEvent: Equatable {
     case leftover
+    case postToolUse
     case preToolUse
     case unspecified
     case userPromptSubmit
 
     public static func parse(_ raw: String?) -> GrokHookEvent {
         switch raw?.lowercased() {
+        case "post_tool_use": return .postToolUse
         case "pre_tool_use": return .preToolUse
         case "user_prompt_submit": return .userPromptSubmit
         case nil: return .unspecified
@@ -49,7 +51,7 @@ public enum GrokSessionHook {
 
     public static func action(for event: GrokHookEvent, state: inout TurnState) -> Action {
         switch event {
-        case .leftover:
+        case .leftover, .postToolUse:
             return .silent
         case .preToolUse:
             if state.emittedThisTurn { return .silent }

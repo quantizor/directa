@@ -8,6 +8,8 @@ import Foundation
 public struct HookPayload: Decodable, Equatable {
     /** Antigravity's conversation, stable across the messages inside it. */
     public var conversationId: String?
+    /** Cursor's conversation, the `conversation_id` field. */
+    public var cursorConversationId: String?
     /** Claude Code's and Grok's session directory. */
     public var cwd: String?
     /** Whether the payload names `cursor_version` at all, with any value:
@@ -19,6 +21,8 @@ public struct HookPayload: Decodable, Equatable {
     /** Antigravity's 0-indexed model call number, as a number (never a
         boolean or a string). It restarts at 0 on each message. */
     public var invocationNumber: Double?
+    /** Claude Code's `session_id`. */
+    public var sessionId: String?
     /** The statusline's `workspace.current_dir`. */
     public var workspaceCurrentDir: String?
     /** Antigravity's workspace list. */
@@ -30,10 +34,12 @@ public struct HookPayload: Decodable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case conversationId
+        case cursorConversationId = "conversation_id"
         case cursorVersion = "cursor_version"
         case cwd
         case initialNumSteps
         case invocationNumber = "invocationNum"
+        case sessionId = "session_id"
         case workspace
         case workspacePaths
         case workspaceRoot
@@ -51,10 +57,12 @@ public struct HookPayload: Decodable, Equatable {
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         conversationId = try? container.decodeIfPresent(String.self, forKey: .conversationId)
+        cursorConversationId = try? container.decodeIfPresent(String.self, forKey: .cursorConversationId)
         cwd = try? container.decodeIfPresent(String.self, forKey: .cwd)
         hasCursorVersion = container.contains(.cursorVersion)
         initialNumSteps = try? container.decodeIfPresent(Int.self, forKey: .initialNumSteps)
         invocationNumber = try? container.decodeIfPresent(Double.self, forKey: .invocationNumber)
+        sessionId = try? container.decodeIfPresent(String.self, forKey: .sessionId)
         workspaceCurrentDir =
             (try? container.nestedContainer(keyedBy: WorkspaceKeys.self, forKey: .workspace))
             .flatMap { try? $0.decodeIfPresent(String.self, forKey: .currentDir) }
@@ -117,25 +125,17 @@ public enum HookPayloadGate {
         return !cursorHookInstalled()
     }
 
-    /** Antigravity has no session-start event, so its hook is registered on
-        PreInvocation, which fires before every model call. `invocationNum`
-        restarts at 0 on each message, so the call number alone cannot tell a
-        new conversation from the next message. A call numbered 1 or higher is
-        a later call of the same message and returns without touching the
-        conversation record. Every other call (a missing or unreadable number
-        included, since that is not a later call) reads the record for
-        `conversationId`: the first message emits and records
-        `initialNumSteps`, a later message with a count that did not fall stays
-        quiet and advances the record, and a count that fell (the harness
-        shortened the conversation) emits again. A missing step count counts as
-        one past the recorded count, so a payload that omits the field does not
-        look like a reset. The record is written before the caller renders, so
-        a project with nothing to say does not ask the daemon again on the next
-        message. */
+    /** Whether this Antigravity call is a session boundary: the first time
+        this conversation is seen, or `initialNumSteps` fell (the harness
+        shortened it). The call number is not consulted. `invocationNum`
+        restarts at 0 on each message, so it cannot tell those apart, and a
+        later call in the same message still has to ask whether the servers
+        changed. A missing step count counts as one past the recorded count,
+        so a payload that omits the field does not look like a reset. The
+        record is written on every call. */
     public static func antigravityHookDecision(
         payload: HookPayload?, stateDir: URL
     ) -> AntigravityHookDecision {
-        if let number = payload?.invocationNumber, number >= 1 { return .silent }
         let key = AntigravitySessionGate.sessionKey(payload?.conversationId)
         let prior = AntigravitySessionGate.load(sessionKey: key, directory: stateDir)
         let steps = nextStepCount(payload: payload, prior: prior?.lastInitialNumSteps)
@@ -176,9 +176,26 @@ public enum HookOutput {
         }
 
         public var injectSteps: [Step]
+        /** Set by the caller when `HookChangeOutcome.pullBack` is true. Omitted
+            from the JSON when nil, so a quiet answer stays `{"injectSteps":[]}`. */
+        public var terminationBehavior: String?
 
-        public init(injectSteps: [Step]) {
+        private enum CodingKeys: String, CodingKey {
+            case injectSteps
+            case terminationBehavior
+        }
+
+        public init(injectSteps: [Step], terminationBehavior: String? = nil) {
             self.injectSteps = injectSteps
+            self.terminationBehavior = terminationBehavior
+        }
+
+        public func encode(to encoder: any Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(injectSteps, forKey: .injectSteps)
+            if let terminationBehavior {
+                try container.encode(terminationBehavior, forKey: .terminationBehavior)
+            }
         }
     }
 

@@ -994,7 +994,9 @@ pass "doctor --fix removes the leftover through the daemon, keeps the claimed di
 "$DIRECTA" trust --json > /dev/null
 AG_STATE="$WORK/ag-hook"
 ag_hook() {
-  DIRECTA_ANTIGRAVITY_HOOK_STATE_DIR="$AG_STATE" "$DIRECTA" hook antigravity-session-start
+  DIRECTA_ANTIGRAVITY_HOOK_STATE_DIR="$AG_STATE" \
+    DIRECTA_HOOK_SNAPSHOT_DIR="$AG_STATE/snapshot" \
+    "$DIRECTA" hook antigravity-session-start
 }
 FIRST_CALL="$(printf '{"conversationId":"smoke","invocationNum":0,"initialNumSteps":0,"workspacePaths":["%s"]}' "$PROJECT" | ag_hook)"
 grep -q '"ephemeralMessage"' <<<"$FIRST_CALL" || fail "antigravity hook was silent on the first message: $FIRST_CALL"
@@ -1004,7 +1006,11 @@ NEXT_TURN="$(printf '{"conversationId":"smoke","invocationNum":0,"initialNumStep
 [[ "$NEXT_TURN" == '{"injectSteps":[]}' ]] || fail "antigravity hook repeated the block on the next message: $NEXT_TURN"
 COMPACTED="$(printf '{"conversationId":"smoke","invocationNum":0,"initialNumSteps":2,"workspacePaths":["%s"]}' "$PROJECT" | ag_hook)"
 grep -q '"ephemeralMessage"' <<<"$COMPACTED" || fail "antigravity hook was silent after the step count dropped: $COMPACTED"
-pass "antigravity hook injects context once per conversation and again after compaction"
+(cd "$PROJECT" && "$DIRECTA" register --name agchange --cmd /bin/sleep --cmd 30 --json >/dev/null) \
+  || fail "could not register a server to change the picture"
+CHANGED="$(printf '{"conversationId":"smoke","invocationNum":0,"initialNumSteps":6,"workspacePaths":["%s"]}' "$PROJECT" | ag_hook)"
+grep -q '"ephemeralMessage"' <<<"$CHANGED" || fail "antigravity hook was silent after a server was added: $CHANGED"
+pass "antigravity hook injects context once per conversation, again after compaction, and again when the servers change"
 
 # Bundle advertises the custom URL scheme and ships CLI + daemon for first-run.
 # Ad-hoc on purpose: the gate asserts layout and never installs this bundle, so

@@ -304,7 +304,7 @@ import os
                 #expect(groups?.first?["matcher"] == nil)
                 let handlers = groups?.first?["hooks"] as? [[String: Any]]
                 #expect(handlers?.first?["timeout"] as? Int == 10)
-                #expect((handlers?.first?["command"] as? String)?.hasSuffix(" hook grok-session-start") == true)
+                #expect((handlers?.first?["command"] as? String)?.hasSuffix(" hook grok-post-tool") == true)
             }
             #expect(hooks?["SessionStart"] == nil)
             #expect(hooks?["SessionEnd"] == nil)
@@ -384,8 +384,7 @@ import os
             ]
             try adapter.writeSettings([
                 "hooks": [
-                    "PreToolUse": [["hooks": [oldHandler]]],
-                    "UserPromptSubmit": [["hooks": [oldHandler]]],
+                    "PostToolUse": [["hooks": [oldHandler]]],
                 ]
             ])
             let newPath = dir.appending(path: "bin/directa").path
@@ -435,7 +434,7 @@ import os
             let adapter = GrokAdapter(settingsURLOverride: settings)
             let cliPath = dir.appending(path: "bin/directa").path
             let handler: [String: Any] = [
-                "command": "\(cliPath) hook grok-session-start", "type": "command",
+                "command": "\(cliPath) hook grok-post-tool", "type": "command",
             ]
             var events: [String: Any] = [:]
             for event in GrokAdapter.registeredEvents {
@@ -485,28 +484,28 @@ import os
                 let commands =
                     ((hooks?[event] as? [[String: Any]])?.first?["hooks"] as? [[String: Any]])?
                     .compactMap { $0["command"] as? String } ?? []
-                #expect(commands.contains("\(cliPath) hook grok-session-start"))
+                #expect(commands.contains("\(cliPath) hook grok-post-tool"))
             }
             #expect(hooks?["SessionStart"] == nil)
         }
     }
 
-    @Test func grokHookStateRequiresBothPreToolUseAndUserPromptSubmit() throws {
+    @Test func grokHookStateRequiresPostToolUse() throws {
         try inScratchDir { dir in
             let settings = dir.appending(path: "hooks/directa.json")
             try FileManager.default.createDirectory(
                 at: settings.deletingLastPathComponent(), withIntermediateDirectories: true)
             let adapter = GrokAdapter(settingsURLOverride: settings)
-            let command = "\(dir.appending(path: "bin/directa").path) hook grok-session-start"
+            let legacy = "\(dir.appending(path: "bin/directa").path) hook grok-session-start"
+            let command = "\(dir.appending(path: "bin/directa").path) hook grok-post-tool"
+            let legacyGroup: [[String: Any]] = [["hooks": [["command": legacy, "type": "command"]]]]
             let group: [[String: Any]] = [["hooks": [["command": command, "type": "command"]]]]
-            try adapter.writeSettings(["hooks": ["PreToolUse": group]])
+            try adapter.writeSettings(["hooks": ["PreToolUse": legacyGroup]])
             #expect(adapter.hookState() == .notInstalled)
-            try adapter.writeSettings(["hooks": ["UserPromptSubmit": group]])
-            #expect(adapter.hookState() == .notInstalled)
-            try adapter.writeSettings(["hooks": ["PreToolUse": group, "UserPromptSubmit": group]])
+            try adapter.writeSettings(["hooks": ["PostToolUse": group]])
             if case .installed = adapter.hookState() {
             } else {
-                Issue.record("expected both events to read as installed")
+                Issue.record("expected PostToolUse to read as installed")
             }
         }
     }
@@ -518,7 +517,7 @@ import os
         #expect(GrokHookEvent.parse(nil) == .unspecified)
         #expect(GrokHookEvent.parse("session_start") == .leftover)
         #expect(GrokHookEvent.parse("stop") == .leftover)
-        #expect(GrokHookEvent.parse("post_tool_use") == .leftover)
+        #expect(GrokHookEvent.parse("post_tool_use") == .postToolUse)
     }
 
     /** Payload shapes copied from the vendor docs: Claude Code's SessionStart
@@ -573,15 +572,11 @@ import os
     }
 
     /** PreInvocation input copied from antigravity.google/docs/hooks (the
-        example carries `invocationNum: 3`), with the number varied. A call
-        numbered 0 is the start of a message. A call numbered 1 or higher is a
-        later call of that message and does not touch the conversation record. */
-    @Test(arguments: [
-        (0, AntigravityHookDecision.emit), (1, AntigravityHookDecision.silent),
-        (3, AntigravityHookDecision.silent),
-    ])
-    func antigravityHookEmitsOnlyOnTheFirstModelCall(invocation: Int, decision: AntigravityHookDecision) throws {
-        let stateDir = try TemporaryTree.directory(named: "ag-call").appending(path: "missing")
+        example carries `invocationNum: 3`). The call number restarts every
+        message, so it is not what decides. A first look emits at any number. */
+    @Test(arguments: [0, 1, 3])
+    func antigravityHookEmitsOnTheFirstLookAtAnyCallNumber(invocation: Int) throws {
+        let stateDir = try TemporaryTree.directory(named: "ag-call")
         let payload = """
             {"invocationNum": \(invocation), "initialNumSteps": 10, \
             "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587", \
@@ -592,10 +587,7 @@ import os
             """
         #expect(
             HookPayloadGate.antigravityHookDecision(
-                payload: HookPayload.parse(Data(payload.utf8)), stateDir: stateDir) == decision)
-        if decision == .silent {
-            #expect(!FileManager.default.fileExists(atPath: stateDir.path))
-        }
+                payload: HookPayload.parse(Data(payload.utf8)), stateDir: stateDir) == .emit)
     }
 
     /** A missing or unreadable call number is not a later call, and neither is
@@ -614,13 +606,14 @@ import os
                 payload: HookPayload.parse(Data(payload.utf8)), stateDir: stateDir) == .emit)
     }
 
-    @Test(arguments: [#"{"invocationNum":1.5}"#, #"{"invocationNum":1e3}"#])
-    func antigravityHookIsSilentForAnyNumberPastTheFirstCall(payload: String) throws {
-        let stateDir = try TemporaryTree.directory(named: "ag-later").appending(path: "missing")
-        #expect(
-            HookPayloadGate.antigravityHookDecision(
-                payload: HookPayload.parse(Data(payload.utf8)), stateDir: stateDir) == .silent)
-        #expect(!FileManager.default.fileExists(atPath: stateDir.path))
+    @Test(arguments: [#"{"invocationNum":1.5,"initialNumSteps":4}"#, #"{"invocationNum":1e3,"initialNumSteps":9}"#])
+    func antigravityHookIsQuietAfterTheFirstLookWhateverTheCallNumber(payload: String) throws {
+        let stateDir = try TemporaryTree.directory(named: "ag-later")
+        let first = HookPayload.parse(
+            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":1}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: first, stateDir: stateDir) == .emit)
+        let later = HookPayload.parse(Data(("{\"conversationId\":\"conv-a\"," + payload.dropFirst()).utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: later, stateDir: stateDir) == .silent)
     }
 
     @Test func antigravitySessionEmitsOnFirstTurnOnly() throws {
@@ -658,12 +651,17 @@ import os
                 == AntigravitySessionState(lastInitialNumSteps: 6))
     }
 
-    @Test func antigravityMidTurnToolCallsAreSilentWithoutDiskAccess() throws {
-        let stateDir = try TemporaryTree.directory(named: "ag-mid").appending(path: "missing")
-        let payload = HookPayload.parse(
-            Data(#"{"conversationId":"conv-a","invocationNum":1,"initialNumSteps":0}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: payload, stateDir: stateDir) == .silent)
-        #expect(!FileManager.default.fileExists(atPath: stateDir.path))
+    @Test func antigravityMidTurnStillRecordsTheStepCount() throws {
+        let stateDir = try TemporaryTree.directory(named: "ag-mid")
+        let first = HookPayload.parse(
+            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":0}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: first, stateDir: stateDir) == .emit)
+        let tool = HookPayload.parse(
+            Data(#"{"conversationId":"conv-a","invocationNum":1,"initialNumSteps":2}"#.utf8))
+        #expect(HookPayloadGate.antigravityHookDecision(payload: tool, stateDir: stateDir) == .silent)
+        #expect(
+            AntigravitySessionGate.load(sessionKey: "conv-a", directory: stateDir)
+                == AntigravitySessionState(lastInitialNumSteps: 2))
     }
 
     @Test func antigravityCompactionReEmitsWhenStepCountDrops() throws {
@@ -880,7 +878,7 @@ import os
             let adapter = GrokAdapter(settingsURLOverride: settings)
             let cliPath = dir.appending(path: "bin/directa").path
             let handler: [String: Any] = [
-                "command": "\(cliPath) hook grok-session-start", "type": "command",
+                "command": "\(cliPath) hook grok-post-tool", "type": "command",
             ]
             var events: [String: Any] = [
                 "Stop": [
@@ -911,10 +909,12 @@ import os
             let adapter = GrokAdapter(settingsURLOverride: settings)
             let cliPath = dir.appending(path: "bin/directa").path
             let handler: [String: Any] = [
-                "command": "\(cliPath) hook grok-session-start", "type": "command",
+                "command": "\(cliPath) hook grok-post-tool", "type": "command",
             ]
             var events: [String: Any] = [
-                "SessionStart": [["hooks": [handler]]]
+                "SessionStart": [[
+                    "hooks": [["command": "\(cliPath) hook grok-session-start", "type": "command"]]
+                ]]
             ]
             for event in GrokAdapter.registeredEvents {
                 events[event] = [["hooks": [handler]]]
