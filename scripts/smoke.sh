@@ -994,9 +994,7 @@ pass "doctor --fix removes the leftover through the daemon, keeps the claimed di
 "$DIRECTA" trust --json > /dev/null
 AG_STATE="$WORK/ag-hook"
 ag_hook() {
-  DIRECTA_ANTIGRAVITY_HOOK_STATE_DIR="$AG_STATE" \
-    DIRECTA_HOOK_SNAPSHOT_DIR="$AG_STATE/snapshot" \
-    "$DIRECTA" hook antigravity-session-start
+  DIRECTA_HOOK_SNAPSHOT_DIR="$AG_STATE" "$DIRECTA" hook antigravity-session-start
 }
 FIRST_CALL="$(printf '{"conversationId":"smoke","invocationNum":0,"initialNumSteps":0,"workspacePaths":["%s"]}' "$PROJECT" | ag_hook)"
 grep -q '"ephemeralMessage"' <<<"$FIRST_CALL" || fail "antigravity hook was silent on the first message: $FIRST_CALL"

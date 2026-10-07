@@ -571,154 +571,31 @@ import os
                 }))
     }
 
-    /** PreInvocation input copied from antigravity.google/docs/hooks (the
-        example carries `invocationNum: 3`). The call number restarts every
-        message, so it is not what decides. A first look emits at any number. */
-    @Test(arguments: [0, 1, 3])
-    func antigravityHookEmitsOnTheFirstLookAtAnyCallNumber(invocation: Int) throws {
-        let stateDir = try TemporaryTree.directory(named: "ag-call")
-        let payload = """
-            {"invocationNum": \(invocation), "initialNumSteps": 10, \
-            "conversationId": "ec33ebf9-0cba-4100-8142-c61503f6c587", \
-            "workspacePaths": ["/workspace/project"], \
-            "transcriptPath": "~/.gemini/antigravity/brain/ec33ebf9-0cba-4100-8142-c61503f6c587/.system_generated/logs/transcript.jsonl", \
-            "artifactDirectoryPath": "~/.gemini/antigravity/brain/ec33ebf9-0cba-4100-8142-c61503f6c587", \
-            "modelName": "gemini-3.6-flash-medium"}
-            """
-        #expect(
-            HookPayloadGate.antigravityHookDecision(
-                payload: HookPayload.parse(Data(payload.utf8)), stateDir: stateDir) == .emit)
+    /** The call number restarts every message, so the step count is what
+        decides a boundary. A missing count is one past the stored count. */
+    @Test func antigravityBoundaryFollowsTheStepCountNotTheCallNumber() {
+        let first = HookPayload.parse(Data(#"{"invocationNum":3,"initialNumSteps":0}"#.utf8))
+        #expect(AntigravityAdapter.isBoundary(payload: first, prior: nil))
+        let later = HookPayload.parse(Data(#"{"invocationNum":0,"initialNumSteps":5}"#.utf8))
+        #expect(!AntigravityAdapter.isBoundary(payload: later, prior: 0))
+        #expect(AntigravityAdapter.notedSteps(payload: later, prior: 0) == 5)
+        let omitted = HookPayload.parse(Data(#"{"invocationNum":1}"#.utf8))
+        #expect(AntigravityAdapter.notedSteps(payload: omitted, prior: 5) == 6)
+        #expect(!AntigravityAdapter.isBoundary(payload: omitted, prior: 5))
+        let compacted = HookPayload.parse(Data(#"{"initialNumSteps":2}"#.utf8))
+        #expect(AntigravityAdapter.isBoundary(payload: compacted, prior: 6))
+        let garbage = HookPayload.parse(Data("garbage".utf8))
+        #expect(AntigravityAdapter.isBoundary(payload: garbage, prior: nil))
     }
 
-    /** A missing or unreadable call number is not a later call, and neither is
-        a negative number: Antigravity's counter only moves up from 0 within a
-        message. Each case gets a fresh directory, so the shared fallback
-        conversation cannot suppress the next case. */
-    @Test(arguments: [
-        #"{"workspacePaths":["/p"]}"#, #"{"invocationNum":"2"}"#, #"{"invocationNum":null}"#, "", "garbage",
-        #"{"invocationNum":true}"#, #"{"invocationNum":false}"#, "[0]", #"{"invocationNum":0.5}"#,
-        #"{"invocationNum":-1}"#,
-    ])
-    func antigravityHookEmitsWhenTheInvocationNumberIsMissingOrUnreadable(payload: String) throws {
-        let stateDir = try TemporaryTree.directory(named: "ag-unreadable")
-        #expect(
-            HookPayloadGate.antigravityHookDecision(
-                payload: HookPayload.parse(Data(payload.utf8)), stateDir: stateDir) == .emit)
-    }
-
-    @Test(arguments: [#"{"invocationNum":1.5,"initialNumSteps":4}"#, #"{"invocationNum":1e3,"initialNumSteps":9}"#])
-    func antigravityHookIsQuietAfterTheFirstLookWhateverTheCallNumber(payload: String) throws {
-        let stateDir = try TemporaryTree.directory(named: "ag-later")
-        let first = HookPayload.parse(
-            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":1}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: first, stateDir: stateDir) == .emit)
-        let later = HookPayload.parse(Data(("{\"conversationId\":\"conv-a\"," + payload.dropFirst()).utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: later, stateDir: stateDir) == .silent)
-    }
-
-    @Test func antigravitySessionEmitsOnFirstTurnOnly() throws {
-        let stateDir = try TemporaryTree.directory(named: "ag-first")
-        let payload = HookPayload.parse(
-            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":0}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: payload, stateDir: stateDir) == .emit)
-        #expect(
-            AntigravitySessionGate.load(sessionKey: "conv-a", directory: stateDir)
-                == AntigravitySessionState(lastInitialNumSteps: 0))
-    }
-
-    /** A later message of the same conversation stays quiet and advances the
-        recorded step count. A different conversation still speaks. A message
-        that omits the step count counts as one past the record, not as a reset. */
-    @Test func antigravitySessionSuppressesSubsequentTurns() throws {
-        let stateDir = try TemporaryTree.directory(named: "ag-next")
-        let first = HookPayload.parse(
-            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":0}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: first, stateDir: stateDir) == .emit)
-        let second = HookPayload.parse(
-            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":5}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: second, stateDir: stateDir) == .silent)
-        #expect(
-            AntigravitySessionGate.load(sessionKey: "conv-a", directory: stateDir)
-                == AntigravitySessionState(lastInitialNumSteps: 5))
-        let other = HookPayload.parse(
-            Data(#"{"conversationId":"conv-b","invocationNum":0,"initialNumSteps":0}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: other, stateDir: stateDir) == .emit)
-        let omitted = HookPayload.parse(
-            Data(#"{"conversationId":"conv-a","invocationNum":0}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: omitted, stateDir: stateDir) == .silent)
-        #expect(
-            AntigravitySessionGate.load(sessionKey: "conv-a", directory: stateDir)
-                == AntigravitySessionState(lastInitialNumSteps: 6))
-    }
-
-    @Test func antigravityMidTurnStillRecordsTheStepCount() throws {
-        let stateDir = try TemporaryTree.directory(named: "ag-mid")
-        let first = HookPayload.parse(
-            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":0}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: first, stateDir: stateDir) == .emit)
-        let tool = HookPayload.parse(
-            Data(#"{"conversationId":"conv-a","invocationNum":1,"initialNumSteps":2}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: tool, stateDir: stateDir) == .silent)
-        #expect(
-            AntigravitySessionGate.load(sessionKey: "conv-a", directory: stateDir)
-                == AntigravitySessionState(lastInitialNumSteps: 2))
-    }
-
-    @Test func antigravityCompactionReEmitsWhenStepCountDrops() throws {
-        let stateDir = try TemporaryTree.directory(named: "ag-compact")
-        let first = HookPayload.parse(
-            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":5}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: first, stateDir: stateDir) == .emit)
-        let held = HookPayload.parse(
-            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":5}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: held, stateDir: stateDir) == .silent)
-        let compacted = HookPayload.parse(
-            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":2}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: compacted, stateDir: stateDir) == .emit)
-        #expect(
-            AntigravitySessionGate.load(sessionKey: "conv-a", directory: stateDir)
-                == AntigravitySessionState(lastInitialNumSteps: 2))
-        let after = HookPayload.parse(
-            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":4}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: after, stateDir: stateDir) == .silent)
-    }
-
-    /** No conversation id shares one file, so the second such message stays
-        quiet. The first still speaks. */
-    @Test func antigravityFallbackOnMissingConversationId() throws {
-        let stateDir = try TemporaryTree.directory(named: "ag-nosession")
-        let first = HookPayload.parse(Data(#"{"invocationNum":0,"initialNumSteps":0}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: first, stateDir: stateDir) == .emit)
-        #expect(
-            AntigravitySessionGate.load(
-                sessionKey: AntigravitySessionGate.fallbackKey, directory: stateDir)
-                == AntigravitySessionState(lastInitialNumSteps: 0))
-        let second = HookPayload.parse(Data(#"{"invocationNum":0,"initialNumSteps":3}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: second, stateDir: stateDir) == .silent)
-        let named = HookPayload.parse(
-            Data(#"{"conversationId":"conv-a","invocationNum":0,"initialNumSteps":0}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: named, stateDir: stateDir) == .emit)
-    }
-
-    @Test func antigravitySessionKeySanitization() throws {
-        #expect(AntigravitySessionGate.sessionKey(nil) == AntigravitySessionGate.fallbackKey)
-        #expect(AntigravitySessionGate.sessionKey("") == AntigravitySessionGate.fallbackKey)
-        #expect(AntigravitySessionGate.sessionKey("ok-id_1.2") == "ok-id_1.2")
-        #expect(AntigravitySessionGate.sessionKey(".") == AntigravitySessionGate.fallbackKey)
-        #expect(AntigravitySessionGate.sessionKey("..") == AntigravitySessionGate.fallbackKey)
-        #expect(!AntigravitySessionGate.sessionKey("../../etc/passwd").contains("/"))
+    @Test func sessionKeyStaysInsideOnePathComponent() {
+        #expect(HookSnapshotStore.sessionKey(nil) == HookSnapshotStore.fallbackKey)
+        #expect(HookSnapshotStore.sessionKey("..") == HookSnapshotStore.fallbackKey)
+        #expect(HookSnapshotStore.sessionKey("ok-id_1.2") == "ok-id_1.2")
+        #expect(!HookSnapshotStore.sessionKey("../../etc/passwd").contains("/"))
         let long = String(repeating: "a", count: 200)
-        #expect(AntigravitySessionGate.sessionKey(long).count == AntigravitySessionGate.maxKeyLength)
-
-        let stateDir = try TemporaryTree.directory(named: "ag-key")
-        let payload = HookPayload.parse(
-            Data(#"{"conversationId":"..","invocationNum":0,"initialNumSteps":1}"#.utf8))
-        #expect(HookPayloadGate.antigravityHookDecision(payload: payload, stateDir: stateDir) == .emit)
-        #expect(
-            FileManager.default.fileExists(
-                atPath: stateDir.appending(path: AntigravitySessionGate.fallbackKey).path))
-        let escaped = stateDir.deletingLastPathComponent().appending(path: AntigravitySessionGate.fallbackKey)
-        #expect(!FileManager.default.fileExists(atPath: escaped.path))
+        #expect(HookSnapshotStore.sessionKey(long).count == HookSnapshotStore.maxKeyLength)
+        #expect(HookSnapshotStore.fileKey(scope: "antigravity", session: "..") == "antigravity-nosession")
     }
 
     /** One wrong-typed field reads as absent without costing the others. */
@@ -747,87 +624,6 @@ import os
                     hookSpecificOutput: .init(additionalContext: "a/b", hookEventName: "SessionStart")))
                 == #"{"hookSpecificOutput":{"additionalContext":"a/b","hookEventName":"SessionStart"}}"#)
         #expect(try text(HookOutput.Cursor(additionalContext: "a/b")) == #"{"additional_context":"a/b"}"#)
-    }
-
-    @Test func grokSessionHookActionMatrix() {
-        var state = GrokSessionHook.TurnState(emittedThisTurn: false, turn: 0)
-        #expect(GrokSessionHook.action(for: .leftover, state: &state) == .silent)
-        #expect(state.turn == 0)
-        #expect(GrokSessionHook.action(for: .unspecified, state: &state) == .emitUnmarked)
-        #expect(state.emittedThisTurn == false)
-
-        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .emitAndMark)
-        #expect(state.emittedThisTurn == false)
-        GrokSessionHook.markEmitted(&state)
-        #expect(state.emittedThisTurn == true)
-        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .silent)
-
-        #expect(GrokSessionHook.action(for: .userPromptSubmit, state: &state) == .silentPersist)
-        #expect(state.turn == 1)
-        #expect(state.emittedThisTurn == false)
-        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .emitAndMark)
-        GrokSessionHook.markEmitted(&state)
-        #expect(state.emittedThisTurn == true)
-        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .silent)
-
-        #expect(GrokSessionHook.action(for: .userPromptSubmit, state: &state) == .silentPersist)
-        #expect(state.turn == 2)
-        #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .emitAndMark)
-        GrokSessionHook.markEmitted(&state)
-        #expect(state.emittedThisTurn == true)
-    }
-
-    @Test func grokTurnGateSessionKeySanitizes() {
-        #expect(GrokTurnGate.sessionKey(nil) == GrokTurnGate.fallbackKey)
-        #expect(GrokTurnGate.sessionKey("") == GrokTurnGate.fallbackKey)
-        #expect(GrokTurnGate.sessionKey("ok-id_1.2") == "ok-id_1.2")
-        #expect(GrokTurnGate.sessionKey(".") == GrokTurnGate.fallbackKey)
-        #expect(GrokTurnGate.sessionKey("..") == GrokTurnGate.fallbackKey)
-        #expect(!GrokTurnGate.sessionKey("../../etc/passwd").contains("/"))
-        let long = String(repeating: "a", count: 200)
-        #expect(GrokTurnGate.sessionKey(long).count == GrokTurnGate.maxKeyLength)
-    }
-
-    @Test func grokTurnGateRoundTripsState() throws {
-        try inScratchDir { dir in
-            let stateDir = dir.appending(path: "state")
-            let original = GrokSessionHook.TurnState(emittedThisTurn: true, turn: 3)
-            GrokTurnGate.save(original, sessionKey: "sess1", directory: stateDir)
-            #expect(GrokTurnGate.load(sessionKey: "sess1", directory: stateDir) == original)
-            let missing = GrokTurnGate.load(sessionKey: "other", directory: stateDir)
-            #expect(missing == GrokSessionHook.TurnState(emittedThisTurn: false, turn: 0))
-        }
-    }
-
-    /** The CLI persist protocol: UPS save is immediate; PreToolUse marks only
-        after a successful emit. Dropping either save would make the next
-        PreToolUse of the same turn emit again. */
-    @Test func grokTurnGateDiskProtocolSkipsASecondPreToolUseOfTheSameTurn() throws {
-        try inScratchDir { dir in
-            let stateDir = dir.appending(path: "state")
-            let key = "sess-disk"
-            var state = GrokTurnGate.load(sessionKey: key, directory: stateDir)
-            #expect(GrokSessionHook.action(for: .userPromptSubmit, state: &state) == .silentPersist)
-            GrokTurnGate.save(state, sessionKey: key, directory: stateDir)
-
-            state = GrokTurnGate.load(sessionKey: key, directory: stateDir)
-            #expect(state.turn == 1)
-            #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .emitAndMark)
-            GrokSessionHook.markEmitted(&state)
-            GrokTurnGate.save(state, sessionKey: key, directory: stateDir)
-
-            state = GrokTurnGate.load(sessionKey: key, directory: stateDir)
-            #expect(GrokSessionHook.action(for: .preToolUse, state: &state) == .silent)
-        }
-    }
-
-    @Test func grokTurnGateDirectoryHonorsOverride() {
-        let override = "/tmp/directa-grok-test-dir"
-        #expect(
-            GrokTurnGate.directory(environment: ["DIRECTA_GROK_HOOK_STATE_DIR": override]).path
-                == override)
-        let fromTmp = GrokTurnGate.directory(environment: ["TMPDIR": "/tmp/custom-tmp"])
-        #expect(fromTmp.lastPathComponent == GrokTurnGate.stateDirName)
     }
 
     @Test func grokInstallStripsALeftoverStopHook() throws {

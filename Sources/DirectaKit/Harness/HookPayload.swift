@@ -91,16 +91,6 @@ public enum HookSessionCwd {
     }
 }
 
-/** Whether this Antigravity invocation injects the context block. */
-public enum AntigravityHookDecision: Equatable, Sendable {
-    /** Render the block. The conversation record is already written. */
-    case emit
-    /** Say nothing. A later model call of the same message does not touch the
-        conversation record; a later message of the same conversation updates
-        the record and stays quiet unless the step count dropped. */
-    case silent
-}
-
 /** Whether a session hook speaks for this invocation, decided from the stdin
     payload. Anything unparseable or unexpected answers true for the hooks that
     have no conversation record: a missing context block costs the agent more
@@ -125,41 +115,6 @@ public enum HookPayloadGate {
         return !cursorHookInstalled()
     }
 
-    /** Whether this Antigravity call is a session boundary: the first time
-        this conversation is seen, or `initialNumSteps` fell (the harness
-        shortened it). The call number is not consulted. `invocationNum`
-        restarts at 0 on each message, so it cannot tell those apart, and a
-        later call in the same message still has to ask whether the servers
-        changed. A missing step count counts as one past the recorded count,
-        so a payload that omits the field does not look like a reset. The
-        record is written on every call. */
-    public static func antigravityHookDecision(
-        payload: HookPayload?, stateDir: URL
-    ) -> AntigravityHookDecision {
-        let key = AntigravitySessionGate.sessionKey(payload?.conversationId)
-        let prior = AntigravitySessionGate.load(sessionKey: key, directory: stateDir)
-        let steps = nextStepCount(payload: payload, prior: prior?.lastInitialNumSteps)
-        let decision: AntigravityHookDecision
-        if let prior, steps >= prior.lastInitialNumSteps {
-            decision = .silent
-        } else {
-            decision = .emit
-        }
-        AntigravitySessionGate.save(
-            AntigravitySessionState(lastInitialNumSteps: steps), sessionKey: key, directory: stateDir)
-        return decision
-    }
-
-    /** The step count to record. A payload that names one wins. The first
-        message of a conversation with no count records 0. A later message with
-        no count records one past the previous count, saturating at `Int.max`
-        so the addition cannot trap. */
-    private static func nextStepCount(payload: HookPayload?, prior: Int?) -> Int {
-        if let steps = payload?.initialNumSteps { return steps }
-        guard let prior else { return 0 }
-        if prior == Int.max { return prior }
-        return prior + 1
-    }
 }
 
 /** A session hook's stdout: one JSON object in the shape its harness reads,
@@ -176,8 +131,8 @@ public enum HookOutput {
         }
 
         public var injectSteps: [Step]
-        /** Set by the caller when `HookChangeOutcome.pullBack` is true. Omitted
-            from the JSON when nil, so a quiet answer stays `{"injectSteps":[]}`. */
+        /** Set by Antigravity when new err lines should bring the model back.
+            Omitted from the JSON when nil, so a quiet answer stays `{"injectSteps":[]}`. */
         public var terminationBehavior: String?
 
         private enum CodingKeys: String, CodingKey {
