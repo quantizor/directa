@@ -4,7 +4,7 @@ import Foundation
 public enum DirectaVersion {
     /** Wire protocol major version; clients abort on mismatch with `version-mismatch`. */
     public static let proto = 1
-    public static let version = "2.0.0"
+    public static let version = "3.0.0"
 }
 
 /** Lifecycle phase of a supervised server. `failed` means the spawn itself never
