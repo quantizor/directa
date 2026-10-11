@@ -1,14 +1,11 @@
 import Foundation
 
-/** The server picture a conversation has already been shown. Clocks stay out,
-    so a later tool call pastes again only when a server actually changed.
-    Err lines are the sanitized last lines the change path may quote, not the
-    paragraph `AgentContext.render` builds. */
+/** The server picture a conversation has already been shown: exactly the
+    fields whose change is worth a line. Clocks and err output stay out, so a
+    later tool call speaks only when a server actually changed. */
 public struct HookServerPicture: Codable, Equatable, Sendable {
     public struct Row: Codable, Equatable, Sendable {
         public var conflict: String?
-        public var errorCount: Int
-        public var errorLines: [String]
         public var exitCode: Int?
         public var exitSignal: Int?
         public var name: String
@@ -21,8 +18,6 @@ public struct HookServerPicture: Codable, Equatable, Sendable {
 
         public init(
             conflict: String?,
-            errorCount: Int,
-            errorLines: [String],
             exitCode: Int?,
             exitSignal: Int?,
             name: String,
@@ -34,8 +29,6 @@ public struct HookServerPicture: Codable, Equatable, Sendable {
             worktree: String?
         ) {
             self.conflict = conflict
-            self.errorCount = errorCount
-            self.errorLines = errorLines
             self.exitCode = exitCode
             self.exitSignal = exitSignal
             self.name = name
@@ -60,14 +53,23 @@ public struct HookServerPicture: Codable, Equatable, Sendable {
 }
 
 /** One conversation's last picture. A harness may hang its own fields off
-    `antigravity`. The compare does not read them. */
+    `antigravity`. The compare does not read them. `shownErrorLines` holds,
+    per server, the sanitized err lines already quoted to this conversation, so
+    a later quote skips them. It is optional so a record from an older version
+    still loads. */
 public struct HookConversationRecord: Codable, Equatable, Sendable {
     public var antigravity: AntigravityConversation?
     public var picture: HookServerPicture
+    public var shownErrorLines: [String: [String]]?
 
-    public init(antigravity: AntigravityConversation? = nil, picture: HookServerPicture) {
+    public init(
+        antigravity: AntigravityConversation? = nil,
+        picture: HookServerPicture,
+        shownErrorLines: [String: [String]]? = nil
+    ) {
         self.antigravity = antigravity
         self.picture = picture
+        self.shownErrorLines = shownErrorLines
     }
 }
 
@@ -86,43 +88,29 @@ public struct HookChangeOutcome: Equatable, Sendable {
     }
 }
 
-/** One err line made safe to sit inside the `<directa-servers>` fence. */
+/** One value (an err line, a server name, a url) made safe to sit on a single
+    line inside the `<directa-servers>` fence. */
 public enum HookErrorText {
-    public static let lineLimit = 10
+    /** How many of a server's latest err lines a crash may quote. */
+    public static let lineLimit = 5
 
     public static func line(_ raw: String) -> String {
         let cleaned = MonitorSanitizer.sanitize(raw).replacingOccurrences(
-            of: "</directa-servers>", with: "<\u{200B}/directa-servers>")
+            of: AgentContext.closingTag, with: AgentContext.defangedClosingTag)
         return cleaned.count > 200 ? String(cleaned.prefix(200)) + "…" : cleaned
     }
 }
 
-/** Compare a fresh status list with the picture this conversation already saw. */
+/** Compare a fresh status list with the picture this conversation already saw
+    and say only what changed. */
 public enum HookChange {
-    /** Servers whose err tail is worth a log read: a crashed, failed, or
-        unhealthy server, or one whose err-line count moved. A healthy server
-        whose count is unchanged is left out. */
-    public static func serversNeedingErrorLines(
-        stored: HookServerPicture?, servers: [ServerStatus]
-    ) -> [String] {
-        servers.compactMap { server in
-            let bad = server.phase == .crashed || server.phase == .failed || server.phase == .unhealthy
-            let count = server.errorSummary?.count ?? 0
-            let previous = stored?.row(server.server)
-            if bad || previous?.errorCount != count { return server.server }
-            return nil
-        }
-    }
+    /** Most lines remembered per server as already shown. */
+    static let shownLinesLimit = 20
 
-    public static func picture(
-        of servers: [ServerStatus], errorLines: [String: [String]] = [:]
-    ) -> HookServerPicture {
+    public static func picture(of servers: [ServerStatus]) -> HookServerPicture {
         let rows = servers.map { server in
             HookServerPicture.Row(
                 conflict: server.portConflict?.state.rawValue,
-                errorCount: server.errorSummary?.count ?? 0,
-                errorLines: (errorLines[server.server] ?? []).prefix(HookErrorText.lineLimit).map(
-                    HookErrorText.line),
                 exitCode: server.lastExit?.code,
                 exitSignal: server.lastExit?.signal,
                 name: server.server,
@@ -136,54 +124,133 @@ public enum HookChange {
         return HookServerPicture(rows: rows.sorted { $0.name < $1.name })
     }
 
-    /** `boundary` pastes the summary even when the picture matches, and does
-        not quote err lines. Any other call pastes only when the picture
-        differs, and quotes err lines that were not stored. Harness fields on
-        the stored record are copied onto the result. The caller updates them. */
+    private static let badPhases: Set<String> = [
+        ServerPhase.crashed.rawValue, ServerPhase.failed.rawValue, ServerPhase.unhealthy.rawValue,
+    ]
+
+    private static func isBad(_ row: HookServerPicture.Row) -> Bool {
+        badPhases.contains(row.phase)
+    }
+
+    /** Servers now crashed, failed, or unhealthy that were not in that phase
+        in `stored`: the only ones whose err lines are worth a log read. Empty
+        without a stored picture, since that call speaks the full summary. */
+    public static func enteringBad(stored: HookServerPicture?, current: HookServerPicture) -> [String] {
+        guard let stored else { return [] }
+        return current.rows.compactMap { row in
+            isBad(row) && stored.row(row.name)?.phase != row.phase ? row.name : nil
+        }
+    }
+
+    /** `boundary`, or a conversation with no record yet, speaks the full
+        summary and quotes nothing. Any other call speaks only the servers whose
+        picture row changed, one line each. `errorLines` holds the latest err
+        lines of the servers `enteringBad` named; of those, the last
+        `HookErrorText.lineLimit` that the stored record has not shown are
+        quoted. Harness fields on the stored record are copied onto the result.
+        The caller updates them. */
     public static func outcome(
         stored: HookConversationRecord?,
         picture: HookServerPicture,
+        errorLines: [String: [String]] = [:],
         summary: String?,
         boundary: Bool
     ) -> HookChangeOutcome {
-        if let stored, stored.picture == picture, !boundary {
+        guard let stored, !boundary else {
+            let record = HookConversationRecord(
+                antigravity: stored?.antigravity, picture: picture,
+                shownErrorLines: pruned(stored?.shownErrorLines, to: picture))
+            return HookChangeOutcome(newErrorLines: false, record: record, text: summary)
+        }
+        guard stored.picture != picture else {
             return HookChangeOutcome(newErrorLines: false, record: stored, text: nil)
         }
-        let fresh = newErrorLines(stored: stored?.picture, current: picture)
-        var text = summary
-        if !boundary, !fresh.isEmpty, let summary {
-            text = insertingErrorLines(fresh, into: summary)
-        }
-        let quotes = !boundary && !fresh.isEmpty && summary != nil
-        let record = HookConversationRecord(antigravity: stored?.antigravity, picture: picture)
-        let speak = boundary ? summary != nil : text != nil
-        return HookChangeOutcome(newErrorLines: quotes, record: record, text: speak ? text : nil)
-    }
-
-    /** Err lines to quote: non-empty, and not the lines already stored for
-        that server. */
-    public static func newErrorLines(
-        stored: HookServerPicture?, current: HookServerPicture
-    ) -> [(name: String, lines: [String])] {
-        current.rows.compactMap { row in
-            guard !row.errorLines.isEmpty, row.errorLines != stored?.row(row.name)?.errorLines else {
-                return nil
+        var shown = stored.shownErrorLines ?? [:]
+        var quotes: [String: [String]] = [:]
+        for name in enteringBad(stored: stored.picture, current: picture) {
+            let seen = Set(shown[name] ?? [])
+            var fresh: [String] = []
+            for line in (errorLines[name] ?? []).suffix(HookErrorText.lineLimit).map(HookErrorText.line)
+            where !line.isEmpty && !seen.contains(line) && !fresh.contains(line) {
+                fresh.append(line)
             }
-            return (row.name, row.errorLines)
+            quotes[name] = fresh
+            shown[name] = Array(((shown[name] ?? []) + fresh).suffix(shownLinesLimit))
+        }
+        let record = HookConversationRecord(
+            antigravity: stored.antigravity, picture: picture,
+            shownErrorLines: pruned(shown, to: picture))
+        let blocks = changeBlocks(old: stored.picture, new: picture, quotes: quotes)
+        guard !blocks.isEmpty else {
+            return HookChangeOutcome(newErrorLines: false, record: record, text: nil)
+        }
+        let text = ([AgentContext.openingTag] + blocks + [AgentContext.closingTag]).joined(separator: "\n")
+        return HookChangeOutcome(
+            newErrorLines: quotes.values.contains { !$0.isEmpty }, record: record, text: text)
+    }
+
+    private static func pruned(
+        _ shown: [String: [String]]?, to picture: HookServerPicture
+    ) -> [String: [String]]? {
+        guard let shown else { return nil }
+        let kept = shown.filter { picture.row($0.key) != nil }
+        return kept.isEmpty ? nil : kept
+    }
+
+    /** One block per changed server in name order: its line, then its quotes. */
+    private static func changeBlocks(
+        old: HookServerPicture, new: HookServerPicture, quotes: [String: [String]]
+    ) -> [String] {
+        let names = Set(old.rows.map(\.name)).union(new.rows.map(\.name)).sorted()
+        return names.compactMap { name -> String? in
+            guard let line = changeLine(old: old.row(name), new: new.row(name)) else { return nil }
+            let quoted = (quotes[name] ?? []).map { "  err: \($0)" }
+            return ([line] + quoted).joined(separator: "\n")
         }
     }
 
-    public static func insertingErrorLines(
-        _ blocks: [(name: String, lines: [String])], into summary: String
-    ) -> String {
-        let body = blocks.map { block in
-            (["  \(block.name) errors:"] + block.lines.map { "  err: \($0)" }).joined(separator: "\n")
-        }.joined(separator: "\n")
-        let closing = "</directa-servers>"
-        guard let range = summary.range(of: closing, options: .backwards) else {
-            return summary + "\n" + body
+    private static func changeLine(old: HookServerPicture.Row?, new: HookServerPicture.Row?) -> String? {
+        guard let new else {
+            return old.map { "\(HookErrorText.line($0.name)): removed" }
         }
-        return summary.replacingCharacters(in: range, with: body + "\n" + closing)
+        let name = HookErrorText.line(new.name)
+        let why = isBad(new) ? "; run: directa why \(ShellWord.inertOr(new.name))" : ""
+        guard let old else {
+            let url = new.url.map { "; url \(HookErrorText.line($0))" } ?? ""
+            return "\(name): new, \(HookErrorText.line(new.phase))\(url)\(why)"
+        }
+        guard old != new else { return nil }
+        var parts: [String] = []
+        if old.phase != new.phase {
+            parts.append("\(HookErrorText.line(new.phase)) (was \(HookErrorText.line(old.phase)))")
+        }
+        if old.port != new.port {
+            parts.append(new.port.map { "port \($0)" } ?? "port cleared")
+        }
+        if old.url != new.url {
+            parts.append(new.url.map { "url \(HookErrorText.line($0))" } ?? "url cleared")
+        }
+        if old.conflict != new.conflict {
+            parts.append(new.conflict.map { "port conflict \(HookErrorText.line($0))" } ?? "port conflict cleared")
+        }
+        if old.specStale != new.specStale {
+            parts.append(new.specStale ? "config changed, restart to apply" : "config applied")
+        }
+        if old.exitCode != new.exitCode || old.exitSignal != new.exitSignal {
+            if let code = new.exitCode {
+                parts.append("exit \(code)")
+            } else if let signal = new.exitSignal {
+                parts.append("signal \(signal)")
+            }
+        }
+        if old.spawnErrno != new.spawnErrno, let errno = new.spawnErrno {
+            parts.append("spawn errno \(errno)")
+        }
+        if old.worktree != new.worktree {
+            parts.append(new.worktree.map { "worktree \(HookErrorText.line($0))" } ?? "worktree cleared")
+        }
+        guard !parts.isEmpty else { return nil }
+        return "\(name): " + parts.joined(separator: "; ") + why
     }
 }
 

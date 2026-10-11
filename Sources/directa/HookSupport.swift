@@ -99,10 +99,14 @@ enum HookSpeak {
             write(Answer(newErrorLines: false, text: nil))
             return
         }
-        let lines = await errorLines(project: project, list: list, stored: stored, boundary: isBoundary)
-        let picture = HookChange.picture(of: list.servers, errorLines: lines)
+        /** An untrusted project is invisible to the hook, so its servers read
+            as new once trust is recorded. */
+        let servers = list.trusted == true ? list.servers : []
+        let picture = HookChange.picture(of: servers)
+        let lines = await errorLines(
+            project: project, stored: stored, picture: picture, boundary: isBoundary)
         let outcome = HookChange.outcome(
-            stored: stored, picture: picture,
+            stored: stored, picture: picture, errorLines: lines,
             summary: AgentContext.render(list: list, harness: harness), boundary: isBoundary)
         var record = outcome.record
         let answer = Answer(newErrorLines: outcome.newErrorLines, text: outcome.text)
@@ -113,29 +117,16 @@ enum HookSpeak {
         write(answer)
     }
 
+    /** The latest err lines of each server that just entered a bad state, and
+        no log read for anything else. */
     private static func errorLines(
-        project: String, list: ServerListResult, stored: HookConversationRecord?, boundary: Bool
+        project: String, stored: HookConversationRecord?, picture: HookServerPicture, boundary: Bool
     ) async -> [String: [String]] {
+        guard !boundary else { return [:] }
         var lines: [String: [String]] = [:]
-        if boundary || list.trusted != true {
-            for server in list.servers {
-                if let previous = stored?.picture.row(server.server)?.errorLines {
-                    lines[server.server] = previous
-                }
-            }
-            return lines
-        }
-        let needed = Set(
-            HookChange.serversNeedingErrorLines(stored: stored?.picture, servers: list.servers))
-        for server in list.servers {
-            if needed.contains(server.server) {
-                if let fetched = await HookContext.errorLines(project: project, server: server.server) {
-                    lines[server.server] = fetched
-                } else if let previous = stored?.picture.row(server.server)?.errorLines {
-                    lines[server.server] = previous
-                }
-            } else if let previous = stored?.picture.row(server.server)?.errorLines {
-                lines[server.server] = previous
+        for name in HookChange.enteringBad(stored: stored?.picture, current: picture) {
+            if let fetched = await HookContext.errorLines(project: project, server: name) {
+                lines[name] = fetched
             }
         }
         return lines
