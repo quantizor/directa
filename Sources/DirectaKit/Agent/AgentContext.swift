@@ -22,6 +22,15 @@ import Foundation
 public enum AgentContext {
     public static let maxLength = 2400
 
+    /** The fence every block this module hands an agent sits inside, the hook's
+        change lines included. */
+    public static let openingTag = "<directa-servers>"
+    public static let closingTag = "</directa-servers>"
+
+    /** The closing tag with a zero-width space after the `<`, so text holding
+        it can never end the fence early. */
+    public static let defangedClosingTag = "<\u{200B}/directa-servers>"
+
     /** Which agent harness is asking, so the monitor-tool line names a tool
         that harness actually has (Claude Code's Monitor, Grok Build's
         monitor); only `.claude` and `.grok` get that line. Every other
@@ -42,7 +51,7 @@ public enum AgentContext {
         pathological value from crowding out every server below it. */
     private static func quoted(_ value: String) -> String {
         let flattened = String(value.map { $0 == "\n" || $0 == "\r" ? " " : $0 })
-            .replacingOccurrences(of: "</directa-servers>", with: "<\u{200B}/directa-servers>")
+            .replacingOccurrences(of: closingTag, with: defangedClosingTag)
         return flattened.count > 200 ? String(flattened.prefix(200)) + "…" : flattened
     }
 
@@ -59,7 +68,7 @@ public enum AgentContext {
             if lb != rb { return lb }
             return lhs.server < rhs.server
         }
-        var lines: [String] = ["<directa-servers>"]
+        var lines: [String] = [openingTag]
         lines.append(
             "This project's dev servers are managed by directa (daemon-supervised; they and their logs survive session compaction and restarts). Prefer directa over launching servers directly.")
         /** Placed right after the intro, ahead of every per-server bullet, so
@@ -103,9 +112,9 @@ public enum AgentContext {
             already produced one report naming a private project. */
         lines.append(
             "Report directa's own problems: if it misbehaves, surprises you, or a missing capability slows you down, flag it (a line in ~/code/directa/BACKLOG.md, or tell the user) rather than silently working around it. Report directa's behavior and how to reproduce it generically, never this project's name, paths, hosts, ports, or log lines: that file lives outside this project.")
-        lines.append("</directa-servers>")
+        lines.append(closingTag)
         let text = lines.joined(separator: "\n")
-        return text.count > maxLength ? String(text.prefix(maxLength)) + "\n</directa-servers>" : text
+        return text.count > maxLength ? String(text.prefix(maxLength)) + "\n" + closingTag : text
     }
 
     /** A server that warrants attention: broken outright, degraded, or running
