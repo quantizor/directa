@@ -130,6 +130,10 @@ public actor ServerSupervisor {
     private var namedPorts: [String: Int]?
     private var observedPort: Int?
     private var outTailer: SpoolTailer?
+    /** A passing check has been recorded for this run. Cleared when the run
+        ends and when the next one starts, so `wait --healthy` cannot treat a
+        previous process's pass as this one's. */
+    private var passedProbeThisRun = false
     private let paths: DirectaPaths
     /** Set when a stop moves the phase to `.stopping`, cleared once the
         phase leaves it or a new run starts. */
@@ -496,15 +500,24 @@ public actor ServerSupervisor {
     }
 
     /** The ensure state matrix: stopped/crashed/failed start fresh; starting joins
-        the in-flight attempt; running and unhealthy are no-ops (unhealthy is
-        reported, not restarted). Blocks until healthy, terminal, or timeout. */
+        the in-flight attempt; running with a passing check for this process is
+        a no-op; running while the latest check is failing waits, without
+        restarting; unhealthy is a no-op (reported, not restarted). Blocks until
+        healthy, terminal, or timeout. */
     public func ensure(timeoutSeconds: Double) async -> EnsureResult {
         guard removalReason == nil else {
             let server = await status()
             return EnsureResult(reason: .stopped, server: server)
         }
         switch phase {
-        case .running, .unhealthy:
+        case .running:
+            /** Latest check failed, but not enough times to mark the server
+                unhealthy. Waiting is the whole point of ensure: returning now
+                would hand back a process that is refusing connections. */
+            guard healthyForThisRun() else { break }
+            let server = await status()
+            return EnsureResult(server: server)
+        case .unhealthy:
             let server = await status()
             return EnsureResult(server: server)
         case .starting:
@@ -544,14 +557,18 @@ public actor ServerSupervisor {
     }
 
     /** Blocks until the condition holds. Rides through non-terminal transitions
-        (another session's restart) and fails fast on crashed/failed/stopped. */
+        (another session's restart) and fails fast on crashed/failed/stopped.
+        Healthy means a check has passed for this process and the latest check
+        passed too. `phase == .running` stays up through failures that have not
+        yet reached `unhealthyAfter`, so the phase alone would answer while the
+        latest check was still failing. */
     public func wait(for condition: WaitCondition, timeoutSeconds: Double) async -> EnsureReason? {
         let deadline = ContinuousClock.now.advanced(
             by: .seconds(Self.boundedTimeoutSeconds(timeoutSeconds)))
         while true {
             switch condition {
             case .healthy:
-                if phase == .running { return nil }
+                if healthyForThisRun() { return nil }
                 if phase == .crashed { return .crashed }
                 if phase == .failed { return .failed }
                 if phase == .stopped { return .stopped }
@@ -854,6 +871,11 @@ public actor ServerSupervisor {
                     try? await Task.sleep(for: .milliseconds(intervalMs))
                     continue
                 }
+                /** Read before the probe. A check that started against the
+                    previous process can finish after the next one has spawned,
+                    and recording that pass would mark the new process healthy
+                    while its port still refuses connections. */
+                guard let generation = await self?.runGeneration else { return }
                 let healthy = await prober.probe(check)
                 guard !Task.isCancelled else { return }
                 /** Failures inside the wake grace window carry no signal: the
@@ -862,13 +884,15 @@ public actor ServerSupervisor {
                     try? await Task.sleep(for: .milliseconds(intervalMs))
                     continue
                 }
-                await self?.recordProbe(success: healthy)
+                await self?.recordProbe(success: healthy, generation: generation)
                 try? await Task.sleep(for: .milliseconds(intervalMs))
             }
         }
     }
 
-    private func recordProbe(success: Bool) async {
+    private func recordProbe(success: Bool, generation: UInt64) async {
+        /** A probe started under a run that has since ended or been replaced. */
+        guard generation == runGeneration else { return }
         /** Probes landing after the process died must not resurrect state. */
         guard phase == .starting || phase == .running || phase == .unhealthy else { return }
         if pid != nil {
@@ -880,6 +904,7 @@ public actor ServerSupervisor {
             consecutiveSuccesses += 1
             consecutiveFailures = 0
             lastHealthAt = Date()
+            passedProbeThisRun = true
             if !everHealthy {
                 if consecutiveSuccesses >= healthyAfter {
                     everHealthy = true
@@ -1163,13 +1188,29 @@ public actor ServerSupervisor {
         spawnError = nil
         errorSummary = nil
         terminalEvidence = nil
-        everHealthy = false
         observedPort = nil
         recentLogTail = .unread
         lastDescendantSnapshot = []
+        clearRunHealth()
+        runningSpecHash = Self.specHash(spec)
+    }
+
+    /** Drops this run's health result. Called when the run ends and when the
+        next one starts, so a pass from the process that just exited cannot
+        satisfy `wait --healthy` or remain as `lastHealthAt`. */
+    private func clearRunHealth() {
         consecutiveFailures = 0
         consecutiveSuccesses = 0
-        runningSpecHash = Self.specHash(spec)
+        everHealthy = false
+        lastHealthAt = nil
+        passedProbeThisRun = false
+    }
+
+    /** This process has passed a health check, and the latest check passed
+        too. `phase == .running` alone is not that: it survives the failures
+        that have not reached `unhealthyAfter`. */
+    private func healthyForThisRun() -> Bool {
+        phase == .running && consecutiveFailures == 0 && passedProbeThisRun
     }
 
     private func startTailers(startAtEnd: Bool) async {
@@ -1193,6 +1234,9 @@ public actor ServerSupervisor {
         async
     {
         startedAt = runStartedAt
+        /** This run has not exited. The previous process's code stays out of
+            status, so a healthy restart does not read as a failure. */
+        lastExit = nil
         switch supervision {
         case .adopted:
             await startTailers(startAtEnd: true)
@@ -1499,6 +1543,9 @@ public actor ServerSupervisor {
             entry.startedAt = nil
             entry.terminalEvidence = evidence
         }
+        /** After the stall check above, which still needs this run's
+            `everHealthy`. The next run must not inherit the pass. */
+        clearRunHealth()
         phase = finalPhase
         pendingStop = nil
         spawnWaiters.settleAll()
