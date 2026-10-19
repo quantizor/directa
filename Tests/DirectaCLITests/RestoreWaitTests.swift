@@ -43,8 +43,23 @@ import Testing
         #expect(!CLIRunner.refusalIsPerServer(info: nil))
     }
 
-    /** The daemon's own message and hint reach the caller on the first
-        refusal, with no wait. */
+    /** Restore finishing between the refusal and the info read makes the same
+        request succeed, so a not-restoring answer retries it once at once. */
+    @Test func aRefusalThatRestoreFinishedBehindIsRetriedOnce() async throws {
+        let attempts = Attempts()
+        let result: String = try await CLIRunner.awaitingRestore(
+            budget: .seconds(30), pollInterval: .milliseconds(1),
+            readInfo: { Self.info(restoring: nil) }
+        ) { _ in
+            if attempts.next() == 1 { throw Self.perServer }
+            return "served"
+        }
+        #expect(result == "served")
+        #expect(attempts.value == 2)
+    }
+
+    /** The daemon's own message and hint reach the caller when the retry is
+        refused again, with no wait. */
     @Test func aPerServerRefusalFailsAtOnceWithTheDaemonsMessage() async throws {
         let attempts = Attempts()
         do {
@@ -59,7 +74,7 @@ import Testing
         } catch let error as WireError {
             #expect(error == Self.perServer)
         }
-        #expect(attempts.value == 1)
+        #expect(attempts.value == 2)
     }
 
     /** A daemon still restoring is retried until it serves, then the request

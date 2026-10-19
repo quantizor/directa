@@ -297,7 +297,13 @@ enum CLIRunner {
                 return try await body(client())
             } catch let error as WireError where error.code == .daemonStarting {
                 guard ContinuousClock.now < deadline else { throw error }
-                if refusalIsPerServer(info: await readInfo()) { throw error }
+                let info = await readInfo()
+                if refusalIsPerServer(info: info) {
+                    /** Restore may have finished between the refusal and the
+                        info read, in which case the same request now goes
+                        through; one immediate retry tells the two apart. */
+                    return try await body(client())
+                }
                 if !announced {
                     announced = true
                     notice(CLINotice.daemonRestoring)
