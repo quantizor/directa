@@ -1612,7 +1612,7 @@ public actor Router {
                     if let squatter {
                         throw WireError(
                             code: .portHeld,
-                            hint: "run: kill \(squatter.pid)  (verify first: ps -p \(squatter.pid))",
+                            hint: "run: directa why \(ShellWord.inertOr(target.name))",
                             message:
                                 "port \(busy) is held by unmanaged pid \(squatter.pid) (\(squatter.command))"
                         )

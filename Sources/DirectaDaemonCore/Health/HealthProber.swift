@@ -247,14 +247,7 @@ public enum PortGuard {
         Reading only the first pid reports a single owner for that case and hides
         the ambiguity that makes a health signal untrustworthy. */
     public static func listenerPids(port: Int) -> [Int] {
-        guard let output = shell("/usr/sbin/lsof", ["-nP", "-tiTCP:\(port)", "-sTCP:LISTEN"])
-        else { return [] }
-        var pids: [Int] = []
-        for line in output.split(separator: "\n") {
-            guard let pid = Int(line.trimmingCharacters(in: .whitespaces)) else { continue }
-            if !pids.contains(pid) { pids.append(pid) }
-        }
-        return pids
+        answeredListenerPids(port: port) ?? []
     }
 
     /** The command behind a pid, for naming a holder in an error. */

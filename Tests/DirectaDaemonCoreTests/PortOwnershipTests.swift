@@ -642,6 +642,32 @@ import Testing
         _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
     }
 
+    /** An unmanaged listener on the port refuses the start with its pid and
+        command in the message and `why` as the next step: the hint is a
+        command to run, never a kill of a process directa does not own. */
+    @Test func anUnmanagedListenerRefusesTheStartWithAWhyHint() async throws {
+        let env = try makeRouterEnv(named: "port")
+        let port = TestPorts.port(27)
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web", port: port))
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths,
+            portProbe: PortProbe(
+                isListening: { $0 == port },
+                listenerInfo: { _ in (pid: 4242, command: "stand-in listener") }),
+            registry: registry)
+
+        let refused = try await router.attempt(
+            .serverStart, ServerTargetParams(name: "web", project: env.project), ServerResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("expected the unmanaged listener to refuse the start")
+            return
+        }
+        #expect(error.code == .portHeld)
+        #expect(error.message == "port \(port) is held by unmanaged pid 4242 (stand-in listener)")
+        #expect(error.hint == "run: directa why web")
+    }
+
     /** `ensure` over a port-failed run stops it first. A listener that the
         stop did not remove would answer the next run's first health check, so
         the ensure is refused with the listener named and nothing is spawned. */
@@ -831,5 +857,5 @@ import Testing
 
 /** Answers every check as passing, whatever listens. */
 private struct PassingProber: HealthProber {
-    func probe(_ check: EffectiveHealthcheck) async -> Bool { true }
+    func probe(_ check: EffectiveHealthcheck) async -> HealthProbeOutcome { .pass }
 }
