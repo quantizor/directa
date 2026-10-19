@@ -1619,6 +1619,7 @@ public actor Router {
                     }
                     throw WireError(
                         code: .portHeld,
+                        hint: "run: directa why \(ShellWord.inertOr(target.name))",
                         message: "port \(busy) already has a listener that directa does not manage"
                     )
                 }
@@ -1632,6 +1633,7 @@ public actor Router {
             if let busy = await firstBusyPort(in: claim, evidence: evidence, excluding: id) {
                 throw WireError(
                     code: .portHeld,
+                    hint: "run: directa why \(ShellWord.inertOr(target.name))",
                     message: "port \(busy) is still busy after rebind resolution")
             }
         }

@@ -645,7 +645,8 @@ import Testing
     /** An unmanaged listener on the port refuses the start with its pid and
         command in the message and `why` as the next step: the hint is a
         command to run, never a kill of a process directa does not own. */
-    @Test func anUnmanagedListenerRefusesTheStartWithAWhyHint() async throws {
+    @Test(arguments: [true, false])
+    func anUnmanagedListenerRefusesTheStartWithAWhyHint(lsofNamesIt: Bool) async throws {
         let env = try makeRouterEnv(named: "port")
         let port = TestPorts.port(27)
         let registry = Registry(paths: env.paths)
@@ -654,7 +655,7 @@ import Testing
             launcher: SubprocessLauncher(), paths: env.paths,
             portProbe: PortProbe(
                 isListening: { $0 == port },
-                listenerInfo: { _ in (pid: 4242, command: "stand-in listener") }),
+                listenerInfo: { _ in lsofNamesIt ? (pid: 4242, command: "stand-in listener") : nil }),
             registry: registry)
 
         let refused = try await router.attempt(
@@ -664,7 +665,11 @@ import Testing
             return
         }
         #expect(error.code == .portHeld)
-        #expect(error.message == "port \(port) is held by unmanaged pid 4242 (stand-in listener)")
+        #expect(
+            error.message
+                == (lsofNamesIt
+                    ? "port \(port) is held by unmanaged pid 4242 (stand-in listener)"
+                    : "port \(port) already has a listener that directa does not manage"))
         #expect(error.hint == "run: directa why web")
     }
 
