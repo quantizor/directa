@@ -44,20 +44,37 @@ private struct PhaseWaiterList {
 /** How long `stop()` waits on a server. `graceSeconds` is the SIGTERM-to-SIGKILL
     window a stop gets when its caller names none; `overtimeSeconds` is the
     margin past that grace before the stop gives up waiting for the phase to
-    clear (see `waitForStoppingToClear`). `treeExitSeconds` is how long after
-    the SIGKILL pass a stop waits for every process it signaled to exit
-    (see `awaitTreeExit`). Injectable so tests reach the give-up path
-    without a real multi-second wait. */
+    clear (see `waitForStoppingToClear`). `portClearSeconds` is how long a
+    transition that stops a run and spawns the next waits for the server's
+    claimed ports to have no listener (`Router.requirePortsClear`).
+    `treeExitSeconds` is how long after the SIGKILL pass a stop waits for
+    every process it signaled to exit (see `awaitTreeExit`). Injectable so
+    tests reach the give-up paths without a real multi-second wait. */
 public struct StopTiming: Sendable {
     public let graceSeconds: Double
     public let overtimeSeconds: Double
+    public let portClearSeconds: Double
     public let treeExitSeconds: Double
 
-    public init(graceSeconds: Double, overtimeSeconds: Double, treeExitSeconds: Double = 5) {
+    public init(
+        graceSeconds: Double, overtimeSeconds: Double,
+        portClearSeconds: Double = StopTiming.standardPortClearSeconds,
+        treeExitSeconds: Double = 5
+    ) {
         self.graceSeconds = graceSeconds
         self.overtimeSeconds = overtimeSeconds
+        self.portClearSeconds = portClearSeconds
         self.treeExitSeconds = treeExitSeconds
     }
+
+    /** By the time a stop returns, the SIGKILL pass has run over the whole
+        recorded tree and the kernel has closed the sockets of everything it
+        killed, which takes milliseconds. What is left to wait for is a process
+        outside that tree that exits on its own once its parent is gone (a
+        worker noticing a closed IPC channel; Node tooling takes a second or
+        two). Five seconds covers that and stays under the stop's own grace; a
+        listener still there after it is not leaving by itself. */
+    public static let standardPortClearSeconds = 5.0
 
     public static let standard = StopTiming(graceSeconds: 7, overtimeSeconds: 10)
 }
@@ -218,6 +235,12 @@ public actor ServerSupervisor {
         already retired or deleted. Covers the moment before the router's
         `Registry.retireState` lands; the registry refuses `writerID` after. */
     private var stateWritesAbandoned = false
+    /** The pids of the run the last `stop` tore down: its root plus every
+        descendant the SIGTERM and SIGKILL passes signaled. Read by the Router
+        right after the stop to say whether a lingering listener belonged to
+        that run; replaced by the next stop and cleared when a new run
+        starts. */
+    private var stoppedRunPids: Set<Int> = []
     /** Waiters for `phase` leaving `.stopping`, settled by `phase`'s `didSet`. */
     private var stoppingWaiters = PhaseWaiterList()
     private let stopTiming: StopTiming
@@ -388,6 +411,17 @@ public actor ServerSupervisor {
         self.portClaim = claim
         self.namedPorts = claim.flatMap { $0.named.isEmpty ? nil : $0.named }
         self.portConflict = portConflict
+    }
+
+    /** The pids of the run the last stop tore down; see `stoppedRunPids`. */
+    public func lastStoppedRunPids() -> Set<Int> {
+        stoppedRunPids
+    }
+
+    /** Writes one line to the server's own log under `sys`, for a decision the
+        Router made about this server that the server's log should explain. */
+    public func recordSys(_ text: String) async {
+        await logStore.append(stream: .sys, text: text)
     }
 
     /** The status and the claim resolved at spawn, read in one actor turn so a
@@ -689,6 +723,7 @@ public actor ServerSupervisor {
             try? await Task.sleep(for: .milliseconds(100))
         }
         let signaled = escalate(pass)
+        stoppedRunPids = Set([Int(target)] + signaled.map { Int($0.pid) })
         guard await waitForStoppingToClear(timeout: stopWaitTimeout) else {
             await recordStuckStop(after: stopWaitTimeout)
             return ConfirmedStop(completion: .stillStopping, status: await status())
@@ -1035,8 +1070,20 @@ public actor ServerSupervisor {
         guard generation == runGeneration else { return }
         await recordObservedPort(generation: generation, ports: ports)
         guard let expected else { return }
-        let owners = await PortGuard.listenerPids(port: expected)
-        await recordPortOwnership(expected: expected, generation: generation, owners: owners, ours: ours)
+        let answered = await PortGuard.answeredListenerPids(port: expected)
+        if let answered, answered.isEmpty, generation == runGeneration {
+            /** lsof ran and named no listener, so the pass that promoted this
+                run was answered by something that is no longer there (or was
+                never on this port). Silence from a lookup that failed is
+                not this evidence, which is why only an answer reaches here. */
+            await logStore.append(
+                stream: .sys,
+                text:
+                    "marked healthy, but nothing is listening on port \(expected) now; some other process may have answered the check"
+            )
+        }
+        await recordPortOwnership(
+            expected: expected, generation: generation, owners: answered ?? [], ours: ours)
     }
 
     /** The managed server whose recorded pid holds one of these listeners, if
@@ -1257,6 +1304,7 @@ public actor ServerSupervisor {
         observedPort = nil
         recentLogTail = .unread
         lastDescendantSnapshot = []
+        stoppedRunPids = []
         clearRunHealth()
         runningSpecHash = Self.specHash(spec)
     }

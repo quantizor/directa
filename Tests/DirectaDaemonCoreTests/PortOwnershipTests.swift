@@ -614,7 +614,76 @@ import Testing
         #expect(settled.phase == .running)
         #expect(settled.portConflict == nil)
         #expect(settled.observedPort == port)
+        let notes = await supervisor.logQuery(LogQueryOptions(streams: [.sys])).lines.map(\.text)
+        #expect(!notes.contains { $0.hasPrefix("marked healthy, but nothing is listening") })
         _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
+    }
+
+    /** The field failure's trace: a check passed, and afterward nothing at all
+        listens on the server's port, so the answer came from some other process.
+        The server's own log says so once lsof has answered with no listener. */
+    @Test func aPassWithNothingListeningAfterwardIsNotedInTheServersLog() async throws {
+        let env = try makeRouterEnv(named: "port")
+        let port = TestPorts.port(25)
+        let registry = Registry(paths: env.paths)
+        let spec = ServerSpec(
+            command: ["/bin/sh", "-c", "sleep 30"], healthcheck: HealthCheckSpec(port: port, type: .tcp),
+            name: "web", port: port)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, prober: PassingProber(),
+            projectPath: env.project, registry: registry, spec: spec)
+        _ = await supervisor.start()
+        let noted = try await eventually(within: .seconds(6), every: .milliseconds(100)) {
+            await supervisor.logQuery(LogQueryOptions(streams: [.sys])).lines.map(\.text).contains(
+                "marked healthy, but nothing is listening on port \(port) now; some other process may have answered the check"
+            )
+        }
+        #expect(noted, "the sys log never noted the empty listen scan")
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
+    }
+
+    /** `ensure` over a port-failed run stops it first. A listener that the
+        stop did not remove would answer the next run's first health check, so
+        the ensure is refused with the listener named and nothing is spawned. */
+    @Test func ensureOverAPortFailedRunIsRefusedWhileAListenerOutlivesItsStop() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeRouterEnv(named: "port")
+        let port = TestPorts.port(26)
+        let lingering = LingeringListener(reports: .outsider)
+        let registry = Registry(paths: env.paths)
+        try await registry.register(
+            project: env.project,
+            spec: ServerSpec(
+                command: [fixture, "--listen-tcp", String(port + 1)],
+                healthcheck: HealthCheckSpec(type: .none), name: "web", port: port,
+                portSpan: 2))
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: lingering.probe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        let target = ServerTargetParams(name: "web", project: env.project)
+        _ = try await router.attempt(.serverStart, target, ServerResult.self)
+        let drifted = try #require(try await failedStatus(router, project: env.project))
+        #expect(drifted.phase == .failed)
+        let oldPid = try #require(drifted.pid)
+        defer { kill(pid_t(oldPid), SIGKILL) }
+        lingering.watch(pid: pid_t(oldPid))
+
+        let refused = try await router.attempt(
+            .serverEnsure, EnsureParams(name: "web", project: env.project, timeoutSeconds: 5),
+            EnsureResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("ensure spawned beside a listener the stop did not remove: \(refused)")
+            return
+        }
+        #expect(error.code == .portHeld)
+        #expect(error.message.contains("pid \(getpid()) (stand-in listener)"))
+        let status = try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: "web", project: env.project), ServerListResult.self
+            ).servers.first)
+        #expect(status.phase == .stopped)
+        #expect(status.pid == nil)
     }
 
     /** ATTACK: the server's own listener lives outside its process tree. A
@@ -758,4 +827,9 @@ import Testing
         """
         try Data(body.utf8).write(to: URL(fileURLWithPath: project).appending(path: "devservers.json"))
     }
+}
+
+/** Answers every check as passing, whatever listens. */
+private struct PassingProber: HealthProber {
+    func probe(_ check: EffectiveHealthcheck) async -> Bool { true }
 }

@@ -2,6 +2,7 @@ import DirectaKit
 import DirectaTestSupport
 import Foundation
 import Testing
+import os
 
 @testable import DirectaDaemonCore
 
@@ -306,5 +307,145 @@ import Testing
         _ = try await router.call(
             .serverStop, ServerTargetParams(name: "db", project: env.project),
             ServerResult.self)
+    }
+
+    private func sysLines(_ router: Router, _ project: String) async throws -> [String] {
+        try await router.call(
+            .logsQuery, LogsQueryParams(name: "db", project: project, streams: [.sys]),
+            LogsQueryResult.self
+        ).lines.map(\.text)
+    }
+
+    /** The field failure: a process the stop did not remove (here, a stand-in
+        for a worker that left the run's tree) still listens, so the next run's
+        first health check would be answered by it. The restart names the
+        listener and starts nothing. */
+    @Test(arguments: [(421, true), (422, false)])
+    func restartIsRefusedWhileAListenerOutlivesTheStop(offset: Int, inStoppedRun: Bool) async throws {
+        let env = try env(offset: offset)
+        let port = TestPorts.port(offset)
+        let lingering = LingeringListener(reports: inStoppedRun ? .stoppedRun : .outsider)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: lingering.probe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        let first = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        let firstPid = try #require(first.server.pid)
+        lingering.watch(pid: pid_t(firstPid))
+        let reported = lingering.reportedPid
+
+        let refused = try await router.attempt(
+            .serverRestart,
+            RestartParams(names: ["db"], project: env.project, timeoutSeconds: 10),
+            GroupResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("restart went ahead beside a listener the stop did not remove")
+            return
+        }
+        #expect(error.code == .portHeld)
+        #expect(
+            error.message
+                == "port \(port) is still held by pid \(reported) (stand-in listener) after stopping 'db'; the new run was not started"
+        )
+        #expect(error.hint == "run: kill \(reported)  (verify first: ps -p \(reported))")
+
+        let status = try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: "db", project: env.project), ServerListResult.self
+            ).servers.first)
+        #expect(status.phase == .stopped)
+        #expect(status.pid == nil)
+        let membership = inStoppedRun ? "was" : "was not"
+        #expect(
+            try await sysLines(router, env.project).contains(
+                "not starting: port \(port) is still held by pid \(reported) (stand-in listener) after the stop; that process \(membership) part of the run just stopped (root and descendants recorded at stop)"
+            ))
+    }
+
+    /** A listener that is on its way out (the stop's SIGKILL pass has run and
+        the socket is closing) is waited for, not refused. */
+    @Test func restartWaitsForAListenerThatLeavesWithinTheBound() async throws {
+        let env = try env(offset: 423)
+        let lingering = LingeringListener(pollsBeforeLeaving: 3, reports: .outsider)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: lingering.probe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 5))
+        let first = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        let firstPid = try #require(first.server.pid)
+        lingering.watch(pid: pid_t(firstPid))
+
+        let restarted = try await router.call(
+            .serverRestart,
+            RestartParams(names: ["db"], project: env.project, timeoutSeconds: 10),
+            GroupResult.self)
+        let server = try #require(restarted.results.first?.server)
+        #expect(server.phase == .running)
+        #expect(server.pid != firstPid)
+        #expect(lingering.polls >= 4, "the restart did not wait for the listener to leave")
+        #expect(try await sysLines(router, env.project).filter { $0.hasPrefix("not starting") }.isEmpty)
+
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "db", project: env.project),
+            ServerResult.self)
+    }
+}
+
+/** The port probe of a stop-then-spawn test, scripted around the first run's
+    process: while that process is alive the ports read free (the pre-checks
+    pass), and once it is gone a stand-in listener holds them for
+    `pollsBeforeLeaving` probes (forever by default). `listenerInfo` names
+    the stand-in: the first run's own pid or a pid outside it. */
+final class LingeringListener: Sendable {
+    enum Reported { case outsider, stoppedRun }
+
+    private struct State {
+        var firstRun: pid_t?
+        var polls = 0
+    }
+
+    private let pollsBeforeLeaving: Int
+    private let reports: Reported
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    init(pollsBeforeLeaving: Int = .max, reports: Reported) {
+        self.pollsBeforeLeaving = pollsBeforeLeaving
+        self.reports = reports
+    }
+
+    /** Probes answered while the stand-in held the ports. */
+    var polls: Int { state.withLock { $0.polls } }
+
+    var probe: PortProbe {
+        PortProbe(
+            isListening: { [self] _ in listening() },
+            listenerInfo: { [self] _ in (pid: Int(reportedPid), command: "stand-in listener") })
+    }
+
+    var reportedPid: pid_t {
+        switch reports {
+        case .outsider: getpid()
+        case .stoppedRun: state.withLock { $0.firstRun } ?? 0
+        }
+    }
+
+    func watch(pid: pid_t) {
+        state.withLock { $0.firstRun = pid }
+    }
+
+    private func listening() -> Bool {
+        state.withLock { state in
+            guard let pid = state.firstRun, kill(pid, 0) != 0 else { return false }
+            state.polls += 1
+            return state.polls <= pollsBeforeLeaving
+        }
     }
 }

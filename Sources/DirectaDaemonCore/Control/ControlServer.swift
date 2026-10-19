@@ -1638,6 +1638,16 @@ public actor Router {
         await materializeSpawnSpec(
             spec, claim: claim, declaredPort: declaredPort, effectivePort: effective,
             portConflict: conflict, on: supervisor)
+        /** A port-failed run is still alive, and `start` would stop it before
+            spawning. Stopping it here, after every refusal above, lets the
+            same re-check restart makes run between that stop and the spawn. */
+        if !force {
+            let current = await supervisor.status()
+            if current.phase == .failed, current.hasLiveRun {
+                _ = await supervisor.stop(deliberate: false, reason: "restarting after a port failure")
+                try await requirePortsClear(supervisor: supervisor, name: target.name)
+            }
+        }
     }
 
     /** `spec` with this checkout's `directa.local.json` entry for it applied,
@@ -1753,6 +1763,47 @@ public actor Router {
             if ContinuousClock.now >= deadline { return busy }
             try? await Task.sleep(for: .milliseconds(50))
         }
+    }
+
+    /** The check every transition that stops a run and spawns the next in one
+        step makes between the two (`restart`, the watch sweep's restart,
+        `start`/`ensure` over a port-failed run). The pre-check ran while the
+        old run was still up and treats the target's own listeners as free, so
+        a process of the old run's tree that outlives the stop would answer the
+        new run's first health check and the server would read healthy with
+        nothing of its own listening. Waits up to `stopTiming.portClearSeconds`
+        for the server's claimed ports to have no listener; one still there is
+        written to the server's log (pid, command, and whether the stop had
+        signaled it) and fails the transition with `port-held`, with the old run
+        already stopped and no new one started. */
+    private func requirePortsClear(supervisor: ServerSupervisor, name: String) async throws {
+        let snapshot = await supervisor.portSnapshot()
+        guard let claim = snapshot.claim else { return }
+        guard let busy = await waitForClaimFree(claim: claim, budgetSeconds: stopTiming.portClearSeconds)
+        else { return }
+        let listener = await portProbe.listenerInfo(busy)
+        guard let listener else {
+            await supervisor.recordSys(
+                "not starting: port \(busy) is still held by a listener directa cannot name after the stop")
+            throw WireError(
+                code: .portHeld,
+                message:
+                    "port \(busy) still has a listener that directa does not manage, after stopping '\(name)'; the new run was not started"
+            )
+        }
+        let stoppedRun = await supervisor.lastStoppedRunPids()
+        let membership = stoppedRun.contains(listener.pid) ? "was" : "was not"
+        await supervisor.recordSys(
+            "not starting: port \(busy) is still held by pid \(listener.pid) (\(listener.command)) after the stop; that process \(membership) part of the run just stopped (root and descendants recorded at stop)"
+        )
+        DirectaLog.daemon.error(
+            "port-held \(busy) by pid \(listener.pid) after stopping \(name); new run not started")
+        throw WireError(
+            code: .portHeld,
+            hint: "run: kill \(listener.pid)  (verify first: ps -p \(listener.pid))",
+            message:
+                "port \(busy) is still held by pid \(listener.pid) (\(listener.command)) after stopping '\(name)'; the new run was not started"
+        )
     }
 
     /** One managed server and every port it holds right now. */
@@ -2345,6 +2396,12 @@ public actor Router {
             let activity = DaemonActivity.shared.begin(
                 .restart, label: "\(serverID(project: params.project, name: entry.spec.name)): \(reason)")
             _ = await entry.supervisor.stop(deliberate: false, reason: reason)
+            do {
+                try await requirePortsClear(supervisor: entry.supervisor, name: entry.spec.name)
+            } catch {
+                DaemonActivity.shared.end(activity, outcome: "port-held")
+                throw error
+            }
             let restarted = await entry.supervisor.ensure(timeoutSeconds: params.timeoutSeconds)
             DaemonActivity.shared.end(
                 activity, outcome: restarted.reason?.rawValue ?? restarted.server.phase.rawValue)
