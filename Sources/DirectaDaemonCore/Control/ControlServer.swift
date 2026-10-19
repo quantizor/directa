@@ -2584,10 +2584,7 @@ public actor Router {
                 status must not clobber that, or agents see the committed port in
                 status while the child listens on the rebind, and a stale flag
                 fires for a config that matches what was actually spawned. */
-            let current = await existing.status()
-            if !current.hasLiveRun {
-                await existing.updateSpec(spec)
-            }
+            await existing.refreshIdleSpec(spec)
             return existing
         }
         let worktree = await CheckoutIdentity.worktreeDisplay(project: project)

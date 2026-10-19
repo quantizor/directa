@@ -222,6 +222,12 @@ public actor ServerSupervisor {
         this supervisor's stops and waits. */
     private let serverID: String
     private var spawnError: SpawnError?
+    /** Set when the Router hands over a prepared spawn spec, cleared when the
+        next run starts or is adopted (`resetForNewRun`). While set, a status
+        read's committed spec does not replace `spec`: a restart's stop leaves
+        a stopped gap between the prepare and the start, and a read landing in
+        it would otherwise spawn the run without the prepared port. */
+    private var spawnSpecPrepared = false
     /** Waiters for the spawn settling (a pid, or a terminal phase). */
     private var spawnWaiters = PhaseWaiterList()
     private var spec: ServerSpec
@@ -316,8 +322,24 @@ public actor ServerSupervisor {
         DaemonActivity.shared.forgetPhase(key: writerID.uuidString)
     }
 
+    /** Hands the supervisor the spec its next run spawns under (the Router's
+        prepared, materialized spec). It stays in force until that run starts:
+        `refreshIdleSpec` will not replace it. */
     public func updateSpec(_ newSpec: ServerSpec) {
         spec = newSpec
+        spawnSpecPrepared = true
+    }
+
+    /** A status read's committed spec for a server with no run: assigned only
+        while nothing is alive and no prepared spawn spec is waiting for its
+        run. The check and the assignment are this one actor turn, so a start
+        cannot land between them; as two calls they let a read that saw an idle
+        server replace the spec of a run that began meanwhile (a run reading
+        stale for its whole life), or of one about to begin (a spawn without the
+        injected port). */
+    public func refreshIdleSpec(_ committed: ServerSpec) {
+        guard !hasLiveRun, !spawnSpecPrepared else { return }
+        spec = committed
     }
 
     /** Absolute watched paths for this run, empty when the server declares no
@@ -1305,6 +1327,7 @@ public actor ServerSupervisor {
         recentLogTail = .unread
         lastDescendantSnapshot = []
         stoppedRunPids = []
+        spawnSpecPrepared = false
         clearRunHealth()
         runningSpecHash = Self.specHash(spec)
     }

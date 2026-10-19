@@ -397,6 +397,170 @@ import os
             .serverStop, ServerTargetParams(name: "db", project: env.project),
             ServerResult.self)
     }
+
+    /** A server whose command only works once the router has substituted its
+        port: the raw committed command carries the literal `{port}`, which the
+        fixture refuses, and the injected `PORT` is written to a file so the
+        spawn's environment is observable. */
+    private func writePortSensitiveConfig(port: Int, project: String) throws -> String {
+        let fixture = try #require(fixtureServerExecutable())
+        let envFile = URL(fileURLWithPath: project).appending(path: "spawn-env.txt").path
+        let script = "echo $PORT > '\(envFile)'; exec '\(fixture)' --listen-tcp {port}"
+        let body = """
+            {
+              "servers": {
+                "db": {
+                  "command": ["/bin/sh", "-c", "\(script)"],
+                  "healthcheck": { "type": "tcp", "port": \(port) },
+                  "port": \(port)
+                }
+              },
+              "version": 1
+            }
+            """
+        try Data(body.utf8)
+            .write(to: URL(fileURLWithPath: project).appending(path: "devservers.json"))
+        return envFile
+    }
+
+    /** A status read lands in the gap between the restart's stop and its
+        spawn (the port probe between them fires one). It must not replace the
+        spec the restart prepared: the new run spawns with the injected port,
+        and is not reported as running a stale config. */
+    @Test func aStatusReadBetweenTheStopAndTheSpawnLeavesThePreparedSpecAlone() async throws {
+        let env = try makeRouterEnv(named: "restart")
+        let port = TestPorts.port(424)
+        let envFile = try writePortSensitiveConfig(port: port, project: env.project)
+        let reader = StatusReadingProbe()
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: reader.probe,
+            registry: registry)
+        reader.attach(router: router, project: env.project)
+        let first = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        #expect(first.server.phase == .running)
+        try FileManager.default.removeItem(atPath: envFile)
+        reader.arm()
+
+        let restarted = try await router.call(
+            .serverRestart,
+            RestartParams(names: ["db"], project: env.project, timeoutSeconds: 5),
+            GroupResult.self)
+        let server = try #require(restarted.results.first?.server)
+        #expect(reader.reads >= 2, "no status read landed between the stop and the spawn")
+        #expect(server.phase == .running)
+        #expect(server.specStale != true)
+        #expect(try String(contentsOfFile: envFile, encoding: .utf8) == "\(port)\n")
+
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "db", project: env.project),
+            ServerResult.self)
+    }
+
+    /** The same race at its natural timing: status reads fired back to back
+        through several restarts never leave a run reading as stale. */
+    @Test func statusReadsDuringRestartsNeverLeaveARunStale() async throws {
+        let env = try makeRouterEnv(named: "restart")
+        let port = TestPorts.port(425)
+        _ = try writePortSensitiveConfig(port: port, project: env.project)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        _ = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+
+        let reads = Task {
+            var stale = 0
+            while !Task.isCancelled {
+                let list = try await router.call(
+                    .serverStatus, ProjectParams(name: "db", project: env.project),
+                    ServerListResult.self)
+                if list.servers.first?.specStale == true { stale += 1 }
+            }
+            return stale
+        }
+        var phases: [ServerPhase] = []
+        for _ in 0..<5 {
+            let restarted = try await router.call(
+                .serverRestart,
+                RestartParams(names: ["db"], project: env.project, timeoutSeconds: 5),
+                GroupResult.self)
+            phases.append(try #require(restarted.results.first?.server.phase))
+        }
+        reads.cancel()
+        let staleReads = try await reads.value
+        #expect(phases == Array(repeating: .running, count: 5))
+        #expect(staleReads == 0)
+        let settled = try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: "db", project: env.project),
+                ServerListResult.self
+            ).servers.first)
+        #expect(settled.specStale != true)
+
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "db", project: env.project),
+            ServerResult.self)
+    }
+}
+
+/** A port probe that reports every port free and fires one status read through
+    the router per probe, so a read lands exactly where the probe is asked: in
+    a restart, between the stop and the spawn. A read's own probes (latent
+    conflict checks) do not fire another. */
+final class StatusReadingProbe: Sendable {
+    private struct State {
+        var armed = false
+        var project = ""
+        var reading = false
+        var reads = 0
+        var router: Router?
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    var reads: Int { state.withLock { $0.reads } }
+
+    var probe: PortProbe {
+        PortProbe(isListening: { [self] _ in
+            await readStatus()
+            return false
+        })
+    }
+
+    func arm() {
+        state.withLock { $0.armed = true }
+    }
+
+    func attach(router: Router, project: String) {
+        state.withLock {
+            $0.project = project
+            $0.router = router
+        }
+    }
+
+    private func readStatus() async {
+        let target = state.withLock { state -> (Router, String)? in
+            guard state.armed, !state.reading, let router = state.router else { return nil }
+            state.reading = true
+            return (router, state.project)
+        }
+        guard let (router, project) = target else { return }
+        do {
+            _ = try await router.call(
+                .serverStatus, ProjectParams(name: "db", project: project), ServerListResult.self)
+        } catch {
+            Issue.record("the status read in the stopped gap failed: \(error)")
+        }
+        state.withLock {
+            $0.reading = false
+            $0.reads += 1
+        }
+    }
 }
 
 /** The port probe of a stop-then-spawn test, scripted around the first run's
