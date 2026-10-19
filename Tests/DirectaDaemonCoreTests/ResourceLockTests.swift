@@ -647,6 +647,17 @@ private struct StuckOrRealLauncher: NeverAdopts {
         let held = try await router.call(
             .lockStatus, LockStatusParams(project: env.project, resource: "data"), LockStatusResult.self)
         #expect(held.holder == nil)
+        try await releaseStuckDeclarer(router: router, project: env.project, gate: gate)
+    }
+
+    /** Lets the stuck declarer's run end and waits for its supervisor to finish
+        writing, so nothing writes into the test's tree after it is removed. */
+    private func releaseStuckDeclarer(router: Router, project: String, gate: AdoptGate) async throws {
+        gate.signal(.signaled(signal: Int(SIGKILL)))
+        let settled = try await eventually(within: .seconds(5)) {
+            try await phaseOf(router: router, project: project, name: "db") == .stopped
+        }
+        #expect(settled, "the stuck declarer never settled after its run was released")
     }
 
     /** A pause that arrives while a stop is already in flight answers with
@@ -695,6 +706,7 @@ private struct StuckOrRealLauncher: NeverAdopts {
         #expect(
             joinerEnded - stopEnded < .milliseconds(150),
             "the pause waited a bound of its own after the stop it joined gave up")
+        try await releaseStuckDeclarer(router: router, project: env.project, gate: gate)
     }
 
     /** One declarer stops cleanly and the next one's stop gives up: the lock is
