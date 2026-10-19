@@ -56,7 +56,20 @@ public actor Router {
         let spec: ServerSpec
     }
 
+    /** Restarts an `ensure` of an unhealthy server started and has not
+        finished, keyed by server id: a later ensure of the same server joins
+        the restart rather than starting a second stop-then-spawn. */
+    private var unhealthyEnsureRestarts: [String: Task<EnsureResult, any Error>] = [:]
+    /** Per server id, how many of those restarts have finished. An ensure
+        that read `unhealthy` before a restart began and resumes after it
+        finished compares this count and does not restart a run that is
+        already new. */
+    private var finishedUnhealthyEnsureRestarts: [String: Int] = [:]
+
     private static let daemonStartingHint = "run: directa daemon status"
+    /** The reason an ensure of an unhealthy server stops the run it replaces;
+        the `stopped` event carries it as its detail. */
+    static let unhealthyEnsureRestartReason = "restarted by ensure: unhealthy"
     /** True once a `daemon.shutdown` with `handoff` was accepted: this daemon is
         leaving its servers running for the next one, so a SIGTERM that races
         the exit must not drain them. */
@@ -211,10 +224,8 @@ public actor Router {
                 let target = ServerTargetParams(
                     name: request.params.name, port: request.params.port, project: project)
                 let supervisor = try await resolvedSupervisor(target)
-                try await prepareSpawn(
-                    target: target, supervisor: supervisor, portOverride: request.params.port,
-                    userInitiated: true)
-                let result = await supervisor.ensure(timeoutSeconds: request.params.timeoutSeconds)
+                let result = try await ensureServer(
+                    request.params, target: target, supervisor: supervisor)
                 DirectaLog.daemon.info(
                     "ensure \(target.name)@\(project) -> \(result.server.phase.rawValue)")
                 return try respond(id: head.id, result: result)
@@ -2358,6 +2369,56 @@ public actor Router {
                 state: .held)
         }
         return annotated
+    }
+
+    /** The ensure transition. An unhealthy server is restarted through
+        `restartServers` (the one stop-then-spawn, with its pre-checks and the
+        port re-check between the stop and the spawn) and the new run awaited;
+        every other phase prepares and takes the supervisor's own ensure.
+
+        The restart is single-flight per server: the in-flight table is read
+        again after the phase read (an await, so another ensure may have
+        started the restart meanwhile) and the finished-restart count decides
+        whether an `unhealthy` read is already stale. */
+    private func ensureServer(
+        _ params: EnsureParams, target: ServerTargetParams, supervisor: ServerSupervisor
+    ) async throws -> EnsureResult {
+        let id = serverID(project: target.project, name: target.name)
+        if let inFlight = unhealthyEnsureRestarts[id] { return try await inFlight.value }
+        let finishedBefore = finishedUnhealthyEnsureRestarts[id, default: 0]
+        let phase = await supervisor.status().phase
+        if let inFlight = unhealthyEnsureRestarts[id] { return try await inFlight.value }
+        guard phase == .unhealthy, finishedUnhealthyEnsureRestarts[id, default: 0] == finishedBefore
+        else {
+            try await prepareSpawn(
+                target: target, supervisor: supervisor, portOverride: params.port,
+                userInitiated: true)
+            return await supervisor.ensure(timeoutSeconds: params.timeoutSeconds)
+        }
+        /** Run in a task of its own so a caller that goes away (a dropped
+            client connection) neither cancels the restart nor leaves the
+            ones that joined it waiting on a cancelled run. */
+        let restart = Task { [self] () throws -> EnsureResult in
+            defer { finishUnhealthyEnsureRestart(id) }
+            let group = try await restartServers(
+                RestartParams(
+                    names: [target.name], port: params.port, project: target.project,
+                    timeoutSeconds: params.timeoutSeconds),
+                reason: Self.unhealthyEnsureRestartReason, userInitiated: true)
+            guard let result = group.results.first else {
+                throw WireError(
+                    code: .internalError, hint: "run: directa why \(ShellWord.inertOr(target.name))",
+                    message: "restarting '\(target.name)' returned no result")
+            }
+            return result
+        }
+        unhealthyEnsureRestarts[id] = restart
+        return try await restart.value
+    }
+
+    private func finishUnhealthyEnsureRestart(_ id: String) {
+        unhealthyEnsureRestarts[id] = nil
+        finishedUnhealthyEnsureRestarts[id, default: 0] += 1
     }
 
     /** The one restart path. Every refusal happens before anything stops: a

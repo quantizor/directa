@@ -454,7 +454,7 @@ private enum ResponderError: Error {
 /** A real HTTP/1.1 responder on one loopback family. It answers every request
     with `statusCode` after `delaySeconds`, on threads of its own, so a test
     can hold an answer back for longer than any timeout under test. */
-private final class TestHTTPResponder: @unchecked Sendable {
+final class TestHTTPResponder: @unchecked Sendable {
     let port: Int
 
     private let delaySeconds: Double

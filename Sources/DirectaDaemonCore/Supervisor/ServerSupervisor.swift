@@ -584,8 +584,10 @@ public actor ServerSupervisor {
     /** The ensure state matrix: stopped/crashed/failed start fresh; starting joins
         the in-flight attempt; running with a passing check for this process is
         a no-op; running while the latest check is failing waits, without
-        restarting; unhealthy is a no-op (reported, not restarted). Blocks until
-        healthy, terminal, or timeout. */
+        restarting; unhealthy is reported as it stands (the Router restarts an
+        unhealthy server before an `ensure` request reaches this, since the
+        restart needs its pre-checks and port re-check). Blocks until healthy,
+        terminal, or timeout. */
     public func ensure(timeoutSeconds: Double) async -> EnsureResult {
         guard removalReason == nil else {
             let server = await status()

@@ -442,6 +442,221 @@ import os
             ServerResult.self)
     }
 
+    // MARK: - ensure over an unhealthy run
+
+    private static let ensureRestartDetail = "restarted by ensure: unhealthy"
+
+    /** The `db` server again, with an HTTP healthcheck answered by `responder`
+        so a test turns the run unhealthy by changing the status code. The
+        fixture listens on `port`, which is declared as an absolute secondary
+        port: the claim the restart's port checks look at, without the primary
+        port that would rewrite the healthcheck URL onto it. */
+    private func writeHTTPHealthConfig(
+        heads: [String: String] = [:], port: Int, project: String, responder: TestHTTPResponder,
+        unhealthyAfter: Int
+    ) throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let headsField =
+            heads.isEmpty
+            ? ""
+            : ",\n          \"heads\": {"
+                + heads.sorted { $0.key < $1.key }.map { "\"\($0.key)\": \"\($0.value)\"" }
+                .joined(separator: ", ") + "}"
+        let body = """
+            {
+              "servers": {
+                "db": {
+                  "command": ["\(fixture)", "--listen-tcp", "\(port)"],
+                  "healthcheck": {
+                    "intervalMs": 50, "timeoutMs": 1000, "type": "http",
+                    "unhealthyAfter": \(unhealthyAfter),
+                    "url": "http://127.0.0.1:\(responder.port)/health"
+                  },
+                  "ports": { "listener": { "port": \(port) } }\(headsField)
+                }
+              },
+              "version": 1
+            }
+            """
+        try Data(body.utf8)
+            .write(to: URL(fileURLWithPath: project).appending(path: "devservers.json"))
+    }
+
+    private func status(_ router: Router, _ project: String) async throws -> ServerStatus {
+        try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: "db", project: project), ServerListResult.self
+            ).servers.first)
+    }
+
+    /** A router over a `db` run that has passed its healthcheck, then had
+        the responder switched to 500 until `failing` holds. */
+    private func failingRun(
+        offset: Int, portProbe: PortProbe = .live, responder: TestHTTPResponder,
+        unhealthyAfter: Int, failing: (ServerStatus) -> Bool
+    ) async throws -> (env: RouterEnv, pid: Int, router: Router) {
+        let env = try makeRouterEnv(named: "restart")
+        try writeHTTPHealthConfig(
+            port: TestPorts.port(offset), project: env.project, responder: responder,
+            unhealthyAfter: unhealthyAfter)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: portProbe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        let first = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        #expect(first.server.phase == .running)
+        let pid = try #require(first.server.pid)
+
+        responder.respond(with: 500)
+        let reached = try await eventually(within: .seconds(5)) {
+            failing(try await status(router, env.project))
+        }
+        try #require(reached, "the run never reached the failing state")
+        return (env: env, pid: pid, router: router)
+    }
+
+    /** Lets the replacement run pass its healthcheck once ensure has stopped
+        the old one: the run being replaced fails until then, so it cannot
+        recover on its own before ensure reaches it. */
+    private func recoverAfterTheStop(
+        _ router: Router, project: String, responder: TestHTTPResponder
+    ) -> Task<Void, Never> {
+        Task {
+            let stopped = try? await awaitStoppedEvents(
+                router, project: project, detail: Self.ensureRestartDetail, within: .seconds(20))
+            if stopped != nil { responder.respond(with: 200) }
+        }
+    }
+
+    @Test func ensureRestartsAnUnhealthyServerAndWaitsForTheNewRun() async throws {
+        let responder = try TestHTTPResponder()
+        defer { responder.stop() }
+        let run = try await failingRun(
+            offset: 431, responder: responder, unhealthyAfter: 2, failing: { $0.phase == .unhealthy })
+        let recover = recoverAfterTheStop(run.router, project: run.env.project, responder: responder)
+        defer { recover.cancel() }
+
+        let ensured = try await run.router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: run.env.project, timeoutSeconds: 15),
+            EnsureResult.self)
+        #expect(ensured.reason == nil)
+        #expect(ensured.server.phase == .running)
+        #expect(ensured.server.pid != run.pid)
+        #expect(ensured.server.lastHealthCheck?.passed == true)
+
+        let events = try await run.router.call(
+            .eventsQuery, EventsQueryParams(project: run.env.project), EventsQueryResult.self)
+        let stopped = events.events.filter { $0.kind == .stopped }
+        #expect(stopped.map(\.detail) == [Self.ensureRestartDetail])
+        #expect(try await sysLines(run.router, run.env.project).contains("stopping: \(Self.ensureRestartDetail)"))
+
+        _ = try await run.router.call(
+            .serverStop, ServerTargetParams(name: "db", project: run.env.project),
+            ServerResult.self)
+    }
+
+    /** Two sessions ensuring one broken server is the ordinary case: the
+        second joins the restart the first started, so one process is stopped
+        and one is spawned. */
+    @Test func twoConcurrentEnsuresOfAnUnhealthyServerRestartItOnce() async throws {
+        let responder = try TestHTTPResponder()
+        defer { responder.stop() }
+        let run = try await failingRun(
+            offset: 432, responder: responder, unhealthyAfter: 2, failing: { $0.phase == .unhealthy })
+        let recover = recoverAfterTheStop(run.router, project: run.env.project, responder: responder)
+        defer { recover.cancel() }
+
+        let params = EnsureParams(name: "db", project: run.env.project, timeoutSeconds: 15)
+        async let first = run.router.call(.serverEnsure, params, EnsureResult.self)
+        async let second = run.router.call(.serverEnsure, params, EnsureResult.self)
+        let results = try await [first, second]
+
+        #expect(results.map(\.reason) == [nil, nil])
+        #expect(results.map(\.server.phase) == [.running, .running])
+        let pids = Set(results.compactMap(\.server.pid))
+        #expect(pids.count == 1)
+        #expect(!pids.contains(run.pid))
+
+        let events = try await run.router.call(
+            .eventsQuery, EventsQueryParams(project: run.env.project), EventsQueryResult.self)
+        #expect(events.events.filter { $0.kind == .stopped }.map(\.detail) == [Self.ensureRestartDetail])
+        #expect(events.events.filter { $0.kind == .started }.count == 2)
+
+        _ = try await run.router.call(
+            .serverStop, ServerTargetParams(name: "db", project: run.env.project),
+            ServerResult.self)
+    }
+
+    /** The restart's port re-check applies to ensure: a listener that outlives
+        the stop refuses the transition, leaves the server stopped, and
+        releases the spec the ensure prepared. */
+    @Test func ensureOfAnUnhealthyServerIsRefusedWhileAListenerOutlivesTheStop() async throws {
+        let responder = try TestHTTPResponder()
+        defer { responder.stop() }
+        let lingering = LingeringListener(reports: .outsider)
+        let run = try await failingRun(
+            offset: 433, portProbe: lingering.probe, responder: responder, unhealthyAfter: 2,
+            failing: { $0.phase == .unhealthy })
+        lingering.watch(pid: pid_t(run.pid))
+        let port = TestPorts.port(433)
+
+        let refused = try await run.router.attempt(
+            .serverEnsure,
+            EnsureParams(name: "db", project: run.env.project, timeoutSeconds: 10),
+            EnsureResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("ensure went ahead beside a listener the stop did not remove")
+            return
+        }
+        #expect(error.code == .portHeld)
+        #expect(
+            error.message
+                == "port \(port) is still held by pid \(lingering.reportedPid) (stand-in listener) after stopping 'db'; the new run was not started"
+        )
+        #expect(error.hint == "run: directa why db")
+
+        let stopped = try await status(run.router, run.env.project)
+        #expect(stopped.phase == .stopped)
+        #expect(stopped.pid == nil)
+
+        let heads = ["api": "http://api.localhost/"]
+        try writeHTTPHealthConfig(
+            heads: heads, port: port, project: run.env.project, responder: responder,
+            unhealthyAfter: 2)
+        #expect(try await status(run.router, run.env.project).heads == heads)
+    }
+
+    /** `running` with a failing latest check is not `unhealthy`: ensure waits
+        for it, as for any run still proving itself, and does not restart. */
+    @Test func ensureOfARunningServerWithAFailingCheckWaitsWithoutRestarting() async throws {
+        let responder = try TestHTTPResponder()
+        defer { responder.stop() }
+        let run = try await failingRun(
+            offset: 434, responder: responder, unhealthyAfter: 200,
+            failing: { $0.phase == .running && ($0.lastHealthCheck?.failures ?? 0) >= 2 })
+
+        let ensured = try await run.router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: run.env.project, timeoutSeconds: 1),
+            EnsureResult.self)
+        #expect(ensured.reason == .timeout)
+        #expect(ensured.server.phase == .running)
+        #expect(ensured.server.pid == run.pid)
+
+        let events = try await run.router.call(
+            .eventsQuery, EventsQueryParams(project: run.env.project), EventsQueryResult.self)
+        #expect(events.events.filter { $0.kind == .stopped }.isEmpty)
+
+        _ = try await run.router.call(
+            .serverStop, ServerTargetParams(name: "db", project: run.env.project),
+            ServerResult.self)
+    }
+
     /** A server whose command only works once the router has substituted its
         port: the raw committed command carries the literal `{port}`, which the
         fixture refuses, and the injected `PORT` is written to a file so the
