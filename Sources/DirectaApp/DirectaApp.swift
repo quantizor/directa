@@ -469,17 +469,20 @@ struct MenuContent: View {
     private var filteredProjects: [DaemonModel.ProjectGroup] {
         let query = filterText.trimmingCharacters(in: .whitespacesAndNewlines)
         if query.isEmpty { return orderedProjects }
+        /** Matches exactly the labels the rows show, so every kept row has a mark. */
         return orderedProjects.compactMap { project in
-            let projectMatches = FuzzyMatcher.matches(project.name, query: query)
+            let projectMatches = FuzzyMatch.ranges(in: project.name, query: query) != nil
             let matchingServers = project.servers.filter { server in
                 if projectMatches { return true }
-                if FuzzyMatcher.matches(server.server, query: query) { return true }
-                if FuzzyMatcher.matches(server.url ?? "", query: query) { return true }
-                if let heads = server.heads {
-                    return heads.keys.contains { FuzzyMatcher.matches($0, query: query) } ||
-                           heads.values.contains { FuzzyMatcher.matches($0, query: query) }
+                let address = PopoverLabel.address(
+                    url: server.url, displayPort: server.displayPort, server: server.server)
+                if FuzzyMatch.ranges(in: address, query: query) != nil { return true }
+                guard let heads = server.heads else { return false }
+                return heads.contains { name, url in
+                    if FuzzyMatch.ranges(in: name, query: query) != nil { return true }
+                    let host = PopoverLabel.headHost(url: url, parentURL: server.url)
+                    return FuzzyMatch.ranges(in: host, query: query) != nil
                 }
-                return false
             }
             if matchingServers.isEmpty { return nil }
             return DaemonModel.ProjectGroup(
@@ -759,17 +762,8 @@ struct ServerRow: View {
         .padding(.vertical, 2)
     }
 
-    /** The address half of the old subtitle, which is what actually identifies
-                the server once the redundant name is gone. */
     private var address: String {
-        if let url = server.url, let parsed = URL(string: url), let host = parsed.host {
-            let port = parsed.port.map { ":\($0)" } ?? ""
-            return "\(host)\(port)"
-        }
-        if let port = server.displayPort {
-            return "port \(port)"
-        }
-        return server.server
+        PopoverLabel.address(url: server.url, displayPort: server.displayPort, server: server.server)
     }
 }
 
@@ -1125,17 +1119,7 @@ struct HeadRow: View {
     }
 
     private var displayHost: String {
-        guard let parsed = URL(string: url), let host = parsed.host else { return url }
-        let headHostPort = parsed.port.map { "\(host):\($0)" } ?? host
-        let headPath = parsed.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-
-        if let parentURL, let parentParsed = URL(string: parentURL), let parentHost = parentParsed.host {
-            let parentHostPort = parentParsed.port.map { "\(parentHost):\($0)" } ?? parentHost
-            if headHostPort == parentHostPort {
-                return headPath.isEmpty ? "" : "/\(headPath)"
-            }
-        }
-        return headPath.isEmpty ? headHostPort : "\(headHostPort)/\(headPath)"
+        PopoverLabel.headHost(url: url, parentURL: parentURL)
     }
 }
 
@@ -1277,8 +1261,9 @@ struct SortOrderMenu: View {
     }
 }
 
-/** Slim fuzzy filter for the popover's top-right corner. Filters projects,
-    servers, urls, and heads; match marks land via FuzzyMatcher.highlightedText.
+/** Slim fuzzy filter for the popover's top-right corner. Filters on exactly the
+    labels the rows display: the project name, each server's address, and each
+    head's name and host. Match marks land via FuzzyMatcher.highlightedText.
     Continuous radius matches the MenuBarExtra panel chrome so the control
     sits in the same curve family as the popover corner. */
 struct FilterBox: View {
@@ -1328,43 +1313,18 @@ struct FilterBox: View {
     }
 }
 
+/** Paints the filter's matches onto a visible label. The matching rules live in
+    DirectaKit's FuzzyMatch, so every range here indexes the label it paints. */
 enum FuzzyMatcher {
-    static func matches(_ text: String, query: String) -> Bool {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return true }
-        let target = text.lowercased()
-        let pattern = trimmed.lowercased()
-        if target.contains(pattern) { return true }
-        var searchIndex = target.startIndex
-        for char in pattern {
-            guard let found = target[searchIndex...].firstIndex(of: char) else {
-                return false
-            }
-            searchIndex = target.index(after: found)
-        }
-        return true
-    }
-
     static func highlightedText(_ text: String, query: String) -> Text {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, matches(text, query: trimmed) else { return Text(text) }
+        guard let ranges = FuzzyMatch.ranges(in: text, query: query), !ranges.isEmpty else {
+            return Text(text)
+        }
         var attr = AttributedString(text)
-        let target = text.lowercased()
-        let pattern = trimmed.lowercased()
         let highlightBg = Color.yellow.opacity(0.35)
-
-        if let range = target.range(of: pattern) {
+        for range in ranges {
             if let attrRange = Range(range, in: attr) {
                 attr[attrRange].backgroundColor = highlightBg
-            }
-        } else {
-            var searchIndex = target.startIndex
-            for char in pattern {
-                guard let found = target[searchIndex...].firstIndex(of: char),
-                    let attrRange = Range(found...found, in: attr)
-                else { break }
-                attr[attrRange].backgroundColor = highlightBg
-                searchIndex = target.index(after: found)
             }
         }
         return Text(attr)
