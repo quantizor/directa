@@ -190,10 +190,15 @@ private actor RecordingEffects: DeepLinkEffects {
     @Test func openWithoutURLThrows() async {
         let daemon = MockDaemon(
             status: ServerStatus(logPath: "", phase: .running, project: "/Users/x/code/myproj", server: "cms"))
-        await #expect(throws: WireError.self) {
+        let error = await #expect(throws: WireError.self) {
             try await runner(daemon, RecordingEffects()).run(
                 DeepLink(verb: .open, projectSlug: "myproj", server: "cms"))
         }
+        /** No command adds a URL, so the devservers.json edit is in the message
+            and the failure carries no hint. */
+        #expect(error?.code == .notFound)
+        #expect(error?.hint == nil)
+        #expect(error?.message.hasSuffix("add a port, url, or heads to cms in devservers.json") == true)
     }
 
     @Test func whyCopiesAndNotifies() async throws {

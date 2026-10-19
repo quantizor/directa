@@ -355,8 +355,10 @@ public actor Router {
                 guard known || configExists else {
                     throw WireError(
                         code: .notFound,
-                        hint: "run: directa config init in the project, or register a server there first",
-                        message: "refusing to write devservers.json for a project directa does not track: \(project)")
+                        hint: "run: directa config init --project \(ShellWord.singleQuoted(project))",
+                        message:
+                            "refusing to write devservers.json for a project directa does not track: \(project); create one with config init in that project, or register a server there first"
+                    )
                 }
                 let currentHash = (try? Data(contentsOf: url)).map {
                     DirectaPaths.hash8(String(decoding: $0, as: UTF8.self))

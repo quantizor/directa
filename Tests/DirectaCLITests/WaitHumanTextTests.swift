@@ -95,13 +95,15 @@ import Testing
                 """)
     }
 
-    @Test func stoppedTimeoutNamesAnUnsafeServerNameAsPlaceholder() {
+    /** Quoted like the other hints in this text, so the line pastes as one
+        command. */
+    @Test func stoppedTimeoutQuotesAnUnsafeServerName() {
         #expect(
             Wait.humanText(
                 Self.result(.failed, reason: .timeout, name: "my app;x", pid: 4242), condition: .stopped,
                 name: "my app;x"
             )
-            .hasSuffix("\nhint: directa stop <name>"))
+            .hasSuffix("\nhint: directa stop 'my app;x'"))
     }
 
     @Test func stoppedTimeoutOnAFailedRunWithNoProcessCarriesNoStopHint() {

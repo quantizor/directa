@@ -216,6 +216,8 @@ import Testing
         }
         #expect(error.code == .notFound)
         #expect(
+            error.hint == "run: directa config init --project \(ShellWord.singleQuoted(canonicalProjectPath(stranger.path)))")
+        #expect(
             !FileManager.default.fileExists(
                 atPath: stranger.appending(path: "devservers.json").path))
     }

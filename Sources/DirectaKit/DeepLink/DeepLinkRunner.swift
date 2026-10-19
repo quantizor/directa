@@ -143,22 +143,12 @@ public struct DeepLinkRunner: Sendable {
         let raw: String
         if let head {
             guard let headURL = server.heads?[head] else {
-                let known = (server.heads ?? [:]).keys.sorted().joined(separator: ", ")
-                let detail = known.isEmpty
-                    ? "this server declares no heads"
-                    : "known heads: \(known)"
-                throw WireError(
-                    code: .notFound,
-                    hint: "run: directa status \(ShellWord.argument(server.server)) --json",
-                    message: "no head named '\(head)' on \(server.server); \(detail)")
+                throw OpenFailure.headNotFound(head: head, server: server)
             }
             raw = headURL
         } else {
             guard let url = server.url else {
-                throw WireError(
-                    code: .notFound,
-                    hint: "add a port, url, or heads to \(server.server) in devservers.json",
-                    message: "\(server.server) has no URL to open")
+                throw OpenFailure.noURL(server: server, code: .notFound)
             }
             raw = url
         }
@@ -183,5 +173,31 @@ public struct DeepLinkRunner: Sendable {
             }
         }
         return lines.joined(separator: "\n")
+    }
+}
+
+/** The two ways opening a server's URL fails for want of something to open,
+    shared by `directa open` and the `open` deep link. The hint is a literal
+    command where one helps; the detail a reader needs is in the message. */
+public enum OpenFailure {
+    /** The server has no head by that name: `directa status <server> --json`
+        lists the heads it has, and the message names them. */
+    public static func headNotFound(head: String, server: ServerStatus) -> WireError {
+        let known = (server.heads ?? [:]).keys.sorted().joined(separator: ", ")
+        let detail = known.isEmpty ? "this server declares no heads" : "known heads: \(known)"
+        return WireError(
+            code: .notFound,
+            hint: "run: directa status \(ShellWord.argument(server.server)) --json",
+            message: "no head named '\(head)' on \(server.server); \(detail)")
+    }
+
+    /** No command adds a URL to a server, so there is no hint: the message
+        names the devservers.json edit. */
+    public static func noURL(server: ServerStatus, code: WireErrorCode) -> WireError {
+        WireError(
+            code: code,
+            message:
+                "\(server.server) has no URL to open (no port declared and no url configured); add a port, url, or heads to \(server.server) in devservers.json"
+        )
     }
 }

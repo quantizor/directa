@@ -535,7 +535,7 @@ struct Wait: AsyncParsableCommand {
             text += "\nhint: \(note)"
         }
         if condition == .stopped, reason == .timeout, result.server.phase == .failed, result.server.hasLiveRun {
-            text += "\nhint: directa stop \(ShellWord.inertOr(name))"
+            text += "\nhint: directa stop \(ShellWord.argument(name))"
         }
         return text
     }
@@ -1212,6 +1212,15 @@ struct HookInstall: AsyncParsableCommand {
         return .success(targets)
     }
 
+    /** The hint is the install with an absolute path in the spot the relative
+        one was, using the usual Homebrew shim path as the example. */
+    static func relativeCliPathError(_ override: String) -> WireError {
+        WireError(
+            code: .usage,
+            hint: "run: directa hook install --cli-path /opt/homebrew/bin/directa",
+            message: "--cli-path must be absolute, got '\(override)'")
+    }
+
     func run() async throws {
         let targets: Targets
         switch Self.resolveTargets(harness: harness, adapters: harnessAdapters()) {
@@ -1221,12 +1230,7 @@ struct HookInstall: AsyncParsableCommand {
             targets = resolved
         }
         if let override = cliPath, !override.hasPrefix("/") {
-            CLIRunner.fail(
-                WireError(
-                    code: .usage,
-                    hint: "pass an absolute path, e.g. --cli-path /opt/homebrew/bin/directa",
-                    message: "--cli-path must be absolute, got '\(override)'"),
-                json: global.json)
+            CLIRunner.fail(Self.relativeCliPathError(override), json: global.json)
         }
         let cliPath = cliPath ?? CLISelf.path
         let result = HarnessBatch.run(targets.install) { try $0.install(cliPath: cliPath) }
@@ -1634,23 +1638,12 @@ struct Open: AsyncParsableCommand {
         var target = server.url
         if let head {
             guard let headURL = server.heads?[head] else {
-                let known = (server.heads ?? [:]).keys.sorted().joined(separator: ", ")
-                CLIRunner.fail(
-                    WireError(
-                        code: .notFound,
-                        hint: known.isEmpty ? "this server declares no heads" : "known heads: \(known)",
-                        message: "no head named '\(head)' on \(name)"),
-                    json: global.json)
+                CLIRunner.fail(OpenFailure.headNotFound(head: head, server: server), json: global.json)
             }
             target = headURL
         }
         guard let url = target else {
-            CLIRunner.fail(
-                WireError(
-                    code: .usage,
-                    hint: "add a port, url, or heads to \(name) in devservers.json",
-                    message: "\(name) has no URL (no port declared and no url configured)"),
-                json: global.json)
+            CLIRunner.fail(OpenFailure.noURL(server: server, code: .usage), json: global.json)
         }
         await LaunchdAdmin.shell("/usr/bin/open", [url])
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in "opened \(url)" }
@@ -1673,14 +1666,20 @@ struct Link: AsyncParsableCommand {
 
     @OptionGroup var global: GlobalOptions
 
+    /** The hint is the same command with a verb that exists; the message names
+        every verb. */
+    static func unknownVerbError(verb: String, name: String) -> WireError {
+        WireError(
+            code: .usage,
+            hint: "run: directa link \(DeepLinkVerb.open.rawValue) \(ShellWord.argument(name))",
+            message:
+                "unknown verb '\(verb)' (verbs: \(DeepLinkVerb.allCases.map(\.rawValue).sorted().joined(separator: ", ")))"
+        )
+    }
+
     func run() async throws {
         guard let deepVerb = DeepLinkVerb(rawValue: verb.lowercased()) else {
-            CLIRunner.fail(
-                WireError(
-                    code: .usage,
-                    hint: "verbs: \(DeepLinkVerb.allCases.map(\.rawValue).sorted().joined(separator: ", "))",
-                    message: "unknown verb '\(verb)'"),
-                json: global.json)
+            CLIRunner.fail(Self.unknownVerbError(verb: verb, name: name), json: global.json)
         }
         if head != nil, deepVerb != .open {
             CLIRunner.fail(
@@ -2554,7 +2553,7 @@ struct DaemonStop: AsyncParsableCommand {
 struct DaemonRestart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "restart",
-        abstract: "Relaunch the daemon, keeping running servers up, and re-ensure any that were not adopted.")
+        abstract: "Relaunch the daemon; running servers keep running, and any it cannot pick back up are started again.")
 
     @OptionGroup var global: GlobalOptions
 
@@ -2658,12 +2657,7 @@ struct Switch: AsyncParsableCommand {
                 json: global.json)
         }
         guard dirty.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            CLIRunner.fail(
-                WireError(
-                    code: .usage,
-                    hint: "commit your work first (directa never stashes or discards changes)",
-                    message: "the working tree has uncommitted changes"),
-                json: global.json)
+            CLIRunner.fail(Self.dirtyTreeError(project: project), json: global.json)
         }
         if !noFetch {
             print("fetching…")
@@ -2754,10 +2748,7 @@ struct Switch: AsyncParsableCommand {
             process.waitUntilExit()
             guard process.terminationStatus == 0 else {
                 CLIRunner.fail(
-                    WireError(
-                        code: .internalError,
-                        hint: "fix the failure, then run: directa up",
-                        message: "lifecycle command failed (\(process.terminationStatus)): \(argv.joined(separator: " "))"),
+                    Self.lifecycleFailureError(status: process.terminationStatus, argv: argv),
                     json: global.json)
             }
         }
@@ -2777,6 +2768,28 @@ struct Switch: AsyncParsableCommand {
         if result.results.contains(where: { $0.reason != nil }) {
             Foundation.exit(1)
         }
+    }
+
+    /** Refuses a dirty tree. The hint shows what is dirty; the message says
+        what to do about it, since no single command commits the right work. */
+    static func dirtyTreeError(project: String) -> WireError {
+        WireError(
+            code: .usage,
+            hint: "run: git -C \(ShellWord.singleQuoted(project)) status",
+            message:
+                "the working tree has uncommitted changes; commit your work first (directa never stashes or discards changes)"
+        )
+    }
+
+    /** A lifecycle command failed: the playbook stops, and `directa up` is the
+        resume once the cause is fixed. */
+    static func lifecycleFailureError(status: Int32, argv: [String]) -> WireError {
+        WireError(
+            code: .internalError,
+            hint: "run: directa up",
+            message:
+                "lifecycle command failed (\(status)): \(argv.joined(separator: " ")); fix the failure, then bring the servers up"
+        )
     }
 
     static func git(_ arguments: [String], in project: String) -> (status: Int32, output: String) {
