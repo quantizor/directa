@@ -396,7 +396,8 @@ public enum LaunchdAdmin {
         let client = DaemonClient(socketPath: paths.socketPath)
         _ = try? await client.request(
             .daemonShutdown, params: ShutdownParams(handoff: true), expecting: WireEmpty.self)
-        for _ in 0..<50 where FileManager.default.fileExists(atPath: paths.socketPath) {
+        let goneBy = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < goneBy, FileManager.default.fileExists(atPath: paths.socketPath) {
             if (try? await DaemonClient(socketPath: paths.socketPath)
                 .request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)) == nil
             {
