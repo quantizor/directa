@@ -573,7 +573,7 @@ public actor ServerSupervisor {
                 if phase == .failed { return .failed }
                 if phase == .stopped { return .stopped }
             case .stopped:
-                if phase == .stopped || phase == .crashed || phase == .failed { return nil }
+                if !hasLiveRun { return nil }
             }
             if ContinuousClock.now >= deadline { return .timeout }
             try? await Task.sleep(for: .milliseconds(100))

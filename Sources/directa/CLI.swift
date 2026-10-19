@@ -438,13 +438,18 @@ struct Wait: AsyncParsableCommand {
         }
     }
 
-    /** The falls-short line, the server, and, when a `--healthy` wait ended
-        on a crash or a stop, the command that brings the server back. */
+    /** The falls-short line, the server, and the command that moves it on: a
+        `--healthy` wait that ended on a crash or a stop names `ensure`, and a
+        `--stopped` wait that timed out on a failed run whose process is still
+        alive names `stop`. */
     static func humanText(_ result: EnsureResult, condition: WaitCondition, name: String) -> String {
         guard let reason = result.reason else { return CLIRunner.describe(result.server) }
         var text = "wait fell short (\(reason.rawValue))\n" + CLIRunner.describe(result.server)
         if condition == .healthy, reason == .crashed || reason == .stopped {
             text += "\nhint: directa ensure \(ShellWord.argument(name))"
+        }
+        if condition == .stopped, reason == .timeout, result.server.phase == .failed, result.server.hasLiveRun {
+            text += "\nhint: directa stop \(ShellWord.inertOr(name))"
         }
         return text
     }

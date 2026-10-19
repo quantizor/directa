@@ -392,6 +392,50 @@ import Testing
         #expect(events.events.filter { $0.kind == .stopped }.map(\.detail) == ["project path gone"])
     }
 
+    /** A port-failed run is alive until its process exits, so `wait --stopped`
+        holds over it for the whole window, and resolves only once `stop` has
+        taken the process down. */
+    @Test func waitStoppedHoldsOverAPortFailedRunUntilItsProcessIsGone() async throws {
+        let port = TestPorts.port(11)
+        let env = try makeRouterEnv(named: "waitstop")
+        let sibling = try env.sibling(named: "sibling")
+        let registry = Registry(paths: env.paths)
+        try await registry.register(
+            project: env.project,
+            spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web", port: port))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let (failed, thief) = try await portFailedVictim(
+            router: router, registry: registry, env: env, sibling: sibling, port: port)
+        let victim = try #require(failed.pid)
+        defer { kill(pid_t(victim), SIGKILL) }
+        _ = await thief.stop(graceSeconds: 2, reason: "test cleanup")
+
+        let held = try await router.attempt(
+            .serverWait,
+            WaitParams(condition: .stopped, name: "web", project: env.project, timeoutSeconds: 1),
+            EnsureResult.self)
+        guard case .success(let heldResult) = held else {
+            Issue.record("wait for stopped failed: \(held)")
+            return
+        }
+        #expect(heldResult.reason == .timeout)
+        #expect(heldResult.server.phase == .failed)
+        #expect(kill(pid_t(victim), 0) == 0, "the port-failed run \(victim) exited before stop")
+
+        _ = try await router.attempt(
+            .serverStop, ServerTargetParams(name: "web", project: env.project), ServerResult.self)
+        let resolved = try await router.attempt(
+            .serverWait,
+            WaitParams(condition: .stopped, name: "web", project: env.project, timeoutSeconds: 10),
+            EnsureResult.self)
+        guard case .success(let resolvedResult) = resolved else {
+            Issue.record("wait for stopped failed after stop: \(resolved)")
+            return
+        }
+        #expect(resolvedResult.reason == nil)
+        #expect(try await awaitExit(pid_t(victim), within: .seconds(5)))
+    }
+
     /** Brings a router-started server to a port failure with its run still
         alive: a thief (another managed server) binds the victim's effective
         port after the victim's pre-check passed, answers its healthcheck, and
