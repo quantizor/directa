@@ -27,6 +27,54 @@ private struct ScriptedProber: HealthProber {
     }
 }
 
+/** One probe in flight per waiter. `started` counts calls, so a test can tell
+    a new check has begun (the previous result is already recorded) without
+    sleeping. */
+private actor ProbeGate {
+    private var served = 0
+    private var waiters: [CheckedContinuation<Bool, Never>] = []
+
+    func next() async -> Bool {
+        served += 1
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    var started: Int { served }
+
+    func releaseOldest(_ success: Bool) {
+        guard !waiters.isEmpty else { return }
+        waiters.removeFirst().resume(returning: success)
+    }
+
+    func releaseAll(_ success: Bool) {
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending {
+            waiter.resume(returning: success)
+        }
+    }
+}
+
+private struct GateProber: HealthProber {
+    let gate: ProbeGate
+
+    func probe(_ check: EffectiveHealthcheck) async -> Bool {
+        await gate.next()
+    }
+}
+
+private actor FinishFlag {
+    private(set) var finished = false
+
+    func mark() { finished = true }
+}
+
+private func waitForProbe(after seen: Int, gate: ProbeGate) async throws {
+    try #require(await eventually(within: .seconds(2)) { await gate.started > seen })
+}
+
 private func makeSupervisor(
     command: [String],
     healthcheck: HealthCheckSpec?,
@@ -124,6 +172,128 @@ private func makeSupervisor(
         async let waiter = supervisor.wait(for: .stopped, timeoutSeconds: 10)
         _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
         #expect(await waiter == nil)
+    }
+
+    /** The pass that made the previous process healthy is not this process's
+        pass. `wait --healthy` was returning in that window, and status still
+        showed the old `lastHealthAt` and the old exit. */
+    @Test func aNewRunDoesNotInheritThePreviousRunsHealth() async throws {
+        let gate = ProbeGate()
+        let (supervisor, _, _) = try makeSupervisor(
+            command: ["/bin/sh", "-c", "sleep 30"],
+            healthcheck: fastTCP,
+            prober: GateProber(gate: gate))
+        do {
+            _ = await supervisor.start()
+            try await waitForProbe(after: 0, gate: gate)
+            await gate.releaseOldest(true)
+            let healthy = try await awaitPhase(supervisor, .running)
+            try #require(healthy.lastHealthAt != nil)
+
+            try await waitForProbe(after: 1, gate: gate)
+            _ = await supervisor.stop(graceSeconds: 1, reason: "restart")
+            let restarted = await supervisor.start()
+            #expect(restarted.phase == .starting)
+            #expect(restarted.lastHealthAt == nil)
+            #expect(restarted.lastExit == nil)
+
+            await gate.releaseOldest(true)
+            let promoted = try await eventually(within: .seconds(1)) {
+                await supervisor.status().phase == .running
+            }
+            #expect(!promoted)
+            #expect((await supervisor.status()).lastHealthAt == nil)
+            await gate.releaseAll(false)
+            _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
+        } catch {
+            await gate.releaseAll(false)
+            _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
+            throw error
+        }
+    }
+
+    /** One failed check leaves the phase `running` until `unhealthyAfter`.
+        `wait --healthy` still has to block: the port is refusing. */
+    @Test func waitHealthyBlocksWhileTheLatestProbeIsFailing() async throws {
+        let (supervisor, gate) = try await serverPastOneFailedProbe()
+        do {
+            let flag = FinishFlag()
+            let task = Task {
+                let reason = await supervisor.wait(for: .healthy, timeoutSeconds: 3)
+                await flag.mark()
+                return reason
+            }
+            let early = try await eventually(within: .milliseconds(500)) { await flag.finished }
+            if early {
+                let reason = await task.value
+                #expect(reason != nil, "wait returned while the latest health check was failing")
+            } else {
+                await gate.releaseOldest(true)
+                #expect(await task.value == nil)
+                #expect(await supervisor.status().phase == .running)
+            }
+            await gate.releaseAll(false)
+            _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
+        } catch {
+            await gate.releaseAll(false)
+            _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
+            throw error
+        }
+    }
+
+    /** Same window as the wait above: the phase stays `running` through a
+        failing check, and ensure waits with it rather than returning. */
+    @Test func ensureWaitsWhileTheLatestProbeIsFailing() async throws {
+        let (supervisor, gate) = try await serverPastOneFailedProbe()
+        do {
+            let flag = FinishFlag()
+            let task = Task {
+                let result = await supervisor.ensure(timeoutSeconds: 3)
+                await flag.mark()
+                return result
+            }
+            let early = try await eventually(within: .milliseconds(500)) { await flag.finished }
+            if early {
+                let result = await task.value
+                #expect(result.reason != nil, "ensure returned while the latest health check was failing")
+            } else {
+                await gate.releaseOldest(true)
+                let result = await task.value
+                #expect(result.reason == nil)
+                #expect(result.server.phase == .running)
+            }
+            await gate.releaseAll(false)
+            _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
+        } catch {
+            await gate.releaseAll(false)
+            _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
+            throw error
+        }
+    }
+
+    /** Healthy, then one failure recorded, with the next probe held. Phase
+        stays `running` (`unhealthyAfter` is 3). */
+    private func serverPastOneFailedProbe() async throws -> (ServerSupervisor, ProbeGate) {
+        let gate = ProbeGate()
+        let (supervisor, _, _) = try makeSupervisor(
+            command: ["/bin/sh", "-c", "sleep 30"],
+            healthcheck: fastTCP,
+            prober: GateProber(gate: gate))
+        do {
+            _ = await supervisor.start()
+            try await waitForProbe(after: 0, gate: gate)
+            await gate.releaseOldest(true)
+            try await waitForProbe(after: 1, gate: gate)
+            try #require((await supervisor.status()).phase == .running)
+            await gate.releaseOldest(false)
+            try await waitForProbe(after: 2, gate: gate)
+            try #require((await supervisor.status()).phase == .running)
+            return (supervisor, gate)
+        } catch {
+            await gate.releaseAll(false)
+            _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
+            throw error
+        }
     }
 }
 
