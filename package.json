@@ -1,6 +1,6 @@
 {
   "name": "directa",
-  "version": "3.0.1",
+  "version": "3.1.0",
   "private": true,
   "description": "Version and changelog source of truth for GitHub releases (Swift product; not published to npm).",
   "repository": {
