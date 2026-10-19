@@ -675,7 +675,8 @@ private func reapStrayProcesses() {
         immediately but the listening socket outlives the call by a moment, and
         a suite spawning straight afterwards would race it and fail with
         `port-held` naming a pid this had just killed. */
-    for _ in 0..<100 where !killed.isEmpty {
+    let reapedBy = ContinuousClock.now + .seconds(2)
+    while !killed.isEmpty, ContinuousClock.now < reapedBy {
         killed = killed.filter { kill($0, 0) == 0 }
         if killed.isEmpty { break }
         usleep(20_000)

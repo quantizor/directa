@@ -571,10 +571,12 @@ final class TestHTTPResponder: @unchecked Sendable {
         var incoming = pollfd(fd: client, events: Int16(POLLIN), revents: 0)
         guard poll(&incoming, 1, 2000) == 1 else { return }
         _ = recv(client, &request, request.count, 0)
-        var waited = 0.0
-        while waited < delaySeconds, !isStopped {
+        /** A clock deadline, not a count of sleeps: timer coalescing on a
+            throttled CI runner wakes each short sleep late, so a hundred
+            counted sleeps add up to several times the delay asked for. */
+        let answerAt = ContinuousClock.now + .seconds(delaySeconds)
+        while ContinuousClock.now < answerAt, !isStopped {
             usleep(20_000)
-            waited += 0.02
         }
         let code = lock.withLock { statusCode }
         let cache = cacheControl.map { "Cache-Control: \($0)\r\nContent-Type: text/plain\r\n" } ?? ""
