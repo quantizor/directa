@@ -2807,9 +2807,10 @@ struct LockAcquireSchedule: Equatable, Sendable {
 
     /** Whether a `resource-locked` answer is worth waiting out, given the
         holder lookup made right after it. No answer (an older daemon without
-        lock.status) keeps waiting. An answer naming nobody means the daemon
-        refused for another reason (a `--pause` whose declarer would not stop
-        completely), which no wait clears. */
+        lock.status, or no lookup made) keeps waiting. An answer naming nobody
+        means the holder just released or the daemon refused for another reason
+        (a `--pause` whose declarer would not stop completely), which no wait
+        clears. */
     static func refusalIsContention(lookup: LockStatusResult?) -> Bool {
         guard let lookup else { return true }
         return lookup.holder != nil
@@ -2820,6 +2821,120 @@ struct LockAcquireSchedule: Equatable, Sendable {
     {
         guard let last = lastAnnouncedElapsed else { return false }
         return elapsed - last >= Self.announceIntervalSeconds
+    }
+}
+
+/** The daemon calls `directa lock` makes while it waits for a resource, behind
+    a protocol so a fake can script a holder that releases between them. */
+protocol LockRequesting: Sendable {
+    func acquire() async throws -> LockResult
+    /** Nil when the daemon cannot answer (an older daemon without lock.status). */
+    func status() async -> LockStatusResult?
+}
+
+protocol LockClock: Sendable {
+    func now() async -> Date
+    func sleep(seconds: Double) async
+}
+
+struct SystemLockClock: LockClock {
+    func now() async -> Date { Date() }
+
+    func sleep(seconds: Double) async {
+        /** A cancelled sleep only shortens one retry step; the budget still
+            ends the loop. */
+        try? await Task.sleep(for: .seconds(seconds))
+    }
+}
+
+struct DaemonClientLockRequester: LockRequesting {
+    let client: DaemonClient
+    let holderPid: Int
+    let pause: Bool
+    let project: String
+    let resource: String
+    let resumeTimeoutSeconds: Double
+
+    func acquire() async throws -> LockResult {
+        try await client.request(
+            .lockAcquire,
+            params: LockParams(
+                holderPid: holderPid, pause: pause, project: project, resource: resource,
+                resumeTimeoutSeconds: resumeTimeoutSeconds),
+            expecting: LockResult.self)
+    }
+
+    func status() async -> LockStatusResult? {
+        try? await client.request(
+            .lockStatus,
+            params: LockStatusParams(project: project, resource: resource),
+            expecting: LockStatusResult.self)
+    }
+}
+
+/** The acquire wait: retry a `resource-locked` refusal until the budget runs
+    out, saying who holds the resource while it waits. */
+struct LockAcquirer: Sendable {
+    let budgetSeconds: Double
+    let clock: any LockClock
+    let notice: @Sendable (String) -> Void
+    let requester: any LockRequesting
+    let resource: String
+
+    /** Throws the last `resource-locked` refusal when the budget runs out. Any
+        other failure propagates at once. */
+    func acquire() async throws -> LockResult {
+        let schedule = LockAcquireSchedule(budgetSeconds: budgetSeconds)
+        let started = await clock.now()
+        var announcedAt: Double?
+        /** Set after a refusal that found no holder: the holder may have
+            released between the refused acquire and the lookup, so the next
+            acquire goes out at once, and a second holderless refusal ends it. */
+        var retriedHolderless = false
+        while true {
+            do {
+                return try await requester.acquire()
+            } catch let error as WireError where error.code == .resourceLocked {
+                let now = await clock.now()
+                let elapsed = now.timeIntervalSince(started)
+                let first = announcedAt == nil
+                let due =
+                    first
+                    || schedule.shouldAnnounceStillWaiting(
+                        atElapsed: elapsed, lastAnnouncedElapsed: announcedAt)
+                /** The holder is looked up only when a notice is due or to
+                    judge the retry above, not on every one-second retry. An
+                    older daemon without lock.status answers nil, which keeps
+                    the wait going in silence. */
+                var lookup: LockStatusResult?
+                if due || retriedHolderless { lookup = await requester.status() }
+                if !LockAcquireSchedule.refusalIsContention(lookup: lookup) {
+                    /** Nobody holds it, so this is no contention: either the
+                        holder just released, or it is a `--pause` whose declarer
+                        would not stop completely, which no wait clears. */
+                    guard !retriedHolderless else { throw error }
+                    retriedHolderless = true
+                    continue
+                }
+                retriedHolderless = false
+                if due, let holder = lookup?.holder {
+                    notice(
+                        first
+                            ? LockNotice.contended(
+                                budgetSeconds: budgetSeconds, holder: holder, now: now, resource: resource)
+                            : LockNotice.stillWaiting(
+                                elapsedSeconds: elapsed, holder: holder,
+                                remainingSeconds: max(budgetSeconds - elapsed, 0), resource: resource))
+                    announcedAt = elapsed
+                }
+                guard schedule.shouldRetry(afterElapsed: elapsed) else { throw error }
+                await clock.sleep(seconds: LockAcquireSchedule.retryIntervalSeconds)
+                let resumed = await clock.now()
+                guard schedule.shouldRetry(afterElapsed: resumed.timeIntervalSince(started)) else {
+                    throw error
+                }
+            }
+        }
     }
 }
 
@@ -3013,6 +3128,7 @@ struct Lock: AsyncParsableCommand {
 
     /** Pure so the exact message is asserted without spawning the CLI. */
     static func usageError(command: [String], resource: String) -> WireError? {
+        if let refused = LockResource.nameError(resource) { return refused }
         guard command.isEmpty else { return nil }
         return WireError(
             code: .usage,
@@ -3042,65 +3158,31 @@ struct Lock: AsyncParsableCommand {
             CLIRunner.fail(GlobalOptions.goneWorkingDirectory, json: global.json)
         }
         let project = global.resolvedProject()
+        let inheritedEnvironment = ProcessInfo.processInfo.environment
+        /** Already inside this lock's hold (a guarded script locking the same
+            resource again): the parent holds it, so the command runs at once
+            and no second acquire waits on the parent. */
+        if Self.isReentrant(inherited: inheritedEnvironment, project: project, resource: resource) {
+            Foundation.exit(
+                Self.runGuardedCommand(
+                    command, run: GuardedRun(cwd: callerCwd, environment: inheritedEnvironment)))
+        }
         let holderPid = Int(getpid())
         let client = CLIRunner.client()
         /** Acquire with patience: another harness may hold it. The daemon owns
             pause/resume of declaring servers; this CLI just runs the command. */
-        let schedule = LockAcquireSchedule(budgetSeconds: acquireTimeout)
-        let started = Date()
-        var acquired: LockResult?
-        var announcedAt: Double?
-        var lastError: WireError?
-        repeat {
-            do {
-                acquired = try await client.request(
-                    .lockAcquire,
-                    params: LockParams(
-                        holderPid: holderPid, pause: pause, project: project, resource: resource,
-                        resumeTimeoutSeconds: timeout),
-                    expecting: LockResult.self)
-                break
-            } catch let error as WireError where error.code == .resourceLocked {
-                lastError = error
-                let elapsed = Date().timeIntervalSince(started)
-                let first = announcedAt == nil
-                let due =
-                    first
-                    || schedule.shouldAnnounceStillWaiting(
-                        atElapsed: elapsed, lastAnnouncedElapsed: announcedAt)
-                /** An older daemon without lock.status degrades to silence
-                    here rather than failing the acquire. */
-                let lookup = try? await client.request(
-                    .lockStatus,
-                    params: LockStatusParams(project: project, resource: resource),
-                    expecting: LockStatusResult.self)
-                /** A refusal while nobody holds the resource is not contention:
-                    it is a `--pause` whose declarer would not stop completely,
-                    which waiting cannot clear and every retry would re-attempt
-                    on servers already paused once. It fails now. */
-                if !LockAcquireSchedule.refusalIsContention(lookup: lookup) { break }
-                if due {
-                    if let holder = lookup?.holder {
-                        CLIRunner.note(
-                            first
-                                ? LockNotice.contended(
-                                    budgetSeconds: acquireTimeout, holder: holder, now: Date(),
-                                    resource: resource)
-                                : LockNotice.stillWaiting(
-                                    elapsedSeconds: elapsed, holder: holder,
-                                    remainingSeconds: max(acquireTimeout - elapsed, 0),
-                                    resource: resource))
-                        announcedAt = elapsed
-                    }
-                }
-                guard schedule.shouldRetry(afterElapsed: elapsed) else { break }
-                try? await Task.sleep(for: .seconds(LockAcquireSchedule.retryIntervalSeconds))
-            }
-        } while schedule.shouldRetry(afterElapsed: Date().timeIntervalSince(started))
-        guard let acquired else {
-            CLIRunner.fail(
-                lastError ?? WireError(code: .resourceLocked, message: "could not acquire '\(resource)'"),
-                json: global.json)
+        let acquirer = LockAcquirer(
+            budgetSeconds: acquireTimeout, clock: SystemLockClock(),
+            notice: { CLIRunner.note($0) },
+            requester: DaemonClientLockRequester(
+                client: client, holderPid: holderPid, pause: pause, project: project,
+                resource: resource, resumeTimeoutSeconds: timeout),
+            resource: resource)
+        let acquired: LockResult
+        do {
+            acquired = try await acquirer.acquire()
+        } catch let error as WireError where error.code == .resourceLocked {
+            CLIRunner.fail(error, json: global.json)
         }
         /** Progress chatter is stderr: stdout belongs to the guarded command, and
             --json governs stdout schemas. */
@@ -3120,7 +3202,7 @@ struct Lock: AsyncParsableCommand {
             run: GuardedRun(
                 cwd: callerCwd,
                 environment: Self.guardedEnvironment(
-                    inherited: ProcessInfo.processInfo.environment, project: project,
+                    inherited: inheritedEnvironment, project: project,
                     resource: resource)))
         var verdict = LockIdentityVerdict.silent
         if let statePath = acquired.statePath, let before {
@@ -3152,6 +3234,15 @@ struct Lock: AsyncParsableCommand {
         Foundation.exit(commandStatus)
     }
 
+    /** Whether the environment this run inherited already lists the lock it
+        asks for: it sits inside its own parent's hold, and acquiring again
+        would wait on that parent. */
+    static func isReentrant(inherited: [String: String], project: String, resource: String) -> Bool {
+        LockResource.isHeld(
+            inherited: inherited[LockResource.environmentKey],
+            key: LockResource.key(project: project, resource: resource))
+    }
+
     /** Where and with what environment the guarded command runs. */
     struct GuardedRun {
         let cwd: String
@@ -3160,10 +3251,14 @@ struct Lock: AsyncParsableCommand {
 
     /** The caller's environment plus `DIRECTA_LOCKS`: this lock's key appended
         to any value already inherited, so a tool with a lock of its own for the
-        same resource can tell it is already serialized. */
+        same resource can tell it is already serialized. A key the inherited
+        value already lists stays listed once. */
     static func guardedEnvironment(
         inherited: [String: String], project: String, resource: String
     ) -> [String: String] {
+        guard !isReentrant(inherited: inherited, project: project, resource: resource) else {
+            return inherited
+        }
         var environment = inherited
         environment[LockResource.environmentKey] = LockResource.exportedValue(
             inherited: inherited[LockResource.environmentKey],

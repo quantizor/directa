@@ -260,6 +260,30 @@ private func phaseOf(router: Router, project: String, name: String) async throws
             LockResult.self)
     }
 
+    /** A name holding `,` or `::` could not be split back out of the
+        `DIRECTA_LOCKS` list a guarded command reads, so the daemon refuses it
+        for a client that never checked, and holds nothing. */
+    @Test func acquireRefusesAResourceNameTheLockListCannotHold() async throws {
+        let env = try makeRouterEnv(named: "lock")
+        let registry = Registry(paths: env.paths)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        for name in ["a,b", "a::b"] {
+            let outcome = try await router.attempt(
+                .lockAcquire,
+                LockParams(holderPid: Int(getpid()), project: env.project, resource: name),
+                LockResult.self)
+            guard case .failure(let error) = outcome else {
+                Issue.record("a lock named \(name) was granted")
+                continue
+            }
+            #expect(error.code == .usage)
+            #expect(error.hint == "run: directa lock a-b -- <command>")
+        }
+        let status = try await router.call(
+            .lockStatus, LockStatusParams(project: env.project, resource: "a,b"), LockStatusResult.self)
+        #expect(status.holder == nil)
+    }
+
     /** If the harness survived the daemon restart, recover must leave the
         paused server down and keep the lock so ensure stays refused. */
     @Test func recoverLeavesPausedWhenHolderStillAlive() async throws {

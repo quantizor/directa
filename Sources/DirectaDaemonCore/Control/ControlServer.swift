@@ -2161,6 +2161,7 @@ public actor Router {
         active declarers without retiring boot intent; persist the hold and return
         who was paused and who was left running. */
     private func acquireLock(_ params: LockParams) async throws -> LockResult {
+        if let refused = LockResource.nameError(params.resource) { throw refused }
         let key = Self.lockKey(project: params.project, resource: params.resource)
         await releaseOrphanedLock(key: key)
         /** A reservation (an acquire still stopping declarers) contends with

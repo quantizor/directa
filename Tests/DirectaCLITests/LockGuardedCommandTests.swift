@@ -92,6 +92,35 @@ import Testing
         }
     }
 
+    /** A run already inside the lock it asks for is passed through: the key
+        stays listed once, so a chain of re-entrant locks does not grow the
+        variable. */
+    @Test func aLockAlreadyHeldIsNotListedTwice() throws {
+        try inScratchDir { dir in
+            let held = "\(physicalPath(dir.path))::d1"
+            let seen = try locksSeenByChild(
+                in: dir, inherited: "/other::c,\(held)", project: dir.path, resource: "d1")
+            #expect(seen == "/other::c,\(held)")
+        }
+    }
+
+    /** The decision `directa lock` makes before it contacts the daemon. */
+    @Test func aLockListedInTheEnvironmentIsReentrant() throws {
+        try inScratchDir { dir in
+            let held = "\(physicalPath(dir.path))::d1"
+            func reentrant(_ inherited: String?, resource: String = "d1") -> Bool {
+                Lock.isReentrant(
+                    inherited: [LockResource.environmentKey: inherited].compactMapValues { $0 },
+                    project: dir.path, resource: resource)
+            }
+            #expect(reentrant(held))
+            #expect(reentrant("/other::c,\(held)"))
+            #expect(!reentrant(nil))
+            #expect(!reentrant("/other::c"))
+            #expect(!reentrant(held, resource: "d2"))
+        }
+    }
+
     @Test func aSubdirectoryIsDistinctFromItsParent() throws {
         try inScratchDir { dir in
             let sub = dir.appending(path: "sub")
