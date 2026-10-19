@@ -4,6 +4,24 @@ import Foundation
     one place so the pause loop, the lock gate, and the identity check cannot
     disagree about which servers declare a resource or where its state lives. */
 public enum LockResource {
+    /** The environment variable a guarded command reads to learn which locks
+        already serialize it. */
+    public static let environmentKey = "DIRECTA_LOCKS"
+
+    /** The identity of one lock: the project's canonical path and the resource,
+        the form the daemon keys its holds on and `DIRECTA_LOCKS` lists. */
+    public static func key(project: String, resource: String) -> String {
+        "\(canonicalProjectPath(project))::\(resource)"
+    }
+
+    /** The `DIRECTA_LOCKS` value for a command run under `held`: any value the
+        caller inherited (a lock this run already sits inside) followed by
+        `held`, comma-joined. */
+    public static func exportedValue(inherited: String?, held: String) -> String {
+        guard let inherited, !inherited.isEmpty else { return held }
+        return "\(inherited),\(held)"
+    }
+
     public static func declares(resource: String, spec: ServerSpec) -> Bool {
         (spec.locks ?? []).contains { $0.name == resource }
     }

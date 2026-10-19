@@ -263,6 +263,25 @@ import Testing
         #expect(LockResource.declarers(resource: "d1", specs: specs) == ["api", "web"])
     }
 
+    /** A lock is named by its project's canonical path, so `/tmp` and
+        `/private/tmp` spellings of one checkout are one lock. */
+    @Test func aLockKeyIsTheCanonicalProjectPathAndTheResource() {
+        #expect(
+            LockResource.key(project: "/tmp", resource: "d1") == "\(canonicalProjectPath("/tmp"))::d1")
+        #expect(
+            LockResource.key(project: "/tmp", resource: "d1")
+                == LockResource.key(project: "/private/tmp", resource: "d1"))
+    }
+
+    @Test func exportedLocksAppendToWhatTheCallerInherited() {
+        #expect(LockResource.exportedValue(inherited: nil, held: "/p::d1") == "/p::d1")
+        #expect(LockResource.exportedValue(inherited: "", held: "/p::d1") == "/p::d1")
+        #expect(LockResource.exportedValue(inherited: "/q::c", held: "/p::d1") == "/q::c,/p::d1")
+        #expect(
+            LockResource.exportedValue(inherited: "/q::c,/r::e", held: "/p::d1")
+                == "/q::c,/r::e,/p::d1")
+    }
+
     /** A lock's state path is documented as project-relative, so it is enforced
         rather than trusted: a committed config must not be able to aim the
         fingerprint at somewhere outside the project. */

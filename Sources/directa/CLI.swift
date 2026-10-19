@@ -3026,24 +3026,19 @@ struct Lock: AsyncParsableCommand {
             } catch let error as WireError where error.code == .resourceLocked {
                 lastError = error
                 let elapsed = Date().timeIntervalSince(started)
-                /** Only look the holder up when there is something to say. The
-                    notice fires once on first contention and then on an interval,
-                    so querying every retry would spend hundreds of round trips
-                    over a long wait to print nothing. */
                 let first = announcedAt == nil
                 let due =
                     first
                     || schedule.shouldAnnounceStillWaiting(
                         atElapsed: elapsed, lastAnnouncedElapsed: announcedAt)
+                /** An older daemon without lock.status degrades to silence
+                    here rather than failing the acquire. */
+                let lookup = try? await client.request(
+                    .lockStatus,
+                    params: LockStatusParams(project: project, resource: resource),
+                    expecting: LockStatusResult.self)
                 if due {
-                    /** An older daemon without lock.status degrades to silence
-                        here rather than failing the acquire. */
-                    let holder = try? await client.request(
-                        .lockStatus,
-                        params: LockStatusParams(project: project, resource: resource),
-                        expecting: LockStatusResult.self
-                    ).holder
-                    if let holder {
+                    if let holder = lookup?.holder {
                         CLIRunner.note(
                             first
                                 ? LockNotice.contended(
@@ -3078,7 +3073,13 @@ struct Lock: AsyncParsableCommand {
         /** Identity is taken before the command and again before release, so a
             resumed server's first writes are never blamed on the command. */
         let before = acquired.statePath.map(ResourceFingerprint.capture(path:))
-        let commandStatus = Self.runGuardedCommand(command, cwd: callerCwd)
+        let commandStatus = Self.runGuardedCommand(
+            command,
+            run: GuardedRun(
+                cwd: callerCwd,
+                environment: Self.guardedEnvironment(
+                    inherited: ProcessInfo.processInfo.environment, project: project,
+                    resource: resource)))
         var verdict = LockIdentityVerdict.silent
         if let statePath = acquired.statePath, let before {
             verdict = LockIdentityVerdict.of(
@@ -3109,14 +3110,34 @@ struct Lock: AsyncParsableCommand {
         Foundation.exit(commandStatus)
     }
 
-    /** Spawns the guarded command with inherited stdio in `cwd`, so a test can
-        assert what directory a real child process observes without acquiring a
-        resource or a live daemon. */
-    static func runGuardedCommand(_ command: [String], cwd: String) -> Int32 {
+    /** Where and with what environment the guarded command runs. */
+    struct GuardedRun {
+        let cwd: String
+        let environment: [String: String]
+    }
+
+    /** The caller's environment plus `DIRECTA_LOCKS`: this lock's key appended
+        to any value already inherited, so a tool with a lock of its own for the
+        same resource can tell it is already serialized. */
+    static func guardedEnvironment(
+        inherited: [String: String], project: String, resource: String
+    ) -> [String: String] {
+        var environment = inherited
+        environment[LockResource.environmentKey] = LockResource.exportedValue(
+            inherited: inherited[LockResource.environmentKey],
+            held: LockResource.key(project: project, resource: resource))
+        return environment
+    }
+
+    /** Spawns the guarded command with inherited stdio in `run.cwd` and
+        `run.environment`, so a test can assert what a real child process
+        observes without acquiring a resource or a live daemon. */
+    static func runGuardedCommand(_ command: [String], run: GuardedRun) -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = command
-        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+        process.currentDirectoryURL = URL(fileURLWithPath: run.cwd)
+        process.environment = run.environment
         do {
             try process.run()
         } catch {
