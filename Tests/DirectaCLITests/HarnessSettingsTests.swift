@@ -600,7 +600,7 @@ import os
 
     /** A Claude Code subagent shares its parent's `session_id` and adds `agent_id`;
         the record file separates them with `+`, which sanitizing removes from
-        both ids, so no two (session, agent) pairs can share a file. */
+        both ids, so a session id cannot pose as a session and an agent. */
     @Test func claudeRecordsAreKeyedOnSessionAndAgent() {
         func key(_ json: String, environment: [String: String] = [:]) -> String {
             ClaudeCodeAdapter.conversationFileKey(

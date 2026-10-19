@@ -160,7 +160,8 @@ public enum HookChange {
         `enteringBad` named; of those, the last `HookErrorText.lineLimit` that
         the record has not shown for `project` are quoted. Harness fields and
         other projects' entries on the stored record are copied onto the
-        result. The caller updates the harness fields. */
+        result, except that a `boundary` drops the other projects' entries. The
+        caller updates the harness fields. */
     public static func outcome(
         stored: HookConversationRecord?,
         project: String,
@@ -174,7 +175,9 @@ public enum HookChange {
                 picture: picture,
                 shownErrorLines: pruned(stored?.projects?[project]?.shownErrorLines, to: picture))
             return HookChangeOutcome(
-                newErrorLines: false, record: recording(entry, for: project, in: stored), text: summary)
+                newErrorLines: false,
+                record: recording(entry, for: project, in: stored, droppingOthers: boundary),
+                text: summary)
         }
         guard known.picture != picture else {
             return HookChangeOutcome(newErrorLines: false, record: stored, text: nil)
@@ -192,7 +195,7 @@ public enum HookChange {
             shown[name] = Array(((shown[name] ?? []) + fresh).suffix(shownLinesLimit))
         }
         let entry = HookProjectRecord(picture: picture, shownErrorLines: pruned(shown, to: picture))
-        let record = recording(entry, for: project, in: stored)
+        let record = recording(entry, for: project, in: stored, droppingOthers: false)
         let blocks = changeBlocks(old: known.picture, new: picture, quotes: quotes)
         guard !blocks.isEmpty else {
             return HookChangeOutcome(newErrorLines: false, record: record, text: nil)
@@ -202,11 +205,14 @@ public enum HookChange {
             newErrorLines: quotes.values.contains { !$0.isEmpty }, record: record, text: text)
     }
 
+    /** A boundary starts the conversation over, so the pictures of every other
+        project go with it and each speaks its full summary on return. */
     private static func recording(
-        _ entry: HookProjectRecord, for project: String, in stored: HookConversationRecord?
+        _ entry: HookProjectRecord, for project: String, in stored: HookConversationRecord?,
+        droppingOthers: Bool
     ) -> HookConversationRecord {
         var record = stored ?? HookConversationRecord()
-        var projects = record.projects ?? [:]
+        var projects = droppingOthers ? [:] : record.projects ?? [:]
         projects[project] = entry
         record.projects = projects
         return record
@@ -294,6 +300,7 @@ public enum HookSnapshotStore {
 
     public static let fallbackKey = "nosession"
     public static let maxKeyLength = 128
+    public static let maxFileKeyLength = 200
 
     /** A conversation id becomes one path component. Anything outside the
         filename alphabet is dropped, the result is capped, and an empty result
@@ -310,12 +317,24 @@ public enum HookSnapshotStore {
         the same file. The caller picks the pieces. The session id and the agent
         id are each sanitized once. `scope` is a fixed harness slug. A subagent
         shares its parent's session id, so a non-empty `agent` takes a file of
-        its own, joined with `+`, which sanitizing removes from both ids so no
-        two (session, agent) pairs can name one file. */
+        its own, joined with `+`, which sanitizing removes from both ids, so
+        two pairs of ids whose sanitized forms differ never share a file.
+
+        The key stays within `maxFileKeyLength` (room for the lock file's
+        prefix and the write's temp name under the 255-byte name limit). When
+        the plain key would pass it, the agent part becomes `~` and the first
+        32 hex characters of a SHA-256 over the raw agent id: sanitizing
+        removes `~`, so a hashed key never equals a plain one, and agent ids
+        that differ anywhere stay apart. Ids that sanitize to the same string
+        (differing only in dropped characters, or past `maxKeyLength`) share a
+        file when the plain key fits. */
     public static func fileKey(scope: String, session: String?, agent: String? = nil) -> String {
         let base = "\(scope)-\(sessionKey(session))"
         guard let agent, !agent.isEmpty else { return base }
-        return "\(base)+\(sessionKey(agent))"
+        let plain = "\(base)+\(sessionKey(agent))"
+        guard plain.utf8.count > maxFileKeyLength else { return plain }
+        let digest = DirectaPaths.hashHex(Array(agent.utf8)).prefix(32)
+        return "\(base)+~\(digest)"
     }
 
     /** How long a hook waits for another invocation on the same record before

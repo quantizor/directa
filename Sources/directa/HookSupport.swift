@@ -73,15 +73,21 @@ enum HookContext {
     }
 }
 
-/** Asks the daemon, compares the picture, and stores it under `project`'s entry
-    in the record. `boundary` is read from the record already on disk. `amend` may update harness fields on that
-    record before it is saved, including when the picture did not change.
-    A failed status read stores nothing and writes an empty answer. */
-enum HookSpeak {
-    struct Answer: Equatable {
-        var newErrorLines: Bool
-        var text: String?
+/** The daemon reads a hook makes, over the CLI's socket client. */
+struct DaemonHookReads: HookDaemonReading {
+    func status(project: String) async -> ServerListResult? {
+        await HookContext.status(project: project)
     }
+
+    func errorLines(project: String, server: String) async -> [String]? {
+        await HookContext.errorLines(project: project, server: server)
+    }
+}
+
+/** Runs `HookSpeaker` against the daemon and hands its answer to the harness's
+    envelope writer. */
+enum HookSpeak {
+    typealias Answer = HookSpeaker.Answer
 
     static func deliver(
         project: String,
@@ -92,64 +98,12 @@ enum HookSpeak {
         amend: ((inout HookConversationRecord, Answer, Bool) -> Void)? = nil,
         write: (Answer) -> Void
     ) async {
-        let directory = HookSnapshotStore.directory(environment: environment)
-        /** The record is read, compared, and saved under one lock, so tool
-            calls that finish together take turns instead of all loading the
-            same stored picture and all speaking. */
-        let answer = await HookSnapshotStore.exclusively(fileKey: fileKey, directory: directory) {
-            await compare(
-                project: project, harness: harness, fileKey: fileKey, directory: directory,
-                boundary: boundary, amend: amend)
-        }
+        let request = HookSpeaker.Request(
+            directory: HookSnapshotStore.directory(environment: environment), fileKey: fileKey,
+            harness: harness, project: project)
+        let answer = await HookSpeaker.speak(
+            request, reads: DaemonHookReads(), boundary: boundary, amend: amend)
         write(answer)
-    }
-
-    private static func compare(
-        project: String,
-        harness: AgentContext.Harness,
-        fileKey: String,
-        directory: URL,
-        boundary: (HookConversationRecord?) -> Bool,
-        amend: ((inout HookConversationRecord, Answer, Bool) -> Void)?
-    ) async -> Answer {
-        let stored = HookSnapshotStore.load(fileKey: fileKey, directory: directory)
-        let isBoundary = boundary(stored)
-        guard let list = await HookContext.status(project: project) else {
-            return Answer(newErrorLines: false, text: nil)
-        }
-        /** An untrusted project is invisible to the hook, so its servers read
-            as new once trust is recorded. */
-        let servers = list.trusted == true ? list.servers : []
-        let picture = HookChange.picture(of: servers)
-        let lines = await errorLines(
-            project: project, stored: stored, picture: picture, boundary: isBoundary)
-        let outcome = HookChange.outcome(
-            stored: stored, project: project, picture: picture, errorLines: lines,
-            summary: AgentContext.render(list: list, harness: harness), boundary: isBoundary)
-        var record = outcome.record
-        let answer = Answer(newErrorLines: outcome.newErrorLines, text: outcome.text)
-        amend?(&record, answer, isBoundary)
-        if record != stored {
-            HookSnapshotStore.save(record, fileKey: fileKey, directory: directory)
-        }
-        return answer
-    }
-
-    /** The latest err lines of each server that just entered a bad state, and
-        no log read for anything else. */
-    private static func errorLines(
-        project: String, stored: HookConversationRecord?, picture: HookServerPicture, boundary: Bool
-    ) async -> [String: [String]] {
-        guard !boundary else { return [:] }
-        var lines: [String: [String]] = [:]
-        for name in HookChange.enteringBad(
-            stored: stored?.projects?[project]?.picture, current: picture)
-        {
-            if let fetched = await HookContext.errorLines(project: project, server: name) {
-                lines[name] = fetched
-            }
-        }
-        return lines
     }
 }
 

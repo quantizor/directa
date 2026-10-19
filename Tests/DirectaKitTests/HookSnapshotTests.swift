@@ -311,68 +311,204 @@ import Testing
         #expect(result.record.projects == record(servers).projects)
     }
 
+    /** Both ids at their cap would make `claude-` + 128 + `+` + 128 characters,
+        past the 255-byte file name limit once the lock file's prefix and the
+        write's temp name are added, and a write that fails is dropped silently,
+        so the agent would be re-told the full summary on every call. */
+    @Test func maximumLengthIdsStillNameAFileThatCanBeWritten() throws {
+        let session = String(repeating: "s", count: 300)
+        let agent = String(repeating: "a", count: 300)
+        let key = HookSnapshotStore.fileKey(scope: "antigravity", session: session, agent: agent)
+        #expect(key.utf8.count <= HookSnapshotStore.maxFileKeyLength)
+        let longest = AtomicFile.tempName(for: URL(fileURLWithPath: "/d/\(key)"))
+        #expect(longest.utf8.count <= 255)
+        #expect(".lock-\(key)".utf8.count <= 255)
+
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let saved = record([server()])
+        HookSnapshotStore.save(saved, fileKey: key, directory: directory)
+        #expect(HookSnapshotStore.load(fileKey: key, directory: directory) == saved)
+    }
+
+    /** The agent part is hashed only to fit, so two agents that differ past
+        the id cap still get their own file, and a hashed key cannot equal one
+        built from ids in the filename alphabet. */
+    @Test func hashedKeysStayDistinctPerAgentAndFromPlainKeys() {
+        let session = String(repeating: "s", count: 128)
+        let first = HookSnapshotStore.fileKey(
+            scope: "claude", session: session, agent: String(repeating: "a", count: 200) + "1")
+        let second = HookSnapshotStore.fileKey(
+            scope: "claude", session: session, agent: String(repeating: "a", count: 200) + "2")
+        #expect(first != second)
+        #expect(
+            first
+                == HookSnapshotStore.fileKey(
+                    scope: "claude", session: session, agent: String(repeating: "a", count: 200) + "1"))
+        #expect(first.hasPrefix("claude-\(session)+"))
+        #expect(first.contains("+~"))
+    }
+
+    @Test func keysThatFitAreUnchanged() {
+        #expect(HookSnapshotStore.fileKey(scope: "claude", session: "s1", agent: "a1") == "claude-s1+a1")
+        let atCap = String(repeating: "a", count: HookSnapshotStore.maxKeyLength)
+        #expect(
+            HookSnapshotStore.fileKey(scope: "claude", session: "s1", agent: atCap)
+                == "claude-s1+\(atCap)")
+    }
+
     private func claudeKey(_ json: String) -> String {
         ClaudeCodeAdapter.conversationFileKey(
             payload: HookPayload.parse(Data(json.utf8)), environment: [:])
     }
 
-    /** One hook call as `directa hook claude-post-tool` makes it: load the
-        record the payload names, compare, store, answer. */
-    private func call(
-        _ payload: String, project: String, servers: [ServerStatus], directory: URL
-    ) -> String? {
-        let key = claudeKey(payload)
-        let stored = HookSnapshotStore.load(fileKey: key, directory: directory)
-        let result = HookChange.outcome(
-            stored: stored, project: project, picture: HookChange.picture(of: servers),
-            summary: summary(for: servers), boundary: false)
-        if result.record != stored {
-            HookSnapshotStore.save(result.record, fileKey: key, directory: directory)
+    /** The daemon as a hook sees it: one scripted status list, optionally slow
+        to answer. */
+    private struct ScriptedReads: HookDaemonReading {
+        var delay: Duration?
+        var errorLines: [String: [String]] = [:]
+        var servers: [ServerStatus]
+        var trusted = true
+
+        func status(project: String) async -> ServerListResult? {
+            if let delay { try? await Task.sleep(for: delay) }
+            return ServerListResult(servers: servers, trusted: trusted)
         }
-        return result.text
+
+        func errorLines(project: String, server: String) async -> [String]? {
+            errorLines[server]
+        }
     }
 
-    @Test func aParentAndItsSubagentEachSpeakOnceNoMatterTheCheckout() throws {
+    private struct SilentDaemon: HookDaemonReading {
+        func status(project: String) async -> ServerListResult? { nil }
+        func errorLines(project: String, server: String) async -> [String]? { nil }
+    }
+
+    /** One hook call as `directa hook claude-post-tool` makes it, through the
+        same `HookSpeaker` the CLI runs. */
+    private func call(
+        _ payload: String, project: String, servers: [ServerStatus], directory: URL,
+        boundary: Bool = false
+    ) async -> String? {
+        let answer = await HookSpeaker.speak(
+            HookSpeaker.Request(
+                directory: directory, fileKey: claudeKey(payload), harness: .neutral, project: project),
+            reads: ScriptedReads(servers: servers), boundary: { _ in boundary })
+        return answer.text
+    }
+
+    @Test func aParentAndItsSubagentEachSpeakOnceNoMatterTheCheckout() async throws {
         let directory = try TemporaryTree.directory(named: "snapshots")
         let servers = [server(name: "pirl")]
         let parent = #"{"session_id":"s1"}"#
         let child = #"{"session_id":"s1","agent_id":"a1"}"#
         var answers: [String?] = []
         for _ in 0..<3 {
-            answers.append(call(parent, project: "/main", servers: servers, directory: directory))
-            answers.append(call(child, project: "/main/.claude/worktrees/a1", servers: servers, directory: directory))
+            answers.append(await call(parent, project: "/main", servers: servers, directory: directory))
+            answers.append(
+                await call(
+                    child, project: "/main/.claude/worktrees/a1", servers: servers, directory: directory))
         }
         let full = summary(for: servers)
         #expect(answers == [full, full, nil, nil, nil, nil])
     }
 
-    @Test func aSubagentInTheParentsCheckoutStillKeepsItsOwnRecord() throws {
+    @Test func aSubagentInTheParentsCheckoutStillKeepsItsOwnRecord() async throws {
         let directory = try TemporaryTree.directory(named: "snapshots")
         let servers = [server()]
         let parent = #"{"session_id":"s1"}"#
         let child = #"{"session_id":"s1","agent_id":"a1"}"#
         let other = #"{"session_id":"s1","agent_id":"a2"}"#
-        let answers = [
-            call(parent, project: "/proj", servers: servers, directory: directory),
-            call(child, project: "/proj", servers: servers, directory: directory),
-            call(other, project: "/proj", servers: servers, directory: directory),
-            call(child, project: "/proj", servers: servers, directory: directory),
-        ]
+        var answers: [String?] = []
+        for payload in [parent, child, other, child] {
+            answers.append(await call(payload, project: "/proj", servers: servers, directory: directory))
+        }
         let full = summary(for: servers)
         #expect(answers == [full, full, full, nil])
     }
 
-    @Test func oneAgentAlternatingBetweenCheckoutsSpeaksOnlyEachFirstSummary() throws {
+    @Test func oneAgentAlternatingBetweenCheckoutsSpeaksOnlyEachFirstSummary() async throws {
         let directory = try TemporaryTree.directory(named: "snapshots")
         let main = [server(name: "native"), server(name: "sandbox", port: 3001)]
         let branch = [server(name: "pirl", port: 4000)]
         let payload = #"{"session_id":"s1"}"#
         var answers: [String?] = []
         for _ in 0..<3 {
-            answers.append(call(payload, project: "/main", servers: main, directory: directory))
-            answers.append(call(payload, project: "/branch", servers: branch, directory: directory))
+            answers.append(await call(payload, project: "/main", servers: main, directory: directory))
+            answers.append(await call(payload, project: "/branch", servers: branch, directory: directory))
         }
         #expect(answers == [summary(for: main), summary(for: branch), nil, nil, nil, nil])
+    }
+
+    /** The boundary rule end to end: a session start in `/a` forgets `/b`, so
+        `/b` speaks its full summary on the next call although nothing in it
+        changed. */
+    @Test func aBoundaryInOneCheckoutMakesTheNextCheckoutSpeakItsFullSummary() async throws {
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let a = [server()]
+        let b = [server(name: "api", port: 4000)]
+        let payload = #"{"session_id":"s1"}"#
+        var answers: [String?] = []
+        answers.append(await call(payload, project: "/a", servers: a, directory: directory))
+        answers.append(await call(payload, project: "/b", servers: b, directory: directory))
+        answers.append(await call(payload, project: "/b", servers: b, directory: directory))
+        answers.append(
+            await call(payload, project: "/a", servers: a, directory: directory, boundary: true))
+        answers.append(await call(payload, project: "/b", servers: b, directory: directory))
+        #expect(answers == [summary(for: a), summary(for: b), nil, summary(for: a), summary(for: b)])
+    }
+
+    @Test func aSilentDaemonStoresNothingAndSaysNothing() async throws {
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let key = claudeKey(#"{"session_id":"s1"}"#)
+        let answer = await HookSpeaker.speak(
+            HookSpeaker.Request(directory: directory, fileKey: key, harness: .neutral, project: "/a"),
+            reads: SilentDaemon(), boundary: { _ in true })
+        #expect(answer == HookSpeaker.Answer(newErrorLines: false, text: nil))
+        #expect(HookSnapshotStore.load(fileKey: key, directory: directory) == nil)
+    }
+
+    @Test func anUntrustedProjectReadsAsEmptyUntilTrustIsRecorded() async throws {
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let key = claudeKey(#"{"session_id":"s1"}"#)
+        let request = HookSpeaker.Request(
+            directory: directory, fileKey: key, harness: .neutral, project: "/a")
+        let untrusted = await HookSpeaker.speak(
+            request, reads: ScriptedReads(servers: [server()], trusted: false), boundary: { _ in false })
+        #expect(untrusted.text == nil)
+        #expect(HookSnapshotStore.load(fileKey: key, directory: directory) == record([], project: "/a"))
+        let trusted = await HookSpeaker.speak(
+            request, reads: ScriptedReads(servers: [server()]), boundary: { _ in false })
+        #expect(trusted.text == fenced("web: new, running; url http://web.localhost:3000"))
+    }
+
+    /** A crash quotes the err lines the daemon reports, and the amend hook sees
+        the answer and boundary flag before the record is saved. */
+    @Test func aCrashQuotesFetchedLinesAndAmendRunsBeforeTheSave() async throws {
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let key = claudeKey(#"{"session_id":"s1"}"#)
+        let request = HookSpeaker.Request(
+            directory: directory, fileKey: key, harness: .neutral, project: "/a")
+        _ = await HookSpeaker.speak(
+            request, reads: ScriptedReads(servers: [server()]), boundary: { _ in false })
+        let counts = AntigravityConversation(lastInitialNumSteps: 3, pullBacks: 0)
+        let crashed = await HookSpeaker.speak(
+            request,
+            reads: ScriptedReads(
+                errorLines: ["web": ["boom"]], servers: [server(exitCode: 1, phase: .crashed)]),
+            boundary: { _ in false },
+            amend: { record, answer, boundary in
+                #expect(answer.newErrorLines)
+                #expect(!boundary)
+                record.antigravity = counts
+            })
+        #expect(
+            crashed.text
+                == fenced("web: crashed (was running); exit 1; run: directa why web", "  err: boom"))
+        #expect(crashed.newErrorLines)
+        let saved = try #require(HookSnapshotStore.load(fileKey: key, directory: directory))
+        #expect(saved.antigravity == counts)
+        #expect(saved.projects?["/a"]?.shownErrorLines == ["web": ["boom"]])
     }
 
     @Test func eachCheckoutIsComparedWithItsOwnLastPicture() {
@@ -387,6 +523,22 @@ import Testing
             back.record.projects?["/b"]?.picture == HookChange.picture(of: [server(name: "api", port: 4000)]))
     }
 
+    /** A session boundary (a new or compacted conversation) forgets what the
+        agent was shown about every other checkout, so coming back to one of
+        them speaks its full summary rather than a diff against a stale picture. */
+    @Test func aBoundaryDropsThePicturesOfEveryOtherProject() {
+        let counts = AntigravityConversation(lastInitialNumSteps: 7, pullBacks: 2)
+        let elsewhere = outcome(from: nil, to: [server(name: "api", port: 4000)], project: "/b")
+        let stored = HookConversationRecord(antigravity: counts, projects: elsewhere.record.projects)
+        let boundary = outcome(from: nil, to: [server()], project: "/a", stored: stored, boundary: true)
+        #expect(boundary.text == summary(for: [server()]))
+        #expect(Set(boundary.record.projects?.keys ?? [:].keys) == ["/a"])
+        #expect(boundary.record.antigravity == counts)
+        let back = outcome(
+            from: nil, to: [server(name: "api", port: 4000)], project: "/b", stored: boundary.record)
+        #expect(back.text == summary(for: [server(name: "api", port: 4000)]))
+    }
+
     @Test func aNewCheckoutKeepsTheAntigravityCounts() {
         let counts = AntigravityConversation(lastInitialNumSteps: 7, pullBacks: 2)
         let stored = record([server()], project: "/a", antigravity: counts)
@@ -397,23 +549,15 @@ import Testing
 
     @Test func concurrentCallsOnOneRecordSpeakExactlyOnce() async throws {
         let directory = try TemporaryTree.directory(named: "snapshots")
-        let servers = [server()]
-        let full = try #require(summary(for: servers))
+        /** The slow status answer widens the window a second caller would
+            load the same stored record in. */
+        let reads = ScriptedReads(delay: .milliseconds(25), servers: [server()])
+        let request = HookSpeaker.Request(
+            directory: directory, fileKey: "claude-s1", harness: .neutral, project: "/proj")
         let spoke = await withTaskGroup(of: Bool.self) { group in
             for _ in 0..<8 {
                 group.addTask {
-                    await HookSnapshotStore.exclusively(fileKey: "claude-s1", directory: directory) {
-                        let stored = HookSnapshotStore.load(fileKey: "claude-s1", directory: directory)
-                        /** Widens the window a second caller would load in. */
-                        try? await Task.sleep(for: .milliseconds(25))
-                        let result = HookChange.outcome(
-                            stored: stored, project: "/proj", picture: HookChange.picture(of: servers),
-                            summary: full, boundary: false)
-                        if result.record != stored {
-                            HookSnapshotStore.save(result.record, fileKey: "claude-s1", directory: directory)
-                        }
-                        return result.text != nil
-                    }
+                    await HookSpeaker.speak(request, reads: reads, boundary: { _ in false }).text != nil
                 }
             }
             return await group.reduce(0) { $0 + ($1 ? 1 : 0) }
