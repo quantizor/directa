@@ -110,6 +110,23 @@ public actor ServerSupervisor {
         let waitBound: Duration
     }
 
+    /** What the Router prepared for the next run: the materialized spec and the
+        port bookkeeping that goes with it. It sits apart from the fields that
+        describe the current run (`spec`, `effectivePort`, `portClaim`, and
+        their companions) until a spawn or an adopt moves it in, so preparing a
+        spawn never changes what status and other servers' port checks read for
+        a run that is still alive. `forRestart` marks a restart's slot, staged
+        while the run it replaces is up: a start or ensure that joins that run
+        leaves it for the restart's own spawn. */
+    struct PendingSpawn: Sendable {
+        var claim: PortClaim?
+        var declaredPort: Int?
+        var effectivePort: Int?
+        var forRestart = false
+        var portConflict: PortConflict?
+        var spec: ServerSpec
+    }
+
     /** The log tail a terminal run's status shows, read once rather than per
         status call: the log stops growing once the process is gone, so one
         read at the transition is both cheaper and a truer snapshot of the
@@ -174,6 +191,14 @@ public actor ServerSupervisor {
     /** Set when a stop moves the phase to `.stopping`, cleared once the
         phase leaves it or a new run starts. */
     private var pendingStop: StopRequest?
+    /** The next run's prepared spawn, moved into the current-run fields when a
+        run starts or is adopted (`resetForNewRun`) and dropped when the
+        transition that prepared it is abandoned or joins a run instead. While
+        it is set, a status read's committed spec does not replace `spec`: a
+        restart's stop leaves a stopped gap between the prepare and the start,
+        and a read landing in it would otherwise spawn the run without the
+        prepared port. */
+    private var pendingSpawn: PendingSpawn?
     /** `didSet` is the one home for leaving `.stopping`: every caller that must
         not proceed until a stop (or the drain half of a crash/exit) has fully
         landed awaits `waitForStoppingToClear` instead of polling `runTask`,
@@ -222,12 +247,6 @@ public actor ServerSupervisor {
         this supervisor's stops and waits. */
     private let serverID: String
     private var spawnError: SpawnError?
-    /** Set when the Router hands over a prepared spawn spec, cleared when the
-        next run starts or is adopted (`resetForNewRun`). While set, a status
-        read's committed spec does not replace `spec`: a restart's stop leaves
-        a stopped gap between the prepare and the start, and a read landing in
-        it would otherwise spawn the run without the prepared port. */
-    private var spawnSpecPrepared = false
     /** Waiters for the spawn settling (a pid, or a terminal phase). */
     private var spawnWaiters = PhaseWaiterList()
     private var spec: ServerSpec
@@ -322,30 +341,46 @@ public actor ServerSupervisor {
         DaemonActivity.shared.forgetPhase(key: writerID.uuidString)
     }
 
-    /** Hands the supervisor the spec its next run spawns under (the Router's
-        prepared, materialized spec). It stays in force until that run starts:
-        `refreshIdleSpec` will not replace it. */
-    public func updateSpec(_ newSpec: ServerSpec) {
-        spec = newSpec
-        spawnSpecPrepared = true
+    /** Hands the supervisor the spawn its next run starts under (the Router's
+        prepared, materialized spec and port bookkeeping). It replaces any
+        earlier pending spawn and stays pending until a run starts or is
+        adopted, or `abandonPreparedSpawn` drops it: `refreshIdleSpec` will not
+        replace the spec meanwhile, and nothing a status read or another
+        server's port check sees changes. */
+    func stageSpawn(_ pending: PendingSpawn) {
+        pendingSpawn = pending
     }
 
-    /** The prepared spec will not be used: the transition that prepared it
+    /** The prepared spawn will not be used: the transition that prepared it
         was refused or failed before any run started. Status reads resume
         applying committed config to this server. */
     public func abandonPreparedSpawn() {
-        spawnSpecPrepared = false
+        pendingSpawn = nil
+    }
+
+    /** A start or ensure that joined a run instead of spawning one: the spawn
+        a speculative prepare staged will never be used. A restart's slot
+        stays, since the run joined is the one that restart is about to
+        stop. */
+    private func discardPendingSpawnUnlessRestarting() {
+        if pendingSpawn?.forRestart != true { pendingSpawn = nil }
+    }
+
+    /** The claim the next run will hold: the pending spawn's, else the last
+        run's. What the port re-check between a stop and the spawn looks at. */
+    func nextRunClaim() -> PortClaim? {
+        pendingSpawn?.claim ?? portClaim
     }
 
     /** A status read's committed spec for a server with no run: assigned only
-        while nothing is alive and no prepared spawn spec is waiting for its
-        run. The check and the assignment are this one actor turn, so a start
-        cannot land between them; as two calls they let a read that saw an idle
+        while nothing is alive and no pending spawn is waiting for its run. The
+        check and the assignment are this one actor turn, so a start cannot
+        land between them; as two calls they let a read that saw an idle
         server replace the spec of a run that began meanwhile (a run reading
         stale for its whole life), or of one about to begin (a spawn without the
         injected port). */
     public func refreshIdleSpec(_ committed: ServerSpec) {
-        guard !hasLiveRun, !spawnSpecPrepared else { return }
+        guard !hasLiveRun, pendingSpawn == nil else { return }
         spec = committed
     }
 
@@ -430,18 +465,6 @@ public actor ServerSupervisor {
         watchRestarts.removeAll()
     }
 
-    /** Port metadata for status/agents. Call after materializing the spawn spec. */
-    public func setPortMeta(
-        claim: PortClaim? = nil,
-        declaredPort: Int?, effectivePort: Int?, portConflict: PortConflict? = nil
-    ) {
-        self.declaredPort = declaredPort
-        self.effectivePort = effectivePort
-        self.portClaim = claim
-        self.namedPorts = claim.flatMap { $0.named.isEmpty ? nil : $0.named }
-        self.portConflict = portConflict
-    }
-
     /** The pids of the run the last stop tore down; see `stoppedRunPids`. */
     public func lastStoppedRunPids() -> Set<Int> {
         stoppedRunPids
@@ -464,11 +487,16 @@ public actor ServerSupervisor {
         in-flight attempt. Returns once a pid exists or the spawn has failed; the
         phase stays `starting` until the healthcheck passes. */
     public func start() async -> ServerStatus {
-        guard removalReason == nil else { return await status() }
+        guard removalReason == nil else {
+            pendingSpawn = nil
+            return await status()
+        }
         switch phase {
         case .running, .unhealthy:
+            discardPendingSpawnUnlessRestarting()
             return await status()
         case .starting:
+            discardPendingSpawnUnlessRestarting()
             await waitForSpawnSettled()
             return await status()
         case .stopping:
@@ -477,6 +505,7 @@ public actor ServerSupervisor {
                 this request (and the wire call behind it) forever. */
             let bound = pendingStop?.waitBound ?? stopWaitBound(graceSeconds: stopTiming.graceSeconds)
             guard await waitForStoppingToClear(timeout: bound) else {
+                discardPendingSpawnUnlessRestarting()
                 return await status()
             }
             return await start()
@@ -486,7 +515,10 @@ public actor ServerSupervisor {
                 the new run's state, so it is stopped first; a stop that gives
                 up reports its honest `.stopping`. */
             let stopped = await stop(deliberate: false, reason: "restarting after a port failure")
-            guard stopped.phase != .stopping else { return stopped }
+            guard stopped.phase != .stopping else {
+                discardPendingSpawnUnlessRestarting()
+                return stopped
+            }
             return await start()
         case .crashed, .failed, .stopped:
             break
@@ -560,7 +592,10 @@ public actor ServerSupervisor {
     public func adopt(
         pid childPid: pid_t, label: String, boundPort: Int?, startedAt runStartedAt: Date?
     ) async -> Bool {
-        guard removalReason == nil, launcher.prepareAdopt(pid: childPid) else { return false }
+        guard removalReason == nil, launcher.prepareAdopt(pid: childPid) else {
+            pendingSpawn = nil
+            return false
+        }
         resetForNewRun()
         pid = childPid
         rootIdentity = readIdentity(childPid)
@@ -590,11 +625,13 @@ public actor ServerSupervisor {
         terminal, or timeout. */
     public func ensure(timeoutSeconds: Double) async -> EnsureResult {
         guard removalReason == nil else {
+            pendingSpawn = nil
             let server = await status()
             return EnsureResult(reason: .stopped, server: server)
         }
         switch phase {
         case .running:
+            discardPendingSpawnUnlessRestarting()
             /** Latest check failed, but not enough times to mark the server
                 unhealthy. Waiting is the whole point of ensure: returning now
                 would hand back a process that is refusing connections. */
@@ -602,15 +639,17 @@ public actor ServerSupervisor {
             let server = await status()
             return EnsureResult(server: server)
         case .unhealthy:
+            discardPendingSpawnUnlessRestarting()
             let server = await status()
             return EnsureResult(server: server)
         case .starting:
-            break
+            discardPendingSpawnUnlessRestarting()
         case .stopping:
             let budget = Self.boundedTimeoutSeconds(timeoutSeconds)
             let waitStart = ContinuousClock.now
             let cleared = await waitForStoppingToClear(timeout: .seconds(budget))
             guard cleared else {
+                discardPendingSpawnUnlessRestarting()
                 let server = await status()
                 return EnsureResult(reason: .timeout, server: server)
             }
@@ -1336,7 +1375,15 @@ public actor ServerSupervisor {
         recentLogTail = .unread
         lastDescendantSnapshot = []
         stoppedRunPids = []
-        spawnSpecPrepared = false
+        if let pending = pendingSpawn {
+            declaredPort = pending.declaredPort
+            effectivePort = pending.effectivePort
+            namedPorts = pending.claim.flatMap { $0.named.isEmpty ? nil : $0.named }
+            portClaim = pending.claim
+            portConflict = pending.portConflict
+            spec = pending.spec
+            pendingSpawn = nil
+        }
         clearRunHealth()
         runningSpecHash = Self.specHash(spec)
     }
@@ -1695,6 +1742,9 @@ public actor ServerSupervisor {
         clearRunHealth()
         phase = finalPhase
         pendingStop = nil
+        /** The run a restart's slot waited out is gone, so a start or ensure
+            that finds a run from here on has no restart to leave it for. */
+        pendingSpawn?.forRestart = false
         spawnWaiters.settleAll()
         /** An external graceful signal lands `.stopped` too, but directa's own
             stop() never ran its SIGTERM/SIGKILL escalation over this run's

@@ -333,9 +333,10 @@ private func makeEnv() throws -> RouterEnv {
         #expect(await rehydrated.status().blockedOn == "interactive-auth")
 
         /** A run that dies differently (instantly, here) breaks the pattern. */
-        await supervisor.updateSpec(
-            ServerSpec(
-                command: [fixture, "--exit-after", "0.1", "--code", "1"], name: "auth-stall"))
+        await supervisor.stageSpawn(
+            ServerSupervisor.PendingSpawn(
+                spec: ServerSpec(
+                    command: [fixture, "--exit-after", "0.1", "--code", "1"], name: "auth-stall")))
         _ = await supervisor.start()
         let third = try await awaitCrashed()
         #expect(third.phase == .crashed)
@@ -953,7 +954,8 @@ private func makeEnv() throws -> RouterEnv {
         _ = await supervisor.start()
         let crashed = try await awaitPhase(supervisor, .crashed)
         #expect(crashed.errorSummary?.count == 1)
-        await supervisor.updateSpec(ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "cycle"))
+        await supervisor.stageSpawn(
+            ServerSupervisor.PendingSpawn(spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "cycle")))
         _ = await supervisor.start()
         /** A fresh run starts with no tally; it fills only on the next failure. */
         #expect(await supervisor.status().errorSummary == nil)

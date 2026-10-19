@@ -66,6 +66,12 @@ public actor Router {
         already new. */
     private var finishedUnhealthyEnsureRestarts: [String: Int] = [:]
 
+    /** How many servers the ensure-restart bookkeeping above still names, in
+        flight or finished: a removed server must leave none behind. */
+    var ensureRestartRecordCount: Int {
+        Set(unhealthyEnsureRestarts.keys).union(finishedUnhealthyEnsureRestarts.keys).count
+    }
+
     private static let daemonStartingHint = "run: directa daemon status"
     /** The reason an ensure of an unhealthy server stops the run it replaces;
         the `stopped` event carries it as its detail. */
@@ -1146,6 +1152,8 @@ public actor Router {
             await retireRemovedState(name: name, project: project, writer: supervisor.writerID)
         }
         supervisors[id] = nil
+        unhealthyEnsureRestarts[id] = nil
+        finishedUnhealthyEnsureRestarts[id] = nil
         return outcome
     }
 
@@ -1522,6 +1530,11 @@ public actor Router {
         anything. The port pre-check treats a listener the target itself owns as
         free, so a running server does not report its own port as held.
 
+        `stopsPortFailedRun` is false for a caller that prepares a set and
+        stops the port-failed members itself once every member has passed
+        (`groupUp`), so a later member's refusal never leaves an earlier one
+        already killed.
+
         `userInitiated` is the security boundary: an explicit command (ensure,
         start, up, restart) acting on a server declared in the committed
         devservers.json IS the user's approval, so it records trust and proceeds.
@@ -1535,7 +1548,7 @@ public actor Router {
         deferral exists to prevent. */
     private func prepareSpawn(
         target: ServerTargetParams, supervisor: ServerSupervisor, portOverride: Int? = nil,
-        force: Bool = false, userInitiated: Bool = false
+        force: Bool = false, stopsPortFailedRun: Bool = true, userInitiated: Bool = false
     ) async throws {
         try refuseWhileDeferred(project: target.project, name: target.name)
         if !force {
@@ -1623,14 +1636,14 @@ public actor Router {
                     if let squatter {
                         throw WireError(
                             code: .portHeld,
-                            hint: "run: directa why \(ShellWord.inertOr(target.name))",
+                            hint: Self.whyHint(name: target.name, project: target.project),
                             message:
                                 "port \(busy) is held by unmanaged pid \(squatter.pid) (\(squatter.command))"
                         )
                     }
                     throw WireError(
                         code: .portHeld,
-                        hint: "run: directa why \(ShellWord.inertOr(target.name))",
+                        hint: Self.whyHint(name: target.name, project: target.project),
                         message: "port \(busy) already has a listener that directa does not manage"
                     )
                 }
@@ -1644,27 +1657,35 @@ public actor Router {
             if let busy = await firstBusyPort(in: claim, evidence: evidence, excluding: id) {
                 throw WireError(
                     code: .portHeld,
-                    hint: "run: directa why \(ShellWord.inertOr(target.name))",
+                    hint: Self.whyHint(name: target.name, project: target.project),
                     message: "port \(busy) is still busy after rebind resolution")
             }
         }
         await materializeSpawnSpec(
             spec, claim: claim, declaredPort: declaredPort, effectivePort: effective,
-            portConflict: conflict, on: supervisor)
-        /** A port-failed run is still alive, and `start` would stop it before
-            spawning. Stopping it here, after every refusal above, lets the
-            same re-check restart makes run between that stop and the spawn. */
-        if !force {
-            let current = await supervisor.status()
-            if current.phase == .failed, current.hasLiveRun {
-                _ = await supervisor.stop(deliberate: false, reason: "restarting after a port failure")
-                do {
-                    try await requirePortsClear(supervisor: supervisor, name: target.name)
-                } catch {
-                    await supervisor.abandonPreparedSpawn()
-                    throw error
-                }
-            }
+            forRestart: force, portConflict: conflict, on: supervisor)
+        if !force && stopsPortFailedRun {
+            try await stopPortFailedRun(name: target.name, project: target.project, supervisor: supervisor)
+        }
+    }
+
+    /** A port-failed run is still alive, and `start` would stop it before
+        spawning. Stopping it after every refusal `prepareSpawn` can raise lets
+        the same re-check restart makes run between that stop and the spawn. A
+        refusal here abandons the spawn prepared for it. */
+    private func stopPortFailedRun(
+        name: String, project: String, supervisor: ServerSupervisor
+    ) async throws {
+        let current = await supervisor.status()
+        guard current.phase == .failed, current.hasLiveRun else { return }
+        let before = await listeningNextRunPorts(supervisor)
+        _ = await supervisor.stop(deliberate: false, reason: "restarting after a port failure")
+        do {
+            try await requirePortsClear(
+                before: before, name: name, project: project, supervisor: supervisor)
+        } catch {
+            await supervisor.abandonPreparedSpawn()
+            throw error
         }
     }
 
@@ -1693,18 +1714,26 @@ public actor Router {
         return claim
     }
 
-    /** Hands a supervisor the spec it spawns or adopts under: the overlaid spec
-        with the effective port substituted (`PortMaterializer`), and the port
-        bookkeeping status reports. The one tail of `prepareSpawn` and
-        `adoptSurvivor`. */
+    /** Stages the spawn a supervisor's next run (or adoption) starts under: the
+        overlaid spec with the effective port substituted (`PortMaterializer`),
+        and the port bookkeeping status reports. It is pending, not applied:
+        the supervisor's current run keeps reporting itself until a run starts.
+        The one tail of `prepareSpawn` and `adoptSurvivor`. */
     private func materializeSpawnSpec(
         _ spec: ServerSpec, claim: PortClaim, declaredPort: Int?, effectivePort: Int?,
-        portConflict: PortConflict? = nil, on supervisor: ServerSupervisor
+        forRestart: Bool = false, portConflict: PortConflict? = nil, on supervisor: ServerSupervisor
     ) async {
-        await supervisor.updateSpec(PortMaterializer.materialize(spec: spec, effectivePort: effectivePort))
-        await supervisor.setPortMeta(
-            claim: claim, declaredPort: declaredPort, effectivePort: effectivePort,
-            portConflict: portConflict)
+        await supervisor.stageSpawn(
+            ServerSupervisor.PendingSpawn(
+                claim: claim, declaredPort: declaredPort, effectivePort: effectivePort,
+                forRestart: forRestart, portConflict: portConflict,
+                spec: PortMaterializer.materialize(spec: spec, effectivePort: effectivePort)))
+    }
+
+    /** The `directa why` hint a `port-held` refusal carries: `--project`
+        because the reader's shell is not necessarily inside the project. */
+    private static func whyHint(name: String, project: String) -> String {
+        "run: directa why \(ShellWord.inertOr(name)) --project \(ShellWord.singleQuoted(project))"
     }
 
     /** One port check's evidence: which of `claim`'s ports have a listener,
@@ -1783,25 +1812,81 @@ public actor Router {
         }
     }
 
+    /** Which of the ports the server's next run claims have a listener right
+        now: read before a stop, so the re-check after it can tell a listener
+        that was already there from one the stop left behind or that arrived
+        since. */
+    private func listeningNextRunPorts(_ supervisor: ServerSupervisor) async -> Set<Int> {
+        guard let claim = await supervisor.nextRunClaim() else { return [] }
+        var listening: Set<Int> = []
+        for port in claim.allPorts {
+            let isListening = await portProbe.isListening(port)
+            if isListening { listening.insert(port) }
+        }
+        return listening
+    }
+
+    /** Waits until no claimed port holds a listener that blocks the new run,
+        or returns the first port that still does when the budget runs out. A
+        port with no listener never blocks. A listener on a port that had one
+        before the stop blocks only when it is a process of the run just
+        stopped (or cannot be named); one outside that run was there first and
+        is shared or foreign, so it is let through, and so is every later
+        sight of that port. A listener on a port that had none before the stop
+        appeared during or after it and blocks. */
+    private func waitForNewRunClear(
+        claim: PortClaim, listeningBefore: Set<Int>, stoppedRun: Set<Int>, budgetSeconds: Double
+    ) async -> Int? {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(budgetSeconds))
+        var shared: Set<Int> = []
+        while true {
+            var blocking: Int?
+            for port in claim.allPorts where !shared.contains(port) {
+                let isListening = await portProbe.isListening(port)
+                guard isListening else { continue }
+                if listeningBefore.contains(port) {
+                    let listener = await portProbe.listenerInfo(port)
+                    if let listener, !stoppedRun.contains(listener.pid) {
+                        shared.insert(port)
+                        continue
+                    }
+                }
+                blocking = port
+                break
+            }
+            guard let busy = blocking else { return nil }
+            if ContinuousClock.now >= deadline { return busy }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
     /** The check every transition that stops a run and spawns the next in one
         step makes between the two (`restart`, the watch sweep's restart,
         `start`/`ensure` over a port-failed run). The pre-check ran while the
         old run was still up and treats the target's own listeners as free, so
         a process of the old run's tree that outlives the stop would answer the
         new run's first health check and the server would read healthy with
-        nothing of its own listening. Waits up to `stopTiming.portClearSeconds`
-        for the server's claimed ports to have no listener; one still there is
-        written to the server's log (pid, command, and whether the stop had
-        signaled it) and fails the transition with `port-held`, with the old run
-        already stopped and no new one started. */
-    private func requirePortsClear(supervisor: ServerSupervisor, name: String) async throws {
-        let snapshot = await supervisor.portSnapshot()
-        guard let claim = snapshot.claim else { return }
-        guard let busy = await waitForClaimFree(claim: claim, budgetSeconds: stopTiming.portClearSeconds)
+        nothing of its own listening. `before` is what
+        `listeningNextRunPorts` read ahead of the stop. Waits up to
+        `stopTiming.portClearSeconds` for the next run's claimed ports to have
+        no listener that belonged to the run just stopped or appeared after
+        the stop (`waitForNewRunClear`); one still there is written to the
+        server's log (pid, command, and whether the stop had signaled it) and
+        fails the transition with `port-held`, with the old run already
+        stopped and no new one started. */
+    private func requirePortsClear(
+        before: Set<Int>, name: String, project: String, supervisor: ServerSupervisor
+    ) async throws {
+        guard let claim = await supervisor.nextRunClaim() else { return }
+        let stoppedRun = await supervisor.lastStoppedRunPids()
+        guard
+            let busy = await waitForNewRunClear(
+                claim: claim, listeningBefore: before, stoppedRun: stoppedRun,
+                budgetSeconds: stopTiming.portClearSeconds)
         else { return }
         let listener = await portProbe.listenerInfo(busy)
         /** The server's log carries the pid and command; `why` reads them. */
-        let hint = "run: directa why \(ShellWord.inertOr(name))"
+        let hint = Self.whyHint(name: name, project: project)
         guard let listener else {
             await supervisor.recordSys(
                 "not starting: port \(busy) is still held by a listener directa cannot name after the stop")
@@ -1812,7 +1897,6 @@ public actor Router {
                     "port \(busy) still has a listener that directa does not manage, after stopping '\(name)'; the new run was not started"
             )
         }
-        let stoppedRun = await supervisor.lastStoppedRunPids()
         let membership = stoppedRun.contains(listener.pid) ? "was" : "was not"
         await supervisor.recordSys(
             "not starting: port \(busy) is still held by pid \(listener.pid) (\(listener.command)) after the stop; that process \(membership) part of the run just stopped (root and descendants recorded at stop)"
@@ -2416,18 +2500,28 @@ public actor Router {
         return try await restart.value
     }
 
+    /** Counts the restart finished only if its server is still tracked: a
+        removal that ran meanwhile already dropped both entries
+        (`removeSupervisor`), and counting then would bring one back. */
     private func finishUnhealthyEnsureRestart(_ id: String) {
-        unhealthyEnsureRestarts[id] = nil
+        guard unhealthyEnsureRestarts.removeValue(forKey: id) != nil else { return }
         finishedUnhealthyEnsureRestarts[id, default: 0] += 1
     }
 
-    /** The one restart path. Every refusal happens before anything stops: a
+    /** The one restart path. `recordsRefusal` is for a caller nobody is waiting
+        on (the watch sweep): a new run refused after the stop records a
+        `stopped` event whose detail carries the refusal, so the server's
+        status, the events feed, and the hooks say why it is down. An explicit
+        restart's caller reads the refusal as the error instead.
+
+        Every refusal happens before anything stops: a
         client-side `stop && ensure` takes the server down and only then discovers
         a held resource or a broken config, leaving it down. The stop is
         non-retiring because the server is coming straight back, so resume-on-boot
         survives what `stop` would otherwise clear. */
     private func restartServers(
-        _ params: RestartParams, rearm: Bool = true, reason: String, userInitiated: Bool = false
+        _ params: RestartParams, rearm: Bool = true, recordsRefusal: Bool = false, reason: String,
+        userInitiated: Bool = false
     ) async throws -> GroupResult {
         let merged = try await mergedSpecs(project: params.project)
         var wanted = merged.specs
@@ -2471,12 +2565,20 @@ public actor Router {
             if rearm { await entry.supervisor.rearmWatch() }
             let activity = DaemonActivity.shared.begin(
                 .restart, label: "\(serverID(project: params.project, name: entry.spec.name)): \(reason)")
+            let listeningBefore = await listeningNextRunPorts(entry.supervisor)
             _ = await entry.supervisor.stop(deliberate: false, reason: reason)
             do {
-                try await requirePortsClear(supervisor: entry.supervisor, name: entry.spec.name)
+                try await requirePortsClear(
+                    before: listeningBefore, name: entry.spec.name, project: params.project,
+                    supervisor: entry.supervisor)
             } catch {
                 DaemonActivity.shared.end(activity, outcome: "port-held")
                 await abandonPreparedSpawns(prepared[index...].map(\.supervisor))
+                if recordsRefusal, let refusal = error as? WireError {
+                    await events.post(
+                        kind: .stopped, project: params.project, server: entry.spec.name,
+                        detail: "restart refused: \(refusal.message)")
+                }
                 throw error
             }
             let restarted = await entry.supervisor.ensure(timeoutSeconds: params.timeoutSeconds)
@@ -2522,7 +2624,8 @@ public actor Router {
                 _ = try await restartServers(
                     RestartParams(
                         names: [split.name], project: split.project, timeoutSeconds: 60),
-                    rearm: false, reason: "watch change in \(relative.joined(separator: ", "))")
+                    rearm: false, recordsRefusal: true,
+                    reason: "watch change in \(relative.joined(separator: ", "))")
                 await supervisor.recordWatchRestart(now)
                 restarted.append(id)
                 DirectaLog.daemon.info(
@@ -2580,12 +2683,24 @@ public actor Router {
             do {
                 try await prepareSpawn(
                     target: target, supervisor: supervisor, portOverride: params.port,
-                    userInitiated: true)
+                    stopsPortFailedRun: false, userInitiated: true)
             } catch {
                 await abandonPreparedSpawns(Array(prepared.values))
                 throw error
             }
             prepared[spec.name] = supervisor
+        }
+        /** Only now, with every member past its refusals, is a port-failed
+            member's run stopped. */
+        for spec in wanted {
+            guard let supervisor = prepared[spec.name] else { continue }
+            do {
+                try await stopPortFailedRun(
+                    name: spec.name, project: params.project, supervisor: supervisor)
+            } catch {
+                await abandonPreparedSpawns(Array(prepared.values))
+                throw error
+            }
         }
         guard case .success(let waves) = DependencyGraph.waves(specs: wanted) else {
             await abandonPreparedSpawns(Array(prepared.values))

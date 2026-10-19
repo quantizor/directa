@@ -670,7 +670,9 @@ import Testing
                 == (lsofNamesIt
                     ? "port \(port) is held by unmanaged pid 4242 (stand-in listener)"
                     : "port \(port) already has a listener that directa does not manage"))
-        #expect(error.hint == "run: directa why web")
+        #expect(
+            error.hint
+                == "run: directa why web --project \(ShellWord.singleQuoted(canonicalProjectPath(env.project)))")
     }
 
     /** `ensure` over a port-failed run stops it first. A listener that the
@@ -715,6 +717,56 @@ import Testing
             ).servers.first)
         #expect(status.phase == .stopped)
         #expect(status.pid == nil)
+    }
+
+    /** `up` prepares every member before it starts any. A later member's
+        refusal ends the rollout, so a port-failed member ahead of it keeps its
+        run: stopping it is part of starting it again, which never happens. */
+    @Test func anUpRefusedAtALaterMemberLeavesAPortFailedMemberRunning() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeRouterEnv(named: "port")
+        let port = TestPorts.port(28)
+        let otherPort = TestPorts.port(31)
+        let registry = Registry(paths: env.paths)
+        try await registry.register(
+            project: env.project,
+            spec: ServerSpec(
+                command: [fixture, "--listen-tcp", String(port + 1)],
+                healthcheck: HealthCheckSpec(type: .none), name: "web", port: port, portSpan: 2))
+        try await registry.register(
+            project: env.project, spec: sleeperSpec(name: "x-other", port: otherPort))
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths,
+            portProbe: PortProbe(
+                isListening: { $0 == otherPort },
+                listenerInfo: { _ in (pid: 4242, command: "stand-in listener") }),
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        _ = try await router.attempt(
+            .serverStart, ServerTargetParams(name: "web", project: env.project), ServerResult.self)
+        let drifted = try #require(try await failedStatus(router, project: env.project))
+        #expect(drifted.phase == .failed)
+        let oldPid = try #require(drifted.pid)
+        defer { kill(pid_t(oldPid), SIGKILL) }
+
+        let refused = try await router.attempt(
+            .groupUp, GroupParams(project: env.project, timeoutSeconds: 5), GroupResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("expected the held port to refuse the rollout")
+            return
+        }
+        #expect(error.code == .portHeld)
+
+        let status = try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: "web", project: env.project), ServerListResult.self
+            ).servers.first)
+        #expect(status.phase == .failed)
+        #expect(status.pid == oldPid)
+        #expect(kill(pid_t(oldPid), 0) == 0)
+
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "web", project: env.project), ServerResult.self)
     }
 
     /** ATTACK: the server's own listener lives outside its process tree. A
