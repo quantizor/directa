@@ -65,8 +65,20 @@ struct GlobalOptions: ParsableArguments {
             }
             return canonicalProjectPath(project)
         }
-        return Self.resolveProject(from: FileManager.default.currentDirectoryPath)
+        guard let resolved = Self.resolveProject(from: FileManager.default.currentDirectoryPath) else {
+            CLIRunner.fail(Self.goneWorkingDirectory, json: json)
+        }
+        return resolved
     }
+
+    /** `FileManager.currentDirectoryPath` answers "" once the current
+        directory is removed (a deleted worktree), and no project can be named
+        from nowhere. */
+    static let goneWorkingDirectory = WireError(
+        code: .usage, hint: "run: directa status --all",
+        message:
+            "the current directory no longer exists (was a worktree removed?), so directa cannot tell which project you mean; "
+            + "change into an existing project directory, or pass --project with its path")
 
     /** A timeout option's seconds, or the usage failure for a bad value. */
     func seconds(_ option: TimeoutOption, flag: String = "--timeout") -> Double {
@@ -80,12 +92,19 @@ struct GlobalOptions: ParsableArguments {
 
     /** One walk up from `cwd`: it answers the first directory holding a
         devservers.json or rooting a linked worktree, and remembers the nearest
-        `.git` on the way for when neither turns up. */
-    static func resolveProject(from cwd: String) -> String {
+        `.git` on the way for when neither turns up. Nil when `cwd` is not an
+        existing absolute directory (a gone current directory reads as ""):
+        a relative URL never reaches the root, so the walk would spin. The
+        walk is also bounded by `cwd`'s own depth. A hook takes the nil as
+        its cue to stay silent. */
+    static func resolveProject(from cwd: String) -> String? {
         let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard cwd.hasPrefix("/"), fm.fileExists(atPath: cwd, isDirectory: &isDirectory), isDirectory.boolValue
+        else { return nil }
         var nearestGitRoot: URL?
         var probe = URL(fileURLWithPath: cwd)
-        while true {
+        for _ in 0...probe.pathComponents.count {
             if fm.fileExists(atPath: probe.appending(path: "devservers.json").path)
                 || CheckoutIdentity.linkedWorktreeGitDir(of: probe.path) != nil
             {
@@ -1279,8 +1298,14 @@ private func deliverAntigravity(continueOnNewErrors: Bool) async throws {
     let payload = HookPayload.parse(CLIRunner.stdinData())
     let environment = ProcessInfo.processInfo.environment
     var pull = false
+    guard let project = GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)) else {
+        /** A gone session directory names no project: the harness still
+            reads an envelope from this hook, so it gets an empty one. */
+        HookOutput.write(HookOutput.Antigravity(injectSteps: [], terminationBehavior: nil))
+        return
+    }
     await HookSpeak.deliver(
-        project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
+        project: project,
         harness: .antigravity,
         fileKey: AntigravityAdapter.conversationFileKey(payload: payload),
         environment: environment,
@@ -1310,9 +1335,12 @@ private func deliverClaude(event: String, boundary: Bool) async throws {
         HookPayloadGate.claudeHookShouldEmit(
             payload, cursorHookInstalled: { CursorAdapter().hookState().isLive })
     else { return }
+    guard
+        let project = GlobalOptions.resolveProject(
+            from: HookSessionCwd.resolve(payload, environment: environment))
+    else { return }
     await HookSpeak.deliver(
-        project: GlobalOptions.resolveProject(
-            from: HookSessionCwd.resolve(payload, environment: environment)),
+        project: project,
         harness: .claude,
         fileKey: ClaudeCodeAdapter.conversationFileKey(payload: payload, environment: environment),
         environment: environment,
@@ -1328,9 +1356,12 @@ private func deliverClaude(event: String, boundary: Bool) async throws {
 private func deliverCursor(boundary: Bool) async throws {
     let payload = HookPayload.parse(CLIRunner.stdinData())
     let environment = ProcessInfo.processInfo.environment
+    guard
+        let project = GlobalOptions.resolveProject(
+            from: HookSessionCwd.resolve(payload, environment: environment))
+    else { return }
     await HookSpeak.deliver(
-        project: GlobalOptions.resolveProject(
-            from: HookSessionCwd.resolve(payload, environment: environment)),
+        project: project,
         harness: .cursor,
         fileKey: CursorAdapter.conversationFileKey(payload: payload),
         environment: environment,
@@ -1345,9 +1376,12 @@ private func deliverGrok() async throws {
     let environment = ProcessInfo.processInfo.environment
     guard GrokHookEvent.parse(environment["GROK_HOOK_EVENT"]).deliversContext else { return }
     let payload = HookPayload.parse(CLIRunner.stdinData())
+    guard
+        let project = GlobalOptions.resolveProject(
+            from: HookSessionCwd.resolve(payload, environment: environment))
+    else { return }
     await HookSpeak.deliver(
-        project: GlobalOptions.resolveProject(
-            from: HookSessionCwd.resolve(payload, environment: environment)),
+        project: project,
         harness: .grok,
         fileKey: GrokAdapter.conversationFileKey(payload: payload, environment: environment),
         environment: environment,
@@ -1369,7 +1403,7 @@ struct Statusline: AsyncParsableCommand {
     func run() async throws {
         let payload = HookPayload.parse(CLIRunner.stdinData())
         let cwd = payload?.workspaceCurrentDir ?? payload?.cwd ?? FileManager.default.currentDirectoryPath
-        let project = GlobalOptions.resolveProject(from: cwd)
+        guard let project = GlobalOptions.resolveProject(from: cwd) else { return }
         let client = CLIRunner.client()
         guard
             let list = try? await client.request(
@@ -2924,6 +2958,11 @@ struct Lock: AsyncParsableCommand {
             its own config by walking up from cwd, must see the same directory
             it would running unwrapped. */
         let callerCwd = FileManager.default.currentDirectoryPath
+        /** The guarded command has nowhere to run from a gone directory, even
+            with an explicit `--project`; refused before the resource is taken. */
+        guard callerCwd.hasPrefix("/") else {
+            CLIRunner.fail(GlobalOptions.goneWorkingDirectory, json: global.json)
+        }
         let project = global.resolvedProject()
         let holderPid = Int(getpid())
         let client = CLIRunner.client()

@@ -489,6 +489,22 @@ set -e
 /usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["ok"] is False and d["error"]["code"]=="usage", d' "$WORK/phantom.json" || fail "phantom --project error shape: $(cat "$WORK/phantom.json")"
 pass "--project name-as-path is refused instead of phantom success"
 
+# A project-scoped command run from a deleted current directory (a removed
+# worktree) is refused at once. It used to walk a relative path upward forever
+# at full CPU, so the alarm below turns a regression into a signal death
+# instead of a hung gate.
+GONE_DIR="$(mktemp -d "$WORK/gone.XXXXXX")"
+GONE_START=$SECONDS
+set +e
+(cd "$GONE_DIR" && rmdir "$GONE_DIR" && exec /usr/bin/perl -e 'alarm 10; exec @ARGV or die' "$DIRECTA" status x --json > "$WORK/gone.json" 2>/dev/null)
+GONE_EXIT=$?
+set -e
+GONE_ELAPSED=$((SECONDS - GONE_START))
+[[ "$GONE_EXIT" -eq 2 ]] || fail "deleted-cwd status exit $GONE_EXIT (expected usage 2): $(cat "$WORK/gone.json" 2>/dev/null)"
+[[ "$GONE_ELAPSED" -lt 5 ]] || fail "deleted-cwd status took ${GONE_ELAPSED}s instead of failing at once"
+/usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["ok"] is False and d["error"]["code"]=="usage" and "no longer exists" in d["error"]["message"], d' "$WORK/gone.json" || fail "deleted-cwd error shape: $(cat "$WORK/gone.json")"
+pass "a deleted current directory is refused at once instead of spinning"
+
 # lock (default): holder stays up while the lock is held.
 cd "$PROJECT3"
 "$DIRECTA" up --timeout 15 --json > /dev/null || fail "up before default-hold test"
