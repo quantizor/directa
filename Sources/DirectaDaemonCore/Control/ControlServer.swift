@@ -111,7 +111,7 @@ public actor Router {
     }
 
     private static func lockKey(project: String, resource: String) -> String {
-        "\(canonicalProjectPath(project))::\(resource)"
+        LockResource.key(project: project, resource: resource)
     }
 
     private static func normalizedLocks(_ locks: [String: LockHolder]) -> [String: LockHolder] {
@@ -1937,9 +1937,25 @@ public actor Router {
                 continue
             }
             /** Non-retiring stop: boot intent survives so a daemon crash
-                mid-hold can still bring the server back if the holder is gone. */
-            _ = await supervisor.stop(
+                mid-hold can still bring the server back if the holder is gone.
+                Granting the lock over a tree that is still running, or a stop
+                that gave up, would hand the guarded command the file the
+                server holds open: refuse, and put back what was already
+                paused. The failing server is not resumed: its processes may
+                still hold the port, and `directa why` says what is left. */
+            let stopped = await supervisor.stopAndConfirm(
                 deliberate: false, reason: "paused for lock \(params.resource)")
+            guard stopped.completion == .treeGone else {
+                DirectaLog.daemon.error(
+                    "lock \(params.resource) refused: \(spec.name)@\(params.project) did not stop completely (\(stopped.completion))")
+                await resumePaused(
+                    names: paused, project: params.project, resource: params.resource,
+                    timeoutSeconds: params.resumeTimeoutSeconds ?? 60)
+                let survivors: [Int]? =
+                    if case .survivors(let pids) = stopped.completion { pids } else { nil }
+                throw Self.pauseRefusal(
+                    server: spec.name, resource: params.resource, survivors: survivors)
+            }
             paused.append(spec.name)
             DirectaLog.daemon.info(
                 "lock \(params.resource) paused \(spec.name)@\(params.project)")
@@ -1956,6 +1972,24 @@ public actor Router {
         persistLocks()
         return LockResult(
             live: live.isEmpty ? nil : live, paused: paused, statePath: statePath)
+    }
+
+    /** Why a `--pause` lock was not granted: one declarer's stop gave up or left
+        processes running. The code is `resource-locked` because the resource
+        is not free; the hint is the command that says what is left. */
+    static func pauseRefusal(server: String, resource: String, survivors: [Int]?) -> WireError {
+        let cause =
+            if let survivors {
+                "stopped, but process \(survivors.map(String.init).joined(separator: ", ")) still run after SIGKILL"
+            } else {
+                "did not finish stopping, so it may still be running"
+            }
+        return WireError(
+            code: .resourceLocked,
+            hint: "run: directa why \(ShellWord.inertOr(server))",
+            message:
+                "server '\(server)' \(cause) and may still hold resource '\(resource)' open; the lock was not granted, so the command did not run, and any server paused for it was resumed"
+        )
     }
 
     /** Who holds a resource right now, if anyone. A dead holder is released

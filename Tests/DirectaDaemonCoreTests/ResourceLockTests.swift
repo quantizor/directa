@@ -455,4 +455,176 @@ private func phaseOf(router: Router, project: String, name: String) async throws
     }
 }
 
+/** Runs a spawn whose command ends in `stuck` on the double that never reports
+    an exit (its stop can only give up) and every other on a real process. */
+private struct StuckOrRealLauncher: NeverAdopts {
+    let stuck: StuckRunLauncher
+    let real: any ProcessLauncher = SubprocessLauncher()
+
+    func run(
+        argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
+        onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
+        onSpawn: @escaping @Sendable (pid_t) async -> Void
+    ) async -> ProcessOutcome {
+        let target: any ProcessLauncher = argv.last == "stuck" ? stuck : real
+        return await target.run(
+            argv: argv, capture: capture, cwd: cwd, environment: environment,
+            onExitedBeforeWatch: onExitedBeforeWatch, onSpawn: onSpawn)
+    }
+}
+
+/** The guarantees `--pause` gives the guarded command: it starts only with
+    every paused declarer's whole tree gone, and never beside one whose stop
+    gave up. Not serialized with the suite above: each test has a tree and a
+    router of its own, and the suite above is already the longest on the
+    critical path. */
+@Suite(.temporaryTree) struct ResourceLockPauseTests {
+    private let stopTiming = StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1)
+
+    private func writeDevservers(project: String, servers: String) throws {
+        let body = #"{ "servers": { \#(servers) }, "version": 1 }"#
+        try Data(body.utf8).write(
+            to: URL(fileURLWithPath: project).appending(path: "devservers.json"))
+    }
+
+    private func outLines(router: Router, project: String, name: String) async throws -> [String] {
+        try await router.call(
+            .logsQuery, LogsQueryParams(name: name, project: project, streams: [.out]),
+            LogsQueryResult.self
+        ).lines.map(\.text)
+    }
+
+    private func pid(prefix: String, in lines: [String]) -> pid_t? {
+        lines.compactMap { line in
+            line.hasPrefix(prefix) ? pid_t(line.dropFirst(prefix.count)) : nil
+        }.first
+    }
+
+    /** A declarer that ignores SIGTERM and leaves a setsid child plus an orphan
+        that ignores it too is only reached by the SIGKILL pass. The acquire
+        that comes back must find none of them alive, not merely the root. */
+    @Test func acquireGrantsOnlyOnceTheWholeTreeOfASigtermIgnoringDeclarerIsGone() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeRouterEnv(named: "lock-tree")
+        let port = TestPorts.port(700)
+        let command = [
+            fixture, "--ignore-sigterm", "--setsid-listener", "\(port)", "--orphan-grandchild-ignterm",
+        ].map { "\"\($0)\"" }.joined(separator: ", ")
+        try writeDevservers(
+            project: env.project, servers: #""db": { "command": [\#(command)], "locks": ["data"] }"#)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, registry: registry,
+            stopTiming: StopTiming(graceSeconds: 0.3, overtimeSeconds: 5))
+        try await startDB(router: router, project: env.project)
+
+        var listener: pid_t?
+        var orphan: pid_t?
+        let reported = try await eventually(within: .seconds(5), every: .milliseconds(20)) {
+            let lines = try await outLines(router: router, project: env.project, name: "db")
+            listener = pid(prefix: "setsid listener pid ", in: lines)
+            orphan = pid(prefix: "grandchild pid ", in: lines)
+            return listener != nil && orphan != nil
+        }
+        #expect(reported, "the fixture never reported its descendants")
+        let descendants = try [#require(listener), #require(orphan)]
+        #expect(descendants.allSatisfy { kill($0, 0) == 0 }, "the descendants were not running before the pause")
+
+        let acquired = try await router.call(
+            .lockAcquire,
+            LockParams(
+                holderPid: Int(getpid()), pause: true, project: env.project, resource: "data",
+                resumeTimeoutSeconds: 15),
+            LockResult.self)
+        #expect(acquired.paused == ["db"])
+        let survivors = descendants.filter { kill($0, 0) == 0 }
+        defer { survivors.forEach { _ = kill($0, SIGKILL) } }
+        #expect(survivors.isEmpty, "the lock was granted while \(survivors) still ran")
+
+        _ = try await router.call(
+            .lockRelease,
+            LockParams(
+                holderPid: Int(getpid()), project: env.project, resource: "data",
+                resumeTimeoutSeconds: 15),
+            LockResult.self)
+        _ = try await router.call(.serverStop, ServerTargetParams(name: "db", project: env.project), ServerResult.self)
+    }
+
+    /** The hint is a command someone pastes, so a server name from committed
+        config reaches it only when it is inert. */
+    @Test func theRefusalNamesTheServerAndPointsAtWhy() {
+        let gaveUp = Router.pauseRefusal(server: "db", resource: "data", survivors: nil)
+        #expect(gaveUp.code == .resourceLocked)
+        #expect(gaveUp.hint == "run: directa why db")
+        #expect(
+            gaveUp.message
+                == "server 'db' did not finish stopping, so it may still be running and may still hold resource 'data' open; the lock was not granted, so the command did not run, and any server paused for it was resumed"
+        )
+
+        let left = Router.pauseRefusal(server: "db", resource: "data", survivors: [41, 42])
+        #expect(
+            left.message
+                == "server 'db' stopped, but process 41, 42 still run after SIGKILL and may still hold resource 'data' open; the lock was not granted, so the command did not run, and any server paused for it was resumed"
+        )
+
+        let hostile = Router.pauseRefusal(server: "x; rm -rf ~", resource: "data", survivors: nil)
+        #expect(hostile.hint == "run: directa why <name>")
+    }
+
+    /** One declarer stops cleanly and the next one's stop gives up: the lock is
+        refused with `resource-locked` naming the second, the first is back up,
+        and no hold is left recorded. */
+    @Test func aDeclarerWhoseStopGivesUpRefusesTheLockAndResumesTheOthers() async throws {
+        let env = try makeRouterEnv(named: "lock-stuck")
+        try writeDevservers(
+            project: env.project,
+            servers: """
+                "a-cache": { "command": ["/bin/sh", "-c", "sleep 60"], "locks": ["data"] },
+                "db": { "command": ["/bin/sh", "-c", "sleep 60", "stuck"], "locks": ["data"] }
+                """)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let gate = AdoptGate()
+        let router = Router(
+            launcher: StuckOrRealLauncher(stuck: StuckRunLauncher(gate: gate)), paths: env.paths,
+            registry: registry, stopTiming: stopTiming)
+        _ = try await router.call(
+            .serverStart, ServerTargetParams(name: "a-cache", project: env.project), ServerResult.self)
+        try await startDB(router: router, project: env.project)
+        defer { gate.signal(.signaled(signal: Int(SIGKILL))) }
+
+        let attempt = try await router.attempt(
+            .lockAcquire,
+            LockParams(
+                holderPid: Int(getpid()), pause: true, project: env.project, resource: "data",
+                resumeTimeoutSeconds: 15),
+            LockResult.self)
+        guard case .failure(let refusal) = attempt else {
+            Issue.record("the lock was granted over a declarer whose stop gave up: \(attempt)")
+            return
+        }
+        #expect(refusal.code == .resourceLocked)
+        #expect(refusal.hint == "run: directa why db")
+        #expect(refusal.message.contains("'db'"))
+
+        let held = try await router.call(
+            .lockStatus, LockStatusParams(project: env.project, resource: "data"), LockStatusResult.self)
+        #expect(held.holder == nil)
+        let resumed = try await eventually(within: .seconds(10), every: .milliseconds(50)) {
+            [.starting, .running].contains(
+                try await phaseOf(router: router, project: env.project, name: "a-cache"))
+        }
+        #expect(resumed, "the declarer paused before the refusal was not resumed")
+
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "a-cache", project: env.project), ServerResult.self)
+        gate.signal(.signaled(signal: Int(SIGKILL)))
+        let settled = try await eventually(within: .seconds(5)) {
+            try await phaseOf(router: router, project: env.project, name: "db") == .stopped
+        }
+        #expect(settled, "the stuck declarer never settled after its run was released")
+    }
+}
+
 private func fixtureServerPath() -> String? { fixtureServerExecutable() }

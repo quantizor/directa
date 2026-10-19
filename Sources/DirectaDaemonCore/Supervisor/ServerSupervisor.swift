@@ -44,18 +44,36 @@ private struct PhaseWaiterList {
 /** How long `stop()` waits on a server. `graceSeconds` is the SIGTERM-to-SIGKILL
     window a stop gets when its caller names none; `overtimeSeconds` is the
     margin past that grace before the stop gives up waiting for the phase to
-    clear (see `waitForStoppingToClear`). Injectable so tests reach the
-    give-up path without a real multi-second wait. */
+    clear (see `waitForStoppingToClear`). `treeExitSeconds` is how long after
+    the SIGKILL pass a stop waits for every process it signaled to exit
+    (see `awaitTreeExit`). Injectable so tests reach the give-up path
+    without a real multi-second wait. */
 public struct StopTiming: Sendable {
     public let graceSeconds: Double
     public let overtimeSeconds: Double
+    public let treeExitSeconds: Double
 
-    public init(graceSeconds: Double, overtimeSeconds: Double) {
+    public init(graceSeconds: Double, overtimeSeconds: Double, treeExitSeconds: Double = 5) {
         self.graceSeconds = graceSeconds
         self.overtimeSeconds = overtimeSeconds
+        self.treeExitSeconds = treeExitSeconds
     }
 
     public static let standard = StopTiming(graceSeconds: 7, overtimeSeconds: 10)
+}
+
+/** How a stop ended for a caller that has to know the run's whole process
+    tree is gone, not only the root (`ServerSupervisor.stopAndConfirm`). */
+public enum StopCompletion: Equatable, Sendable {
+    /** The phase left `.stopping` and every process the stop signaled has
+        exited. */
+    case treeGone
+    /** The bounded wait for the phase to leave `.stopping` (or for a pid to
+        appear) expired. */
+    case stillStopping
+    /** The phase cleared, but these pids still run past the SIGKILL pass and
+        its bounded wait. */
+    case survivors(pids: [Int])
 }
 
 /** One actor per server: owns the child's lifecycle and serializes every mutation,
@@ -594,10 +612,25 @@ public actor ServerSupervisor {
         carried onto the `stopped` event's detail: it is the only durable record
         of why directa tore the process down, since OSLog does not persist and
         the log otherwise only ever says `exited code=N`. A nil `graceSeconds`
-        takes `stopTiming.graceSeconds`. */
+        takes `stopTiming.graceSeconds`. After the SIGKILL pass the stop also
+        waits, bounded by `stopTiming.treeExitSeconds`, for every process it
+        signaled to exit, for every caller: a restart or watch respawn that
+        followed a descendant still releasing its listener would otherwise
+        lose the port to it. The result is the same status either way. */
     public func stop(
         graceSeconds requestedGrace: Double? = nil, deliberate: Bool = true, reason: String
     ) async -> ServerStatus {
+        await stopAndConfirm(graceSeconds: requestedGrace, deliberate: deliberate, reason: reason).status
+    }
+
+    /** `stop`, answering also whether the run's whole process tree is gone:
+        the one stop a caller that is about to touch what the run held open
+        (a lock's pause) can trust. A stop that joins one already in flight can
+        speak only for the phase (the descendants belong to the stop it
+        joined), so it answers `.treeGone` once that clears. */
+    public func stopAndConfirm(
+        graceSeconds requestedGrace: Double? = nil, deliberate: Bool = true, reason: String
+    ) async -> ConfirmedStop {
         let graceSeconds = requestedGrace ?? stopTiming.graceSeconds
         let stopWaitTimeout = stopWaitBound(graceSeconds: graceSeconds)
         switch phase {
@@ -606,19 +639,21 @@ public actor ServerSupervisor {
                 running one. */
             break
         case .stopped, .crashed, .failed:
-            return await status()
+            return ConfirmedStop(completion: .treeGone, status: await status())
         case .stopping:
-            if await !waitForStoppingToClear(timeout: stopWaitTimeout) {
+            let cleared = await waitForStoppingToClear(timeout: stopWaitTimeout)
+            if !cleared {
                 await recordStuckStop(after: stopWaitTimeout)
             }
-            return await status()
+            return ConfirmedStop(
+                completion: cleared ? .treeGone : .stillStopping, status: await status())
         case .starting, .running, .unhealthy:
             break
         }
         guard let target = pid else {
             guard phase == .starting else {
                 phase = .stopped
-                return await status()
+                return ConfirmedStop(completion: .treeGone, status: await status())
             }
             /** The launcher has not reported a pid yet (a launchd job takes a
                 moment to publish one). Reading `.stopped` here would let that
@@ -632,9 +667,10 @@ public actor ServerSupervisor {
                     text: "stop waited \(seconds)s for the process to start and gave up; it may still come up")
                 DirectaLog.supervisor.error(
                     "\(spec.name) stop waited \(seconds)s for the process to start and gave up; it may still come up")
-                return await status()
+                return ConfirmedStop(completion: .stillStopping, status: await status())
             }
-            return await stop(graceSeconds: requestedGrace, deliberate: deliberate, reason: reason)
+            return await stopAndConfirm(
+                graceSeconds: requestedGrace, deliberate: deliberate, reason: reason)
         }
         let activity = DaemonActivity.shared.begin(.stop, label: "\(serverID): \(reason)")
         defer { DaemonActivity.shared.end(activity, outcome: phase.rawValue) }
@@ -652,11 +688,27 @@ public actor ServerSupervisor {
             if !rootRunning, !pass.candidates.contains(where: ProcessTree.isRunning) { break }
             try? await Task.sleep(for: .milliseconds(100))
         }
-        escalate(pass)
-        if await !waitForStoppingToClear(timeout: stopWaitTimeout) {
+        let signaled = escalate(pass)
+        guard await waitForStoppingToClear(timeout: stopWaitTimeout) else {
             await recordStuckStop(after: stopWaitTimeout)
+            return ConfirmedStop(completion: .stillStopping, status: await status())
         }
-        return await status()
+        let survivors = await ProcessTree.awaitExit(
+            of: signaled, within: .seconds(stopTiming.treeExitSeconds))
+        guard survivors.isEmpty else {
+            await recordSurvivors(survivors)
+            return ConfirmedStop(
+                completion: .survivors(pids: survivors.map { Int($0.pid) }.sorted()),
+                status: await status())
+        }
+        return ConfirmedStop(completion: .treeGone, status: await status())
+    }
+
+    /** What `stopAndConfirm` answers: whether the whole tree is gone, beside
+        the status `stop` returns. */
+    public struct ConfirmedStop: Equatable, Sendable {
+        public let completion: StopCompletion
+        public let status: ServerStatus
     }
 
     /** A deliberate stop for a caller about to drop this supervisor (unregister,
@@ -753,8 +805,10 @@ public actor ServerSupervisor {
         invisible to every live source (setsid, the now-dead root's parent
         chain, younger than the snapshot) is still re-signaled, revalidated
         against its recorded identity. The group is signaled only while the
-        root still lives, and otherwise the survivors individually. */
-    private func escalate(_ pass: TeardownPass) {
+        root still lives, and otherwise the survivors individually. Returns the
+        union it signaled, which `stopAndConfirm` waits on. */
+    @discardableResult
+    private func escalate(_ pass: TeardownPass) -> [ProcessIdentity] {
         signalRun(
             target: pass.target, keys: pass.keys, signalGroup: pass.signalGroup, signal: SIGKILL,
             priorCandidates: pass.candidates)
@@ -1699,6 +1753,18 @@ public actor ServerSupervisor {
         guard phase == .stopping else { return true }
         await park(on: .stopping, timeout: timeout, activity: .stopWait) { phase == .stopping }
         return phase != .stopping
+    }
+
+    /** A stop whose SIGKILL pass left processes running past their bounded
+        wait, recorded where `recordStuckStop` records its own give-up. */
+    private func recordSurvivors(_ survivors: [ProcessIdentity]) async {
+        let pids = survivors.map { String($0.pid) }.sorted().joined(separator: ", ")
+        let seconds = stopTiming.treeExitSeconds
+        await logStore.append(
+            stream: .sys,
+            text: "stop sent SIGKILL but pid \(pids) still run after \(seconds)s; they may still hold the server's files and ports")
+        DirectaLog.supervisor.error(
+            "\(spec.name) stop sent SIGKILL but pid \(pids) still run after \(seconds)s")
     }
 
     /** A stop whose bounded wait expired: recorded in the server's sys stream

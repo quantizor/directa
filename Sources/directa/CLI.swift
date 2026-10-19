@@ -2778,6 +2778,16 @@ struct LockAcquireSchedule: Equatable, Sendable {
         elapsed < budgetSeconds
     }
 
+    /** Whether a `resource-locked` answer is worth waiting out, given the
+        holder lookup made right after it. No answer (an older daemon without
+        lock.status) keeps waiting. An answer naming nobody means the daemon
+        refused for another reason (a `--pause` whose declarer would not stop
+        completely), which no wait clears. */
+    static func refusalIsContention(lookup: LockStatusResult?) -> Bool {
+        guard let lookup else { return true }
+        return lookup.holder != nil
+    }
+
     func shouldAnnounceStillWaiting(atElapsed elapsed: Double, lastAnnouncedElapsed: Double?)
         -> Bool
     {
@@ -3037,6 +3047,11 @@ struct Lock: AsyncParsableCommand {
                     .lockStatus,
                     params: LockStatusParams(project: project, resource: resource),
                     expecting: LockStatusResult.self)
+                /** A refusal while nobody holds the resource is not contention:
+                    it is a `--pause` whose declarer would not stop completely,
+                    which waiting cannot clear and every retry would re-attempt
+                    on servers already paused once. It fails now. */
+                if !LockAcquireSchedule.refusalIsContention(lookup: lookup) { break }
                 if due {
                     if let holder = lookup?.holder {
                         CLIRunner.note(

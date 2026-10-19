@@ -106,6 +106,16 @@ import Testing
         #expect(schedule.shouldRetry(afterElapsed: 300.1) == false)
     }
 
+    /** A `resource-locked` answer with nobody holding the resource is a
+        `--pause` whose declarer would not stop: waiting only repeats the
+        attempt on servers already paused once. */
+    @Test func aRefusalWithNoHolderIsNotWorthWaitingOut() {
+        let holder = LockHolder(pause: true, paused: [], pid: 9, since: since)
+        #expect(LockAcquireSchedule.refusalIsContention(lookup: LockStatusResult(holder: holder)))
+        #expect(!LockAcquireSchedule.refusalIsContention(lookup: LockStatusResult(holder: nil)))
+        #expect(LockAcquireSchedule.refusalIsContention(lookup: nil))
+    }
+
     @Test func stillWaitingAnnouncesOnceEveryInterval() {
         let schedule = LockAcquireSchedule(budgetSeconds: 300)
         #expect(schedule.shouldAnnounceStillWaiting(atElapsed: 0, lastAnnouncedElapsed: nil) == false)
