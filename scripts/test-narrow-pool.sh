@@ -35,8 +35,10 @@
 # printed at the end.
 #
 # Fails (nonzero) when a test fails, when a pool thread was reported
-# blocked, or when the pool could not be narrowed. Tests run with
-# DIRECTA_TEST_TEMP_ROOT set to a fresh directory, removed afterward.
+# blocked, when the pool could not be narrowed, or when no test in any bundle
+# matched the arguments. A bundle whose --filter matched no tests is skipped
+# with a line saying so (the helper exits 69 before any run starts). Tests run
+# with DIRECTA_TEST_TEMP_ROOT set to a fresh directory, removed afterward.
 #
 # Blind spots: those of the library (a wait under the threshold, a user-space
 # spin, other QoS classes); and only the default-QoS pool is narrowed, so work
@@ -107,6 +109,7 @@ run=$(mktemp -d "$(getconf DARWIN_USER_TEMP_DIR)directa-narrow.XXXXXX") || exit 
 temp_root=$(mktemp -d "$(getconf DARWIN_USER_TEMP_DIR)directa-run.XXXXXX") || exit 1
 
 result=0
+ran=0
 for bundle in $bundles; do
   [[ -x $bundle ]] || { echo "error: no test bundle at $bundle after the build" >&2; result=1; continue }
   log=$run/${bundle:t}.log
@@ -118,7 +121,12 @@ for bundle in $bundles; do
   DIRECTA_TEST_TEMP_ROOT="$temp_root" \
     "$helper" --test-bundle-path "$bundle" "$@" "$bundle" --testing-library swift-testing 2>&1 | tee "$log"
   test_status=${pipestatus[1]}
-  (( test_status == 0 )) || result=1
+  if (( test_status == 69 )) && ! grep -q 'Test run started' "$log"; then
+    echo "skipped ${bundle:t}: the filter matched no tests"
+  else
+    ran=$(( ran + 1 ))
+    (( test_status == 0 )) || result=1
+  fi
   if (( test_status == 139 )); then
     echo "error: the test process crashed (exit 139) in ${bundle:t}; a crash inside the narrow-pool watcher shows up as a swiftpm-testing-helper crash report in ~/Library/Logs/DiagnosticReports" >&2
   fi
@@ -136,5 +144,9 @@ for bundle in $bundles; do
   fi
   echo "run log: $log"
 done
+if (( ran == 0 )); then
+  echo "error: nothing matched ($*): no test in any test bundle matched those arguments; check the spelling of --filter" >&2
+  result=1
+fi
 rm -rf "$temp_root"
 exit $result
