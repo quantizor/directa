@@ -453,10 +453,12 @@ private enum ResponderError: Error {
 
 /** A real HTTP/1.1 responder on one loopback family. It answers every request
     with `statusCode` after `delaySeconds`, on threads of its own, so a test
-    can hold an answer back for longer than any timeout under test. */
+    can hold an answer back for longer than any timeout under test. A
+    `cacheControl` value is sent as the `Cache-Control` header. */
 final class TestHTTPResponder: @unchecked Sendable {
     let port: Int
 
+    private let cacheControl: String?
     private let delaySeconds: Double
     private let listener: Int32
     private let lock = NSLock()
@@ -465,7 +467,8 @@ final class TestHTTPResponder: @unchecked Sendable {
     private var statusCode: Int
 
     init(
-        delaySeconds: Double = 0, family: Int32 = AF_INET, port: Int = 0, statusCode: Int = 200
+        cacheControl: String? = nil, delaySeconds: Double = 0, family: Int32 = AF_INET, port: Int = 0,
+        statusCode: Int = 200
     ) throws {
         let sock = socket(family, SOCK_STREAM, 0)
         guard sock >= 0 else { throw ResponderError.socket(errno: errno) }
@@ -516,6 +519,7 @@ final class TestHTTPResponder: @unchecked Sendable {
             bound = Int(UInt16(bigEndian: found.sin_port))
         }
         listen(sock, 8)
+        self.cacheControl = cacheControl
         self.delaySeconds = delaySeconds
         self.listener = sock
         self.port = bound
@@ -573,7 +577,9 @@ final class TestHTTPResponder: @unchecked Sendable {
             waited += 0.02
         }
         let code = lock.withLock { statusCode }
-        let response = "HTTP/1.1 \(code) Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        let cache = cacheControl.map { "Cache-Control: \($0)\r\nContent-Type: text/plain\r\n" } ?? ""
+        let body = cacheControl == nil ? "" : "ok"
+        let response = "HTTP/1.1 \(code) Test\r\n\(cache)Content-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
         _ = Array(response.utf8).withUnsafeBufferPointer { send(client, $0.baseAddress, $0.count, 0) }
     }
 }
@@ -637,6 +643,25 @@ final class TestHTTPResponder: @unchecked Sendable {
         gate.signal()
         await holder.value
         #expect(await probe.value == .pass)
+    }
+
+    /** A cacheable answer must never stand in for a later probe. The responder's
+        `max-age` lets URLSession serve the first 200 without a connect, which
+        would report a server healthy after its port stopped listening. */
+    @Test func aCachedAnswerNeverStandsInForALaterProbe() async throws {
+        let responder = try TestHTTPResponder(cacheControl: "max-age=60")
+        let prober = NetworkHealthProber()
+        let check = EffectiveHealthcheck.http(url: url(responder), timeoutMs: 2000)
+        #expect(await prober.probe(check) == .pass)
+        let port = responder.port
+        responder.stop()
+        let refused = try await eventually(within: .seconds(5)) {
+            let answer = await offPool { LoopbackProbe.probe(port: port, timeoutMs: 1000) }
+            return answer == .refused
+        }
+        try #require(refused, "the responder's port did not close")
+        let second = await prober.probe(check)
+        #expect(second == .fail("connection refused"))
     }
 
     @Test func anAnswerPastTimeoutMsFailsAtTheDeadlineAndSaysSo() async throws {

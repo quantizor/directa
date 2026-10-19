@@ -69,12 +69,17 @@ public struct NetworkHealthProber: HealthProber {
         caches. Its timeouts sit at the ceiling `timeoutMs` may take, because
         a session-wide resource timeout caps every request below whatever its
         own `timeoutInterval` asks (a 10s `timeoutMs` once failed at 5s);
-        `probe` enforces the configured bound itself. */
+        `probe` enforces the configured bound itself.
+        The session keeps no HTTP cache and every request ignores cached
+        answers. A cached 200 would answer the probe without a connect, which
+        reports a server healthy when nothing is listening on its port. */
     static let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         let ceiling = Double(HealthCheckSpec.durationRange.upperBound) / 1000
         config.timeoutIntervalForRequest = ceiling
         config.timeoutIntervalForResource = ceiling
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.waitsForConnectivity = false
         return URLSession(configuration: config, delegate: RedirectStopper.shared, delegateQueue: nil)
     }()
@@ -136,6 +141,7 @@ public struct NetworkHealthProber: HealthProber {
         let clock = ContinuousClock()
         let began = clock.now
         var request = URLRequest(url: parsed)
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         /** `*.localhost` is probed at loopback because the daemon embeds an
             Info.plist, so App Transport Security applies to its URLSession, and
             ATS refuses plain http to `*.localhost` (error -1022) while it allows
@@ -156,6 +162,7 @@ public struct NetworkHealthProber: HealthProber {
         let (seconds, attoseconds) = began.duration(to: clock.now).components
         let spentMs = Int(seconds) * 1000 + Int(attoseconds / 1_000_000_000_000_000)
         var v6 = URLRequest(url: rewritten)
+        v6.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         v6.setValue(localhostName, forHTTPHeaderField: "Host")
         let second = await Self.send(v6, timeoutMs: max(1, timeoutMs - spentMs))
         return Self.outcome(second, timeoutMs: timeoutMs)
