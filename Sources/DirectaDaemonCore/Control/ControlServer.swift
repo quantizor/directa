@@ -15,6 +15,10 @@ public actor Router {
     private let agentJobs: AgentJobs?
     private let deferredSurvivorRetry: DeferredSurvivorRetry
     private let events: EventStore
+    /** How a `daemon.shutdown` ends the process, given the reason to record.
+        An init parameter so a test can observe the exit instead of taking its
+        own process down with it. */
+    private let exitProcess: @Sendable (String) -> Void
     private let launcher: any ProcessLauncher
     private let paths: DirectaPaths
     private let portProbe: PortProbe
@@ -53,10 +57,17 @@ public actor Router {
     }
 
     private static let daemonStartingHint = "run: directa daemon status"
+    /** True once a `daemon.shutdown` with `handoff` was accepted: this daemon is
+        leaving its servers running for the next one, so a SIGTERM that races
+        the exit must not drain them. */
+    private var handedOff = false
 
     public init(
         agentJobs: AgentJobs? = LaunchdJobLauncher.runningAsAgent ? .live : nil,
         deferredSurvivorRetry: DeferredSurvivorRetry = .standard,
+        exitProcess: @escaping @Sendable (String) -> Void = { reason in
+            DaemonTelemetry.exit(code: 0, reason: reason)
+        },
         launcher: any ProcessLauncher, paths: DirectaPaths, portProbe: PortProbe = .live,
         registry: Registry,
         stopTiming: StopTiming = .standard,
@@ -64,6 +75,7 @@ public actor Router {
     ) {
         self.agentJobs = agentJobs
         self.deferredSurvivorRetry = deferredSurvivorRetry
+        self.exitProcess = exitProcess
         self.watchEnabled = watchEnabled
         self.events = EventStore(url: paths.eventsFile)
         self.launcher = launcher
@@ -147,6 +159,23 @@ public actor Router {
             case .daemonInfo:
                 return try respond(id: head.id, result: await daemonInfo())
             case .daemonShutdown:
+                /** Lenient on purpose: shutdown is the way out of a wedged
+                    restore, so a frame whose params do not decode is a drain,
+                    never a refusal. */
+                let requestsHandoff =
+                    (try? decoder.decode(WireRequest<ShutdownParams>.self, from: line))?.params.handoff == true
+                /** Only launchd child jobs outlive this process to be adopted,
+                    so a daemon that is not the agent drains instead. */
+                if requestsHandoff, agentJobs != nil {
+                    /** Set before the answer goes out: the bounce that follows
+                        sends SIGTERM, and its drain must already know. */
+                    handedOff = true
+                    let frame = try respond(id: head.id, result: WireEmpty())
+                    Task { [weak self] in
+                        self?.exitProcess("daemon.shutdown handoff")
+                    }
+                    return frame
+                }
                 let frame = try respond(id: head.id, result: WireEmpty())
                 Task { [weak self] in
                     guard let self else { return }
@@ -155,7 +184,7 @@ public actor Router {
                         auto-bootstrap from resurrecting the daemon, and exit 0
                         satisfies KeepAlive={SuccessfulExit:false}. */
                     try? Data().write(to: self.paths.stoppedIntentFile)
-                    await self.exitDaemon()
+                    self.exitProcess("daemon.shutdown request")
                 }
                 return frame
             case .serverRegister:
@@ -564,6 +593,14 @@ public actor Router {
                 }
             }
         }
+    }
+
+    /** SIGTERM's drain, skipped after a handoff exit began: the bounce that
+        follows a handoff terminates the old daemon, and draining then would
+        stop the servers the handoff exists to keep. */
+    public func drainOnTermination() async {
+        guard !handedOff else { return }
+        await drainAll()
     }
 
     /** How long a project's checkout path must be observed continuously
@@ -1333,10 +1370,6 @@ public actor Router {
             searchPath: ProcessInfo.processInfo.environment["PATH"],
             socketPath: paths.socketPath
         )
-    }
-
-    private func exitDaemon() -> Never {
-        DaemonTelemetry.exit(code: 0, reason: "daemon.shutdown request")
     }
 
     /** Writes a devservers.json from what the daemon already knows, which is the

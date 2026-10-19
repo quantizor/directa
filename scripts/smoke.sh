@@ -203,6 +203,39 @@ STRAY_PIDS+=("$(grep grandchild "$RAW_SPOOL" | tail -1 | awk '{print $NF}')")
 kill -9 "-$CHILD_PID" 2>/dev/null || true
 CHILD_PID=""
 
+# Handoff fallback: only a daemon running as the launchd agent can hand its
+# servers on (adoption needs a child job to find), so a handoff shutdown sent to
+# this foreground daemon must drain like any other shutdown: the server stops,
+# the stop marker lands, and the daemon exits. The agent-mode handoff itself is
+# covered by DaemonHandoffTests.
+"$BIN/ddirecta" --foreground --socket "$DIRECTA_SOCKET" --data-dir "$WORK/data" --logs-dir "$WORK/logs" \
+  >>"$DAEMON_LOG" 2>&1 &
+DAEMON_PID=$!
+await_daemon "handoff fallback boot"
+"$DIRECTA" start web --json > /dev/null
+CHILD_PID="$("$DIRECTA" status web --json | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["servers"][0]["pid"])')"
+/usr/bin/python3 - "$DIRECTA_SOCKET" <<'PY' || fail "handoff shutdown request was not answered"
+import json, socket, sys
+conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+conn.settimeout(10)
+conn.connect(sys.argv[1])
+stream = conn.makefile("rwb")
+stream.readline()  # hello
+request = {"id": "handoff", "method": "daemon.shutdown", "params": {"handoff": True}}
+stream.write(json.dumps(request).encode() + b"\n")
+stream.flush()
+sys.exit(0 if json.loads(stream.readline()).get("ok") is True else 1)
+PY
+for i in {1..100}; do kill -0 "$DAEMON_PID" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$DAEMON_PID" 2>/dev/null && fail "daemon did not exit after a handoff shutdown"
+wait "$DAEMON_PID" 2>/dev/null || true
+DAEMON_PID=""
+for i in {1..100}; do kill -0 "$CHILD_PID" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$CHILD_PID" 2>/dev/null && fail "a foreground daemon left the server running after a handoff shutdown"
+[[ -e "$WORK/data/stopped.intent" ]] || fail "a handoff shutdown to a foreground daemon wrote no stop marker"
+CHILD_PID=""
+pass "a foreground daemon drains on a handoff shutdown (server stopped, stop marker written)"
+
 # Phase 5: a real devservers.json project with dependencies, trust, up/down.
 PROJECT3="$WORK/project3"
 mkdir -p "$PROJECT3"

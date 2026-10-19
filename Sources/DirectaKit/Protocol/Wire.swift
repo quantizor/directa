@@ -218,6 +218,19 @@ public struct WireEmpty: Codable, Equatable, Sendable {
     public init() {}
 }
 
+/** `daemon.shutdown`'s params. `handoff` true asks a daemon running as the
+    background agent to exit without stopping its servers, so the next daemon
+    adopts them; absent or false drains them first. A daemon that predates the
+    field ignores it and drains, and a client that predates it sends `{}`,
+    which decodes here as a drain. */
+public struct ShutdownParams: Codable, Equatable, Sendable {
+    public var handoff: Bool?
+
+    public init(handoff: Bool? = nil) {
+        self.handoff = handoff
+    }
+}
+
 /** Method names; string-typed on the wire, enum-checked in code. */
 public enum WireMethod: String, CaseIterable, Sendable {
     case daemonInfo = "daemon.info"

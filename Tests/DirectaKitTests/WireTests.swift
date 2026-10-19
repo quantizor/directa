@@ -328,6 +328,23 @@ import Testing
         )
     }
 
+    /** `daemon.shutdown`'s params: a plain drain encodes the `{}` every client
+        has always sent, and `{}` or an unknown key from a newer client decodes
+        as a drain. */
+    @Test func shutdownParamsSchemaGolden() throws {
+        func encoded(_ params: ShutdownParams) throws -> String {
+            String(data: try JSONCoding.encoder().encode(params), encoding: .utf8)!
+        }
+        #expect(try encoded(ShutdownParams()) == "{}")
+        #expect(try encoded(ShutdownParams(handoff: true)) == #"{"handoff":true}"#)
+        #expect(try encoded(ShutdownParams(handoff: false)) == #"{"handoff":false}"#)
+        let decoder = JSONCoding.decoder()
+        #expect(try decoder.decode(ShutdownParams.self, from: Data("{}".utf8)) == ShutdownParams())
+        #expect(
+            try decoder.decode(ShutdownParams.self, from: Data(#"{"handoff":true,"later":1}"#.utf8))
+                == ShutdownParams(handoff: true))
+    }
+
     /** `project.forget`'s result names the servers it dropped along with the
         row, trust, and log directory: `doctor --fix` reports the count in its
         finding without a second query. */

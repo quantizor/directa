@@ -235,13 +235,14 @@ do {
 }
 
 /** Graceful termination: drain-stop every supervised server through the normal
-    teardown path, unregister power notifications, then exit 0 (a deliberate
-    stop must not trigger KeepAlive). */
+    teardown path (except after a handoff exit began, which leaves them
+    running), unregister power notifications, then exit 0 (a deliberate stop
+    must not trigger KeepAlive). */
 let terminationSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
 signal(SIGTERM, SIG_IGN)
 terminationSource.setEventHandler {
     Task { @MainActor in
-        await router.drainAll()
+        await router.drainOnTermination()
         if let port = powerPort {
             IONotificationPortSetDispatchQueue(port, nil)
         }

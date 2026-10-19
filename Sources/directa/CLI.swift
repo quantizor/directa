@@ -2518,7 +2518,7 @@ struct DaemonStop: AsyncParsableCommand {
 
     func run() async throws {
         let client = CLIRunner.client()
-        _ = try? await client.request(.daemonShutdown, params: WireEmpty(), expecting: WireEmpty.self)
+        _ = try? await client.request(.daemonShutdown, params: ShutdownParams(), expecting: WireEmpty.self)
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
             "the daemon is stopping (servers drained; directa daemon start to bring it back)"
         }
@@ -2528,7 +2528,7 @@ struct DaemonStop: AsyncParsableCommand {
 struct DaemonRestart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "restart",
-        abstract: "Drain, relaunch the daemon, and re-ensure the servers that were running.")
+        abstract: "Relaunch the daemon, keeping running servers up, and re-ensure any that were not adopted.")
 
     @OptionGroup var global: GlobalOptions
 

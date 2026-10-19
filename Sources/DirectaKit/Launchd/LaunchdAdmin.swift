@@ -3,10 +3,20 @@ import os
 
 /** launchd administration: install renders the LaunchAgent and bootstraps it;
     upgrades stage-and-rename the binary (overwriting a running signed Mach-O
-    gets it SIGKILLed); restart drains, kickstarts, and re-ensures what ran.
+    gets it SIGKILLed); restart hands the servers to the next daemon,
+    kickstarts, and re-ensures what ran.
     Shared by the CLI and the menu bar app so both can bring the daemon back. */
 public enum LaunchdAdmin {
     public static let label = "dev.quantizor.directa"
+
+    /** The `launchctl` call a bounce makes, by arguments. A parameter of
+        `restart` so a test records the order of a bounce's steps without a
+        real launchd domain. */
+    public typealias Launchctl = @Sendable (_ arguments: [String]) async -> (status: Int32, output: String)
+
+    public static let liveLaunchctl: Launchctl = { arguments in
+        await shell("/bin/launchctl", arguments)
+    }
 
     public static var plistURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -236,7 +246,7 @@ public enum LaunchdAdmin {
         (correct Bundle.main). Otherwise writes the home LaunchAgent.
 
         Same bounce contract as restart either way: capture what is running,
-        drain, swap binary + bootstrap, re-ensure. The daemon's recoverAtStartup
+        hand off to the next daemon, swap binary + bootstrap, re-ensure. The daemon's recoverAtStartup
         is the reboot path; install cannot rely on it alone because a pre-feature
         state.json may lack resumeOnBoot, and the CLI already knows the live
         names from status. */
@@ -248,17 +258,7 @@ public enum LaunchdAdmin {
     )] {
         let client = DaemonClient(socketPath: paths.socketPath)
         let runningServers = await captureActiveServers(client: client)
-        /** Drain through the daemon FIRST: bootout's own kill can outrun the
-            SIGTERM drain and orphan server trees mid-escalation. */
-        _ = try? await client.request(.daemonShutdown, params: WireEmpty(), expecting: WireEmpty.self)
-        for _ in 0..<50 where FileManager.default.fileExists(atPath: paths.socketPath) {
-            if (try? await DaemonClient(socketPath: paths.socketPath)
-                .request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)) == nil
-            {
-                break
-            }
-            try? await Task.sleep(for: .milliseconds(100))
-        }
+        await handOffRunningDaemon(paths: paths)
         try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
 
         if !forceLegacy, applicationsAppPresent() {
@@ -315,7 +315,7 @@ public enum LaunchdAdmin {
         removes any leftover home plist. */
     public static func uninstall(loginItem: Bool = false, paths: DirectaPaths, purge: Bool) async {
         let client = DaemonClient(socketPath: paths.socketPath)
-        _ = try? await client.request(.daemonShutdown, params: WireEmpty(), expecting: WireEmpty.self)
+        _ = try? await client.request(.daemonShutdown, params: ShutdownParams(), expecting: WireEmpty.self)
         if applicationsAppPresent() {
             if loginItem {
                 _ = requestAppLaunchItemsUnregister()
@@ -348,14 +348,20 @@ public enum LaunchdAdmin {
         try await pollHello(paths: paths)
     }
 
-    /** Drain, kickstart -k, re-ensure what was running: "servers bounce, then
-        come back" is the restart contract. */
+    /** Hand off, kickstart -k, re-ensure what was running: the old daemon exits
+        without stopping its servers (a daemon that cannot hand off drains them
+        instead), the new one adopts what is still running, and the re-ensure
+        starts whatever it could not. The stop marker is cleared after the old
+        daemon is gone, since a daemon that drained writes it on its way out. */
     @discardableResult
-    public static func restart(paths: DirectaPaths) async throws -> [(project: String, name: String)] {
+    public static func restart(
+        paths: DirectaPaths, launchctl: Launchctl = LaunchdAdmin.liveLaunchctl
+    ) async throws -> [(project: String, name: String)] {
         let client = DaemonClient(socketPath: paths.socketPath)
         let runningServers = await captureActiveServers(client: client)
+        await handOffRunningDaemon(paths: paths)
         try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
-        let result = await shell("/bin/launchctl", ["kickstart", "-k", "\(LaunchdJobs.guiDomain)/\(label)"])
+        let result = await launchctl(["kickstart", "-k", "\(LaunchdJobs.guiDomain)/\(label)"])
         if result.status != 0 {
             throw WireError(
                 code: .internalError,
@@ -379,9 +385,54 @@ public enum LaunchdAdmin {
             .map { (project: $0.project, name: $0.server) }
     }
 
+    /** Asks the running daemon to hand its servers to the next one and exit,
+        then waits (bounded) for it to stop answering. A daemon running as the
+        background agent stops nothing; any other daemon, and one that predates
+        the field, drains. Sent before the bounce because launchd's own kill can
+        outrun a SIGTERM drain and orphan server trees mid-escalation; after a
+        handoff the daemon also skips the drain that SIGTERM would start. No
+        daemon answering is not an error: the bounce then only starts one. */
+    public static func handOffRunningDaemon(paths: DirectaPaths) async {
+        let client = DaemonClient(socketPath: paths.socketPath)
+        _ = try? await client.request(
+            .daemonShutdown, params: ShutdownParams(handoff: true), expecting: WireEmpty.self)
+        for _ in 0..<50 where FileManager.default.fileExists(atPath: paths.socketPath) {
+            if (try? await DaemonClient(socketPath: paths.socketPath)
+                .request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)) == nil
+            {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    /** Returns once the daemon is no longer restoring, it stops answering, or
+        `timeoutSeconds` pass. A daemon answers `daemon.info` from the moment
+        it accepts but refuses real work until restore (adoption included)
+        returns, so a re-ensure sent on the first answer would be refused. */
+    public static func awaitRestoreFinished(
+        paths: DirectaPaths, timeoutSeconds: Double = 30
+    ) async {
+        await awaitRestoreFinished(timeoutSeconds: timeoutSeconds, interval: .milliseconds(100)) {
+            try? await DaemonClient(socketPath: paths.socketPath)
+                .request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
+        }
+    }
+
+    static func awaitRestoreFinished(
+        timeoutSeconds: Double, interval: Duration,
+        readInfo: @Sendable () async -> DaemonInfo?
+    ) async {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(timeoutSeconds))
+        while let info = await readInfo(), info.restoring == true, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: interval)
+        }
+    }
+
     public static func reensure(
         _ servers: [(project: String, name: String)], paths: DirectaPaths
     ) async {
+        await awaitRestoreFinished(paths: paths)
         let fresh = DaemonClient(socketPath: paths.socketPath)
         for server in servers {
             _ = try? await fresh.request(
