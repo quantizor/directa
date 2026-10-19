@@ -70,7 +70,7 @@ public struct NetworkHealthProber: HealthProber {
         a session-wide resource timeout caps every request below whatever its
         own `timeoutInterval` asks (a 10s `timeoutMs` once failed at 5s);
         `probe` enforces the configured bound itself. */
-    private static let session: URLSession = {
+    static let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         let ceiling = Double(HealthCheckSpec.durationRange.upperBound) / 1000
         config.timeoutIntervalForRequest = ceiling
@@ -79,7 +79,17 @@ public struct NetworkHealthProber: HealthProber {
         return URLSession(configuration: config, delegate: RedirectStopper.shared, delegateQueue: nil)
     }()
 
-    public init() {}
+    /** Where the TCP connect waits, so a slow healthcheck never queues ahead
+        of the `system` lane's launchctl, lsof, and ps calls. */
+    let lane: BlockingLane
+
+    public init() {
+        self.init(lane: .health)
+    }
+
+    init(lane: BlockingLane) {
+        self.lane = lane
+    }
 
     public func probe(_ check: EffectiveHealthcheck) async -> HealthProbeOutcome {
         switch check {
@@ -93,7 +103,7 @@ public struct NetworkHealthProber: HealthProber {
         case .tcp(let port, let timeoutMs):
             /** The connect waits in `poll(2)` for up to the configured timeout. */
             let bounded = Self.bounded(timeoutMs)
-            let outcome = await BlockingLane.system.run {
+            let outcome = await lane.run {
                 LoopbackProbe.probe(port: port, timeoutMs: bounded)
             }
             switch outcome {

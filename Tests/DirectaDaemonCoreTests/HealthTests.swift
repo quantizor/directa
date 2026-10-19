@@ -587,17 +587,56 @@ final class TestHTTPResponder: @unchecked Sendable {
 
     /** `timeoutMs` bounds the whole probe. A shared session capped every probe
         at five seconds whatever the config said, so a cold boot that answered
-        at seven read as a timeout. Runs beside every other suite and costs the
-        seven seconds of the answer it waits for. */
+        at seven read as a timeout. The session's own timeouts are asserted
+        directly (they sit at the longest `timeoutMs` a config may carry, so
+        neither can end a request that `timeoutMs` still allows), and a real
+        answer that outlasts the 1.5 second default `timeoutMs` passes under a
+        longer one. */
     @Test func aSlowAnswerInsideTimeoutMsPasses() async throws {
-        let responder = try TestHTTPResponder(delaySeconds: 7)
+        let ceiling = Double(HealthCheckSpec.durationRange.upperBound) / 1000
+        let configuration = NetworkHealthProber.session.configuration
+        #expect(ceiling > 5)
+        #expect(configuration.timeoutIntervalForRequest == ceiling)
+        #expect(configuration.timeoutIntervalForResource == ceiling)
+
+        let responder = try TestHTTPResponder(delaySeconds: 2)
         defer { responder.stop() }
         let clock = ContinuousClock()
         let began = clock.now
-        let outcome = await NetworkHealthProber().probe(
-            .http(url: url(responder), timeoutMs: 10_000))
+        let outcome = await NetworkHealthProber().probe(.http(url: url(responder), timeoutMs: 10_000))
         #expect(outcome == .pass)
-        #expect(began.duration(to: clock.now) >= .seconds(7))
+        #expect(began.duration(to: clock.now) >= .seconds(2))
+    }
+
+    /** A TCP connect waits on the `health` lane, so a probe held there never
+        queues ahead of the `system` lane. The probe runs on a lane of its
+        own that a held job fills: it queues behind that job, and answers once
+        the job lets go. */
+    @Test func aTcpProbeWaitsOnTheLaneItWasGiven() async throws {
+        #expect(NetworkHealthProber().lane === BlockingLane.health)
+        let listener = try TestHTTPResponder()
+        defer { listener.stop() }
+        let lane = BlockingLane(name: "tcp-probe", width: 1)
+        let entered = DispatchSemaphore(value: 0)
+        let gate = DispatchSemaphore(value: 0)
+        let holder = Task.detached {
+            await lane.run {
+                entered.signal()
+                gate.wait()
+            }
+        }
+        let held = await offPool { entered.wait(timeout: .now() + 30) == .success }
+        defer { gate.signal() }
+        try #require(held)
+        let port = listener.port
+        let probe = Task.detached {
+            await NetworkHealthProber(lane: lane).probe(.tcp(port: port, timeoutMs: 2000))
+        }
+        let queued = try await eventually(within: .seconds(10)) { lane.pressure().queued == 1 }
+        #expect(queued, "the probe did not wait behind the job holding its lane")
+        gate.signal()
+        await holder.value
+        #expect(await probe.value == .pass)
     }
 
     @Test func anAnswerPastTimeoutMsFailsAtTheDeadlineAndSaysSo() async throws {
