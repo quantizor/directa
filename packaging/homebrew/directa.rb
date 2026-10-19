@@ -55,11 +55,11 @@ cask "directa" do
   # the user's Library.
   zap trash: [
     "~/Library/Application Support/directa",
-    "~/Library/Caches/dev.quantizor.directa.app",
-    "~/Library/Caches/dev.quantizor.ddirecta",
     "~/Library/Caches/ddirecta",
-    "~/Library/HTTPStorages/dev.quantizor.ddirecta",
+    "~/Library/Caches/dev.quantizor.ddirecta",
+    "~/Library/Caches/dev.quantizor.directa.app",
     "~/Library/HTTPStorages/ddirecta",
+    "~/Library/HTTPStorages/dev.quantizor.ddirecta",
     "~/Library/LaunchAgents/dev.quantizor.directa.plist",
     "~/Library/Logs/directa",
     "~/Library/Preferences/dev.quantizor.directa.app.plist",
