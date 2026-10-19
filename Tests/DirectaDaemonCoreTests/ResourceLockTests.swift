@@ -578,6 +578,125 @@ private struct StuckOrRealLauncher: NeverAdopts {
         #expect(hostile.hint == "run: directa why <name>")
     }
 
+    /** A declarer whose stop never lands (its run reports no exit), declaring
+        `data`, running through `router`. */
+    private func stuckDeclarerRouter(
+        named name: String, gate: AdoptGate, overtimeSeconds: Double
+    ) async throws -> (env: RouterEnv, router: Router) {
+        let env = try makeRouterEnv(named: name)
+        try writeDevservers(
+            project: env.project,
+            servers: #""db": { "command": ["/bin/sh", "-c", "sleep 60", "stuck"], "locks": ["data"] }"#)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: StuckOrRealLauncher(stuck: StuckRunLauncher(gate: gate)), paths: env.paths,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: overtimeSeconds))
+        try await startDB(router: router, project: env.project)
+        return (env, router)
+    }
+
+    /** The key is held from the moment an acquire begins pausing declarers: an
+        `ensure` of the declarer, or a second acquire, that lands while the
+        pause is still stopping it is refused as contended and names the
+        holder. When the pause then gives up, nothing stays held. */
+    @Test func anEnsureOrASecondAcquireLandingMidPauseIsRefusedAsContended() async throws {
+        let gate = AdoptGate()
+        defer { gate.signal(.signaled(signal: Int(SIGKILL))) }
+        let (env, router) = try await stuckDeclarerRouter(
+            named: "lock-reserve", gate: gate, overtimeSeconds: 0.5)
+        let project = env.project
+        let first = Task {
+            try await router.attempt(
+                .lockAcquire,
+                LockParams(
+                    holderPid: Int(getpid()), pause: true, project: project, resource: "data",
+                    resumeTimeoutSeconds: 15),
+                LockResult.self)
+        }
+        let pausing = try await eventually(within: .seconds(5), every: .milliseconds(5)) {
+            try await phaseOf(router: router, project: env.project, name: "db") == .stopping
+        }
+        try #require(pausing)
+
+        let ensure = try await router.response(
+            .serverEnsure, EnsureParams(name: "db", project: env.project, timeoutSeconds: 2),
+            EnsureResult.self)
+        #expect(ensure.error?.code == .resourceLocked)
+        #expect(ensure.error?.hint == "run: ps -p \(getpid())")
+
+        let second = try await router.attempt(
+            .lockAcquire,
+            LockParams(
+                holderPid: Int(getppid()), pause: true, project: env.project, resource: "data",
+                resumeTimeoutSeconds: 15),
+            LockResult.self)
+        guard case .failure(let contended) = second else {
+            Issue.record("a second acquire was granted over a pause still in progress: \(second)")
+            return
+        }
+        #expect(contended.code == .resourceLocked)
+        #expect(contended.hint == "run: ps -p \(getpid())")
+
+        guard case .failure(let refusal) = try await first.value else {
+            Issue.record("the pause was granted over a declarer whose stop never landed")
+            return
+        }
+        #expect(refusal.hint == "run: directa why db")
+        let held = try await router.call(
+            .lockStatus, LockStatusParams(project: env.project, resource: "data"), LockStatusResult.self)
+        #expect(held.holder == nil)
+    }
+
+    /** A pause that arrives while a stop is already in flight answers with
+        that stop's own completion, the moment it lands, rather than waiting
+        out a bound of its own that starts later: the in-flight stop never
+        lands here, so both give up together. */
+    @Test func aPauseJoiningAStopInFlightSharesItsCompletion() async throws {
+        let gate = AdoptGate()
+        defer { gate.signal(.signaled(signal: Int(SIGKILL))) }
+        let (env, router) = try await stuckDeclarerRouter(
+            named: "lock-join", gate: gate, overtimeSeconds: 0.6)
+        let clock = ContinuousClock()
+        let stopBegan = clock.now
+        let project = env.project
+        let stop = Task {
+            _ = try await router.attempt(
+                .serverStop, ServerTargetParams(name: "db", project: project), ServerResult.self)
+            return clock.now
+        }
+        let stopping = try await eventually(within: .seconds(5), every: .milliseconds(5)) {
+            try await phaseOf(router: router, project: env.project, name: "db") == .stopping
+        }
+        try #require(stopping)
+        /** Joins well into the stop's bound, so a bound of its own would end
+            long after the stop's. */
+        let joinAt = stopBegan.advanced(by: .milliseconds(300))
+        let late = try await eventually(within: .seconds(5), every: .milliseconds(5)) {
+            clock.now >= joinAt
+        }
+        try #require(late)
+
+        let attempt = try await router.attempt(
+            .lockAcquire,
+            LockParams(
+                holderPid: Int(getpid()), pause: true, project: env.project, resource: "data",
+                resumeTimeoutSeconds: 15),
+            LockResult.self)
+        let joinerEnded = clock.now
+        let stopEnded = try await stop.value
+
+        guard case .failure(let refusal) = attempt else {
+            Issue.record("the pause was granted over a stop that never landed: \(attempt)")
+            return
+        }
+        #expect(refusal.hint == "run: directa why db")
+        #expect(
+            joinerEnded - stopEnded < .milliseconds(150),
+            "the pause waited a bound of its own after the stop it joined gave up")
+    }
+
     /** One declarer stops cleanly and the next one's stop gives up: the lock is
         refused with `resource-locked` naming the second, the first is back up,
         and no hold is left recorded. */

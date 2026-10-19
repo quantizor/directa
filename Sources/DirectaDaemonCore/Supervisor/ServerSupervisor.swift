@@ -82,15 +82,15 @@ public struct StopTiming: Sendable {
 /** How a stop ended for a caller that has to know the run's whole process
     tree is gone, not only the root (`ServerSupervisor.stopAndConfirm`). */
 public enum StopCompletion: Equatable, Sendable {
-    /** The phase left `.stopping` and every process the stop signaled has
-        exited. */
-    case treeGone
     /** The bounded wait for the phase to leave `.stopping` (or for a pid to
         appear) expired. */
     case stillStopping
     /** The phase cleared, but these pids still run past the SIGKILL pass and
         its bounded wait. */
     case survivors(pids: [Int])
+    /** The phase left `.stopping` and every process the stop signaled has
+        exited. */
+    case treeGone
 }
 
 /** One actor per server: owns the child's lifecycle and serializes every mutation,
@@ -260,6 +260,17 @@ public actor ServerSupervisor {
         already retired or deleted. Covers the moment before the router's
         `Registry.retireState` lands; the registry refuses `writerID` after. */
     private var stateWritesAbandoned = false
+    private var stopGeneration = 0
+    /** The teardown of the stop in flight (its SIGTERM and SIGKILL passes and
+        the wait for every signaled process to exit), kept so a stop or a lock
+        pause that arrives while it runs awaits the same completion rather
+        than judging the tree from the phase alone, which clears before the
+        tree has finished exiting. `generation` tells a teardown's own
+        cleanup apart from a later stop's entry. `begun` is false from the
+        moment the stop is recorded until its task has moved the phase to
+        `.stopping`, a gap in which a second stop must join rather than read
+        the still-live phase as a newer run. */
+    private var stopInFlight: (begun: Bool, generation: Int, task: Task<StopCompletion, Never>)?
     /** The pids of the run the last `stop` tore down: its root plus every
         descendant the SIGTERM and SIGKILL passes signaled. Read by the Router
         right after the stop to say whether a lingering listener belonged to
@@ -731,14 +742,17 @@ public actor ServerSupervisor {
 
     /** `stop`, answering also whether the run's whole process tree is gone:
         the one stop a caller that is about to touch what the run held open
-        (a lock's pause) can trust. A stop that joins one already in flight can
-        speak only for the phase (the descendants belong to the stop it
-        joined), so it answers `.treeGone` once that clears. */
+        (a lock's pause) can trust. A stop that joins one already in flight
+        answers with that stop's own completion, so the descendants it is
+        still waiting on are waited on here too. */
     public func stopAndConfirm(
         graceSeconds requestedGrace: Double? = nil, deliberate: Bool = true, reason: String
     ) async -> ConfirmedStop {
         let graceSeconds = requestedGrace ?? stopTiming.graceSeconds
         let stopWaitTimeout = stopWaitBound(graceSeconds: graceSeconds)
+        if let joined = await stopInFlightCompletion() {
+            return ConfirmedStop(completion: joined, status: await status())
+        }
         switch phase {
         case .failed where pid != nil:
             /** A port failure leaves its run alive, so it stops like a
@@ -778,8 +792,55 @@ public actor ServerSupervisor {
             return await stopAndConfirm(
                 graceSeconds: requestedGrace, deliberate: deliberate, reason: reason)
         }
+        stopGeneration += 1
+        let generation = stopGeneration
+        let teardown = Task {
+            await self.tearDown(
+                target: target, deliberate: deliberate, generation: generation,
+                graceSeconds: graceSeconds, reason: reason, stopWaitTimeout: stopWaitTimeout)
+        }
+        stopInFlight = (begun: false, generation: generation, task: teardown)
+        return ConfirmedStop(completion: await teardown.value, status: await status())
+    }
+
+    /** The completion of the stop in flight, for a caller whose run is already
+        down by phase alone (stopping, stopped, crashed, or failed with no
+        pid) and who must still wait for the tree that stop is waiting on. Nil
+        when no stop is running, or when the phase says a newer run is up (a
+        start that followed the stop), whose tree the stop in flight does not
+        speak for. */
+    public func stopInFlightCompletion() async -> StopCompletion? {
+        guard let inFlight = stopInFlight, !inFlight.begun || runIsDownByPhase else { return nil }
+        return await inFlight.task.value
+    }
+
+    private var runIsDownByPhase: Bool {
+        switch phase {
+        case .crashed, .stopped, .stopping:
+            true
+        case .failed:
+            pid == nil
+        case .running, .starting, .unhealthy:
+            false
+        }
+    }
+
+    /** The teardown of one stop of a known pid, run as its own task so every
+        stop that arrives while it runs awaits the same completion
+        (`stopInFlightCompletion`). */
+    private func tearDown(
+        target: pid_t, deliberate: Bool, generation: Int, graceSeconds: Double, reason: String,
+        stopWaitTimeout: Duration
+    ) async -> StopCompletion {
         let activity = DaemonActivity.shared.begin(.stop, label: "\(serverID): \(reason)")
-        defer { DaemonActivity.shared.end(activity, outcome: phase.rawValue) }
+        defer {
+            DaemonActivity.shared.end(activity, outcome: phase.rawValue)
+            if stopInFlight?.generation == generation { stopInFlight = nil }
+        }
+        /** Read as begun only from here: `beginStop` moves the phase to
+            `.stopping` before its first suspension, so no other caller
+            observes the flag set with the phase still live. */
+        if stopInFlight?.generation == generation { stopInFlight?.begun = true }
         let pass = await beginStop(
             target: target, reason: reason, deliberate: deliberate, graceSeconds: graceSeconds)
         /** The grace ends early only once the root and every SIGTERM candidate
@@ -798,17 +859,15 @@ public actor ServerSupervisor {
         stoppedRunPids = Set([Int(target)] + signaled.map { Int($0.pid) })
         guard await waitForStoppingToClear(timeout: stopWaitTimeout) else {
             await recordStuckStop(after: stopWaitTimeout)
-            return ConfirmedStop(completion: .stillStopping, status: await status())
+            return .stillStopping
         }
         let survivors = await ProcessTree.awaitExit(
             of: signaled, within: .seconds(stopTiming.treeExitSeconds))
         guard survivors.isEmpty else {
             await recordSurvivors(survivors)
-            return ConfirmedStop(
-                completion: .survivors(pids: survivors.map { Int($0.pid) }.sorted()),
-                status: await status())
+            return .survivors(pids: survivors.map { Int($0.pid) }.sorted())
         }
-        return ConfirmedStop(completion: .treeGone, status: await status())
+        return .treeGone
     }
 
     /** What `stopAndConfirm` answers: whether the whole tree is gone, beside

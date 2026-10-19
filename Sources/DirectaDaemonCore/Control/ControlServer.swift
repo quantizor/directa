@@ -56,6 +56,12 @@ public actor Router {
     /** Deferred servers whose decision is being made right now, so a retry
         tick and a request that both find a dead run settle it once. */
     private var settlingDeferredSurvivors: Set<String> = []
+    /** Lock keys whose `acquireLock` is still stopping declarers. The key is
+        held by a reservation in `resourceLocks` meanwhile, which refuses a
+        declarer's start and any other acquire as contended; this set tells
+        the reservation apart from a completed hold, which is the only one a
+        retrying holder may re-acquire and the only one persisted. */
+    private var pendingLockAcquires: Set<String> = []
 
     /** What the per-row restore decision needs, captured when the row was
         deferred. */
@@ -82,13 +88,13 @@ public actor Router {
         Set(unhealthyEnsureRestarts.keys).union(finishedUnhealthyEnsureRestarts.keys).count
     }
 
+    private static let daemonRestartHint = "run: directa daemon restart"
     private static let daemonStartingHint = "run: directa daemon status"
     /** The reason an ensure of an unhealthy server stops the run it replaces;
         the `stopped` event carries it as its detail. */
     static let unhealthyEnsureRestartReason = "restarted by ensure: unhealthy"
     /** True once a `daemon.shutdown` with `handoff` was accepted: this daemon is
         leaving its servers running for the next one, so a SIGTERM that races
-    private static let daemonRestartHint = "run: directa daemon restart"
         the exit must not drain them. */
     private var handedOff = false
 
@@ -415,13 +421,13 @@ public actor Router {
                 let target = ServerTargetParams(
                     name: request.params.name,
                     project: canonicalProjectPath(request.params.project))
+                try await refuseWhileDeferred(project: target.project, name: target.name)
                 let supervisor = try await resolvedSupervisor(target)
                 let reason = await supervisor.wait(
                     for: request.params.condition, timeoutSeconds: request.params.timeoutSeconds)
                 return try respond(
                     id: head.id,
                     result: EnsureResult(reason: reason, server: reported(await supervisor.status())))
-                try await refuseWhileDeferred(project: target.project, name: target.name)
             case .lockAcquire:
                 let request = try decoder.decode(WireRequest<LockParams>.self, from: line)
                 var params = request.params
@@ -620,14 +626,17 @@ public actor Router {
         is stopped too (`drainDeferredSurvivor`), so a shutdown or uninstall
         leaves no server running unsupervised. */
     public func drainAll() async {
+        drainingDeferredSurvivors = true
+        let deferredIDs = Array(deferredSurvivors.keys)
         await withTaskGroup(of: Void.self) { group in
             for supervisor in supervisors.values {
                 group.addTask {
                     _ = await supervisor.stop(deliberate: false, reason: "daemon shutting down")
                 }
             }
-        drainingDeferredSurvivors = true
-        let deferredIDs = Array(deferredSurvivors.keys)
+            for id in deferredIDs {
+                group.addTask { await self.drainDeferredSurvivor(id: id) }
+            }
         }
     }
 
@@ -637,15 +646,6 @@ public actor Router {
         await withTaskGroup(of: Void.self) { group in
             for supervisor in supervisors.values {
                 group.addTask { await supervisor.prepareHandoff() }
-            }
-        }
-    }
-
-    /** SIGTERM's drain, skipped after a handoff exit began: the bounce that
-        follows a handoff terminates the old daemon, and draining then would
-        stop the servers the handoff exists to keep. */
-            for id in deferredIDs {
-                group.addTask { await self.drainDeferredSurvivor(id: id) }
             }
         }
     }
@@ -668,8 +668,14 @@ public actor Router {
                     entry.startedAt = nil
                 }
             }
-    public func drainOnTermination() async {
+        }
         deferredSurvivors[id] = nil
+    }
+
+    /** SIGTERM's drain, skipped after a handoff exit began: the bounce that
+        follows a handoff terminates the old daemon, and draining then would
+        stop the servers the handoff exists to keep. */
+    public func drainOnTermination() async {
         guard !handedOff else { return }
         await drainAll()
     }
@@ -1012,24 +1018,24 @@ public actor Router {
         while !deferredSurvivors.isEmpty, !drainingDeferredSurvivors {
             let remaining = deadline - clock.now
             guard remaining > .zero else {
+                deferredRetryGaveUp = true
                 DirectaLog.daemon.error(
                     "recover: launchd's job list never answered; \(deferredSurvivors.count) server(s) stay deferred until the next daemon launch")
                 return
             }
             do {
                 try await Task.sleep(for: min(delay, remaining))
-                deferredRetryGaveUp = true
             } catch {
                 return
             }
+            await settleGoneDeferredSurvivors()
+            guard !deferredSurvivors.isEmpty else { return }
             switch await agentJobs.listChildJobs() {
             case .listed(let jobs):
                 await settleDeferredSurvivors(against: jobs)
                 return
             case .unavailable(let reason):
                 DirectaLog.daemon.error(
-            await settleGoneDeferredSurvivors()
-            guard !deferredSurvivors.isEmpty else { return }
                     "recover: launchd job list re-read failed, retrying in \(min(delay * 2, deferredSurvivorRetry.longestDelay)): \(reason)")
                 delay = min(delay * 2, deferredSurvivorRetry.longestDelay)
             }
@@ -1074,12 +1080,6 @@ public actor Router {
         guard !drainingDeferredSurvivors, let survivor = deferredSurvivors[id],
             settlingDeferredSurvivors.insert(id).inserted
         else { return }
-        throw WireError(
-            code: .daemonStarting,
-            hint: Self.daemonStartingHint,
-            message:
-                "'\(name)' in \(project) still has its process (pid \(pid)) from before the daemon restarted, and directa is waiting for launchd to say whether it can take that process back over. It cannot be started, restarted, waited on, or stopped until then; try again shortly.")
-    }
         defer { settlingDeferredSurvivors.remove(id) }
         let decision = await decideRecoveredRow(
             adoptableChildJobs: adoptableChildJobs, id: id, name: survivor.name,
@@ -1113,6 +1113,12 @@ public actor Router {
                 message:
                     "'\(name)' in \(project) still has its process (pid \(pid)) from before the daemon restarted, and launchd's job list never answered, so directa cannot tell whether it can take that process back over. It cannot be started, restarted, waited on, or stopped until the daemon restarts.")
         }
+        throw WireError(
+            code: .daemonStarting,
+            hint: Self.daemonStartingHint,
+            message:
+                "'\(name)' in \(project) still has its process (pid \(pid)) from before the daemon restarted, and directa is waiting for launchd to say whether it can take that process back over. It cannot be started, restarted, waited on, or stopped until then; try again shortly.")
+    }
 
     /** `status` as a client should read it: a deferred survivor shows the
         phase, pid, and uptime its row records, since no supervisor owns the
@@ -1196,12 +1202,6 @@ public actor Router {
     private func bounceOrphan(
         _ root: ProcessIdentity, project: String, name: String
     ) async {
-        guard ProcessTree.shouldSignal(
-            snapshotted: root, live: ProcessTree.identity(of: root.pid))
-        else {
-            DirectaLog.daemon.info(
-                "orphan bounce skip \(name)@\(project): pid \(root.pid) gone or reused")
-            return false
         guard await terminateRun(root, project: project, name: name) else { return }
         await events.post(
             kind: .crashed, project: project, server: name,
@@ -1215,6 +1215,12 @@ public actor Router {
     private func terminateRun(
         _ root: ProcessIdentity, project: String, name: String
     ) async -> Bool {
+        guard ProcessTree.shouldSignal(
+            snapshotted: root, live: ProcessTree.identity(of: root.pid))
+        else {
+            DirectaLog.daemon.info(
+                "orphan bounce skip \(name)@\(project): pid \(root.pid) gone or reused")
+            return false
         }
         let pid = root.pid
         /** The shape of the supervisor's stop. A server is spawned as a
@@ -1665,6 +1671,15 @@ public actor Router {
             /** Phase, not `hasLiveRun`: a live port-failed run still resolves
                 afresh, since `start` replaces it. */
             let current = await supervisor.status()
+            if current.phase == .stopping {
+                /** An ensure of a stopping server waits out the stop and then
+                    spawns, so a lock held meanwhile (a pause still stopping
+                    this very server) refuses it here. */
+                let declared = try await mergedSpecs(project: target.project).specs
+                if let spec = declared.first(where: { $0.name == target.name }) {
+                    try await lockGate(project: target.project, spec: spec)
+                }
+            }
             if current.phase.isActive { return }
         }
         let merged = try await mergedSpecs(project: target.project)
@@ -2148,7 +2163,12 @@ public actor Router {
     private func acquireLock(_ params: LockParams) async throws -> LockResult {
         let key = Self.lockKey(project: params.project, resource: params.resource)
         await releaseOrphanedLock(key: key)
-        if let holder = resourceLocks[key], holder.pid != params.holderPid {
+        /** A reservation (an acquire still stopping declarers) contends with
+            every other acquire, its own holder's retry included: that retry
+            would otherwise read the half-built hold as a finished one. */
+        if let holder = resourceLocks[key],
+            holder.pid != params.holderPid || pendingLockAcquires.contains(key)
+        {
             throw WireError(
                 code: .resourceLocked,
                 hint: "run: ps -p \(holder.pid)",
@@ -2172,9 +2192,39 @@ public actor Router {
                 statePath: try LockResource.statePath(
                     project: params.project, resource: params.resource, specs: merged.specs))
         }
+        let shouldPause = params.pause ?? false
+        /** The key is reserved before the first await below, so everything
+            that lands while declarers are stopping sees it held: a `start` or
+            `ensure` of a declarer is refused by `lockGate`, a restore start
+            joins the paused set (`waitUnderLiveLock`), and a second acquire is
+            refused above. Every way out of the grant either completes the hold
+            or takes the reservation back and resumes what it paused. */
+        resourceLocks[key] = LockHolder(
+            pause: shouldPause, pid: params.holderPid,
+            resumeTimeoutSeconds: params.resumeTimeoutSeconds, since: Date())
+        pendingLockAcquires.insert(key)
+        do {
+            return try await grantLock(params, key: key, shouldPause: shouldPause)
+        } catch {
+            let paused = resourceLocks[key]?.paused ?? []
+            resourceLocks[key] = nil
+            pendingLockAcquires.remove(key)
+            persistLocks()
+            await resumePaused(
+                names: paused, project: params.project, resource: params.resource,
+                timeoutSeconds: params.resumeTimeoutSeconds ?? 60)
+            throw error
+        }
+    }
+
+    /** The body of `acquireLock` once the key is reserved: finds the declarers,
+        stops them when pausing, and replaces the reservation with the finished
+        hold. */
+    private func grantLock(_ params: LockParams, key: String, shouldPause: Bool) async throws
+        -> LockResult
+    {
         var live: [String] = []
         var paused: [String] = []
-        let shouldPause = params.pause ?? false
         /** Not `try?`. Swallowing the merge failure left `specs` empty, so no
             declarer was found, nothing was paused, and the lock reported success:
             the caller then ran its migration against a live server holding the
@@ -2194,6 +2244,16 @@ public actor Router {
         where LockResource.declares(resource: params.resource, spec: spec) {
             let supervisor = await supervisor(project: params.project, spec: spec)
             let status = reported(await supervisor.status())
+            /** A declarer whose phase already reads stopped can still have its
+                last stop waiting on the run's tree: the grant waits for that
+                tree too. */
+            if shouldPause, !status.hasLiveRun,
+                let completion = await supervisor.stopInFlightCompletion(), completion != .treeGone
+            {
+                throw Self.pauseRefusal(
+                    server: spec.name, resource: params.resource,
+                    survivors: Self.survivors(of: completion))
+            }
             guard status.hasLiveRun else { continue }
             guard shouldPause else {
                 /** Sound for the whole hold: lockGate refuses to start a
@@ -2207,37 +2267,46 @@ public actor Router {
                 Granting the lock over a tree that is still running, or a stop
                 that gave up, would hand the guarded command the file the
                 server holds open: refuse, and put back what was already
-                paused. The failing server is not resumed: its processes may
-                still hold the port, and `directa why` says what is left. */
+                paused (`acquireLock` resumes the reservation's paused set).
+                The failing server is not resumed: its processes may still
+                hold the port, and `directa why` says what is left. */
             let stopped = await supervisor.stopAndConfirm(
                 deliberate: false, reason: "paused for lock \(params.resource)")
             guard stopped.completion == .treeGone else {
                 DirectaLog.daemon.error(
                     "lock \(params.resource) refused: \(spec.name)@\(params.project) did not stop completely (\(stopped.completion))")
-                await resumePaused(
-                    names: paused, project: params.project, resource: params.resource,
-                    timeoutSeconds: params.resumeTimeoutSeconds ?? 60)
-                let survivors: [Int]? =
-                    if case .survivors(let pids) = stopped.completion { pids } else { nil }
                 throw Self.pauseRefusal(
-                    server: spec.name, resource: params.resource, survivors: survivors)
+                    server: spec.name, resource: params.resource,
+                    survivors: Self.survivors(of: stopped.completion))
             }
             paused.append(spec.name)
+            resourceLocks[key]?.paused.append(spec.name)
             DirectaLog.daemon.info(
                 "lock \(params.resource) paused \(spec.name)@\(params.project)")
         }
         live.sort()
-        paused.sort()
         /** Refusing here is correct when directa cannot tell which state the lock
             guards: taking it anyway would report on the wrong file. */
         let statePath = try LockResource.statePath(
             project: params.project, resource: params.resource, specs: merged.specs)
+        /** Servers a restore start parked on the reservation (`waitUnderLiveLock`)
+            join the hold's paused set, so its release starts them. */
+        let parked = resourceLocks[key]?.paused ?? []
         resourceLocks[key] = LockHolder(
-            live: live.isEmpty ? nil : live, pause: shouldPause, paused: paused,
+            live: live.isEmpty ? nil : live, pause: shouldPause,
+            paused: Array(Set(paused).union(parked)).sorted(),
             pid: params.holderPid, resumeTimeoutSeconds: params.resumeTimeoutSeconds, since: Date())
+        pendingLockAcquires.remove(key)
         persistLocks()
+        paused.sort()
         return LockResult(
             live: live.isEmpty ? nil : live, paused: paused, statePath: statePath)
+    }
+
+    /** The pids that outlived a stop, for `pauseRefusal`; nil for a stop that
+        never finished. */
+    private static func survivors(of completion: StopCompletion) -> [Int]? {
+        if case .survivors(let pids) = completion { pids } else { nil }
     }
 
     /** Why a `--pause` lock was not granted: one declarer's stop gave up or left
@@ -2271,7 +2340,9 @@ public actor Router {
         that was paused. */
     private func releaseLock(_ params: LockParams) async throws -> LockResult {
         let key = Self.lockKey(project: params.project, resource: params.resource)
-        guard let holder = resourceLocks[key], holder.pid == params.holderPid else {
+        guard let holder = resourceLocks[key], holder.pid == params.holderPid,
+            !pendingLockAcquires.contains(key)
+        else {
             return LockResult(paused: [])
         }
         resourceLocks[key] = nil
@@ -2287,7 +2358,7 @@ public actor Router {
         and at startup so a crashed harness (or a dead CLI after a daemon bounce)
         never leaves servers stopped. */
     private func releaseOrphanedLock(key: String) async {
-        guard let holder = resourceLocks[key] else { return }
+        guard let holder = resourceLocks[key], !pendingLockAcquires.contains(key) else { return }
         guard !ProcessTree.isAlive(holder.pid) else { return }
         guard let separator = key.range(of: "::") else {
             resourceLocks[key] = nil
@@ -2399,9 +2470,12 @@ public actor Router {
     }
 
     private func persistLocks() {
-        /** Empty file is fine: defensive load treats missing/corrupt as {}. */
+        /** Empty file is fine: defensive load treats missing/corrupt as {}.
+            A reservation is not a hold yet and is never written: a daemon that
+            died mid-acquire would otherwise reload a half-built hold. */
+        let holds = resourceLocks.filter { !pendingLockAcquires.contains($0.key) }
         try? AtomicFile.write(
-            JSONCoding.encoder().encode(LocksFile(locks: resourceLocks)), to: paths.locksFile)
+            JSONCoding.encoder().encode(LocksFile(locks: holds)), to: paths.locksFile)
     }
 
     /** Refuses to start a server while an external holder owns one of its
