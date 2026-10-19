@@ -752,7 +752,8 @@ private func runOwnerIsGone(run name: String) -> Bool {
 private func darwinUserTempDirectory() -> String? {
     var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
     guard confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count) > 0 else { return nil }
-    return String(cString: buffer)
+    let end = buffer.firstIndex(of: 0) ?? buffer.count
+    return String(decoding: buffer[..<end].map { UInt8(bitPattern: $0) }, as: UTF8.self)
 }
 
 private struct RunningProcess {
