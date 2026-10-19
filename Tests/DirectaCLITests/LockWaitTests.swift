@@ -125,8 +125,7 @@ import Testing
         #expect(schedule.shouldAnnounceStillWaiting(atElapsed: 30, lastAnnouncedElapsed: 15))
     }
 
-    // MARK: the acquire wait, over a scripted daemon
-
+    /** The acquire wait below runs over a scripted daemon and a virtual clock. */
     private static let refused = WireError(
         code: .resourceLocked, hint: "run: ps -p 9", message: "resource 'd1' is locked by pid 9")
 
