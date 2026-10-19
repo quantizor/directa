@@ -675,6 +675,47 @@ private func tempDir() throws -> URL {
         #expect(result.findings.first?.summary == "running and healthy")
     }
 
+    /** `running` holds until enough checks fail to turn the server unhealthy.
+        A server answering 500 is running, not healthy. */
+    @Test func aRunningServerIsHealthyOnlyWhileItsLatestCheckPasses() {
+        func summary(_ check: HealthCheckResult?) -> String? {
+            var running = status("web", .running)
+            running.lastHealthCheck = check
+            return WhyEngine.diagnose(
+                target: "web",
+                statuses: ["web": running],
+                specs: ["web": ServerSpec(command: ["w"], name: "web")],
+                evidenceLines: { _ in [] }
+            ).findings.first?.summary
+        }
+        let at = Date(timeIntervalSince1970: 1_700_000_000)
+        #expect(summary(HealthCheckResult(at: at, failures: 0, passed: true)) == "running and healthy")
+        #expect(
+            summary(HealthCheckResult(at: at, detail: "HTTP 500", failures: 4, passed: false))
+                == "running; 4 health checks failed in a row (HTTP 500)")
+        #expect(
+            summary(HealthCheckResult(at: at, detail: "timed out after 10s", failures: 1, passed: false))
+                == "running; 1 health check failed in a row (timed out after 10s)")
+        #expect(
+            summary(HealthCheckResult(at: at, failures: 2, passed: false))
+                == "running; 2 health checks failed in a row")
+    }
+
+    @Test func anUnhealthyServerNamesItsLatestFailure() {
+        var unhealthy = status("web", .unhealthy)
+        unhealthy.lastHealthCheck = HealthCheckResult(
+            at: Date(timeIntervalSince1970: 1_700_000_000), detail: "connection refused", failures: 5,
+            passed: false)
+        let result = WhyEngine.diagnose(
+            target: "web",
+            statuses: ["web": unhealthy],
+            specs: ["web": ServerSpec(command: ["w"], name: "web")],
+            evidenceLines: { _ in [] })
+        #expect(
+            result.findings.first?.summary
+                == "healthcheck failing; last healthy startup; 5 health checks failed in a row (connection refused)")
+    }
+
     @Test func portMismatchIsSurfaced() {
         var mismatched = status("web", .running)
         mismatched.declaredPort = 3000

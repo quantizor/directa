@@ -13,6 +13,7 @@ import Testing
         heads: [String: String]? = nil,
         lastExit: LastExit? = nil,
         lastHealthAt: Date? = nil,
+        lastHealthCheck: HealthCheckResult? = nil,
         phase: ServerPhase,
         port: Int? = nil,
         recentLogTail: [String]? = nil,
@@ -29,6 +30,7 @@ import Testing
             healthcheck: .none,
             lastExit: lastExit,
             lastHealthAt: lastHealthAt,
+            lastHealthCheck: lastHealthCheck,
             logPath: "/logs/\(server)/current.log",
             phase: phase,
             project: "/tmp/proj",
@@ -173,6 +175,32 @@ import Testing
         #expect(text.contains("- web: unhealthy · http://proj.localhost:3000/ · port 3000 · last healthy 2025-07-18T19:46:40.000Z · log /logs/web/current.log"))
         #expect(text.contains("  2 error lines since"))
         #expect(text.contains("  run: directa why web --json"))
+    }
+
+    /** `running` holds until enough checks fail to turn the server unhealthy,
+        so a server answering errors needs its failing check named and the
+        `why` pointer, and sorts ahead of the quiet ones. A passing latest
+        check adds nothing. */
+    @Test func aRunningServerWhoseLatestCheckFailedIsNamedAndPointsAtWhy() {
+        let failing = HealthCheckResult(at: crashedAt, detail: "HTTP 500", failures: 4, passed: false)
+        let passing = HealthCheckResult(at: crashedAt, failures: 0, passed: true)
+        let list = ServerListResult(
+            servers: [
+                status(lastHealthCheck: passing, phase: .running, port: 3000, server: "aaa-ok"),
+                status(
+                    lastHealthCheck: failing, phase: .running, port: 3001, server: "zzz-web",
+                    url: "http://proj.localhost:3001/"),
+            ],
+            trusted: true)
+        let text = AgentContext.render(list: list, harness: .neutral) ?? ""
+        #expect(
+            text.contains(
+                "- zzz-web: running · http://proj.localhost:3001/ · port 3001 · 4 health checks failed in a row (HTTP 500) · log /logs/zzz-web/current.log\n  run: directa why zzz-web --json"
+            ))
+        #expect(text.contains("- aaa-ok: running · port 3000 · log /logs/aaa-ok/current.log"))
+        #expect(!text.contains("aaa-ok/current.log\n  run:"))
+        #expect(
+            text.range(of: "- zzz-web:")!.lowerBound < text.range(of: "- aaa-ok:")!.lowerBound)
     }
 
     @Test func specStaleOnRunningServerGetsRunLineOnly() {

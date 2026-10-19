@@ -252,6 +252,25 @@ import Testing
         #expect(HookChange.picture(of: [base]) == HookChange.picture(of: [later]))
     }
 
+    /** A health check lands every few seconds, each with a new time and a
+        higher failure count; none of that is a change a tool hook speaks about
+        (the phase moving to `unhealthy` is, and is its own field). */
+    @Test func aNewHealthCheckResultIsNotAChange() {
+        var before = server()
+        before.lastHealthCheck = HealthCheckResult(
+            at: Date(timeIntervalSince1970: 10), detail: "HTTP 500", failures: 1, passed: false)
+        var after = before
+        after.lastHealthCheck = HealthCheckResult(
+            at: Date(timeIntervalSince1970: 12), detail: "HTTP 503", failures: 2, passed: false)
+        #expect(HookChange.picture(of: [before]) == HookChange.picture(of: [after]))
+        #expect(outcome(from: [before], to: [after]).text == nil)
+
+        var recovered = after
+        recovered.lastHealthCheck = HealthCheckResult(
+            at: Date(timeIntervalSince1970: 14), failures: 0, passed: true)
+        #expect(outcome(from: [after], to: [recovered]).text == nil)
+    }
+
     @Test func onlyAServerThatEnteredABadStateNeedsItsErrorLinesRead() {
         let stored = HookChange.picture(of: [
             server(name: "api", phase: .crashed), server(name: "db", phase: .running),
