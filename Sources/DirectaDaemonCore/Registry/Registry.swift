@@ -31,6 +31,33 @@ public struct StateFile: Codable, Sendable {
     }
 }
 
+/** Where a tailer stopped in one spool file: the spool's identity (device and
+    inode, so a replaced file is told from the one the tailer read) and the
+    byte offset of the first spool byte not yet in the structured log. */
+public struct SpoolPosition: Codable, Equatable, Sendable {
+    public var bytesRead: UInt64
+    public var device: Int
+    public var inode: UInt64
+
+    public init(bytesRead: UInt64, device: Int, inode: UInt64) {
+        self.bytesRead = bytesRead
+        self.device = device
+        self.inode = inode
+    }
+}
+
+/** The position of a run's two spool tailers, recorded when a daemon hands
+    its servers to the next one. */
+public struct SpoolPositions: Codable, Equatable, Sendable {
+    public var err: SpoolPosition?
+    public var out: SpoolPosition?
+
+    public init(err: SpoolPosition? = nil, out: SpoolPosition? = nil) {
+        self.err = err
+        self.out = out
+    }
+}
+
 public struct PersistedServerState: Codable, Sendable {
     /** Sibling-rebind assignment; optional so older state files keep parsing. */
     public var boundPort: Int?
@@ -48,6 +75,12 @@ public struct PersistedServerState: Codable, Sendable {
         written before this field existed keep parsing. */
     public var resumeOnBoot: Bool?
     public var spawnError: SpawnError?
+    /** Where each spool tailer stopped when the daemon handed this run to its
+        successor, so the adopting daemon ingests what the child wrote during
+        the bounce. Valid for the next adoption only: the adopting daemon and
+        every fresh start clear it. Optional so state files written before
+        this field existed keep parsing. */
+    public var spoolPositions: SpoolPositions?
     public var startedAt: Date?
     /** Consecutive self-exits shaped like an interactive-auth stall (nonzero,
         bounded lifetime, never health-verified a bind). Two or more is what
@@ -65,6 +98,7 @@ public struct PersistedServerState: Codable, Sendable {
         pid: Int? = nil,
         resumeOnBoot: Bool? = nil,
         spawnError: SpawnError? = nil,
+        spoolPositions: SpoolPositions? = nil,
         startedAt: Date? = nil,
         stallStreak: Int? = nil,
         terminalEvidence: [String]? = nil
@@ -76,6 +110,7 @@ public struct PersistedServerState: Codable, Sendable {
         self.pid = pid
         self.resumeOnBoot = resumeOnBoot
         self.spawnError = spawnError
+        self.spoolPositions = spoolPositions
         self.startedAt = startedAt
         self.stallStreak = stallStreak
         self.terminalEvidence = terminalEvidence

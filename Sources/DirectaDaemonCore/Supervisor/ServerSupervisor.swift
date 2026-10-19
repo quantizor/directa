@@ -572,11 +572,13 @@ public actor ServerSupervisor {
         new one: the agent-mode survivor of a jetsam SIGKILL, still registered as
         launchd child job `label` (`ControlServer.recoverAtStartup` found the
         match). Mirrors `recordSpawn` but does not spawn: `pid` is already
-        running and its spool files already exist, so the tailers seed their
-        offset to end-of-file instead of re-ingesting what a prior run already
-        logged. `startedAt` is carried forward from the persisted state rather
-        than stamped now, so uptime is not reset by the adoption itself; a
-        missing value (pre-feature state) falls back to now.
+        running and its spool files already exist, so the tailers resume from
+        the positions a handing-over daemon recorded (when the spools are still
+        the files it read) and otherwise seed their offset to end-of-file,
+        instead of re-ingesting what a prior run already logged. `startedAt`
+        is carried forward from the persisted state rather than stamped now,
+        so uptime is not reset by the adoption itself; a missing value
+        (pre-feature state) falls back to now.
 
         The exit watch is armed first, before anything is recorded: false
         means nothing changed here (phase, pid, registry, tailers) and the
@@ -1407,12 +1409,12 @@ public actor ServerSupervisor {
         phase == .running && consecutiveFailures == 0 && passedProbeThisRun
     }
 
-    private func startTailers(startAtEnd: Bool) async {
+    private func startTailers(startAtEnd: Bool, resumeFrom: SpoolPositions? = nil) async {
         let out = SpoolTailer(
-            startAtEnd: startAtEnd, store: logStore, stream: .out,
+            resumeFrom: resumeFrom?.out, startAtEnd: startAtEnd, store: logStore, stream: .out,
             url: paths.spoolOutFile(project: projectPath, server: spec.name))
         let err = SpoolTailer(
-            startAtEnd: startAtEnd, store: logStore, stream: .err,
+            resumeFrom: resumeFrom?.err, startAtEnd: startAtEnd, store: logStore, stream: .err,
             url: paths.spoolErrFile(project: projectPath, server: spec.name))
         outTailer = out
         errTailer = err
@@ -1433,7 +1435,12 @@ public actor ServerSupervisor {
         lastExit = nil
         switch supervision {
         case .adopted:
-            await startTailers(startAtEnd: true)
+            /** The recorded positions serve this adoption only: cleared before
+                the tailers start, so a daemon that dies right after cannot
+                leave offsets for a later adoption to replay from. */
+            let positions = await registry.persistedState(serverID: serverID)?.spoolPositions
+            if positions != nil { await registryUpdate { $0.spoolPositions = nil } }
+            await startTailers(startAtEnd: true, resumeFrom: positions)
             await logStore.append(stream: .sys, text: "adopted pid=\(childPid)")
             await events?.post(
                 kind: .started, project: projectPath, server: spec.name,
@@ -1452,9 +1459,23 @@ public actor ServerSupervisor {
             entry.pid = Int(childPid)
             entry.resumeOnBoot = true
             entry.spawnError = nil
+            entry.spoolPositions = nil
             entry.startedAt = runStartedAt
         }
         spawnWaiters.settleAll()
+    }
+
+    /** A handoff exit's last act for this run: each tailer ingests what its
+        spool holds now and stops polling, then the positions are persisted
+        for the adopting daemon. A run with no tailers (stopped, or not yet
+        spawned) records nothing. */
+    func prepareHandoff() async {
+        guard let out = outTailer, let err = errTailer else { return }
+        async let outPosition = out.pause()
+        async let errPosition = err.pause()
+        let positions = SpoolPositions(err: await errPosition, out: await outPosition)
+        guard positions.err != nil || positions.out != nil else { return }
+        await registryUpdate { $0.spoolPositions = positions }
     }
 
     private func recordSpawn(pid childPid: pid_t) async {

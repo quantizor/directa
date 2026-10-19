@@ -171,6 +171,158 @@ import os
         try await finish(pid: pid, routers: [first, next], project: env.project)
     }
 
+    private func outSpool(_ env: RouterEnv) -> URL {
+        env.paths.spoolOutFile(project: canonicalProjectPath(env.project), server: "web")
+    }
+
+    /** What the child prints: appended through a descriptor of its own, the
+        way launchd's O_APPEND open of the spool writes. */
+    private func childPrints(_ text: String, to spool: URL) throws {
+        let handle = try FileHandle(forWritingTo: spool)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(text.utf8))
+    }
+
+    /** The server's `out` lines in the structured log, as the router answers
+        them. The fixture's own output is left out: its listening line, and
+        its heartbeats (its stdout is a file, so they arrive in blocks or not
+        at all). */
+    private func outLines(_ router: Router, _ env: RouterEnv) async throws -> [String] {
+        try await router.call(
+            .logsQuery, LogsQueryParams(name: "web", project: env.project, streams: [.out]), LogsQueryResult.self
+        ).lines.map(\.text).filter { !$0.hasPrefix("heartbeat") && !$0.hasPrefix("listening on") }
+    }
+
+    /** A second daemon over the first's files, adopting `pid`; returns once
+        the adoption shows in the next daemon's status. */
+    private func adoptingRouter(
+        pid: pid_t, env: RouterEnv, gate: AdoptGate, registry: Registry
+    ) async throws -> Router {
+        let next = Router(
+            agentJobs: agentJobs(listing: [
+                LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.handoff-logs", pid: pid)
+            ]),
+            launcher: FakeAdoptLauncher(gate: gate), paths: env.paths, registry: registry)
+        await next.recoverAtStartup()
+        let adopted = try await eventually(within: .seconds(10)) {
+            try await next.call(
+                .serverStatus, ProjectParams(project: env.project), ServerListResult.self
+            ).servers.first { $0.server == "web" }.map { $0.pid == Int(pid) && $0.phase == .running }
+                ?? false
+        }
+        #expect(adopted)
+        return next
+    }
+
+    /** Output the child wrote while no daemon tailed its spool (the bounce)
+        reaches the structured log once. The first daemon logs up to the
+        handoff, the child then finishes a torn line and writes two more, and
+        the adopting daemon logs all of it plus what comes after, with no
+        line repeated or dropped. The recorded positions serve that one
+        adoption: the adopting daemon clears them. */
+    @Test func linesWrittenDuringTheBounceReachTheAdoptingDaemonsLogOnce() async throws {
+        let env = try makeRouterEnv(named: "handoff-logs")
+        let exits = ExitRecorder()
+        let (first, pid, registry) = try await startedRouter(
+            agentMode: true, env: env, exits: exits, offset: 520)
+        defer { kill(pid, SIGKILL) }
+        let id = serverID(project: env.project, name: "web")
+        let spool = outSpool(env)
+        try childPrints("before 1\nbefore 2\ntorn-", to: spool)
+
+        _ = try await first.call(.daemonShutdown, ShutdownParams(handoff: true), WireEmpty.self)
+        _ = try await exits.firstReason()
+
+        let loggedByFirst = try await outLines(first, env)
+        #expect(loggedByFirst == ["before 1", "before 2"])
+        #expect(try #require(await registry.persistedState(serverID: id)).spoolPositions?.out != nil)
+        try childPrints("line\nduring 1\nduring 2\n", to: spool)
+
+        let gate = AdoptGate()
+        defer { gate.signal(.exitedStatusUnknown) }
+        let nextRegistry = Registry(paths: env.paths)
+        let next = try await adoptingRouter(pid: pid, env: env, gate: gate, registry: nextRegistry)
+        try childPrints("after 1\n", to: spool)
+
+        let sawLast = try await eventually(within: .seconds(10)) {
+            try await outLines(next, env).contains("after 1")
+        }
+        #expect(sawLast)
+        let loggedByNext = try await outLines(next, env)
+        #expect(loggedByNext == ["before 1", "before 2", "torn-line", "during 1", "during 2", "after 1"])
+        #expect(await nextRegistry.persistedState(serverID: id)?.spoolPositions == nil)
+
+        gate.signal(.signaled(signal: Int(SIGKILL)))
+        try await finish(pid: pid, routers: [first, next], project: env.project)
+    }
+
+    /** A spool replaced during the bounce is a different file from the one
+        the positions describe, so the adopting daemon starts at its end and
+        logs only what is written after. */
+    @Test func aSpoolReplacedDuringTheBounceStartsAtItsEnd() async throws {
+        let env = try makeRouterEnv(named: "handoff-replaced")
+        let exits = ExitRecorder()
+        let (first, pid, _) = try await startedRouter(
+            agentMode: true, env: env, exits: exits, offset: 521)
+        defer { kill(pid, SIGKILL) }
+        let spool = outSpool(env)
+        try childPrints("before 1\n", to: spool)
+
+        _ = try await first.call(.daemonShutdown, ShutdownParams(handoff: true), WireEmpty.self)
+        _ = try await exits.firstReason()
+
+        let replacement = spool.deletingLastPathComponent().appending(path: "replacement.spool")
+        try Data("old 1\nold 2\n".utf8).write(to: replacement)
+        try FileManager.default.removeItem(at: spool)
+        try FileManager.default.moveItem(at: replacement, to: spool)
+
+        let gate = AdoptGate()
+        defer { gate.signal(.exitedStatusUnknown) }
+        let next = try await adoptingRouter(
+            pid: pid, env: env, gate: gate, registry: Registry(paths: env.paths))
+        /** The adopting tailer seeds at the end of the file on its first
+            drain, which can land after a single write, so the child keeps
+            writing markers until one is logged. */
+        let sawMarker = try await eventually(within: .seconds(10), every: .milliseconds(50)) {
+            try childPrints("marker\n", to: spool)
+            return try await outLines(next, env).contains("marker")
+        }
+        #expect(sawMarker)
+        let loggedByNext = try await outLines(next, env)
+        #expect(loggedByNext.filter { $0 != "marker" } == ["before 1"])
+
+        gate.signal(.signaled(signal: Int(SIGKILL)))
+        try await finish(pid: pid, routers: [first, next], project: env.project)
+    }
+
+    /** Positions recorded for an adoption that never happened do not outlive
+        the run: a fresh start clears them. */
+    @Test func aFreshStartClearsTheRecordedPositions() async throws {
+        let env = try makeRouterEnv(named: "handoff-fresh")
+        let exits = ExitRecorder()
+        let (first, pid, registry) = try await startedRouter(
+            agentMode: true, env: env, exits: exits, offset: 522)
+        defer { kill(pid, SIGKILL) }
+        let id = serverID(project: env.project, name: "web")
+        _ = try await first.call(.daemonShutdown, ShutdownParams(handoff: true), WireEmpty.self)
+        _ = try await exits.firstReason()
+        #expect(try #require(await registry.persistedState(serverID: id)).spoolPositions != nil)
+        try await finish(pid: pid, routers: [first], project: env.project)
+
+        let second = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let restarted = try await second.call(
+            .serverEnsure, EnsureParams(name: "web", project: env.project, timeoutSeconds: 10),
+            EnsureResult.self)
+        let freshPid = pid_t(try #require(restarted.server.pid))
+        defer { kill(freshPid, SIGKILL) }
+
+        #expect(freshPid != pid)
+        #expect(await registry.persistedState(serverID: id)?.spoolPositions == nil)
+
+        try await finish(pid: freshPid, routers: [second], project: env.project)
+    }
+
     /** Anything but an agent-mode handoff is a drain: a plain shutdown from
         `daemon stop`, uninstall, and a client that predates the field, a
         handoff that names false, and a handoff asked of a daemon that is not

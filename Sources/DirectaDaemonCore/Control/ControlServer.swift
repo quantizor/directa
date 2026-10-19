@@ -189,6 +189,9 @@ public actor Router {
                     /** Set before the answer goes out: the bounce that follows
                         sends SIGTERM, and its drain must already know. */
                     handedOff = true
+                    /** Before the answer: the bounce starts when the client
+                        reads it, and the positions must be on disk by then. */
+                    await prepareSupervisorsForHandoff()
                     let frame = try respond(id: head.id, result: WireEmpty())
                     Task { [weak self] in
                         self?.exitProcess("daemon.shutdown handoff")
@@ -608,6 +611,16 @@ public actor Router {
                 group.addTask {
                     _ = await supervisor.stop(deliberate: false, reason: "daemon shutting down")
                 }
+            }
+        }
+    }
+
+    /** Every supervised run tails its spools to the end and records where it
+        stopped, in parallel, for the daemon that adopts the run. */
+    private func prepareSupervisorsForHandoff() async {
+        await withTaskGroup(of: Void.self) { group in
+            for supervisor in supervisors.values {
+                group.addTask { await supervisor.prepareHandoff() }
             }
         }
     }
