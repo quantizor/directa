@@ -17,6 +17,8 @@ Agents forget their dev servers. After a context compaction they spawn duplicate
 
 ## Quick start
 
+directa runs on Apple silicon Macs with macOS 26 or later.
+
 Install with Homebrew:
 
 ```sh
