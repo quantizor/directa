@@ -55,8 +55,17 @@ enum AgentService {
         Ad-hoc resigns change the helper CDHash. Registering (or KeepAlive
         respawning) before BTM drops the prior launch constraint produces
         `SIGKILL (Code Signature Invalid)` / Launch Constraint Violation. So
-        unregister always waits for launchd + a BTM settle before register. */
-    nonisolated static func reregister() async throws {
+        unregister always waits for launchd + a BTM settle before register.
+
+        `reason` is logged at error level first (see `AgentEscalation`). A
+        daemon that answers hands its servers to the next one before the
+        unregister, whose SIGTERM would otherwise drain (stop) every server. */
+    nonisolated static func reregister(
+        because reason: AgentEscalation, pollError: String? = nil,
+        paths: DirectaPaths = DirectaPaths()
+    ) async throws {
+        let loaded = await LaunchdAdmin.isAgentLoaded()
+        DirectaLog.app.error(reason.logLine(loaded: loaded, pollError: pollError))
         let registered = try await onLane {
             try LaunchdAdmin.writeAgentPath()
             migrateLegacyHomeAgent()
@@ -64,6 +73,7 @@ enum AgentService {
             return status == .enabled || status == .requiresApproval
         }
         if registered {
+            await LaunchdAdmin.handOffRunningDaemon(paths: paths)
             /** Register below is what reports a real problem; a failed
                 unregister is logged so a Launch Constraint Violation that
                 follows has its cause on record. */
@@ -174,23 +184,21 @@ enum AgentService {
             let status = try await register()
             DirectaLog.app.info("agent register at launch: \(status)")
             if AgentRebindPolicy.shouldForceReregisterAfterHelloMiss(rebindNeeded: rebind) {
-                if (try? await LaunchdAdmin.pollHello(
-                    paths: paths, timeoutSeconds: AgentRebindPolicy.postReplaceHelloSeconds))
-                    == nil
-                {
-                    DirectaLog.app.info(
-                        "post-replace spawn missed (ad-hoc LWCR repair is a dead end); re-registering")
-                    try await reregister()
+                let spawnMiss = await helloMiss(
+                    paths: paths, timeoutSeconds: AgentRebindPolicy.postReplaceHelloSeconds)
+                if let spawnMiss {
+                    /** The ad-hoc LWCR repair launchd would try is a dead end. */
+                    try await reregister(
+                        because: .spawnMissedAfterReplace, pollError: spawnMiss, paths: paths)
                     /** Not `try`: a miss here used to throw straight out of
                         launch, which abandoned the sequence and left the daemon
                         to whatever recovery poll came next, a whole cooldown
                         later. Falling through instead keeps the escalation in
                         this call, where the marker is still set and the next
                         step is already written. */
-                    if (try? await LaunchdAdmin.pollHello(
-                        paths: paths,
-                        timeoutSeconds: AgentRebindPolicy.postReregisterHelloSeconds)) == nil
-                    {
+                    let afterMiss = await helloMiss(
+                        paths: paths, timeoutSeconds: AgentRebindPolicy.postReregisterHelloSeconds)
+                    if afterMiss != nil {
                         try await waitForHelloOrEscalate(paths: paths, escalate: true)
                     }
                 }
@@ -214,7 +222,7 @@ enum AgentService {
     nonisolated static func waitForHelloOrEscalate(
         paths: DirectaPaths = DirectaPaths(), escalate: Bool
     ) async throws {
-        if (try? await LaunchdAdmin.pollHello(paths: paths, timeoutSeconds: 2)) != nil {
+        guard let firstMiss = await helloMiss(paths: paths, timeoutSeconds: 2) else {
             return
         }
         let enabled = await BlockingLane.system.run { agent.service.status == .enabled }
@@ -226,8 +234,7 @@ enum AgentService {
         let loaded = await LaunchdAdmin.isAgentLoaded()
         if !loaded {
             guard escalate else { return }
-            DirectaLog.app.info("agent enabled but not loaded; re-registering")
-            try await reregister()
+            try await reregister(because: .notLoaded, pollError: firstMiss, paths: paths)
             try await LaunchdAdmin.pollHello(paths: paths, timeoutSeconds: 12)
             return
         }
@@ -242,23 +249,31 @@ enum AgentService {
         }
         if slowToSpawn {
             if rebindNeeded {
-                DirectaLog.app.info(
-                    "post-replace agent still silent; re-registering instead of waiting on LWCR repair")
                 guard escalate else { return }
-                try await reregister()
+                try await reregister(because: .silentAfterReplace, pollError: firstMiss, paths: paths)
                 try await LaunchdAdmin.pollHello(paths: paths, timeoutSeconds: 12)
                 LaunchdAdmin.clearAgentRebindMarker(paths: paths)
                 return
             }
             DirectaLog.app.info("agent spawn scheduled (launchd throttle); waiting")
         }
-        if (try? await LaunchdAdmin.pollHello(paths: paths, timeoutSeconds: 12)) != nil {
+        guard let throttleMiss = await helloMiss(paths: paths, timeoutSeconds: 12) else {
             return
         }
         guard escalate else { return }
-        DirectaLog.app.info("agent still silent after throttle window; re-registering")
-        try await reregister()
+        try await reregister(because: .silentAfterThrottle, pollError: throttleMiss, paths: paths)
         try await LaunchdAdmin.pollHello(paths: paths, timeoutSeconds: 12)
+    }
+
+    /** Nil when the daemon answered within `timeoutSeconds`, else the poll's
+        last error, which an escalation logs. */
+    nonisolated private static func helloMiss(paths: DirectaPaths, timeoutSeconds: Double) async -> String? {
+        do {
+            try await LaunchdAdmin.pollHello(paths: paths, timeoutSeconds: timeoutSeconds)
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
     }
 
     /** Restart ddirecta when the running one predates this app. Installing a new
@@ -275,10 +290,9 @@ enum AgentService {
                 .daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self),
             info.daemonVersion != DirectaVersion.version
         else { return }
-        DirectaLog.app.info(
-            "ddirecta v\(info.daemonVersion) predates this app (v\(DirectaVersion.version)); restarting it")
         do {
-            try await reregister()
+            try await reregister(
+                because: .staleDaemon(running: info.daemonVersion, app: DirectaVersion.version), paths: paths)
             try await waitForHelloOrEscalate(paths: paths, escalate: false)
         } catch {
             DirectaLog.app.error("could not restart the stale daemon: \(error.localizedDescription)")
