@@ -272,7 +272,7 @@ public enum LaunchdAdmin {
                     an unapproved background item. Say that instead of a timeout. */
                 throw WireError(
                     code: .daemonUnreachable,
-                    hint: "open \"x-apple.systempreferences:com.apple.LoginItems-Settings.extension\"",
+                    hint: "run: open \"x-apple.systempreferences:com.apple.LoginItems-Settings.extension\"",
                     message:
                         "asked \(SetupPlanner.applicationsAppPath) to start the daemon, but it never answered. If macOS is waiting for permission, turn on quantizor/directa in System Settings > General > Login Items & Extensions, or run: directa daemon install --legacy")
             }
