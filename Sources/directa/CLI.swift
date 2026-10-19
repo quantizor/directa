@@ -128,6 +128,18 @@ enum CLIRunner {
         DaemonClient(socketPath: DirectaPaths.fromEnvironment().socketPath)
     }
 
+    /** The `not-found` for a name `project` lacks, with the other registered
+        projects that define it read in one machine-wide status query. The
+        lookup only sharpens the hint, so a failed one answers as if no other
+        project had the name rather than hiding the not-found. */
+    static func serverNotFound(name: String, project: String) async -> WireError {
+        let everywhere = try? await client().request(
+            .serverStatus, params: ProjectParams(name: name, project: ""), expecting: ServerListResult.self)
+        return ProjectConfigLoader.serverNotFound(
+            name: name, project: project,
+            elsewhere: ProjectConfigLoader.projects(defining: name, among: everywhere?.servers ?? []))
+    }
+
     static func stdinData() -> Data {
         (try? FileHandle.standardInput.readToEnd()) ?? Data()
     }
@@ -575,13 +587,13 @@ struct Status: AsyncParsableCommand {
             try await client.request(.serverStatus, params: params, expecting: ServerListResult.self)
         }
         if let name, result.servers.isEmpty {
-            CLIRunner.fail(
+            let failure =
                 all
-                    ? WireError(
-                        code: .notFound, hint: "run: directa status --all --json",
-                        message: "no server named '\(name)' is registered on this machine")
-                    : ProjectConfigLoader.serverNotFound(name: name, project: project),
-                json: global.json)
+                ? WireError(
+                    code: .notFound, hint: "run: directa status --all --json",
+                    message: "no server named '\(name)' is registered on this machine")
+                : await CLIRunner.serverNotFound(name: name, project: project)
+            CLIRunner.fail(failure, json: global.json)
         }
         /** Human mode on the empty scoped path only: one machine-wide read tells
             an empty project from an empty machine. The lookup is a hint, so a
@@ -1561,8 +1573,8 @@ struct Open: AsyncParsableCommand {
             try await client.request(.serverStatus, params: params, expecting: ServerListResult.self)
         }
         guard let server = result.servers.first else {
-            CLIRunner.fail(
-                ProjectConfigLoader.serverNotFound(name: name, project: params.project), json: global.json)
+            let failure = await CLIRunner.serverNotFound(name: name, project: params.project)
+            CLIRunner.fail(failure, json: global.json)
         }
         var target = server.url
         if let head {

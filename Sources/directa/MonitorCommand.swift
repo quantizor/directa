@@ -356,6 +356,16 @@ struct MonitorSession: Sendable {
         }
     }
 
+    /** The `not-found` for a name the project's status lacks, naming the other
+        registered projects that define it when one machine-wide read answers
+        (the hint only, so a failed read answers without them). */
+    private func notFound() async -> WireError {
+        let everywhere = try? await client.fetchStatus(ProjectParams(name: config.name, project: ""))
+        return ProjectConfigLoader.serverNotFound(
+            name: config.name, project: config.project,
+            elsewhere: ProjectConfigLoader.projects(defining: config.name, among: everywhere?.servers ?? []))
+    }
+
     /** One `tail: 0` query plus one status call, in that order. `tail: 0`
         takes the daemon's tail fast path: the family's end cursor, no
         lines, and no read of the log's history (a per-stream trim of 0
@@ -375,7 +385,8 @@ struct MonitorSession: Sendable {
             let statusResult = try await client.fetchStatus(
                 ProjectParams(name: config.name, project: config.project))
             guard let server = statusResult.servers.first(where: { $0.server == config.name }) else {
-                return .exit(ProjectConfigLoader.serverNotFound(name: config.name, project: config.project))
+                let failure = await notFound()
+                return .exit(failure)
             }
             let stream = MonitorStream(
                 config: MonitorConfig(
@@ -391,8 +402,10 @@ struct MonitorSession: Sendable {
                 Streaming(cursor: cursor, lastHealth: description, lastStatusPollAt: now, startedAt: now, stream: stream))
             return .events(events, delaySeconds: config.tickSeconds)
         } catch let error as WireError {
+            /** The daemon built this refusal with the other projects that
+                define the name already in it. */
             if error.code == .notFound {
-                return .exit(ProjectConfigLoader.serverNotFound(name: config.name, project: config.project))
+                return .exit(error)
             }
             guard let kind = MonitorTransient(error.code) else { return .exit(error) }
             return attachTransient(kind, detail: error.message, at: now)

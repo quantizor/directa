@@ -345,27 +345,64 @@ public enum ProjectConfigLoader {
             message: "cannot parse \(url.path): \(detail)")
     }
 
-    /** The one `not-found` for a server name a project does not have. Asked
-        from a linked worktree with no devservers.json of its own, for a name
-        its main checkout declares, the message names why (the worktree does
-        not see that file, which is often untracked) and both ways out, and
-        the hint is the command that lists the main checkout's servers, its
-        path single-quoted since a checkout path can hold any character. */
+    /** The one `not-found` for a server name a project does not have.
+        `elsewhere` is every other registered project that defines the name
+        (the caller reads it from the registry or one machine-wide status; the
+        name is never resolved into one of them on its own). The hint is a
+        literal command, every path single-quoted since a checkout path can
+        hold any character:
+        - none: `directa status --all`
+        - one: that project's status for the name, through `--project`
+        - several: `directa status --all <name>`, which lists every project
+          that defines it
+
+        Asked from a linked worktree with no devservers.json of its own, for a
+        name its main checkout declares, the message instead names why (the
+        worktree does not see that file, which is often untracked) and both
+        ways out, and the hint lists the main checkout's servers. */
     public static func serverNotFound(
-        name: String, project: String, hint: String = "run: directa status --json"
+        name: String, project: String, elsewhere: [String] = []
     ) -> WireError {
         let message = "no server named '\(name)' in \(project)"
-        guard !FileManager.default.fileExists(atPath: configURL(project: project).path),
+        if !FileManager.default.fileExists(atPath: configURL(project: project).path),
             let main = CheckoutIdentity.mainCheckout(ofLinkedWorktree: project),
             declares(name, project: main)
-        else { return WireError(code: .notFound, hint: hint, message: message) }
-        return WireError(
-            code: .notFound,
-            hint: "run: directa status --project \(ShellWord.singleQuoted(main))",
-            message:
-                "\(message): this linked worktree has no devservers.json, and its main checkout \(main) declares '\(name)'; "
-                + "commit or copy devservers.json into this worktree, or pass --project with the main checkout's path"
-        )
+        {
+            return WireError(
+                code: .notFound,
+                hint: "run: directa status --project \(ShellWord.singleQuoted(main))",
+                message:
+                    "\(message): this linked worktree has no devservers.json, and its main checkout \(main) declares '\(name)'; "
+                    + "commit or copy devservers.json into this worktree to run its own server, "
+                    + "or pass --project with the main checkout's path to act on the main checkout's server instead"
+            )
+        }
+        let others = Set(elsewhere).subtracting([project]).sorted()
+        switch others.count {
+        case 0:
+            return WireError(code: .notFound, hint: "run: directa status --all", message: message)
+        case 1:
+            return WireError(
+                code: .notFound,
+                hint: "run: directa status \(ShellWord.argument(name)) --project \(ShellWord.singleQuoted(others[0]))",
+                message: "\(message), but the registered project \(others[0]) defines it; pass --project with that path"
+            )
+        default:
+            return WireError(
+                code: .notFound,
+                hint: "run: directa status --all \(ShellWord.argument(name))",
+                message:
+                    "\(message), but these registered projects define it: \(others.joined(separator: ", ")); "
+                    + "pass --project with the one you mean"
+            )
+        }
+    }
+
+    /** The distinct projects among a machine-wide status answer that carry a
+        server called `name`: the `elsewhere` a client hands `serverNotFound`
+        after one `server.status` read with an empty project. */
+    public static func projects(defining name: String, among servers: [ServerStatus]) -> [String] {
+        Set(servers.lazy.filter { $0.server == name }.map(\.project)).sorted()
     }
 
     /** Whether the project's devservers.json names this server. A file that

@@ -173,14 +173,44 @@ private actor FakeMonitorClock: MonitorClock {
 
     @Test func notFoundAtAttachExitsBeforeStreaming() async {
         let requester = FakeMonitorRequester()
-        await requester.enqueueLogs(.failure(WireError(code: .notFound, message: "no server named 'web' in /tmp/proj")))
+        let daemonRefusal = WireError(
+            code: .notFound, hint: "run: directa status --all", message: "no server named 'web' in /tmp/proj")
+        await requester.enqueueLogs(.failure(daemonRefusal))
         var session = MonitorSession(
             client: requester, clock: FakeMonitorClock(start: Self.epoch), config: config())
         guard case .exit(let error) = await session.step() else {
             Issue.record("expected .exit for an unknown server name")
             return
         }
-        #expect(error.code == .notFound)
+        #expect(error == daemonRefusal)
+    }
+
+    /** A status answer without the name looks for it in the other registered
+        projects with one machine-wide read; the daemon's own not-found at
+        attach already carries that, so it passes through unchanged. */
+    @Test func aStatusWithoutTheNameNamesTheProjectsThatDefineIt() async {
+        let requester = FakeMonitorRequester()
+        await requester.enqueueLogs(.success(attachLogsResult()))
+        await requester.enqueueStatus(.success(ServerListResult(servers: [])))
+        await requester.enqueueStatus(
+            .success(
+                ServerListResult(servers: [
+                    ServerStatus(logPath: "", phase: .stopped, project: "/code/other", server: "web")
+                ])))
+        var session = MonitorSession(
+            client: requester, clock: FakeMonitorClock(start: Self.epoch), config: config())
+        guard case .exit(let error) = await session.step() else {
+            Issue.record("expected .exit for a name the project's status lacks")
+            return
+        }
+        #expect(
+            error
+                == WireError(
+                    code: .notFound,
+                    hint: "run: directa status web --project '/code/other'",
+                    message:
+                        "no server named 'web' in /tmp/proj, but the registered project /code/other defines it; pass --project with that path"
+                ))
     }
 
     @Test func notFoundAfterAttachEndsTheStreamGracefully() async {

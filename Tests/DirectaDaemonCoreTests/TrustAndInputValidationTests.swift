@@ -46,6 +46,60 @@ import Testing
         #expect(await registry.spec(project: env.project, name: "web") == nil)
     }
 
+    /** A name the asked project lacks is looked for in the other registered
+        projects whose directory still exists: none, one, or several define it,
+        through the arm that resolves a server (start) and the one that checks
+        a restart's names. The name is never resolved into another project. */
+    @Test func aNotFoundNamesTheOtherRegisteredProjectsThatDefineTheName() async throws {
+        let env = try makeEnv()
+        let base = URL(fileURLWithPath: env.project).deletingLastPathComponent()
+        let alpha = canonicalProjectPath(base.appending(path: "alpha").path)
+        let beta = canonicalProjectPath(base.appending(path: "beta").path)
+        let gone = canonicalProjectPath(base.appending(path: "gone").path)
+        for directory in [alpha, beta] {
+            try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        }
+        let project = canonicalProjectPath(env.project)
+        let registry = Registry(paths: env.paths)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        func register(_ directory: String) async throws {
+            _ = try await router.call(
+                .serverRegister,
+                RegisterParams(project: directory, spec: ServerSpec(command: ["bun", "dev"], name: "pirl", port: 3000)),
+                ServerResult.self)
+        }
+        func refusals() async throws -> [WireError] {
+            let start = try await router.attempt(
+                .serverStart, ServerTargetParams(name: "pirl", project: project), ServerResult.self)
+            let restart = try await router.attempt(
+                .serverRestart, RestartParams(names: ["pirl"], project: project, timeoutSeconds: 10), GroupResult.self)
+            return [start.map { _ in () }, restart.map { _ in () }].compactMap {
+                if case .failure(let error) = $0 { error } else { nil }
+            }
+        }
+        let message = "no server named 'pirl' in \(project)"
+
+        #expect(
+            try await refusals()
+                == Array(repeating: WireError(code: .notFound, hint: "run: directa status --all", message: message), count: 2))
+
+        try await register(alpha)
+        try await register(gone)
+        let one = WireError(
+            code: .notFound,
+            hint: "run: directa status pirl --project '\(alpha)'",
+            message: "\(message), but the registered project \(alpha) defines it; pass --project with that path")
+        #expect(try await refusals() == [one, one])
+
+        try await register(beta)
+        let several = WireError(
+            code: .notFound,
+            hint: "run: directa status --all pirl",
+            message:
+                "\(message), but these registered projects define it: \(alpha), \(beta); pass --project with the one you mean")
+        #expect(try await refusals() == [several, several])
+    }
+
     @Test func registerAcceptsAValidSpec() async throws {
         let env = try makeEnv()
         let registry = Registry(paths: env.paths)

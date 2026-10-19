@@ -98,8 +98,12 @@ public struct DeepLinkRunner: Sendable {
         case .open:
             let list = try await daemon.statusList(project: project, name: link.server)
             guard let server = list.servers.first else {
+                /** The lookup only sharpens the hint, so a failed one answers
+                    as if no other project had the name. */
+                let everywhere = try? await daemon.statusList(project: "", name: link.server)
                 throw ProjectConfigLoader.serverNotFound(
-                    name: link.server, project: project, hint: "run: directa status --project \(ShellWord.argument(project)) --json")
+                    name: link.server, project: project,
+                    elsewhere: ProjectConfigLoader.projects(defining: link.server, among: everywhere?.servers ?? []))
             }
             let target = try resolveOpenURL(server: server, head: link.head)
             await effects.openBrowser(target)

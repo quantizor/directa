@@ -12,7 +12,17 @@ private struct MockDaemon: DeepLinkDaemon {
     var stopResult: ServerResult?
     var whyResult: WhyResult?
 
+    /** Other projects that define the asked-for name, answered to a
+        machine-wide read that names one. */
+    var definingProjects: [String] = []
+
     func statusList(project: String, name: String?) async throws -> ServerListResult {
+        if project.isEmpty, let name {
+            return ServerListResult(
+                servers: definingProjects.map {
+                    ServerStatus(logPath: "", phase: .stopped, project: $0, server: name)
+                })
+        }
         if project.isEmpty {
             // Machine-wide slug resolution: one status per project path.
             return ServerListResult(
@@ -117,6 +127,26 @@ private actor RecordingEffects: DeepLinkEffects {
             #expect(error.code == .notFound)
             #expect(error.hint == "run: directa status cms --json")
             #expect(error.message.contains("known heads: wren-hollow"))
+        } catch {
+            Issue.record("unexpected error \(error)")
+        }
+    }
+
+    @Test func openOfAServerTheProjectLacksNamesTheProjectsThatDefineIt() async {
+        let daemon = MockDaemon(definingProjects: ["/Users/x/code/other"])
+        do {
+            _ = try await runner(daemon, RecordingEffects()).run(
+                DeepLink(verb: .open, projectSlug: "myproj", server: "cms"))
+            Issue.record("expected WireError")
+        } catch let error as WireError {
+            #expect(
+                error
+                    == WireError(
+                        code: .notFound,
+                        hint: "run: directa status cms --project '/Users/x/code/other'",
+                        message:
+                            "no server named 'cms' in /Users/x/code/myproj, but the registered project /Users/x/code/other defines it; pass --project with that path"
+                    ))
         } catch {
             Issue.record("unexpected error \(error)")
         }

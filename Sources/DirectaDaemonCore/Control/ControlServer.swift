@@ -1502,7 +1502,8 @@ public actor Router {
         }
         let merged = try await mergedSpecs(project: target.project)
         guard let committed = merged.specs.first(where: { $0.name == target.name }) else {
-            throw ProjectConfigLoader.serverNotFound(name: target.name, project: target.project)
+            let failure = await serverNotFound(name: target.name, project: target.project)
+            throw failure
         }
         if merged.fileNames.contains(target.name) {
             let trusted = await registry.isTrusted(project: target.project)
@@ -2092,9 +2093,28 @@ public actor Router {
     private func resolvedSupervisor(_ params: ServerTargetParams) async throws -> ServerSupervisor {
         let merged = try await mergedSpecs(project: params.project)
         guard let spec = merged.specs.first(where: { $0.name == params.name }) else {
-            throw ProjectConfigLoader.serverNotFound(name: params.name, project: params.project)
+            let failure = await serverNotFound(name: params.name, project: params.project)
+            throw failure
         }
         return await supervisor(project: params.project, spec: spec)
+    }
+
+    /** The one `not-found` for a server name `project` lacks, naming the other
+        registered projects (whose directory still exists) that define it.
+        The name is never resolved into one of them on its own. */
+    private func serverNotFound(name: String, project: String) async -> WireError {
+        var elsewhere: [String] = []
+        for other in await registry.allProjects() where other != project {
+            guard FileManager.default.fileExists(atPath: other) else { continue }
+            var specs = (try? await mergedSpecs(project: other))?.specs
+            if specs == nil {
+                specs = await registry.specs(project: other)
+            }
+            if specs?.contains(where: { $0.name == name }) == true {
+                elsewhere.append(other)
+            }
+        }
+        return ProjectConfigLoader.serverNotFound(name: name, project: project, elsewhere: elsewhere)
     }
 
     private func statusList(_ params: ProjectParams) async throws -> ServerListResult {
@@ -2224,7 +2244,8 @@ public actor Router {
         var wanted = merged.specs
         if let names = params.names {
             for name in names where !merged.specs.contains(where: { $0.name == name }) {
-                throw ProjectConfigLoader.serverNotFound(name: name, project: params.project)
+                let failure = await serverNotFound(name: name, project: params.project)
+                throw failure
             }
             wanted = merged.specs.filter { names.contains($0.name) }
         }

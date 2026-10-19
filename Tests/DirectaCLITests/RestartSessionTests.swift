@@ -377,17 +377,35 @@ import os
         #expect(await harness.daemon.calls == ["restart web"])
     }
 
-    @Test func aServerGoneAfterTheDropIsNotFound() async throws {
-        let harness = Harness(
-            daemon: FakeDaemon(
-                restarts: [.failure(Self.closed)],
-                statuses: [.success(Self.list())]))
-
-        let error = await #expect(throws: WireError.self) {
-            _ = try await harness.session.run(before: Self.list(Self.status("web", phase: .running, pid: 10)))
+    /** The not-found looks for the name in the other registered projects with
+        one machine-wide read (the name only, project ""), and a failed read
+        leaves the plain refusal. */
+    @Test func aServerGoneAfterTheDropIsNotFoundAndNamesTheProjectsThatDefineIt() async throws {
+        func other(_ project: String) -> ServerStatus {
+            ServerStatus(logPath: "", phase: .stopped, project: project, server: "web")
         }
+        let cases: [(lookup: Result<ServerListResult, WireError>, hint: String, message: String)] = [
+            (
+                .success(Self.list(Self.status("web", phase: .stopped), other("/code/other"))),
+                "run: directa status web --project '/code/other'",
+                "no server named 'web' in /code/app, but the registered project /code/other defines it; pass --project with that path"
+            ),
+            (.success(Self.list()), "run: directa status --all", "no server named 'web' in /code/app"),
+            (.failure(Self.closed), "run: directa status --all", "no server named 'web' in /code/app"),
+        ]
+        for scripted in cases {
+            let harness = Harness(
+                daemon: FakeDaemon(
+                    restarts: [.failure(Self.closed)],
+                    statuses: [.success(Self.list()), scripted.lookup]))
 
-        #expect(error?.code == .notFound)
+            let error = await #expect(throws: WireError.self) {
+                _ = try await harness.session.run(before: Self.list(Self.status("web", phase: .running, pid: 10)))
+            }
+
+            #expect(error == WireError(code: .notFound, hint: scripted.hint, message: scripted.message))
+            #expect(await harness.daemon.calls == ["restart web", "status web", "status web"])
+        }
     }
 
     @Test func aNamedRestartScopesStatusToThatServer() {
