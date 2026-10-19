@@ -142,11 +142,11 @@ public struct NetworkHealthProber: HealthProber {
         let began = clock.now
         var request = URLRequest(url: parsed)
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        /** `*.localhost` is probed at loopback because the daemon embeds an
-            Info.plist, so App Transport Security applies to its URLSession, and
-            ATS refuses plain http to `*.localhost` (error -1022) while it allows
-            the literal loopback addresses and bare `localhost`. The Host header
-            keeps vhost-aware dev servers routing. The bind stack is not
+        /** `*.localhost` is probed at loopback because App Transport Security
+            refuses plain http to `*.localhost` (error -1022), with or without an
+            embedded Info.plist, while it allows the literal loopback addresses and
+            bare `localhost`. The Host header keeps vhost-aware dev servers
+            routing. The bind stack is not
             knowable ahead (Vite 5+ binds `::1` only), so IPv6 loopback is
             tried when IPv4 refuses the connection, and only then. */
         let localhostName = parsed.host.flatMap { $0.hasSuffix(".localhost") ? $0 : nil }
