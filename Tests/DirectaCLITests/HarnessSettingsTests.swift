@@ -598,6 +598,30 @@ import os
         #expect(HookSnapshotStore.fileKey(scope: "antigravity", session: "..") == "antigravity-nosession")
     }
 
+    /** A Claude Code subagent shares its parent's `session_id` and adds `agent_id`;
+        the record file separates them with `+`, which sanitizing removes from
+        both ids, so no two (session, agent) pairs can share a file. */
+    @Test func claudeRecordsAreKeyedOnSessionAndAgent() {
+        func key(_ json: String, environment: [String: String] = [:]) -> String {
+            ClaudeCodeAdapter.conversationFileKey(
+                payload: HookPayload.parse(Data(json.utf8)), environment: environment)
+        }
+        #expect(key(#"{"session_id":"s1"}"#) == "claude-s1")
+        #expect(key(#"{"session_id":"s1","agent_id":"a1"}"#) == "claude-s1+a1")
+        #expect(key(#"{"session_id":"s1","agent_id":"a2"}"#) == "claude-s1+a2")
+        #expect(key(#"{"session_id":"s1","agent_id":""}"#) == "claude-s1")
+        #expect(key(#"{"session_id":"s1","agent_id":7}"#) == "claude-s1")
+        #expect(key(#"{"session_id":"s1","agent_id":"../x"}"#) == "claude-s1+..x")
+        #expect(
+            key(#"{"agent_id":"a1"}"#, environment: ["CLAUDE_CODE_SESSION_ID": "env1"])
+                == "claude-env1+a1")
+        #expect(key(#"{"session_id":"s1-a1"}"#) != key(#"{"session_id":"s1","agent_id":"a1"}"#))
+        #expect(
+            CursorAdapter.conversationFileKey(
+                payload: HookPayload.parse(Data(#"{"conversation_id":"c1","agent_id":"a1"}"#.utf8)))
+                == "cursor-c1")
+    }
+
     /** One wrong-typed field reads as absent without costing the others. */
     @Test func aWrongTypedFieldDoesNotFailTheWholePayload() {
         let payload = HookPayload.parse(

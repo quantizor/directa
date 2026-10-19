@@ -198,7 +198,8 @@ public struct ClaudeCodeAdapter: HarnessAdapter {
 
     public static func conversationFileKey(payload: HookPayload?, environment: [String: String]) -> String {
         HookSnapshotStore.fileKey(
-            scope: "claude", session: payload?.sessionId ?? environment["CLAUDE_CODE_SESSION_ID"])
+            scope: "claude", session: payload?.sessionId ?? environment["CLAUDE_CODE_SESSION_ID"],
+            agent: payload?.agentId)
     }
 
     public var settingsURL: URL {
