@@ -134,10 +134,9 @@ enum CLIRunner {
         project had the name rather than hiding the not-found. */
     static func serverNotFound(name: String, project: String) async -> WireError {
         let everywhere = try? await client().request(
-            .serverStatus, params: ProjectParams(name: name, project: ""), expecting: ServerListResult.self)
-        return ProjectConfigLoader.serverNotFound(
-            name: name, project: project,
-            elsewhere: ProjectConfigLoader.projects(defining: name, among: everywhere?.servers ?? []))
+            .serverStatus, params: ProjectParams(name: name, project: ""), expecting: ServerListResult.self,
+            responseTimeoutSeconds: ProjectConfigLoader.notFoundLookupSeconds)
+        return ProjectConfigLoader.serverNotFound(name: name, project: project, everywhere: everywhere)
     }
 
     static func stdinData() -> Data {

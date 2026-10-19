@@ -200,7 +200,9 @@ enum MonitorFlagOption {
     every transient, budget, and lifetime decision is unit-tested against a
     fake without a socket. */
 protocol MonitorRequesting: Sendable {
-    func fetchStatus(_ params: ProjectParams) async throws -> ServerListResult
+    /** `responseTimeoutSeconds` nil keeps the client's default deadline. */
+    func fetchStatus(_ params: ProjectParams, responseTimeoutSeconds: Double?) async throws
+        -> ServerListResult
     func queryLogs(_ params: LogsQueryParams) async throws -> LogsQueryResult
 }
 
@@ -209,8 +211,12 @@ extension DaemonClient: MonitorRequesting {
         to await), but the protocol requirement is `async` so a fake in
         tests can suspend; the actor isolation alone is what makes this a
         safe synchronous call here. */
-    func fetchStatus(_ params: ProjectParams) async throws -> ServerListResult {
-        try request(.serverStatus, params: params, expecting: ServerListResult.self)
+    func fetchStatus(_ params: ProjectParams, responseTimeoutSeconds: Double?) async throws
+        -> ServerListResult
+    {
+        try request(
+            .serverStatus, params: params, expecting: ServerListResult.self,
+            responseTimeoutSeconds: responseTimeoutSeconds)
     }
 
     func queryLogs(_ params: LogsQueryParams) async throws -> LogsQueryResult {
@@ -360,10 +366,11 @@ struct MonitorSession: Sendable {
         registered projects that define it when one machine-wide read answers
         (the hint only, so a failed read answers without them). */
     private func notFound() async -> WireError {
-        let everywhere = try? await client.fetchStatus(ProjectParams(name: config.name, project: ""))
+        let everywhere = try? await client.fetchStatus(
+            ProjectParams(name: config.name, project: ""),
+            responseTimeoutSeconds: ProjectConfigLoader.notFoundLookupSeconds)
         return ProjectConfigLoader.serverNotFound(
-            name: config.name, project: config.project,
-            elsewhere: ProjectConfigLoader.projects(defining: config.name, among: everywhere?.servers ?? []))
+            name: config.name, project: config.project, everywhere: everywhere)
     }
 
     /** One `tail: 0` query plus one status call, in that order. `tail: 0`
@@ -383,7 +390,7 @@ struct MonitorSession: Sendable {
                 return .exit(Logs.olderDaemon)
             }
             let statusResult = try await client.fetchStatus(
-                ProjectParams(name: config.name, project: config.project))
+                ProjectParams(name: config.name, project: config.project), responseTimeoutSeconds: nil)
             guard let server = statusResult.servers.first(where: { $0.server == config.name }) else {
                 let failure = await notFound()
                 return .exit(failure)
@@ -512,7 +519,7 @@ struct MonitorSession: Sendable {
         if now.timeIntervalSince(streaming.lastStatusPollAt) >= MonitorRunTuning.statusPollInterval {
             do {
                 let statusResult = try await client.fetchStatus(
-                    ProjectParams(name: config.name, project: config.project))
+                    ProjectParams(name: config.name, project: config.project), responseTimeoutSeconds: nil)
                 if let server = statusResult.servers.first(where: { $0.server == config.name }) {
                     let description = Self.statusDescription(for: server)
                     if description != streaming.lastHealth {

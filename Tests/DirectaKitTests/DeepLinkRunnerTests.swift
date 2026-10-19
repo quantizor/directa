@@ -1,7 +1,14 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 
 @testable import DirectaKit
+
+private actor DeadlineLog {
+    private(set) var seen: [Double?] = []
+
+    func record(_ deadline: Double?) { seen.append(deadline) }
+}
 
 /** A daemon stand-in: fixed project list plus a per-server status, and canned
     ensure/stop/why results. Records nothing beyond what the runner returns. */
@@ -16,8 +23,14 @@ private struct MockDaemon: DeepLinkDaemon {
         machine-wide read that names one. */
     var definingProjects: [String] = []
 
-    func statusList(project: String, name: String?) async throws -> ServerListResult {
+    /** The response deadline of each machine-wide read that names one server. */
+    let lookupDeadlines = DeadlineLog()
+
+    func statusList(project: String, name: String?, responseTimeoutSeconds: Double?) async throws
+        -> ServerListResult
+    {
         if project.isEmpty, let name {
+            await lookupDeadlines.record(responseTimeoutSeconds)
             return ServerListResult(
                 servers: definingProjects.map {
                     ServerStatus(logPath: "", phase: .stopped, project: $0, server: name)
@@ -132,8 +145,9 @@ private actor RecordingEffects: DeepLinkEffects {
         }
     }
 
-    @Test func openOfAServerTheProjectLacksNamesTheProjectsThatDefineIt() async {
-        let daemon = MockDaemon(definingProjects: ["/Users/x/code/other"])
+    @Test(.temporaryTree) func openOfAServerTheProjectLacksNamesTheProjectsThatDefineIt() async throws {
+        let other = try TemporaryTree.directory(named: "other").path
+        let daemon = MockDaemon(definingProjects: [other])
         do {
             _ = try await runner(daemon, RecordingEffects()).run(
                 DeepLink(verb: .open, projectSlug: "myproj", server: "cms"))
@@ -143,10 +157,31 @@ private actor RecordingEffects: DeepLinkEffects {
                 error
                     == WireError(
                         code: .notFound,
-                        hint: "run: directa status cms --project '/Users/x/code/other'",
+                        hint: "run: directa status cms --project '\(other)'",
                         message:
-                            "no server named 'cms' in /Users/x/code/myproj, but the registered project /Users/x/code/other defines it; pass --project with that path"
+                            "no server named 'cms' in /Users/x/code/myproj, but the registered project \(other) defines it; pass --project with that path"
                     ))
+        } catch {
+            Issue.record("unexpected error \(error)")
+        }
+        #expect(await daemon.lookupDeadlines.seen == [ProjectConfigLoader.notFoundLookupSeconds])
+    }
+
+    /** A registered project whose checkout is gone is not named: its path is
+        no use to `--project`, and the daemon's own lookup skips it. */
+    @Test(.temporaryTree) func openLeavesOutAProjectWhoseCheckoutIsGone() async throws {
+        let gone = try TemporaryTree.path(named: "gone").path
+        let daemon = MockDaemon(definingProjects: [gone])
+        do {
+            _ = try await runner(daemon, RecordingEffects()).run(
+                DeepLink(verb: .open, projectSlug: "myproj", server: "cms"))
+            Issue.record("expected WireError")
+        } catch let error as WireError {
+            #expect(
+                error
+                    == WireError(
+                        code: .notFound, hint: "run: directa status --all",
+                        message: "no server named 'cms' in /Users/x/code/myproj"))
         } catch {
             Issue.record("unexpected error \(error)")
         }

@@ -399,10 +399,29 @@ public enum ProjectConfigLoader {
     }
 
     /** The distinct projects among a machine-wide status answer that carry a
-        server called `name`: the `elsewhere` a client hands `serverNotFound`
-        after one `server.status` read with an empty project. */
+        server called `name` and whose checkout still exists (the daemon's own
+        lookup skips a gone one, and `--project` could not use its path): the
+        `elsewhere` a client hands `serverNotFound` after one `server.status`
+        read with an empty project. */
     public static func projects(defining name: String, among servers: [ServerStatus]) -> [String] {
-        Set(servers.lazy.filter { $0.server == name }.map(\.project)).sorted()
+        Set(servers.lazy.filter { $0.server == name }.map(\.project))
+            .filter { FileManager.default.fileExists(atPath: $0) }
+            .sorted()
+    }
+
+    /** How long a client's machine-wide read for `serverNotFound` waits for the
+        daemon: it only sharpens a hint, so a slow daemon costs a short wait,
+        not the client's whole response deadline. */
+    public static let notFoundLookupSeconds: Double = 5
+
+    /** `serverNotFound` for a client that made the machine-wide read itself;
+        nil (the read failed) answers as if no other project had the name. */
+    public static func serverNotFound(
+        name: String, project: String, everywhere: ServerListResult?
+    ) -> WireError {
+        serverNotFound(
+            name: name, project: project,
+            elsewhere: projects(defining: name, among: everywhere?.servers ?? []))
     }
 
     /** Whether the project's devservers.json names this server. A file that

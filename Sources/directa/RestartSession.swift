@@ -156,20 +156,15 @@ struct RestartSession: Sendable {
         throw Self.gaveUp(lastLoss)
     }
 
-    /** How long the not-found lookup waits for the daemon: it only sharpens a
-        hint, so a daemon that is slow to answer costs a short wait, not the
-        client's whole response deadline. */
-    static let notFoundLookupSeconds: Double = 5
-
     /** The `not-found` for a target the daemon no longer reports, naming the
         other registered projects that define it when one machine-wide read
         answers. */
     private func notFound(_ name: String) async -> WireError {
         let everywhere = try? await requester.status(
-            ProjectParams(name: name, project: ""), responseTimeoutSeconds: Self.notFoundLookupSeconds)
+            ProjectParams(name: name, project: ""),
+            responseTimeoutSeconds: ProjectConfigLoader.notFoundLookupSeconds)
         return ProjectConfigLoader.serverNotFound(
-            name: name, project: params.project,
-            elsewhere: ProjectConfigLoader.projects(defining: name, among: everywhere?.servers ?? []))
+            name: name, project: params.project, everywhere: everywhere)
     }
 
     private func act(after: ServerListResult, livePids: [String: Int], targets: [String]) async throws

@@ -31,7 +31,9 @@ public struct DeepLinkRunResult: Sendable, Equatable, Codable {
     exists so the runner's branching is testable without a live socket. */
 protocol DeepLinkDaemon: Sendable {
     func ensure(_ params: EnsureParams) async throws -> EnsureResult
-    func statusList(project: String, name: String?) async throws -> ServerListResult
+    /** `responseTimeoutSeconds` nil keeps the client's default deadline. */
+    func statusList(project: String, name: String?, responseTimeoutSeconds: Double?) async throws
+        -> ServerListResult
     func stop(_ target: ServerTargetParams) async throws -> ServerResult
     func why(_ target: ServerTargetParams) async throws -> WhyResult
 }
@@ -41,10 +43,12 @@ extension DaemonClient: DeepLinkDaemon {
         try request(.serverEnsure, params: params, expecting: EnsureResult.self)
     }
 
-    func statusList(project: String, name: String?) async throws -> ServerListResult {
+    func statusList(project: String, name: String?, responseTimeoutSeconds: Double?) async throws
+        -> ServerListResult
+    {
         try request(
             .serverStatus, params: ProjectParams(name: name, project: project),
-            expecting: ServerListResult.self)
+            expecting: ServerListResult.self, responseTimeoutSeconds: responseTimeoutSeconds)
     }
 
     func stop(_ target: ServerTargetParams) async throws -> ServerResult {
@@ -96,14 +100,16 @@ public struct DeepLinkRunner: Sendable {
                 body: result.rootCause ?? "Diagnosis copied to the clipboard.")
             return DeepLinkRunResult(verb: .why, projectPath: project, detail: result.rootCause)
         case .open:
-            let list = try await daemon.statusList(project: project, name: link.server)
+            let list = try await daemon.statusList(
+                project: project, name: link.server, responseTimeoutSeconds: nil)
             guard let server = list.servers.first else {
                 /** The lookup only sharpens the hint, so a failed one answers
                     as if no other project had the name. */
-                let everywhere = try? await daemon.statusList(project: "", name: link.server)
+                let everywhere = try? await daemon.statusList(
+                    project: "", name: link.server,
+                    responseTimeoutSeconds: ProjectConfigLoader.notFoundLookupSeconds)
                 throw ProjectConfigLoader.serverNotFound(
-                    name: link.server, project: project,
-                    elsewhere: ProjectConfigLoader.projects(defining: link.server, among: everywhere?.servers ?? []))
+                    name: link.server, project: project, everywhere: everywhere)
             }
             let target = try resolveOpenURL(server: server, head: link.head)
             await effects.openBrowser(target)
@@ -113,7 +119,7 @@ public struct DeepLinkRunner: Sendable {
     }
 
     private func resolveProjectPath(_ slug: String) async throws -> String {
-        let list = try await daemon.statusList(project: "", name: nil)
+        let list = try await daemon.statusList(project: "", name: nil, responseTimeoutSeconds: nil)
         var paths: [String] = []
         var seen: Set<String> = []
         for status in list.servers where seen.insert(status.project).inserted {

@@ -31,8 +31,14 @@ private actor FakeMonitorRequester: MonitorRequesting {
         statusQueue.append(result)
     }
 
-    func fetchStatus(_ params: ProjectParams) async throws -> ServerListResult {
+    /** The response deadline of each status call, in call order. */
+    private(set) var statusDeadlines: [Double?] = []
+
+    func fetchStatus(_ params: ProjectParams, responseTimeoutSeconds: Double?) async throws
+        -> ServerListResult
+    {
         statusCallCount += 1
+        statusDeadlines.append(responseTimeoutSeconds)
         let popped = statusQueue.isEmpty ? nil : statusQueue.removeFirst()
         guard let result = popped ?? lastStatus else {
             fatalError("FakeMonitorRequester: no queued server.status response for call #\(statusCallCount)")
@@ -188,14 +194,15 @@ private actor FakeMonitorClock: MonitorClock {
     /** A status answer without the name looks for it in the other registered
         projects with one machine-wide read; the daemon's own not-found at
         attach already carries that, so it passes through unchanged. */
-    @Test func aStatusWithoutTheNameNamesTheProjectsThatDefineIt() async {
+    @Test(.temporaryTree) func aStatusWithoutTheNameNamesTheProjectsThatDefineIt() async throws {
+        let other = try TemporaryTree.directory(named: "other").path
         let requester = FakeMonitorRequester()
         await requester.enqueueLogs(.success(attachLogsResult()))
         await requester.enqueueStatus(.success(ServerListResult(servers: [])))
         await requester.enqueueStatus(
             .success(
                 ServerListResult(servers: [
-                    ServerStatus(logPath: "", phase: .stopped, project: "/code/other", server: "web")
+                    ServerStatus(logPath: "", phase: .stopped, project: other, server: "web")
                 ])))
         var session = MonitorSession(
             client: requester, clock: FakeMonitorClock(start: Self.epoch), config: config())
@@ -207,10 +214,37 @@ private actor FakeMonitorClock: MonitorClock {
             error
                 == WireError(
                     code: .notFound,
-                    hint: "run: directa status web --project '/code/other'",
+                    hint: "run: directa status web --project '\(other)'",
                     message:
-                        "no server named 'web' in /tmp/proj, but the registered project /code/other defines it; pass --project with that path"
+                        "no server named 'web' in /tmp/proj, but the registered project \(other) defines it; pass --project with that path"
                 ))
+        /** The project's own read keeps the default deadline; only the
+            machine-wide lookup is short. */
+        #expect(await requester.statusDeadlines == [nil, ProjectConfigLoader.notFoundLookupSeconds])
+    }
+
+    /** A project whose checkout is gone is not named in the hint. */
+    @Test(.temporaryTree) func aStatusWithoutTheNameLeavesOutAProjectWhoseCheckoutIsGone() async throws {
+        let gone = try TemporaryTree.path(named: "gone").path
+        let requester = FakeMonitorRequester()
+        await requester.enqueueLogs(.success(attachLogsResult()))
+        await requester.enqueueStatus(.success(ServerListResult(servers: [])))
+        await requester.enqueueStatus(
+            .success(
+                ServerListResult(servers: [
+                    ServerStatus(logPath: "", phase: .stopped, project: gone, server: "web")
+                ])))
+        var session = MonitorSession(
+            client: requester, clock: FakeMonitorClock(start: Self.epoch), config: config())
+        guard case .exit(let error) = await session.step() else {
+            Issue.record("expected .exit for a name the project's status lacks")
+            return
+        }
+        #expect(
+            error
+                == WireError(
+                    code: .notFound, hint: "run: directa status --all",
+                    message: "no server named 'web' in /tmp/proj"))
     }
 
     @Test func notFoundAfterAttachEndsTheStreamGracefully() async {

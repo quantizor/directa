@@ -414,15 +414,35 @@ import Testing
         #expect(several.hint == "run: directa status --all '$(x)'")
     }
 
-    @Test func projectsDefiningANameAreDistinctAndSorted() {
+    @Test(.temporaryTree) func projectsDefiningANameAreDistinctAndSorted() throws {
         func status(_ server: String, _ project: String) -> ServerStatus {
             ServerStatus(logPath: "", phase: .stopped, project: project, server: server)
         }
-        let servers = [
-            status("pirl", "/code/b"), status("web", "/code/c"), status("pirl", "/code/a"), status("pirl", "/code/b"),
-        ]
-        #expect(ProjectConfigLoader.projects(defining: "pirl", among: servers) == ["/code/a", "/code/b"])
+        let a = try TemporaryTree.directory(named: "a").path
+        let b = try TemporaryTree.directory(named: "b").path
+        let c = try TemporaryTree.directory(named: "c").path
+        let servers = [status("pirl", b), status("web", c), status("pirl", a), status("pirl", b)]
+        #expect(ProjectConfigLoader.projects(defining: "pirl", among: servers) == [a, b].sorted())
         #expect(ProjectConfigLoader.projects(defining: "api", among: servers) == [])
+    }
+
+    /** The daemon's own lookup skips a registered project whose checkout is
+        gone, so a client reading the machine-wide status must not name one
+        either: it would point at a path `--project` cannot use. */
+    @Test(.temporaryTree) func projectsDefiningANameLeaveOutCheckoutsThatAreGone() throws {
+        func status(_ project: String) -> ServerStatus {
+            ServerStatus(logPath: "", phase: .stopped, project: project, server: "pirl")
+        }
+        let live = try TemporaryTree.directory(named: "live").path
+        let gone = try TemporaryTree.path(named: "gone").path
+        #expect(!FileManager.default.fileExists(atPath: gone))
+        #expect(ProjectConfigLoader.projects(defining: "pirl", among: [status(gone), status(live)]) == [live])
+        #expect(ProjectConfigLoader.projects(defining: "pirl", among: [status(gone)]) == [])
+    }
+
+    /** One short deadline for every not-found lookup, whichever command asks. */
+    @Test func theNotFoundLookupDeadlineIsShort() {
+        #expect(ProjectConfigLoader.notFoundLookupSeconds == 5)
     }
 
     /** The hint is a command a reader pastes, so a main checkout path with a
