@@ -13,6 +13,7 @@ public actor Router {
         launchd side effects, no matter what it injects, because there is
         nothing to call. See `AgentJobs`. */
     private let agentJobs: AgentJobs?
+    private let deferredSurvivorRetry: DeferredSurvivorRetry
     private let events: EventStore
     private let launcher: any ProcessLauncher
     private let paths: DirectaPaths
@@ -35,15 +36,34 @@ public actor Router {
         Defaults to false so a directly constructed Router (every test, and any
         embedder) serves immediately; only the daemon's boot sequence raises it. */
     private var restoring = false
+    /** Live survivors boot restore could not decide about because launchd's
+        job list gave no answer, keyed by server id. Each is reported as the
+        run its row records, counts in every port check, and refuses
+        start-shaped and stop-shaped requests until `settleDeferredSurvivors`
+        decides it; no supervisor owns the run in the meantime. */
+    private var deferredSurvivors: [String: DeferredSurvivor] = [:]
+
+    /** What the per-row restore decision needs, captured when the row was
+        deferred. */
+    private struct DeferredSurvivor {
+        let name: String
+        let persisted: PersistedServerState
+        let project: String
+        let spec: ServerSpec
+    }
+
+    private static let daemonStartingHint = "run: directa daemon status"
 
     public init(
         agentJobs: AgentJobs? = LaunchdJobLauncher.runningAsAgent ? .live : nil,
+        deferredSurvivorRetry: DeferredSurvivorRetry = .standard,
         launcher: any ProcessLauncher, paths: DirectaPaths, portProbe: PortProbe = .live,
         registry: Registry,
         stopTiming: StopTiming = .standard,
         watchEnabled: Bool = ProcessInfo.processInfo.environment[WatchPolicy.disableEnvironmentKey] != "1"
     ) {
         self.agentJobs = agentJobs
+        self.deferredSurvivorRetry = deferredSurvivorRetry
         self.watchEnabled = watchEnabled
         self.events = EventStore(url: paths.eventsFile)
         self.launcher = launcher
@@ -120,7 +140,7 @@ public actor Router {
             guard !restoring || Self.isServableWhileRestoring(method) else {
                 throw WireError(
                     code: .daemonStarting,
-                    hint: "run: directa daemon status",
+                    hint: Self.daemonStartingHint,
                     message: "the daemon is still restoring supervised servers and is not serving requests yet")
             }
             switch method {
@@ -154,7 +174,8 @@ public actor Router {
                 let supervisor = await supervisor(project: project, spec: request.params.spec)
                 await events.post(
                     kind: .registered, project: project, server: request.params.spec.name)
-                return try respond(id: head.id, result: ServerResult(server: await supervisor.status()))
+                return try respond(
+                    id: head.id, result: ServerResult(server: reported(await supervisor.status())))
             case .serverEnsure:
                 let request = try decoder.decode(WireRequest<EnsureParams>.self, from: line)
                 let project = canonicalProjectPath(request.params.project)
@@ -316,6 +337,7 @@ public actor Router {
                 let target = ServerTargetParams(
                     name: request.params.name, port: request.params.port,
                     project: canonicalProjectPath(request.params.project))
+                try refuseWhileDeferred(project: target.project, name: target.name)
                 let supervisor = try await resolvedSupervisor(target)
                 let stopped = await supervisor.stop(reason: "requested by stop")
                 DirectaLog.daemon.info("stop \(target.name)@\(target.project)")
@@ -337,7 +359,8 @@ public actor Router {
                 let reason = await supervisor.wait(
                     for: request.params.condition, timeoutSeconds: request.params.timeoutSeconds)
                 return try respond(
-                    id: head.id, result: EnsureResult(reason: reason, server: await supervisor.status()))
+                    id: head.id,
+                    result: EnsureResult(reason: reason, server: reported(await supervisor.status())))
             case .lockAcquire:
                 let request = try decoder.decode(WireRequest<LockParams>.self, from: line)
                 var params = request.params
@@ -485,6 +508,7 @@ public actor Router {
                         hint: "run: directa status --json",
                         message: "'\(name)' is not registered as an ad hoc server for \(project)")
                 }
+                try refuseWhileDeferred(project: project, name: name)
                 let id = serverID(project: project, name: name)
                 /** A server still running when it is unregistered must be
                     stopped through the normal stop path first, awaiting its
@@ -615,7 +639,9 @@ public actor Router {
         paused set (`waitUnderLiveLock`) and starts on its release. A restored
         row reads `crashed` only when its run was live when the daemon died; a
         row the drain left `stopped` stays `stopped`, including when its
-        restore is refused.
+        restore is refused. A live survivor with restore intent is deferred,
+        not decided, when launchd's job list gave no answer:
+        `settleDeferredSurvivors` decides it later.
 
         Specs resolve through the merged view (devservers.json + ad-hoc registry),
         the same path ensure/status use. Config-defined servers are never written
@@ -662,9 +688,7 @@ public actor Router {
                 DirectaLog.daemon.info("recover skip \(name)@\(project): project path is missing")
                 continue
             }
-            let leftActive = persisted.phase == .running || persisted.phase == .starting
-            let wantsRestore = persisted.resumeOnBoot ?? false
-            guard persisted.pid != nil || leftActive || wantsRestore else { continue }
+            guard persisted.pid != nil || persisted.restoresAtBoot else { continue }
             if isPausedUnderLiveLock(project: project, name: name) {
                 DirectaLog.daemon.info(
                     "recover skip \(name)@\(project): paused under a live resource lock")
@@ -690,93 +714,30 @@ public actor Router {
                     "recover defer \(name)@\(project): config unreadable; keeping resume intent")
                 continue
             case .found(let spec):
-                let restores = leftActive || wantsRestore
-                /** A bare pid match is not proof: the number may have been
-                    recycled during the daemon-down window (a reboot hands it
-                    to an unrelated app, and the pid space is only ~100k wide).
-                    Adopting or bouncing it is mutative, so both need the
-                    kernel start time to be consistent with the moment this
-                    pid was last recorded running. Without that proof the
-                    process is someone else's and is never signaled; the
-                    recorded run is treated as gone. */
-                if let identity = ProcessTree.provenIdentity(
-                    pid: persisted.pid, startedAt: persisted.startedAt)
+                /** Without a job listing, whether a live run is an adoptable
+                    child job is unknown, and bouncing it would stop a server
+                    recovery may well have kept. The row stays as it is, the
+                    server is reported and guarded as the run it records, and
+                    `settleDeferredSurvivors` decides it once launchd answers. */
+                if persisted.restoresAtBoot, listed == nil,
+                    let identity = ProcessTree.provenIdentity(
+                        pid: persisted.pid, startedAt: persisted.startedAt)
                 {
-                    /** Without a job listing, whether this run is an adoptable
-                        child job is unknown, and bouncing it would stop a
-                        server recovery may well have kept. The row stays as
-                        it is for the next boot to decide. */
-                    if restores, listed == nil {
-                        DirectaLog.daemon.error(
-                            "recover defer \(name)@\(project): launchd's job list is unavailable; leaving live pid \(identity.pid) alone")
-                        continue
-                    }
-                    /** A row with no restore intent (a removal whose stop gave
-                        up retired it) keeps its pid only so its leftover run
-                        can be bounced here: it is never adopted or restarted. */
-                    if restores, let job = adoptableChildJobs[identity.pid],
-                        await adoptSurvivor(
-                            boundPort: persisted.boundPort, job: job, name: name, pid: identity.pid,
-                            project: project, spec: spec, startedAt: persisted.startedAt)
-                    {
-                        continue
-                    }
-                    await bounceOrphan(identity, project: project, name: name)
-                } else if leftActive {
-                    await events.post(
-                        kind: .crashed, project: project, server: name,
-                        detail: DaemonRestartDetail.crashed)
-                }
-                guard restores else {
-                    try? await registry.updateState(serverID: id, writer: .router) { entry in
-                        entry.pid = nil
-                        entry.startedAt = nil
-                    }
+                    DirectaLog.daemon.error(
+                        "recover defer \(name)@\(project): launchd's job list is unavailable; leaving live pid \(identity.pid) alone")
+                    deferredSurvivors[id] = DeferredSurvivor(
+                        name: name, persisted: persisted, project: project, spec: spec)
                     continue
                 }
-                /** A row the daemon's own drain left `stopped` did not crash:
-                    it reads `stopped` until a start or a refusal says more.
-                    Any other phase here was live when the daemon died. */
-                let drained = persisted.phase == .stopped
-                try? await registry.updateState(serverID: id, writer: .router) { entry in
-                    if !drained {
-                        entry.lastExit = entry.lastExit ?? LastExit(at: Date())
-                        entry.phase = .crashed
-                    }
-                    entry.pid = nil
-                    entry.startedAt = nil
+                let decision = await decideRecoveredRow(
+                    adoptableChildJobs: adoptableChildJobs, id: id, name: name,
+                    persisted: persisted, project: project, spec: spec)
+                if decision == .restart {
+                    toStart.append((project: project, spec: spec))
                 }
-                toStart.append((project: project, spec: spec))
             }
         }
-        for item in toStart {
-            /** Before the supervisor exists, which reads its first phase from
-                the row: a server waiting on a live holder reads `stopped`
-                even when its run was left active. */
-            let waiting = await waitUnderLiveLock(project: item.project, spec: item.spec)
-            if waiting {
-                try? await registry.updateState(
-                    serverID: serverID(project: item.project, name: item.spec.name), writer: .router
-                ) { $0.phase = .stopped }
-                continue
-            }
-            let supervisor = await self.supervisor(project: item.project, spec: item.spec)
-            do {
-                try await self.prepareSpawn(
-                    target: ServerTargetParams(name: item.spec.name, project: item.project),
-                    supervisor: supervisor)
-            } catch let error as WireError {
-                DirectaLog.daemon.error(
-                    "recover skip \(item.spec.name)@\(item.project): \(error.message)")
-                continue
-            } catch {
-                DirectaLog.daemon.error(
-                    "recover skip \(item.spec.name)@\(item.project): \(error.localizedDescription)")
-                continue
-            }
-            DirectaLog.daemon.info("recover start \(item.spec.name)@\(item.project)")
-            _ = await supervisor.start()
-        }
+        await startRecovered(toStart)
         /** Second pass: drop leftover rows for renamed/deleted servers even when
             they carry no resume intent (e.g. a deliberate stop under the old
             name). Only when the config is readable so a parse blip cannot wipe
@@ -818,6 +779,201 @@ public actor Router {
                 DirectaLog.daemon.info("reaped \(staleJobs.count) leftover child launchd job(s)")
             }
         }
+    }
+
+    /** What the daemon does with one persisted row once the job listing is
+        known (`adoptableChildJobs` maps pid to listed child job): the one home
+        for the decision, shared by boot restore and the later settling of a
+        deferred survivor. A proven live run with restore intent that is a
+        listed child job is adopted, else bounced; a run that is gone, or whose
+        pid no longer proves out, is treated as gone; a row with restore intent
+        is then readied to start fresh.
+
+        A bare pid match is not proof: the number may have been recycled
+        during the daemon-down window (a reboot hands it to an unrelated app,
+        and the pid space is only ~100k wide). Adopting or bouncing it is
+        mutative, so both need the kernel start time to be consistent with the
+        moment this pid was last recorded running. Without that proof the
+        process is someone else's and is never signaled; the recorded run is
+        treated as gone. The proof is read here, at decision time, so a
+        deferred survivor that died or was replaced while deferred is judged
+        as it is now. */
+    private func decideRecoveredRow(
+        adoptableChildJobs: [pid_t: LaunchdJobs.ChildJob], id: String, name: String,
+        persisted: PersistedServerState, project: String, spec: ServerSpec
+    ) async -> RecoveredRowDecision {
+        let restores = persisted.restoresAtBoot
+        if let identity = ProcessTree.provenIdentity(
+            pid: persisted.pid, startedAt: persisted.startedAt)
+        {
+            /** A row with no restore intent (a removal whose stop gave up
+                retired it) keeps its pid only so its leftover run can be
+                bounced here: it is never adopted or restarted. */
+            if restores, let job = adoptableChildJobs[identity.pid],
+                await adoptSurvivor(
+                    boundPort: persisted.boundPort, job: job, name: name, pid: identity.pid,
+                    project: project, spec: spec, startedAt: persisted.startedAt)
+            {
+                return .adopted
+            }
+            await bounceOrphan(identity, project: project, name: name)
+        } else if persisted.leftActive {
+            await events.post(
+                kind: .crashed, project: project, server: name,
+                detail: DaemonRestartDetail.crashed)
+        }
+        guard restores else {
+            try? await registry.updateState(serverID: id, writer: .router) { entry in
+                entry.pid = nil
+                entry.startedAt = nil
+            }
+            return .finished
+        }
+        /** A row the daemon's own drain left `stopped` did not crash: it reads
+            `stopped` until a start or a refusal says more. Any other phase
+            here was live when the daemon died. */
+        let drained = persisted.phase == .stopped
+        try? await registry.updateState(serverID: id, writer: .router) { entry in
+            if !drained {
+                entry.lastExit = entry.lastExit ?? LastExit(at: Date())
+                entry.phase = .crashed
+            }
+            entry.pid = nil
+            entry.startedAt = nil
+        }
+        return .restart
+    }
+
+    private enum RecoveredRowDecision {
+        case adopted
+        case finished
+        case restart
+    }
+
+    /** Starts each recovered server the way boot restore does: unless it
+        waits on a live resource holder or `prepareSpawn` refuses it. */
+    private func startRecovered(_ toStart: [(project: String, spec: ServerSpec)]) async {
+        for item in toStart {
+            /** Before the supervisor exists, which reads its first phase from
+                the row: a server waiting on a live holder reads `stopped`
+                even when its run was left active. */
+            let waiting = await waitUnderLiveLock(project: item.project, spec: item.spec)
+            if waiting {
+                try? await registry.updateState(
+                    serverID: serverID(project: item.project, name: item.spec.name), writer: .router
+                ) { $0.phase = .stopped }
+                continue
+            }
+            let supervisor = await self.supervisor(project: item.project, spec: item.spec)
+            do {
+                try await self.prepareSpawn(
+                    target: ServerTargetParams(name: item.spec.name, project: item.project),
+                    supervisor: supervisor)
+            } catch let error as WireError {
+                DirectaLog.daemon.error(
+                    "recover skip \(item.spec.name)@\(item.project): \(error.message)")
+                continue
+            } catch {
+                DirectaLog.daemon.error(
+                    "recover skip \(item.spec.name)@\(item.project): \(error.localizedDescription)")
+                continue
+            }
+            DirectaLog.daemon.info("recover start \(item.spec.name)@\(item.project)")
+            _ = await supervisor.start()
+        }
+    }
+
+    /** Decides every survivor boot restore deferred, once launchd's job list
+        answers. Reads the list on a requeued timer (each wait is a fresh
+        sleep scheduled after the previous read returns, never an interval)
+        with the delays and total window of `DeferredSurvivorRetry`. The first
+        answer settles every deferred entry through `decideRecoveredRow`, the
+        decision restore makes. A list that never answers in the window leaves
+        the entries deferred and their rows untouched for the next boot. The
+        leftover-job reap restore runs is not repeated here: this list was
+        taken after servers started, so a job a supervisor is still
+        registering could read as stale. Returns at once when nothing is
+        deferred, so the daemon starts it unconditionally after restore. */
+    public func settleDeferredSurvivors() async {
+        guard let agentJobs, !deferredSurvivors.isEmpty else { return }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: deferredSurvivorRetry.window)
+        var delay = deferredSurvivorRetry.firstDelay
+        while !deferredSurvivors.isEmpty {
+            let remaining = deadline - clock.now
+            guard remaining > .zero else {
+                DirectaLog.daemon.error(
+                    "recover: launchd's job list never answered; \(deferredSurvivors.count) server(s) stay deferred until the next daemon launch")
+                return
+            }
+            do {
+                try await Task.sleep(for: min(delay, remaining))
+            } catch {
+                return
+            }
+            switch await agentJobs.listChildJobs() {
+            case .listed(let jobs):
+                await settleDeferredSurvivors(against: jobs)
+                return
+            case .unavailable(let reason):
+                DirectaLog.daemon.error(
+                    "recover: launchd job list re-read failed, retrying in \(min(delay * 2, deferredSurvivorRetry.longestDelay)): \(reason)")
+                delay = min(delay * 2, deferredSurvivorRetry.longestDelay)
+            }
+        }
+    }
+
+    private func settleDeferredSurvivors(against jobs: [LaunchdJobs.ChildJob]) async {
+        let adoptableChildJobs = Dictionary(
+            jobs.compactMap { job in job.pid.map { ($0, job) } },
+            uniquingKeysWith: { first, _ in first })
+        var toStart: [(project: String, spec: ServerSpec)] = []
+        for (id, survivor) in deferredSurvivors {
+            /** A project forgotten while this ran took its entries with it. */
+            guard deferredSurvivors[id] != nil else { continue }
+            /** The entry stays until the decision finishes, so a request
+                that lands while a bounce waits out its grace is still
+                refused rather than spawning beside the dying survivor. */
+            let decision = await decideRecoveredRow(
+                adoptableChildJobs: adoptableChildJobs, id: id, name: survivor.name,
+                persisted: survivor.persisted, project: survivor.project, spec: survivor.spec)
+            deferredSurvivors[id] = nil
+            DirectaLog.daemon.info(
+                "recover settle \(survivor.name)@\(survivor.project): \(decision)")
+            if decision == .restart {
+                toStart.append((project: survivor.project, spec: survivor.spec))
+            }
+        }
+        await startRecovered(toStart)
+    }
+
+    /** Refuses a request that would start, restart, or stop a server whose
+        surviving process is still undecided: a second copy would run beside
+        it (or fail on the port it holds), and a stop would signal a process
+        the daemon has not yet proven it may. */
+    private func refuseWhileDeferred(project: String, name: String) throws {
+        guard let pid = deferredSurvivors[serverID(project: project, name: name)]?.persisted.pid
+        else { return }
+        throw WireError(
+            code: .daemonStarting,
+            hint: Self.daemonStartingHint,
+            message:
+                "'\(name)' in \(project) still has its process (pid \(pid)) from before the daemon restarted, and directa is waiting for launchd to say whether it can take that process back over. It cannot be started, restarted, or stopped until then; try again shortly.")
+    }
+
+    /** `status` as a client should read it: a deferred survivor shows the
+        phase, pid, and uptime its row records, since no supervisor owns the
+        run. */
+    private func reported(_ status: ServerStatus) -> ServerStatus {
+        guard
+            let persisted = deferredSurvivors[serverID(project: status.project, name: status.server)]?
+                .persisted
+        else { return status }
+        var reported = status
+        reported.phase = persisted.phase
+        reported.pid = persisted.pid
+        reported.uptimeSec = persisted.startedAt.map { Int(Date().timeIntervalSince($0)) }
+        return reported
     }
 
     /** The child jobs recovery judges adoption and the leftover reap on, or
@@ -1030,6 +1186,10 @@ public actor Router {
         guard forgetting.insert(project).inserted else { return [] }
         defer { forgetting.remove(project) }
         let prefix = "\(project)::"
+        /** The live roots collected below include a deferred survivor's, which
+            is bounced with the same start-time proof; nothing is left to
+            settle afterward. */
+        deferredSurvivors = deferredSurvivors.filter { !$0.key.hasPrefix(prefix) }
         /** Snapshot identities before teardown: a composite tree can outlive a
             no-op stop (phase already crashed after the checkout vanished),
             so we keep the recorded ProcessIdentity and bounce only while that
@@ -1324,11 +1484,16 @@ public actor Router {
         An autonomous path (boot restore, the watch sweep) must not act on a
         project's committed config until that approval was given, so it refuses.
         A spec that came from `register` rather than the file carries its own
-        approval and is never gated. */
+        approval and is never gated.
+
+        A server with a deferred survivor is refused first, with
+        `daemon-starting`, since spawning beside the survivor is the failure
+        deferral exists to prevent. */
     private func prepareSpawn(
         target: ServerTargetParams, supervisor: ServerSupervisor, portOverride: Int? = nil,
         force: Bool = false, userInitiated: Bool = false
     ) async throws {
+        try refuseWhileDeferred(project: target.project, name: target.name)
         if !force {
             /** Phase, not `hasLiveRun`: a live port-failed run still resolves
                 afresh, since `start` replaces it. */
@@ -1592,7 +1757,10 @@ public actor Router {
         been asked about; state.json answers for the rest, since the pool is
         built lazily and a server started before this daemon's first request
         for it has no entry there at all. A persisted row counts only while its
-        phase holds ports and its recorded pid is still alive. */
+        phase holds ports and its recorded pid is still alive. A deferred
+        survivor counts through its row even though a status read may have
+        built a supervisor for it, since that supervisor does not own the
+        run. */
     private func managedHolds() async -> ManagedHolds {
         var holds: [ManagedHold] = []
         for (id, other) in supervisors {
@@ -1606,7 +1774,8 @@ public actor Router {
         }
         var specsByProject: [String: [ServerSpec]] = [:]
         for (id, persisted) in await registry.allPersistedState() {
-            guard supervisors[id] == nil, persisted.phase.holdsPort, let pid = persisted.pid,
+            guard supervisors[id] == nil || deferredSurvivors[id] != nil, persisted.phase.holdsPort,
+                let pid = persisted.pid,
                 ProcessTree.isAlive(pid), let parsed = parseServerID(id)
             else { continue }
             if specsByProject[parsed.project] == nil {
@@ -1713,10 +1882,18 @@ public actor Router {
             A broken config has to refuse the hold rather than grant a hold that
             protects nothing. `config init` on the same failure already throws. */
         let merged = try await mergedSpecs(project: params.project)
+        /** Pausing stops, so it is refused for a deferred survivor before any
+            declarer is stopped, rather than half-pausing the set. */
+        if shouldPause {
+            for spec in merged.specs
+            where LockResource.declares(resource: params.resource, spec: spec) {
+                try refuseWhileDeferred(project: params.project, name: spec.name)
+            }
+        }
         for spec in merged.specs
         where LockResource.declares(resource: params.resource, spec: spec) {
             let supervisor = await supervisor(project: params.project, spec: spec)
-            let status = await supervisor.status()
+            let status = reported(await supervisor.status())
             guard status.hasLiveRun else { continue }
             guard shouldPause else {
                 /** Sound for the whole hold: lockGate refuses to start a
@@ -1957,7 +2134,8 @@ public actor Router {
     private func annotatedStatuses(_ targets: [(project: String, spec: ServerSpec)]) async -> [ServerStatus] {
         var statuses: [ServerStatus] = []
         for target in targets {
-            statuses.append(await supervisor(project: target.project, spec: target.spec).status())
+            let status = await supervisor(project: target.project, spec: target.spec).status()
+            statuses.append(reported(status))
         }
         let latentPorts = Set(statuses.compactMap(Self.latentConflictPort))
         guard !latentPorts.isEmpty else { return statuses }
@@ -2224,6 +2402,11 @@ public actor Router {
                 message: "dependency cycle in devservers.json")
         }
         let specsByName = Dictionary(uniqueKeysWithValues: merged.specs.map { ($0.name, $0) })
+        /** Before any wave stops, so a deferred survivor refuses the whole
+            teardown rather than leaving half the project down. */
+        for spec in merged.specs {
+            try refuseWhileDeferred(project: params.project, name: spec.name)
+        }
         var results: [EnsureResult] = []
         for wave in waves.reversed() {
             let waveResults = await withTaskGroup(of: EnsureResult.self) { group in
@@ -2279,6 +2462,19 @@ public actor Router {
 
     private func respond<R: Codable & Sendable>(id: String, result: R) throws -> Data {
         try NDJSON.encodeLine(WireResponse(id: id, ok: true, result: result))
+    }
+}
+
+extension PersistedServerState {
+    /** The daemon died with this run live, as far as the row can say. */
+    fileprivate var leftActive: Bool {
+        phase == .running || phase == .starting
+    }
+
+    /** Boot restore brings this server back: its start intent survived
+        (resume-on-boot) or its run was left active. */
+    fileprivate var restoresAtBoot: Bool {
+        leftActive || (resumeOnBoot ?? false)
     }
 }
 

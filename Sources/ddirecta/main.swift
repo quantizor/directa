@@ -291,6 +291,12 @@ Task {
         Data(
             "ddirecta \(DirectaVersion.version) listening on \(socketPath) (pid \(getpid()))\n"
                 .utf8))
+    /** A survivor restore could not decide about (launchd's job list gave no
+        answer) is decided here once launchd answers; returns at once when
+        restore deferred nothing. */
+    Task {
+        await router.settleDeferredSurvivors()
+    }
     /** The watch sweep starts only after restore, so a boot-time spawn is never
         mistaken for a config change. Polling rather than an fd-based watcher:
         nearly every editor and build tool saves by writing a temp file and
