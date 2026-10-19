@@ -392,6 +392,50 @@ import Testing
         #expect(events.events.filter { $0.kind == .stopped }.map(\.detail) == ["project path gone"])
     }
 
+    /** A port-failed run is alive until its process exits, so `wait --stopped`
+        holds over it for the whole window, and resolves only once `stop` has
+        taken the process down. */
+    @Test func waitStoppedHoldsOverAPortFailedRunUntilItsProcessIsGone() async throws {
+        let port = TestPorts.port(11)
+        let env = try makeRouterEnv(named: "waitstop")
+        let sibling = try env.sibling(named: "sibling")
+        let registry = Registry(paths: env.paths)
+        try await registry.register(
+            project: env.project,
+            spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "web", port: port))
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let (failed, thief) = try await portFailedVictim(
+            router: router, registry: registry, env: env, sibling: sibling, port: port)
+        let victim = try #require(failed.pid)
+        defer { kill(pid_t(victim), SIGKILL) }
+        _ = await thief.stop(graceSeconds: 2, reason: "test cleanup")
+
+        let held = try await router.attempt(
+            .serverWait,
+            WaitParams(condition: .stopped, name: "web", project: env.project, timeoutSeconds: 1),
+            EnsureResult.self)
+        guard case .success(let heldResult) = held else {
+            Issue.record("wait for stopped failed: \(held)")
+            return
+        }
+        #expect(heldResult.reason == .timeout)
+        #expect(heldResult.server.phase == .failed)
+        #expect(kill(pid_t(victim), 0) == 0, "the port-failed run \(victim) exited before stop")
+
+        _ = try await router.attempt(
+            .serverStop, ServerTargetParams(name: "web", project: env.project), ServerResult.self)
+        let resolved = try await router.attempt(
+            .serverWait,
+            WaitParams(condition: .stopped, name: "web", project: env.project, timeoutSeconds: 10),
+            EnsureResult.self)
+        guard case .success(let resolvedResult) = resolved else {
+            Issue.record("wait for stopped failed after stop: \(resolved)")
+            return
+        }
+        #expect(resolvedResult.reason == nil)
+        #expect(try await awaitExit(pid_t(victim), within: .seconds(5)))
+    }
+
     /** Brings a router-started server to a port failure with its run still
         alive: a thief (another managed server) binds the victim's effective
         port after the victim's pre-check passed, answers its healthcheck, and
@@ -570,7 +614,159 @@ import Testing
         #expect(settled.phase == .running)
         #expect(settled.portConflict == nil)
         #expect(settled.observedPort == port)
+        let notes = await supervisor.logQuery(LogQueryOptions(streams: [.sys])).lines.map(\.text)
+        #expect(!notes.contains { $0.hasPrefix("marked healthy, but nothing is listening") })
         _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
+    }
+
+    /** The field failure's trace: a check passed, and afterward nothing at all
+        listens on the server's port, so the answer came from some other process.
+        The server's own log says so once lsof has answered with no listener. */
+    @Test func aPassWithNothingListeningAfterwardIsNotedInTheServersLog() async throws {
+        let env = try makeRouterEnv(named: "port")
+        let port = TestPorts.port(25)
+        let registry = Registry(paths: env.paths)
+        let spec = ServerSpec(
+            command: ["/bin/sh", "-c", "sleep 30"], healthcheck: HealthCheckSpec(port: port, type: .tcp),
+            name: "web", port: port)
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: env.paths, prober: PassingProber(),
+            projectPath: env.project, registry: registry, spec: spec)
+        _ = await supervisor.start()
+        let noted = try await eventually(within: .seconds(6), every: .milliseconds(100)) {
+            await supervisor.logQuery(LogQueryOptions(streams: [.sys])).lines.map(\.text).contains(
+                "marked healthy, but nothing is listening on port \(port) now; some other process may have answered the check"
+            )
+        }
+        #expect(noted, "the sys log never noted the empty listen scan")
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
+    }
+
+    /** An unmanaged listener on the port refuses the start with its pid and
+        command in the message and `why` as the next step: the hint is a
+        command to run, never a kill of a process directa does not own. */
+    @Test(arguments: [true, false])
+    func anUnmanagedListenerRefusesTheStartWithAWhyHint(lsofNamesIt: Bool) async throws {
+        let env = try makeRouterEnv(named: "port")
+        let port = TestPorts.port(27)
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web", port: port))
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths,
+            portProbe: PortProbe(
+                isListening: { $0 == port },
+                listenerInfo: { _ in lsofNamesIt ? (pid: 4242, command: "stand-in listener") : nil }),
+            registry: registry)
+
+        let refused = try await router.attempt(
+            .serverStart, ServerTargetParams(name: "web", project: env.project), ServerResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("expected the unmanaged listener to refuse the start")
+            return
+        }
+        #expect(error.code == .portHeld)
+        #expect(
+            error.message
+                == (lsofNamesIt
+                    ? "port \(port) is held by unmanaged pid 4242 (stand-in listener)"
+                    : "port \(port) already has a listener that directa does not manage"))
+        #expect(
+            error.hint
+                == "run: directa why web --project \(ShellWord.singleQuoted(canonicalProjectPath(env.project)))")
+    }
+
+    /** `ensure` over a port-failed run stops it first. A listener that the
+        stop did not remove would answer the next run's first health check, so
+        the ensure is refused with the listener named and nothing is spawned. */
+    @Test func ensureOverAPortFailedRunIsRefusedWhileAListenerOutlivesItsStop() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeRouterEnv(named: "port")
+        let port = TestPorts.port(26)
+        let lingering = LingeringListener(reports: .outsider)
+        let registry = Registry(paths: env.paths)
+        try await registry.register(
+            project: env.project,
+            spec: ServerSpec(
+                command: [fixture, "--listen-tcp", String(port + 1)],
+                healthcheck: HealthCheckSpec(type: .none), name: "web", port: port,
+                portSpan: 2))
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: lingering.probe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        let target = ServerTargetParams(name: "web", project: env.project)
+        _ = try await router.attempt(.serverStart, target, ServerResult.self)
+        let drifted = try #require(try await failedStatus(router, project: env.project))
+        #expect(drifted.phase == .failed)
+        let oldPid = try #require(drifted.pid)
+        defer { kill(pid_t(oldPid), SIGKILL) }
+        lingering.watch(pid: pid_t(oldPid))
+
+        let refused = try await router.attempt(
+            .serverEnsure, EnsureParams(name: "web", project: env.project, timeoutSeconds: 5),
+            EnsureResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("ensure spawned beside a listener the stop did not remove: \(refused)")
+            return
+        }
+        #expect(error.code == .portHeld)
+        #expect(error.message.contains("pid \(getpid()) (stand-in listener)"))
+        let status = try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: "web", project: env.project), ServerListResult.self
+            ).servers.first)
+        #expect(status.phase == .stopped)
+        #expect(status.pid == nil)
+    }
+
+    /** `up` prepares every member before it starts any. A later member's
+        refusal ends the rollout, so a port-failed member ahead of it keeps its
+        run: stopping it is part of starting it again, which never happens. */
+    @Test func anUpRefusedAtALaterMemberLeavesAPortFailedMemberRunning() async throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let env = try makeRouterEnv(named: "port")
+        let port = TestPorts.port(28)
+        let otherPort = TestPorts.port(31)
+        let registry = Registry(paths: env.paths)
+        try await registry.register(
+            project: env.project,
+            spec: ServerSpec(
+                command: [fixture, "--listen-tcp", String(port + 1)],
+                healthcheck: HealthCheckSpec(type: .none), name: "web", port: port, portSpan: 2))
+        try await registry.register(
+            project: env.project, spec: sleeperSpec(name: "x-other", port: otherPort))
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths,
+            portProbe: PortProbe(
+                isListening: { $0 == otherPort },
+                listenerInfo: { _ in (pid: 4242, command: "stand-in listener") }),
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        _ = try await router.attempt(
+            .serverStart, ServerTargetParams(name: "web", project: env.project), ServerResult.self)
+        let drifted = try #require(try await failedStatus(router, project: env.project))
+        #expect(drifted.phase == .failed)
+        let oldPid = try #require(drifted.pid)
+        defer { kill(pid_t(oldPid), SIGKILL) }
+
+        let refused = try await router.attempt(
+            .groupUp, GroupParams(project: env.project, timeoutSeconds: 5), GroupResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("expected the held port to refuse the rollout")
+            return
+        }
+        #expect(error.code == .portHeld)
+
+        let status = try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: "web", project: env.project), ServerListResult.self
+            ).servers.first)
+        #expect(status.phase == .failed)
+        #expect(status.pid == oldPid)
+        #expect(kill(pid_t(oldPid), 0) == 0)
+
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "web", project: env.project), ServerResult.self)
     }
 
     /** ATTACK: the server's own listener lives outside its process tree. A
@@ -714,4 +910,9 @@ import Testing
         """
         try Data(body.utf8).write(to: URL(fileURLWithPath: project).appending(path: "devservers.json"))
     }
+}
+
+/** Answers every check as passing, whatever listens. */
+private struct PassingProber: HealthProber {
+    func probe(_ check: EffectiveHealthcheck) async -> HealthProbeOutcome { .pass }
 }

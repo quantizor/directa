@@ -38,6 +38,45 @@ import os
         #expect(results == Array(0..<jobs))
     }
 
+    /** Telemetry reports every shared lane under its own name, and a full
+        `health` lane (every thread held on a connect that waits out its
+        timeout) leaves a `system` job to run at once. The held jobs release
+        in a `defer`, so a failure cannot leave the shared lane stuck for
+        every other suite. */
+    @Test func aFullHealthLaneLeavesTheSystemLaneFree() async throws {
+        #expect(BlockingLane.all.map(\.name) == ["repository", "health", "system"])
+        #expect(BlockingLane.all.map(\.width) == [2, 4, 4])
+        #expect(BlockingLane.all.map { $0.pressure().name } == ["repository", "health", "system"])
+
+        let health = BlockingLane.health
+        let entered = DispatchSemaphore(value: 0)
+        let gate = DispatchSemaphore(value: 0)
+        let held = (0..<health.width).map { _ in
+            Task.detached {
+                await health.run {
+                    entered.signal()
+                    gate.wait()
+                }
+            }
+        }
+        let width = health.width
+        func release() { for _ in 0..<width { gate.signal() } }
+        let allEntered = await offPool {
+            (0..<width).allSatisfy { _ in entered.wait(timeout: .now() + 60) == .success }
+        }
+        guard allEntered else {
+            release()
+            Issue.record("the health lane never ran \(width) jobs at once")
+            return
+        }
+        let systemRan = await BlockingLane.system.run { true }
+        let healthRunning = health.pressure().running
+        release()
+        for call in held { await call.value }
+        #expect(systemRan)
+        #expect(healthRunning == width)
+    }
+
     /** Pressure counts running and queued jobs exactly, the oldest queued
         wait grows while the lane is full, and only a job that waited past the
         lane's slow-wait bound is reported, once, with its lane name. The jobs

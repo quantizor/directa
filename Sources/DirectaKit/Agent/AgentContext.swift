@@ -123,7 +123,10 @@ public enum AgentContext {
         switch server.phase {
         case .crashed, .failed, .unhealthy:
             return true
-        case .running, .starting, .stopped, .stopping:
+        case .running:
+            return server.specStale == true || conflictWarrantsAttention(server.portConflict?.state)
+                || server.lastHealthCheck?.failureNote != nil
+        case .starting, .stopped, .stopping:
             return server.specStale == true || conflictWarrantsAttention(server.portConflict?.state)
         }
     }
@@ -220,7 +223,11 @@ public enum AgentContext {
         case .unhealthy:
             let since = server.lastHealthAt.map { JSONCoding.formatISO8601($0) } ?? "startup"
             parts.append("last healthy \(since)")
-        case .running, .starting, .stopped, .stopping:
+        case .running:
+            /** `running` holds until enough checks fail to turn it unhealthy,
+                so a server answering errors still reads as running here. */
+            if let note = server.lastHealthCheck?.failureNote { parts.append(note) }
+        case .starting, .stopped, .stopping:
             break
         }
         if server.specStale == true { parts.append("config changed since start") }

@@ -333,9 +333,10 @@ private func makeEnv() throws -> RouterEnv {
         #expect(await rehydrated.status().blockedOn == "interactive-auth")
 
         /** A run that dies differently (instantly, here) breaks the pattern. */
-        await supervisor.updateSpec(
-            ServerSpec(
-                command: [fixture, "--exit-after", "0.1", "--code", "1"], name: "auth-stall"))
+        await supervisor.stageSpawn(
+            ServerSupervisor.PendingSpawn(
+                spec: ServerSpec(
+                    command: [fixture, "--exit-after", "0.1", "--code", "1"], name: "auth-stall")))
         _ = await supervisor.start()
         let third = try await awaitCrashed()
         #expect(third.phase == .crashed)
@@ -656,10 +657,17 @@ private func makeEnv() throws -> RouterEnv {
     @Test func stopGivesADescendantItsGraceAfterTheRootExits() async throws {
         let env = try makeEnv()
         let marker = URL(fileURLWithPath: env.project).appending(path: "cleaned")
+        let ready = URL(fileURLWithPath: env.project).appending(path: "ready")
+        /** Absolute paths in the script text keep the temporary tree's path in
+            the shell's argv, which is how `make test` finds a leftover shell
+            after a killed run. The loops end on their own after a minute, so
+            a killed run never leaves one spinning. */
         let spec = ServerSpec(
             command: [
                 "/bin/sh", "-c",
-                #"trap "exit 0" TERM; (trap "sleep 1; echo done > cleaned; exit 0" TERM; : > ready; while :; do sleep 0.1; done) & while :; do sleep 0.1; done"#,
+                """
+                trap "exit 0" TERM; (trap "sleep 1; echo done > '\(marker.path)'; exit 0" TERM; : > '\(ready.path)'; while [ $SECONDS -lt 60 ]; do sleep 0.1; done) & while [ $SECONDS -lt 60 ]; do sleep 0.1; done
+                """,
             ],
             name: "slow-worker")
         let supervisor = ServerSupervisor(
@@ -667,7 +675,6 @@ private func makeEnv() throws -> RouterEnv {
             registry: Registry(paths: env.paths), spec: spec)
         #expect(await supervisor.start().pid != nil)
         /** The subshell writes `ready` once its trap is installed. */
-        let ready = URL(fileURLWithPath: env.project).appending(path: "ready")
         try #require(
             try await eventually(within: .seconds(5)) { FileManager.default.fileExists(atPath: ready.path) },
             "the worker never installed its trap")
@@ -947,7 +954,8 @@ private func makeEnv() throws -> RouterEnv {
         _ = await supervisor.start()
         let crashed = try await awaitPhase(supervisor, .crashed)
         #expect(crashed.errorSummary?.count == 1)
-        await supervisor.updateSpec(ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "cycle"))
+        await supervisor.stageSpawn(
+            ServerSupervisor.PendingSpawn(spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 30"], name: "cycle")))
         _ = await supervisor.start()
         /** A fresh run starts with no tally; it fills only on the next failure. */
         #expect(await supervisor.status().errorSummary == nil)
@@ -1196,7 +1204,7 @@ private func makeEnv() throws -> RouterEnv {
         let ready = URL(fileURLWithPath: env.project).appending(path: "ready")
         let survivor = try spawnReapedSessionLeader([
             "/bin/sh", "-c",
-            "trap 'sleep 0.5; echo done > \"\(marker.path)\"; exit 0' TERM; : > \"\(ready.path)\"; while :; do sleep 0.1; done",
+            "trap 'sleep 0.5; echo done > \"\(marker.path)\"; exit 0' TERM; : > \"\(ready.path)\"; while [ $SECONDS -lt 60 ]; do sleep 0.1; done",
         ])
         defer { kill(survivor, SIGKILL) }
         /** The survivor writes `ready` once its trap is installed. */
@@ -1669,11 +1677,11 @@ private struct ExitsAtOnceAdoptLauncher: ProcessLauncher {
 }
 
 private struct AlwaysHealthyProber: HealthProber {
-    func probe(_ check: EffectiveHealthcheck) async -> Bool { true }
+    func probe(_ check: EffectiveHealthcheck) async -> HealthProbeOutcome { .pass }
 }
 
 private struct NeverHealthyProber: HealthProber {
-    func probe(_ check: EffectiveHealthcheck) async -> Bool { false }
+    func probe(_ check: EffectiveHealthcheck) async -> HealthProbeOutcome { .fail("test failure") }
 }
 
 @Suite(.temporaryTree) struct RegistryTests {

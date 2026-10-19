@@ -349,6 +349,156 @@ private func tempDir() throws -> URL {
         #expect(texts == ["appended after attach"])
     }
 
+    /** The identity a handoff records for `url`, with `bytesRead` as its offset. */
+    private func position(of url: URL, bytesRead: UInt64, inodeShift: UInt64 = 0) throws -> SpoolPosition {
+        var info = stat()
+        try #require(stat(url.path, &info) == 0)
+        return SpoolPosition(bytesRead: bytesRead, device: Int(info.st_dev), inode: UInt64(info.st_ino) + inodeShift)
+    }
+
+    private func ingested(_ store: LogStore) async -> [String] {
+        await store.query(LogQueryOptions(streams: [.out])).map(\.text)
+    }
+
+    /** A handoff pause logs the complete lines the spool holds and answers
+        the start of the line still in progress, so the next daemon logs that
+        line whole rather than from its middle. */
+    @Test func pauseAnswersWhereTheNextDaemonResumes() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data("one\ntwo\nthr".utf8).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(intervalMs: 20, store: store, stream: .out, url: spool)
+        await tailer.start()
+
+        let paused = await tailer.pause()
+
+        #expect(paused == (try position(of: spool, bytesRead: 8)))
+        #expect(await ingested(store) == ["one", "two"])
+    }
+
+    @Test func pauseOfAMissingSpoolAnswersNothing() async throws {
+        let dir = try tempDir()
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(store: store, stream: .out, url: dir.appending(path: "out.spool"))
+        #expect(await tailer.pause() == nil)
+    }
+
+    /** The adopting daemon reads from the recorded byte: the lines written
+        during the bounce arrive once, and the torn line arrives whole. */
+    @Test func resumingFromARecordedPositionIngestsWhatFollowsIt() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data("old\nnew 1\nnew 2\n".utf8).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(
+            intervalMs: 20, resumeFrom: try position(of: spool, bytesRead: 4), startAtEnd: true, store: store,
+            stream: .out, url: spool)
+        await tailer.start()
+        await tailer.stop()
+        #expect(await ingested(store) == ["new 1", "new 2"])
+    }
+
+    /** A recorded position that does not describe this file seeds at the end,
+        as an adoption after a crash does: a different inode (the spool was
+        replaced) or a file shorter than the offset. */
+    @Test(arguments: [
+        (inodeShift: UInt64(1), bytesRead: UInt64(4)),
+        (inodeShift: UInt64(0), bytesRead: UInt64(1_000)),
+    ])
+    func aPositionThatDoesNotMatchTheSpoolSeedsAtTheEnd(inodeShift: UInt64, bytesRead: UInt64) async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data("old\nnew 1\nnew 2\n".utf8).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(
+            intervalMs: 20, resumeFrom: try position(of: spool, bytesRead: bytesRead, inodeShift: inodeShift),
+            startAtEnd: true, store: store, stream: .out, url: spool)
+        await tailer.start()
+        await tailer.stop()
+        #expect(await ingested(store).isEmpty)
+        let handle = try FileHandle(forWritingTo: spool)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("after\n".utf8))
+        try handle.close()
+        await tailer.start()
+        await tailer.stop()
+        #expect(await ingested(store) == ["after"])
+    }
+
+    /** A resumed backlog is held to the catch-up cap like any other, and the
+        skip is named. */
+    @Test func aResumedBacklogPastTheCatchUpCapIsSkippedAndNamed() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        var payload = Data()
+        for index in 0..<20 {
+            payload.append(contentsOf: "line-\(index)\n".utf8)
+        }
+        try payload.write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(
+            intervalMs: 20, maxCatchUpBytes: 30, resumeFrom: try position(of: spool, bytesRead: 0), startAtEnd: true,
+            store: store, stream: .out, url: spool)
+        await tailer.start()
+        await tailer.stop()
+        let out = await ingested(store)
+        let sys = await store.query(LogQueryOptions(streams: [.sys])).map(\.text)
+        #expect(out.contains("line-19"))
+        #expect(!out.contains("line-0"))
+        #expect(sys.contains { $0.hasPrefix("spool catch-up skipped ") })
+    }
+
+    /** A pause ingests what the spool holds when it begins and returns, even
+        though the child keeps writing faster than the tailer reads. */
+    @Test func pauseDoesNotChaseAFloodingChild() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data().write(to: spool)
+        /** A writer on a thread of its own that appends faster than one-byte
+            reads can follow, so a drain that chases end of file never reaches
+            it. The tailer releases what it ingests, which keeps the disk use
+            small however large the file grows. */
+        let writing = OSAllocatedUnfairLock(initialState: true)
+        let flood = Task {
+            await offPool {
+                let descriptor = open(spool.path, O_WRONLY | O_APPEND | O_CLOEXEC)
+                guard descriptor >= 0 else { return }
+                defer { close(descriptor) }
+                let line = [UInt8](repeating: 0x61, count: 999) + [0x0A]
+                let block = Array((0..<64).map { _ in line }.joined())
+                while writing.withLock({ $0 }) {
+                    _ = write(descriptor, block, block.count)
+                    usleep(200)
+                }
+            }
+        }
+        defer { writing.withLock { $0 = false } }
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(
+            intervalMs: 20, maxCatchUpBytes: 2048, readChunkBytes: 1, retainBytes: 16 * 1024, store: store,
+            stream: .out, url: spool)
+        await tailer.start()
+        _ = try await eventually(within: .seconds(20), every: .milliseconds(20)) {
+            try spoolSizes(spool).apparent >= 1_048_576
+        }
+        let finished = OSAllocatedUnfairLock(initialState: false)
+        let paused = Task {
+            let answer = await tailer.pause()
+            finished.withLock { $0 = true }
+            return answer
+        }
+        let returned = try await eventually(within: .seconds(20), every: .milliseconds(20)) {
+            finished.withLock { $0 }
+        }
+        #expect(returned, "pause was still chasing the flood after 20 seconds")
+        writing.withLock { $0 = false }
+        await flood.value
+        let answer = await paused.value
+        #expect((answer?.bytesRead ?? 0) > 0)
+        #expect((answer?.bytesRead ?? .max) <= UInt64(try spoolSizes(spool).apparent))
+    }
+
     /** The two ways a child's spool descriptor is opened: the daemon's own
         open for a direct spawn, and launchd's for an agent-mode job (read
         and write, appending, never truncating; observed on a real job). */
@@ -673,6 +823,47 @@ private func tempDir() throws -> URL {
             evidenceLines: { _ in [] })
         #expect(result.rootCause == nil)
         #expect(result.findings.first?.summary == "running and healthy")
+    }
+
+    /** `running` holds until enough checks fail to turn the server unhealthy.
+        A server answering 500 is running, not healthy. */
+    @Test func aRunningServerIsHealthyOnlyWhileItsLatestCheckPasses() {
+        func summary(_ check: HealthCheckResult?) -> String? {
+            var running = status("web", .running)
+            running.lastHealthCheck = check
+            return WhyEngine.diagnose(
+                target: "web",
+                statuses: ["web": running],
+                specs: ["web": ServerSpec(command: ["w"], name: "web")],
+                evidenceLines: { _ in [] }
+            ).findings.first?.summary
+        }
+        let at = Date(timeIntervalSince1970: 1_700_000_000)
+        #expect(summary(HealthCheckResult(at: at, failures: 0, passed: true)) == "running and healthy")
+        #expect(
+            summary(HealthCheckResult(at: at, detail: "HTTP 500", failures: 4, passed: false))
+                == "running; 4 health checks failed in a row (HTTP 500)")
+        #expect(
+            summary(HealthCheckResult(at: at, detail: "timed out after 10s", failures: 1, passed: false))
+                == "running; 1 health check failed in a row (timed out after 10s)")
+        #expect(
+            summary(HealthCheckResult(at: at, failures: 2, passed: false))
+                == "running; 2 health checks failed in a row")
+    }
+
+    @Test func anUnhealthyServerNamesItsLatestFailure() {
+        var unhealthy = status("web", .unhealthy)
+        unhealthy.lastHealthCheck = HealthCheckResult(
+            at: Date(timeIntervalSince1970: 1_700_000_000), detail: "connection refused", failures: 5,
+            passed: false)
+        let result = WhyEngine.diagnose(
+            target: "web",
+            statuses: ["web": unhealthy],
+            specs: ["web": ServerSpec(command: ["w"], name: "web")],
+            evidenceLines: { _ in [] })
+        #expect(
+            result.findings.first?.summary
+                == "healthcheck failing; last healthy startup; 5 health checks failed in a row (connection refused)")
     }
 
     @Test func portMismatchIsSurfaced() {

@@ -235,13 +235,14 @@ do {
 }
 
 /** Graceful termination: drain-stop every supervised server through the normal
-    teardown path, unregister power notifications, then exit 0 (a deliberate
-    stop must not trigger KeepAlive). */
+    teardown path (except after a handoff exit began, which leaves them
+    running), unregister power notifications, then exit 0 (a deliberate stop
+    must not trigger KeepAlive). */
 let terminationSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
 signal(SIGTERM, SIG_IGN)
 terminationSource.setEventHandler {
     Task { @MainActor in
-        await router.drainAll()
+        await router.drainOnTermination()
         if let port = powerPort {
             IONotificationPortSetDispatchQueue(port, nil)
         }
@@ -291,6 +292,12 @@ Task {
         Data(
             "ddirecta \(DirectaVersion.version) listening on \(socketPath) (pid \(getpid()))\n"
                 .utf8))
+    /** A survivor restore could not decide about (launchd's job list gave no
+        answer) is decided here once launchd answers; returns at once when
+        restore deferred nothing. */
+    Task {
+        await router.settleDeferredSurvivors()
+    }
     /** The watch sweep starts only after restore, so a boot-time spawn is never
         mistaken for a config change. Polling rather than an fd-based watcher:
         nearly every editor and build tool saves by writing a temp file and

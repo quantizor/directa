@@ -44,18 +44,53 @@ private struct PhaseWaiterList {
 /** How long `stop()` waits on a server. `graceSeconds` is the SIGTERM-to-SIGKILL
     window a stop gets when its caller names none; `overtimeSeconds` is the
     margin past that grace before the stop gives up waiting for the phase to
-    clear (see `waitForStoppingToClear`). Injectable so tests reach the
-    give-up path without a real multi-second wait. */
+    clear (see `waitForStoppingToClear`). `portClearSeconds` is how long a
+    transition that stops a run and spawns the next waits for the server's
+    claimed ports to have no listener (`Router.requirePortsClear`).
+    `treeExitSeconds` is how long after the SIGKILL pass a stop waits for
+    every process it signaled to exit (see `awaitTreeExit`). Injectable so
+    tests reach the give-up paths without a real multi-second wait. */
 public struct StopTiming: Sendable {
     public let graceSeconds: Double
     public let overtimeSeconds: Double
+    public let portClearSeconds: Double
+    public let treeExitSeconds: Double
 
-    public init(graceSeconds: Double, overtimeSeconds: Double) {
+    public init(
+        graceSeconds: Double, overtimeSeconds: Double,
+        portClearSeconds: Double = StopTiming.standardPortClearSeconds,
+        treeExitSeconds: Double = 5
+    ) {
         self.graceSeconds = graceSeconds
         self.overtimeSeconds = overtimeSeconds
+        self.portClearSeconds = portClearSeconds
+        self.treeExitSeconds = treeExitSeconds
     }
 
+    /** By the time a stop returns, the SIGKILL pass has run over the whole
+        recorded tree and the kernel has closed the sockets of everything it
+        killed, which takes milliseconds. What is left to wait for is a process
+        outside that tree that exits on its own once its parent is gone (a
+        worker noticing a closed IPC channel; Node tooling takes a second or
+        two). Five seconds covers that and stays under the stop's own grace; a
+        listener still there after it is not leaving by itself. */
+    public static let standardPortClearSeconds = 5.0
+
     public static let standard = StopTiming(graceSeconds: 7, overtimeSeconds: 10)
+}
+
+/** How a stop ended for a caller that has to know the run's whole process
+    tree is gone, not only the root (`ServerSupervisor.stopAndConfirm`). */
+public enum StopCompletion: Equatable, Sendable {
+    /** The bounded wait for the phase to leave `.stopping` (or for a pid to
+        appear) expired. */
+    case stillStopping
+    /** The phase cleared, but these pids still run past the SIGKILL pass and
+        its bounded wait. */
+    case survivors(pids: [Int])
+    /** The phase left `.stopping` and every process the stop signaled has
+        exited. */
+    case treeGone
 }
 
 /** One actor per server: owns the child's lifecycle and serializes every mutation,
@@ -73,6 +108,23 @@ public actor ServerSupervisor {
         let deliberate: Bool
         let reason: String
         let waitBound: Duration
+    }
+
+    /** What the Router prepared for the next run: the materialized spec and the
+        port bookkeeping that goes with it. It sits apart from the fields that
+        describe the current run (`spec`, `effectivePort`, `portClaim`, and
+        their companions) until a spawn or an adopt moves it in, so preparing a
+        spawn never changes what status and other servers' port checks read for
+        a run that is still alive. `forRestart` marks a restart's slot, staged
+        while the run it replaces is up: a start or ensure that joins that run
+        leaves it for the restart's own spawn. */
+    struct PendingSpawn: Sendable {
+        var claim: PortClaim?
+        var declaredPort: Int?
+        var effectivePort: Int?
+        var forRestart = false
+        var portConflict: PortConflict?
+        var spec: ServerSpec
     }
 
     /** The log tail a terminal run's status shows, read once rather than per
@@ -123,6 +175,7 @@ public actor ServerSupervisor {
     private var lastDescendantSnapshot: [ProcessIdentity] = []
     private var lastExit: LastExit?
     private var lastHealthAt: Date?
+    private var lastHealthCheck: HealthCheckResult?
     private let launcher: any ProcessLauncher
     private let logStore: LogStore
     private let mainProjectSlug: String?
@@ -138,6 +191,14 @@ public actor ServerSupervisor {
     /** Set when a stop moves the phase to `.stopping`, cleared once the
         phase leaves it or a new run starts. */
     private var pendingStop: StopRequest?
+    /** The next run's prepared spawn, moved into the current-run fields when a
+        run starts or is adopted (`resetForNewRun`) and dropped when the
+        transition that prepared it is abandoned or joins a run instead. While
+        it is set, a status read's committed spec does not replace `spec`: a
+        restart's stop leaves a stopped gap between the prepare and the start,
+        and a read landing in it would otherwise spawn the run without the
+        prepared port. */
+    private var pendingSpawn: PendingSpawn?
     /** `didSet` is the one home for leaving `.stopping`: every caller that must
         not proceed until a stop (or the drain half of a crash/exit) has fully
         landed awaits `waitForStoppingToClear` instead of polling `runTask`,
@@ -199,6 +260,23 @@ public actor ServerSupervisor {
         already retired or deleted. Covers the moment before the router's
         `Registry.retireState` lands; the registry refuses `writerID` after. */
     private var stateWritesAbandoned = false
+    private var stopGeneration = 0
+    /** The teardown of the stop in flight (its SIGTERM and SIGKILL passes and
+        the wait for every signaled process to exit), kept so a stop or a lock
+        pause that arrives while it runs awaits the same completion rather
+        than judging the tree from the phase alone, which clears before the
+        tree has finished exiting. `generation` tells a teardown's own
+        cleanup apart from a later stop's entry. `begun` is false from the
+        moment the stop is recorded until its task has moved the phase to
+        `.stopping`, a gap in which a second stop must join rather than read
+        the still-live phase as a newer run. */
+    private var stopInFlight: (begun: Bool, generation: Int, task: Task<StopCompletion, Never>)?
+    /** The pids of the run the last `stop` tore down: its root plus every
+        descendant the SIGTERM and SIGKILL passes signaled. Read by the Router
+        right after the stop to say whether a lingering listener belonged to
+        that run; replaced by the next stop and cleared when a new run
+        starts. */
+    private var stoppedRunPids: Set<Int> = []
     /** Waiters for `phase` leaving `.stopping`, settled by `phase`'s `didSet`. */
     private var stoppingWaiters = PhaseWaiterList()
     private let stopTiming: StopTiming
@@ -274,8 +352,47 @@ public actor ServerSupervisor {
         DaemonActivity.shared.forgetPhase(key: writerID.uuidString)
     }
 
-    public func updateSpec(_ newSpec: ServerSpec) {
-        spec = newSpec
+    /** Hands the supervisor the spawn its next run starts under (the Router's
+        prepared, materialized spec and port bookkeeping). It replaces any
+        earlier pending spawn and stays pending until a run starts or is
+        adopted, or `abandonPreparedSpawn` drops it: `refreshIdleSpec` will not
+        replace the spec meanwhile, and nothing a status read or another
+        server's port check sees changes. */
+    func stageSpawn(_ pending: PendingSpawn) {
+        pendingSpawn = pending
+    }
+
+    /** The prepared spawn will not be used: the transition that prepared it
+        was refused or failed before any run started. Status reads resume
+        applying committed config to this server. */
+    public func abandonPreparedSpawn() {
+        pendingSpawn = nil
+    }
+
+    /** A start or ensure that joined a run instead of spawning one: the spawn
+        a speculative prepare staged will never be used. A restart's slot
+        stays, since the run joined is the one that restart is about to
+        stop. */
+    private func discardPendingSpawnUnlessRestarting() {
+        if pendingSpawn?.forRestart != true { pendingSpawn = nil }
+    }
+
+    /** The claim the next run will hold: the pending spawn's, else the last
+        run's. What the port re-check between a stop and the spawn looks at. */
+    func nextRunClaim() -> PortClaim? {
+        pendingSpawn?.claim ?? portClaim
+    }
+
+    /** A status read's committed spec for a server with no run: assigned only
+        while nothing is alive and no pending spawn is waiting for its run. The
+        check and the assignment are this one actor turn, so a start cannot
+        land between them; as two calls they let a read that saw an idle
+        server replace the spec of a run that began meanwhile (a run reading
+        stale for its whole life), or of one about to begin (a spawn without the
+        injected port). */
+    public func refreshIdleSpec(_ committed: ServerSpec) {
+        guard !hasLiveRun, pendingSpawn == nil else { return }
+        spec = committed
     }
 
     /** Absolute watched paths for this run, empty when the server declares no
@@ -359,16 +476,15 @@ public actor ServerSupervisor {
         watchRestarts.removeAll()
     }
 
-    /** Port metadata for status/agents. Call after materializing the spawn spec. */
-    public func setPortMeta(
-        claim: PortClaim? = nil,
-        declaredPort: Int?, effectivePort: Int?, portConflict: PortConflict? = nil
-    ) {
-        self.declaredPort = declaredPort
-        self.effectivePort = effectivePort
-        self.portClaim = claim
-        self.namedPorts = claim.flatMap { $0.named.isEmpty ? nil : $0.named }
-        self.portConflict = portConflict
+    /** The pids of the run the last stop tore down; see `stoppedRunPids`. */
+    public func lastStoppedRunPids() -> Set<Int> {
+        stoppedRunPids
+    }
+
+    /** Writes one line to the server's own log under `sys`, for a decision the
+        Router made about this server that the server's log should explain. */
+    public func recordSys(_ text: String) async {
+        await logStore.append(stream: .sys, text: text)
     }
 
     /** The status and the claim resolved at spawn, read in one actor turn so a
@@ -382,11 +498,16 @@ public actor ServerSupervisor {
         in-flight attempt. Returns once a pid exists or the spawn has failed; the
         phase stays `starting` until the healthcheck passes. */
     public func start() async -> ServerStatus {
-        guard removalReason == nil else { return await status() }
+        guard removalReason == nil else {
+            pendingSpawn = nil
+            return await status()
+        }
         switch phase {
         case .running, .unhealthy:
+            discardPendingSpawnUnlessRestarting()
             return await status()
         case .starting:
+            discardPendingSpawnUnlessRestarting()
             await waitForSpawnSettled()
             return await status()
         case .stopping:
@@ -395,6 +516,7 @@ public actor ServerSupervisor {
                 this request (and the wire call behind it) forever. */
             let bound = pendingStop?.waitBound ?? stopWaitBound(graceSeconds: stopTiming.graceSeconds)
             guard await waitForStoppingToClear(timeout: bound) else {
+                discardPendingSpawnUnlessRestarting()
                 return await status()
             }
             return await start()
@@ -404,7 +526,10 @@ public actor ServerSupervisor {
                 the new run's state, so it is stopped first; a stop that gives
                 up reports its honest `.stopping`. */
             let stopped = await stop(deliberate: false, reason: "restarting after a port failure")
-            guard stopped.phase != .stopping else { return stopped }
+            guard stopped.phase != .stopping else {
+                discardPendingSpawnUnlessRestarting()
+                return stopped
+            }
             return await start()
         case .crashed, .failed, .stopped:
             break
@@ -458,11 +583,13 @@ public actor ServerSupervisor {
         new one: the agent-mode survivor of a jetsam SIGKILL, still registered as
         launchd child job `label` (`ControlServer.recoverAtStartup` found the
         match). Mirrors `recordSpawn` but does not spawn: `pid` is already
-        running and its spool files already exist, so the tailers seed their
-        offset to end-of-file instead of re-ingesting what a prior run already
-        logged. `startedAt` is carried forward from the persisted state rather
-        than stamped now, so uptime is not reset by the adoption itself; a
-        missing value (pre-feature state) falls back to now.
+        running and its spool files already exist, so the tailers resume from
+        the positions a handing-over daemon recorded (when the spools are still
+        the files it read) and otherwise seed their offset to end-of-file,
+        instead of re-ingesting what a prior run already logged. `startedAt`
+        is carried forward from the persisted state rather than stamped now,
+        so uptime is not reset by the adoption itself; a missing value
+        (pre-feature state) falls back to now.
 
         The exit watch is armed first, before anything is recorded: false
         means nothing changed here (phase, pid, registry, tailers) and the
@@ -478,7 +605,10 @@ public actor ServerSupervisor {
     public func adopt(
         pid childPid: pid_t, label: String, boundPort: Int?, startedAt runStartedAt: Date?
     ) async -> Bool {
-        guard removalReason == nil, launcher.prepareAdopt(pid: childPid) else { return false }
+        guard removalReason == nil, launcher.prepareAdopt(pid: childPid) else {
+            pendingSpawn = nil
+            return false
+        }
         resetForNewRun()
         pid = childPid
         rootIdentity = readIdentity(childPid)
@@ -502,15 +632,19 @@ public actor ServerSupervisor {
     /** The ensure state matrix: stopped/crashed/failed start fresh; starting joins
         the in-flight attempt; running with a passing check for this process is
         a no-op; running while the latest check is failing waits, without
-        restarting; unhealthy is a no-op (reported, not restarted). Blocks until
-        healthy, terminal, or timeout. */
+        restarting; unhealthy is reported as it stands (the Router restarts an
+        unhealthy server before an `ensure` request reaches this, since the
+        restart needs its pre-checks and port re-check). Blocks until healthy,
+        terminal, or timeout. */
     public func ensure(timeoutSeconds: Double) async -> EnsureResult {
         guard removalReason == nil else {
+            pendingSpawn = nil
             let server = await status()
             return EnsureResult(reason: .stopped, server: server)
         }
         switch phase {
         case .running:
+            discardPendingSpawnUnlessRestarting()
             /** Latest check failed, but not enough times to mark the server
                 unhealthy. Waiting is the whole point of ensure: returning now
                 would hand back a process that is refusing connections. */
@@ -518,15 +652,17 @@ public actor ServerSupervisor {
             let server = await status()
             return EnsureResult(server: server)
         case .unhealthy:
+            discardPendingSpawnUnlessRestarting()
             let server = await status()
             return EnsureResult(server: server)
         case .starting:
-            break
+            discardPendingSpawnUnlessRestarting()
         case .stopping:
             let budget = Self.boundedTimeoutSeconds(timeoutSeconds)
             let waitStart = ContinuousClock.now
             let cleared = await waitForStoppingToClear(timeout: .seconds(budget))
             guard cleared else {
+                discardPendingSpawnUnlessRestarting()
                 let server = await status()
                 return EnsureResult(reason: .timeout, server: server)
             }
@@ -573,7 +709,7 @@ public actor ServerSupervisor {
                 if phase == .failed { return .failed }
                 if phase == .stopped { return .stopped }
             case .stopped:
-                if phase == .stopped || phase == .crashed || phase == .failed { return nil }
+                if !hasLiveRun { return nil }
             }
             if ContinuousClock.now >= deadline { return .timeout }
             try? await Task.sleep(for: .milliseconds(100))
@@ -593,31 +729,51 @@ public actor ServerSupervisor {
         carried onto the `stopped` event's detail: it is the only durable record
         of why directa tore the process down, since OSLog does not persist and
         the log otherwise only ever says `exited code=N`. A nil `graceSeconds`
-        takes `stopTiming.graceSeconds`. */
+        takes `stopTiming.graceSeconds`. After the SIGKILL pass the stop also
+        waits, bounded by `stopTiming.treeExitSeconds`, for every process it
+        signaled to exit, for every caller: a restart or watch respawn that
+        followed a descendant still releasing its listener would otherwise
+        lose the port to it. The result is the same status either way. */
     public func stop(
         graceSeconds requestedGrace: Double? = nil, deliberate: Bool = true, reason: String
     ) async -> ServerStatus {
+        await stopAndConfirm(graceSeconds: requestedGrace, deliberate: deliberate, reason: reason).status
+    }
+
+    /** `stop`, answering also whether the run's whole process tree is gone:
+        the one stop a caller that is about to touch what the run held open
+        (a lock's pause) can trust. A stop that joins one already in flight
+        answers with that stop's own completion, so the descendants it is
+        still waiting on are waited on here too. */
+    public func stopAndConfirm(
+        graceSeconds requestedGrace: Double? = nil, deliberate: Bool = true, reason: String
+    ) async -> ConfirmedStop {
         let graceSeconds = requestedGrace ?? stopTiming.graceSeconds
         let stopWaitTimeout = stopWaitBound(graceSeconds: graceSeconds)
+        if let joined = await stopInFlightCompletion() {
+            return ConfirmedStop(completion: joined, status: await status())
+        }
         switch phase {
         case .failed where pid != nil:
             /** A port failure leaves its run alive, so it stops like a
                 running one. */
             break
         case .stopped, .crashed, .failed:
-            return await status()
+            return ConfirmedStop(completion: .treeGone, status: await status())
         case .stopping:
-            if await !waitForStoppingToClear(timeout: stopWaitTimeout) {
+            let cleared = await waitForStoppingToClear(timeout: stopWaitTimeout)
+            if !cleared {
                 await recordStuckStop(after: stopWaitTimeout)
             }
-            return await status()
+            return ConfirmedStop(
+                completion: cleared ? .treeGone : .stillStopping, status: await status())
         case .starting, .running, .unhealthy:
             break
         }
         guard let target = pid else {
             guard phase == .starting else {
                 phase = .stopped
-                return await status()
+                return ConfirmedStop(completion: .treeGone, status: await status())
             }
             /** The launcher has not reported a pid yet (a launchd job takes a
                 moment to publish one). Reading `.stopped` here would let that
@@ -631,12 +787,60 @@ public actor ServerSupervisor {
                     text: "stop waited \(seconds)s for the process to start and gave up; it may still come up")
                 DirectaLog.supervisor.error(
                     "\(spec.name) stop waited \(seconds)s for the process to start and gave up; it may still come up")
-                return await status()
+                return ConfirmedStop(completion: .stillStopping, status: await status())
             }
-            return await stop(graceSeconds: requestedGrace, deliberate: deliberate, reason: reason)
+            return await stopAndConfirm(
+                graceSeconds: requestedGrace, deliberate: deliberate, reason: reason)
         }
+        stopGeneration += 1
+        let generation = stopGeneration
+        let teardown = Task {
+            await self.tearDown(
+                target: target, deliberate: deliberate, generation: generation,
+                graceSeconds: graceSeconds, reason: reason, stopWaitTimeout: stopWaitTimeout)
+        }
+        stopInFlight = (begun: false, generation: generation, task: teardown)
+        return ConfirmedStop(completion: await teardown.value, status: await status())
+    }
+
+    /** The completion of the stop in flight, for a caller whose run is already
+        down by phase alone (stopping, stopped, crashed, or failed with no
+        pid) and who must still wait for the tree that stop is waiting on. Nil
+        when no stop is running, or when the phase says a newer run is up (a
+        start that followed the stop), whose tree the stop in flight does not
+        speak for. */
+    public func stopInFlightCompletion() async -> StopCompletion? {
+        guard let inFlight = stopInFlight, !inFlight.begun || runIsDownByPhase else { return nil }
+        return await inFlight.task.value
+    }
+
+    private var runIsDownByPhase: Bool {
+        switch phase {
+        case .crashed, .stopped, .stopping:
+            true
+        case .failed:
+            pid == nil
+        case .running, .starting, .unhealthy:
+            false
+        }
+    }
+
+    /** The teardown of one stop of a known pid, run as its own task so every
+        stop that arrives while it runs awaits the same completion
+        (`stopInFlightCompletion`). */
+    private func tearDown(
+        target: pid_t, deliberate: Bool, generation: Int, graceSeconds: Double, reason: String,
+        stopWaitTimeout: Duration
+    ) async -> StopCompletion {
         let activity = DaemonActivity.shared.begin(.stop, label: "\(serverID): \(reason)")
-        defer { DaemonActivity.shared.end(activity, outcome: phase.rawValue) }
+        defer {
+            DaemonActivity.shared.end(activity, outcome: phase.rawValue)
+            if stopInFlight?.generation == generation { stopInFlight = nil }
+        }
+        /** Read as begun only from here: `beginStop` moves the phase to
+            `.stopping` before its first suspension, so no other caller
+            observes the flag set with the phase still live. */
+        if stopInFlight?.generation == generation { stopInFlight?.begun = true }
         let pass = await beginStop(
             target: target, reason: reason, deliberate: deliberate, graceSeconds: graceSeconds)
         /** The grace ends early only once the root and every SIGTERM candidate
@@ -651,11 +855,26 @@ public actor ServerSupervisor {
             if !rootRunning, !pass.candidates.contains(where: ProcessTree.isRunning) { break }
             try? await Task.sleep(for: .milliseconds(100))
         }
-        escalate(pass)
-        if await !waitForStoppingToClear(timeout: stopWaitTimeout) {
+        let signaled = escalate(pass)
+        stoppedRunPids = Set([Int(target)] + signaled.map { Int($0.pid) })
+        guard await waitForStoppingToClear(timeout: stopWaitTimeout) else {
             await recordStuckStop(after: stopWaitTimeout)
+            return .stillStopping
         }
-        return await status()
+        let survivors = await ProcessTree.awaitExit(
+            of: signaled, within: .seconds(stopTiming.treeExitSeconds))
+        guard survivors.isEmpty else {
+            await recordSurvivors(survivors)
+            return .survivors(pids: survivors.map { Int($0.pid) }.sorted())
+        }
+        return .treeGone
+    }
+
+    /** What `stopAndConfirm` answers: whether the whole tree is gone, beside
+        the status `stop` returns. */
+    public struct ConfirmedStop: Equatable, Sendable {
+        public let completion: StopCompletion
+        public let status: ServerStatus
     }
 
     /** A deliberate stop for a caller about to drop this supervisor (unregister,
@@ -752,8 +971,10 @@ public actor ServerSupervisor {
         invisible to every live source (setsid, the now-dead root's parent
         chain, younger than the snapshot) is still re-signaled, revalidated
         against its recorded identity. The group is signaled only while the
-        root still lives, and otherwise the survivors individually. */
-    private func escalate(_ pass: TeardownPass) {
+        root still lives, and otherwise the survivors individually. Returns the
+        union it signaled, which `stopAndConfirm` waits on. */
+    @discardableResult
+    private func escalate(_ pass: TeardownPass) -> [ProcessIdentity] {
         signalRun(
             target: pass.target, keys: pass.keys, signalGroup: pass.signalGroup, signal: SIGKILL,
             priorCandidates: pass.candidates)
@@ -824,6 +1045,7 @@ public actor ServerSupervisor {
             icon: spec.icon,
             lastExit: lastExit,
             lastHealthAt: lastHealthAt,
+            lastHealthCheck: lastHealthCheck,
             locks: spec.locks.map { $0.map(\.name) },
             logPath: paths.structuredLogFile(project: projectPath, server: spec.name).path,
             mainProject: mainProjectSlug,
@@ -876,21 +1098,21 @@ public actor ServerSupervisor {
                     and recording that pass would mark the new process healthy
                     while its port still refuses connections. */
                 guard let generation = await self?.runGeneration else { return }
-                let healthy = await prober.probe(check)
+                let outcome = await prober.probe(check)
                 guard !Task.isCancelled else { return }
                 /** Failures inside the wake grace window carry no signal: the
                     machine (and the server) just woke up. */
-                if case .ignoreFailures = policy, !healthy {
+                if case .ignoreFailures = policy, !outcome.passed {
                     try? await Task.sleep(for: .milliseconds(intervalMs))
                     continue
                 }
-                await self?.recordProbe(success: healthy, generation: generation)
+                await self?.recordProbe(outcome, generation: generation)
                 try? await Task.sleep(for: .milliseconds(intervalMs))
             }
         }
     }
 
-    private func recordProbe(success: Bool, generation: UInt64) async {
+    private func recordProbe(_ outcome: HealthProbeOutcome, generation: UInt64) async {
         /** A probe started under a run that has since ended or been replaced. */
         guard generation == runGeneration else { return }
         /** Probes landing after the process died must not resurrect state. */
@@ -900,6 +1122,16 @@ public actor ServerSupervisor {
         }
         let healthyAfter = spec.healthcheck?.healthyAfter ?? 1
         let unhealthyAfter = spec.healthcheck?.unhealthyAfter ?? 3
+        let success = outcome.passed
+        /** With no healthcheck the probe answers "alive" by construction,
+            which says nothing about the server, so no result is kept. Recorded
+            before the first suspension below, which a run ending could
+            otherwise slip past. */
+        if EffectiveHealthcheck.resolve(spec: spec).kind != .none {
+            lastHealthCheck = HealthCheckResult(
+                at: Date(), detail: success ? nil : outcome.detail,
+                failures: success ? 0 : consecutiveFailures + 1, passed: success)
+        }
         if success {
             consecutiveSuccesses += 1
             consecutiveFailures = 0
@@ -969,8 +1201,20 @@ public actor ServerSupervisor {
         guard generation == runGeneration else { return }
         await recordObservedPort(generation: generation, ports: ports)
         guard let expected else { return }
-        let owners = await PortGuard.listenerPids(port: expected)
-        await recordPortOwnership(expected: expected, generation: generation, owners: owners, ours: ours)
+        let answered = await PortGuard.answeredListenerPids(port: expected)
+        if let answered, answered.isEmpty, generation == runGeneration {
+            /** lsof ran and named no listener, so the pass that promoted this
+                run was answered by something that is no longer there (or was
+                never on this port). Silence from a lookup that failed is
+                not this evidence, which is why only an answer reaches here. */
+            await logStore.append(
+                stream: .sys,
+                text:
+                    "marked healthy, but nothing is listening on port \(expected) now; some other process may have answered the check"
+            )
+        }
+        await recordPortOwnership(
+            expected: expected, generation: generation, owners: answered ?? [], ours: ours)
     }
 
     /** The managed server whose recorded pid holds one of these listeners, if
@@ -1191,6 +1435,16 @@ public actor ServerSupervisor {
         observedPort = nil
         recentLogTail = .unread
         lastDescendantSnapshot = []
+        stoppedRunPids = []
+        if let pending = pendingSpawn {
+            declaredPort = pending.declaredPort
+            effectivePort = pending.effectivePort
+            namedPorts = pending.claim.flatMap { $0.named.isEmpty ? nil : $0.named }
+            portClaim = pending.claim
+            portConflict = pending.portConflict
+            spec = pending.spec
+            pendingSpawn = nil
+        }
         clearRunHealth()
         runningSpecHash = Self.specHash(spec)
     }
@@ -1203,6 +1457,7 @@ public actor ServerSupervisor {
         consecutiveSuccesses = 0
         everHealthy = false
         lastHealthAt = nil
+        lastHealthCheck = nil
         passedProbeThisRun = false
     }
 
@@ -1213,12 +1468,12 @@ public actor ServerSupervisor {
         phase == .running && consecutiveFailures == 0 && passedProbeThisRun
     }
 
-    private func startTailers(startAtEnd: Bool) async {
+    private func startTailers(startAtEnd: Bool, resumeFrom: SpoolPositions? = nil) async {
         let out = SpoolTailer(
-            startAtEnd: startAtEnd, store: logStore, stream: .out,
+            resumeFrom: resumeFrom?.out, startAtEnd: startAtEnd, store: logStore, stream: .out,
             url: paths.spoolOutFile(project: projectPath, server: spec.name))
         let err = SpoolTailer(
-            startAtEnd: startAtEnd, store: logStore, stream: .err,
+            resumeFrom: resumeFrom?.err, startAtEnd: startAtEnd, store: logStore, stream: .err,
             url: paths.spoolErrFile(project: projectPath, server: spec.name))
         outTailer = out
         errTailer = err
@@ -1239,7 +1494,12 @@ public actor ServerSupervisor {
         lastExit = nil
         switch supervision {
         case .adopted:
-            await startTailers(startAtEnd: true)
+            /** The recorded positions serve this adoption only: cleared before
+                the tailers start, so a daemon that dies right after cannot
+                leave offsets for a later adoption to replay from. */
+            let positions = await registry.persistedState(serverID: serverID)?.spoolPositions
+            if positions != nil { await registryUpdate { $0.spoolPositions = nil } }
+            await startTailers(startAtEnd: true, resumeFrom: positions)
             await logStore.append(stream: .sys, text: "adopted pid=\(childPid)")
             await events?.post(
                 kind: .started, project: projectPath, server: spec.name,
@@ -1258,9 +1518,23 @@ public actor ServerSupervisor {
             entry.pid = Int(childPid)
             entry.resumeOnBoot = true
             entry.spawnError = nil
+            entry.spoolPositions = nil
             entry.startedAt = runStartedAt
         }
         spawnWaiters.settleAll()
+    }
+
+    /** A handoff exit's last act for this run: each tailer ingests what its
+        spool holds now and stops polling, then the positions are persisted
+        for the adopting daemon. A run with no tailers (stopped, or not yet
+        spawned) records nothing. */
+    func prepareHandoff() async {
+        guard let out = outTailer, let err = errTailer else { return }
+        async let outPosition = out.pause()
+        async let errPosition = err.pause()
+        let positions = SpoolPositions(err: await errPosition, out: await outPosition)
+        guard positions.err != nil || positions.out != nil else { return }
+        await registryUpdate { $0.spoolPositions = positions }
     }
 
     private func recordSpawn(pid childPid: pid_t) async {
@@ -1548,6 +1822,9 @@ public actor ServerSupervisor {
         clearRunHealth()
         phase = finalPhase
         pendingStop = nil
+        /** The run a restart's slot waited out is gone, so a start or ensure
+            that finds a run from here on has no restart to leave it for. */
+        pendingSpawn?.forRestart = false
         spawnWaiters.settleAll()
         /** An external graceful signal lands `.stopped` too, but directa's own
             stop() never ran its SIGTERM/SIGKILL escalation over this run's
@@ -1686,6 +1963,18 @@ public actor ServerSupervisor {
         guard phase == .stopping else { return true }
         await park(on: .stopping, timeout: timeout, activity: .stopWait) { phase == .stopping }
         return phase != .stopping
+    }
+
+    /** A stop whose SIGKILL pass left processes running past their bounded
+        wait, recorded where `recordStuckStop` records its own give-up. */
+    private func recordSurvivors(_ survivors: [ProcessIdentity]) async {
+        let pids = survivors.map { String($0.pid) }.sorted().joined(separator: ", ")
+        let seconds = stopTiming.treeExitSeconds
+        await logStore.append(
+            stream: .sys,
+            text: "stop sent SIGKILL but pid \(pids) still run after \(seconds)s; they may still hold the server's files and ports")
+        DirectaLog.supervisor.error(
+            "\(spec.name) stop sent SIGKILL but pid \(pids) still run after \(seconds)s")
     }
 
     /** A stop whose bounded wait expired: recorded in the server's sys stream

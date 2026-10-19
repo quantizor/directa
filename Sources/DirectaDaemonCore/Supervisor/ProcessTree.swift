@@ -441,6 +441,26 @@ public enum ProcessTree {
             == identity
     }
 
+    /** The identities in `identities` still running once `bound` has passed,
+        in the order given, answering as soon as none is. Suspends between
+        checks, never holding a cooperative-pool thread. A SIGKILL is only a
+        request the kernel finishes later: `kill(2)` returns before the target
+        has released its files and ports, so a caller that must know the
+        processes are gone waits on them here instead of assuming it. */
+    public static func awaitExit(of identities: [ProcessIdentity], within bound: Duration) async
+        -> [ProcessIdentity]
+    {
+        let deadline = ContinuousClock.now.advanced(by: bound)
+        var remaining = identities.filter(isRunning)
+        while !remaining.isEmpty, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: awaitExitPollInterval)
+            remaining = remaining.filter(isRunning)
+        }
+        return remaining
+    }
+
+    private static let awaitExitPollInterval = Duration.milliseconds(25)
+
     private static func processInfo(of pid: pid_t) -> kinfo_proc? {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
         var length = MemoryLayout<kinfo_proc>.stride

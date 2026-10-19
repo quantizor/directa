@@ -196,6 +196,38 @@ import Testing
         )
     }
 
+    /** `lastHealthCheck` sorts between `healthcheck` and `logPath`; `detail`
+        is present on a failure and absent on a pass, and the goldens above,
+        which carry no check, are unchanged by the field. */
+    @Test func statusSchemaGoldenWithTheLatestHealthCheck() throws {
+        let failed = ServerStatus(
+            declaredPort: 3000,
+            healthcheck: .http,
+            lastHealthCheck: HealthCheckResult(
+                at: Date(timeIntervalSince1970: 1_752_868_000), detail: "HTTP 500", failures: 4,
+                passed: false),
+            logPath: "/logs/web/current.log",
+            phase: .running,
+            project: "/tmp/proj",
+            server: "web"
+        )
+        let failedJSON = String(data: try JSONCoding.encoder().encode(failed), encoding: .utf8)!
+        #expect(
+            failedJSON
+                == #"{"declaredPort":3000,"healthcheck":"http","lastHealthCheck":{"at":"2025-07-18T19:46:40.000Z","detail":"HTTP 500","failures":4,"passed":false},"logPath":"/logs/web/current.log","phase":"running","project":"/tmp/proj","server":"web"}"#
+        )
+
+        var passed = failed
+        passed.lastHealthCheck = HealthCheckResult(
+            at: Date(timeIntervalSince1970: 1_752_868_002), failures: 0, passed: true)
+        let passedJSON = String(data: try JSONCoding.encoder().encode(passed), encoding: .utf8)!
+        #expect(
+            passedJSON
+                == #"{"declaredPort":3000,"healthcheck":"http","lastHealthCheck":{"at":"2025-07-18T19:46:42.000Z","failures":0,"passed":true},"logPath":"/logs/web/current.log","phase":"running","project":"/tmp/proj","server":"web"}"#
+        )
+        #expect(try JSONCoding.decoder().decode(ServerStatus.self, from: Data(failedJSON.utf8)) == failed)
+    }
+
     /** The worktree display fields are a contract like any other: their key
         names and sort positions are pinned here, and their absence (a main
         checkout) is the golden above, which omits both. */
@@ -294,6 +326,23 @@ import Testing
             json
                 == #"{"effectiveHost":"pinned.localhost","effectiveHostReason":"local-overlay","errors":[],"host":"app.localhost","serverHosts":[{"declared":"app.localhost","effective":"pinned.localhost","reason":"local-overlay","server":"api"}],"servers":["api","web"],"warnings":[],"worktree":"review"}"#
         )
+    }
+
+    /** `daemon.shutdown`'s params: a plain drain encodes the `{}` every client
+        has always sent, and `{}` or an unknown key from a newer client decodes
+        as a drain. */
+    @Test func shutdownParamsSchemaGolden() throws {
+        func encoded(_ params: ShutdownParams) throws -> String {
+            String(data: try JSONCoding.encoder().encode(params), encoding: .utf8)!
+        }
+        #expect(try encoded(ShutdownParams()) == "{}")
+        #expect(try encoded(ShutdownParams(handoff: true)) == #"{"handoff":true}"#)
+        #expect(try encoded(ShutdownParams(handoff: false)) == #"{"handoff":false}"#)
+        let decoder = JSONCoding.decoder()
+        #expect(try decoder.decode(ShutdownParams.self, from: Data("{}".utf8)) == ShutdownParams())
+        #expect(
+            try decoder.decode(ShutdownParams.self, from: Data(#"{"handoff":true,"later":1}"#.utf8))
+                == ShutdownParams(handoff: true))
     }
 
     /** `project.forget`'s result names the servers it dropped along with the

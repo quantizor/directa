@@ -1,6 +1,7 @@
 import DirectaTestSupport
 import Foundation
 import Testing
+import os
 
 @testable import DirectaKit
 
@@ -257,5 +258,66 @@ import Testing
         let result = await LaunchdAdmin.shell("/bin/sh", ["-c", "yes | head -c \(target); exit 4"])
         #expect(result.status == 4)
         #expect(result.output.utf8.count == target)
+    }
+}
+
+/** A re-ensure sent while the new daemon still restores is refused with
+    `daemon-starting`, so a bounce waits the restore out first. */
+@Suite struct LaunchdAdminRestoreWaitTests {
+    /** Answers `daemon.info` from a script, repeating the last entry, and
+        counts the reads. */
+    private final class ScriptedInfo: Sendable {
+        private let answers: [DaemonInfo?]
+        private let reads = OSAllocatedUnfairLock(initialState: 0)
+
+        init(_ answers: [DaemonInfo?]) {
+            self.answers = answers
+        }
+
+        var readCount: Int { reads.withLock { $0 } }
+
+        func read() -> DaemonInfo? {
+            let index = reads.withLock { value -> Int in
+                defer { value += 1 }
+                return min(value, answers.count - 1)
+            }
+            return answers[index]
+        }
+    }
+
+    private static func info(restoring: Bool?) -> DaemonInfo {
+        DaemonInfo(
+            dataDir: "/d", daemonVersion: "1", logsDir: "/l", pid: 1, proto: 1, restoring: restoring,
+            socketPath: "/s")
+    }
+
+    private func wait(on script: ScriptedInfo, timeoutSeconds: Double = 30) async {
+        await LaunchdAdmin.awaitRestoreFinished(
+            timeoutSeconds: timeoutSeconds, interval: .milliseconds(1), readInfo: { script.read() })
+    }
+
+    @Test func waitsUntilTheDaemonStopsRestoring() async {
+        let script = ScriptedInfo([Self.info(restoring: true), Self.info(restoring: true), Self.info(restoring: nil)])
+        await wait(on: script)
+        #expect(script.readCount == 3)
+    }
+
+    @Test func aDaemonThatStopsAnsweringEndsTheWait() async {
+        let script = ScriptedInfo([Self.info(restoring: true), nil])
+        await wait(on: script)
+        #expect(script.readCount == 2)
+    }
+
+    @Test func aServingDaemonIsReadOnce() async {
+        let script = ScriptedInfo([Self.info(restoring: nil)])
+        await wait(on: script)
+        #expect(script.readCount == 1)
+    }
+
+    /** A restore that never finishes ends at the bound rather than hanging. */
+    @Test func aRestoreThatNeverFinishesEndsAtTheBound() async {
+        let script = ScriptedInfo([Self.info(restoring: true)])
+        await wait(on: script, timeoutSeconds: 0.05)
+        #expect(script.readCount >= 2)
     }
 }

@@ -10,17 +10,25 @@ import os
     than adding one. Threads come from a private Dispatch queue and return to
     Dispatch while the lane is idle, so a quiet lane holds none.
 
-    Two lanes, so the one whose commands read a user's repository (and can hang
-    on its filesystem) never queues ahead of the launchd and port calls that
-    spawn and supervise servers. */
+    Three lanes, so the one whose commands read a user's repository (and can
+    hang on its filesystem) and the one whose connects wait out a healthcheck
+    timeout never queue ahead of the launchd and port calls that spawn and
+    supervise servers. */
 public final class BlockingLane: Sendable {
+    /** Healthcheck TCP connects. Each supervisor runs one probe at a time, and
+        a loopback connect answers at once unless the listener is wedged, in
+        which case the connect holds its thread for the full `timeoutMs` (up to
+        ten minutes). Four threads let a few wedged servers wait out their
+        timeouts without delaying the checks of the others, and a quiet lane
+        holds none. */
+    public static let health = BlockingLane(name: "health", width: 4)
     /** `git` against a project checkout. */
     public static let repository = BlockingLane(name: "repository", width: 2)
-    /** `launchctl`, `lsof`, `ps`, and loopback connect probes. */
+    /** `launchctl`, `lsof`, `ps`, and the port pre-check's loopback probes. */
     public static let system = BlockingLane(name: "system", width: 4)
 
     /** Every shared lane, in the order telemetry reports them. */
-    public static let all = [repository, system]
+    public static let all = [repository, health, system]
 
     private struct Pending {
         let enqueuedAt: ContinuousClock.Instant

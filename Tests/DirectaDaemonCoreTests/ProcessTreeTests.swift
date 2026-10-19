@@ -336,6 +336,31 @@ import Testing
         #expect(!ProcessTree.isRunning(zombie))
     }
 
+    /** The wait answers once the last process exits, however long that takes
+        inside the bound, and names exactly the ones still running when the
+        bound passes. A process that outlives the bound is the positive control
+        for the first, a short-lived one for the second. */
+    @Test func awaitExitWaitsForSlowExitsAndNamesWhatOutlivesTheBound() async throws {
+        let lingering = try spawnSurvivor()
+        let brief = try spawnReapedSessionLeader(["/bin/sh", "-c", "sleep 0.4"])
+        defer { kill(lingering, SIGKILL) }
+        let lingeringIdentity = try #require(ProcessTree.identity(of: lingering))
+        let briefIdentity = try #require(ProcessTree.identity(of: brief))
+
+        let started = ContinuousClock.now
+        let remaining = await ProcessTree.awaitExit(
+            of: [lingeringIdentity, briefIdentity], within: .seconds(1.5))
+        #expect(remaining == [lingeringIdentity])
+        #expect(ContinuousClock.now - started >= .milliseconds(300), "the brief process was not waited for")
+
+        kill(lingering, SIGKILL)
+        #expect(await ProcessTree.awaitExit(of: [lingeringIdentity, briefIdentity], within: .seconds(5)).isEmpty)
+    }
+
+    @Test func awaitExitAnswersAtOnceForNothingToWaitOn() async {
+        #expect(await ProcessTree.awaitExit(of: [], within: .seconds(30)).isEmpty)
+    }
+
     @Test func failedDescendantsAreNotEmptySuccess() {
         /** Live sweep against a nonsense pid still returns .ok([]) (no children),
             never .failed. Failure is a sysctl errno path; assert the result type

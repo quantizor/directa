@@ -2,6 +2,7 @@ import DirectaKit
 import DirectaTestSupport
 import Foundation
 import Testing
+import os
 
 @testable import DirectaDaemonCore
 
@@ -20,7 +21,8 @@ import Testing
     }
 
     private func writeConfig(
-        flood: Bool = false, port: Int, project: String, waitFor: String? = nil
+        flood: Bool = false, heads: [String: String] = [:], port: Int, project: String,
+        waitFor: String? = nil
     ) throws {
         let fixture = try #require(fixtureServerExecutable())
         /** `--flood` composes with `--listen-tcp`: the fixture still binds and
@@ -30,6 +32,12 @@ import Testing
             wait. */
         let floodFlag = flood ? ", \"--flood\"" : ""
         let waitForField = waitFor.map { ",\n          \"waitFor\": \"\($0)\"" } ?? ""
+        let headsField =
+            heads.isEmpty
+            ? ""
+            : ",\n          \"heads\": {"
+                + heads.sorted { $0.key < $1.key }.map { "\"\($0.key)\": \"\($0.value)\"" }
+                .joined(separator: ", ") + "}"
         let body = """
             {
               "servers": {
@@ -37,7 +45,7 @@ import Testing
                   "command": ["\(fixture)", "--listen-tcp", "\(port)"\(floodFlag)],
                   "healthcheck": { "type": "tcp", "port": \(port) },
                   "locks": ["data"],
-                  "port": \(port)\(waitForField)
+                  "port": \(port)\(waitForField)\(headsField)
                 }
               },
               "version": 1
@@ -306,5 +314,876 @@ import Testing
         _ = try await router.call(
             .serverStop, ServerTargetParams(name: "db", project: env.project),
             ServerResult.self)
+    }
+
+    /** The hint a `port-held` refusal for `db` carries: `why` needs the project
+        because the reader's shell may not be in it. */
+    private func whyHint(_ project: String) -> String {
+        "run: directa why db --project \(ShellWord.singleQuoted(canonicalProjectPath(project)))"
+    }
+
+    private func sysLines(_ router: Router, _ project: String) async throws -> [String] {
+        try await router.call(
+            .logsQuery, LogsQueryParams(name: "db", project: project, streams: [.sys]),
+            LogsQueryResult.self
+        ).lines.map(\.text)
+    }
+
+    /** The field failure: a process the stop did not remove (here, a stand-in
+        for a worker that left the run's tree) still listens, so the next run's
+        first health check would be answered by it. The restart names the
+        listener and starts nothing. */
+    @Test(arguments: [(421, true), (422, false)])
+    func restartIsRefusedWhileAListenerOutlivesTheStop(offset: Int, inStoppedRun: Bool) async throws {
+        let env = try env(offset: offset)
+        let port = TestPorts.port(offset)
+        let lingering = LingeringListener(reports: inStoppedRun ? .stoppedRun : .outsider)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: lingering.probe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        let first = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        let firstPid = try #require(first.server.pid)
+        lingering.watch(pid: pid_t(firstPid))
+        let reported = lingering.reportedPid
+
+        let refused = try await router.attempt(
+            .serverRestart,
+            RestartParams(names: ["db"], project: env.project, timeoutSeconds: 10),
+            GroupResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("restart went ahead beside a listener the stop did not remove")
+            return
+        }
+        #expect(error.code == .portHeld)
+        #expect(
+            error.message
+                == "port \(port) is still held by pid \(reported) (stand-in listener) after stopping 'db'; the new run was not started"
+        )
+        #expect(error.hint == whyHint(env.project))
+
+        let status = try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: "db", project: env.project), ServerListResult.self
+            ).servers.first)
+        #expect(status.phase == .stopped)
+        #expect(status.pid == nil)
+        let membership = inStoppedRun ? "was" : "was not"
+        #expect(
+            try await sysLines(router, env.project).contains(
+                "not starting: port \(port) is still held by pid \(reported) (stand-in listener) after the stop; that process \(membership) part of the run just stopped (root and descendants recorded at stop)"
+            ))
+    }
+
+    /** A restart that fails after its prepare abandons the prepared spec: the
+        server stays down, and a config edit made afterward shows in its status
+        rather than the spec the failed restart prepared. */
+    @Test func aRestartRefusedAfterItsStopLeavesTheServerReadingLaterConfigEdits() async throws {
+        let env = try env(offset: 426)
+        let port = TestPorts.port(426)
+        let lingering = LingeringListener(reports: .outsider)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: lingering.probe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        let first = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        lingering.watch(pid: pid_t(try #require(first.server.pid)))
+        let refused = try await router.attempt(
+            .serverRestart,
+            RestartParams(names: ["db"], project: env.project, timeoutSeconds: 10),
+            GroupResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("restart went ahead beside a listener the stop did not remove")
+            return
+        }
+        #expect(error.code == .portHeld)
+
+        let heads = ["api": "http://api.localhost/"]
+        try writeConfig(heads: heads, port: port, project: env.project)
+        let status = try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: "db", project: env.project), ServerListResult.self
+            ).servers.first)
+        #expect(status.phase == .stopped)
+        #expect(status.heads == heads)
+    }
+
+    /** A listener that is on its way out (the stop's SIGKILL pass has run and
+        the socket is closing) is waited for, not refused. */
+    @Test func restartWaitsForAListenerThatLeavesWithinTheBound() async throws {
+        let env = try env(offset: 423)
+        let lingering = LingeringListener(pollsBeforeLeaving: 3, reports: .outsider)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: lingering.probe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 5))
+        let first = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        let firstPid = try #require(first.server.pid)
+        lingering.watch(pid: pid_t(firstPid))
+
+        let restarted = try await router.call(
+            .serverRestart,
+            RestartParams(names: ["db"], project: env.project, timeoutSeconds: 10),
+            GroupResult.self)
+        let server = try #require(restarted.results.first?.server)
+        #expect(server.phase == .running)
+        #expect(server.pid != firstPid)
+        #expect(lingering.polls >= 4, "the restart did not wait for the listener to leave")
+        #expect(try await sysLines(router, env.project).filter { $0.hasPrefix("not starting") }.isEmpty)
+
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "db", project: env.project),
+            ServerResult.self)
+    }
+
+    /** `alpha` first, then `beta` (a restart takes specs in name order): two
+        servers on ports of their own, each with a url the port substitution
+        rewrites, so a prepared spawn that leaks into status shows in the url
+        and the port at once. `beta` declares the `data` lock when asked. */
+    private func writeTwoServerConfig(
+        first: Int, project: String, second: Int, locksOnSecond: Bool = false
+    ) throws {
+        let fixture = try #require(fixtureServerExecutable())
+        func server(_ name: String, _ port: Int, locks: String = "") -> String {
+            """
+                "\(name)": {
+                  "command": ["\(fixture)", "--listen-tcp", "\(port)"],
+                  "healthcheck": { "type": "tcp", "port": \(port) },\(locks)
+                  "port": \(port),
+                  "url": "http://127.0.0.1:{port}/"
+                }
+            """
+        }
+        let body = """
+            {
+              "servers": {
+            \(server("alpha", first)),
+            \(server("beta", second, locks: locksOnSecond ? " \"locks\": [\"data\"]," : ""))
+              },
+              "version": 1
+            }
+            """
+        try Data(body.utf8)
+            .write(to: URL(fileURLWithPath: project).appending(path: "devservers.json"))
+    }
+
+    private func status(_ router: Router, _ project: String, name: String) async throws -> ServerStatus {
+        try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: name, project: project), ServerListResult.self
+            ).servers.first)
+    }
+
+    /** Preparing every entry before any stop is what makes a refusal arrive
+        early, and it must leave no trace on a server the restart never reached:
+        `beta` is still running its old run, so its status keeps the spec, port,
+        and url that run started with, not the `--port` override prepared for the
+        restart that never got to it. */
+    @Test func aMultiNameRestartRefusedAtItsFirstEntryLeavesALaterLiveEntryReportingItsOwnRun() async throws {
+        let env = try makeRouterEnv(named: "restart")
+        let project = canonicalProjectPath(env.project)
+        let alphaPort = TestPorts.port(440)
+        let betaPort = TestPorts.port(441)
+        try writeTwoServerConfig(first: alphaPort, project: env.project, second: betaPort)
+        let lingering = LingeringListener(reports: .outsider)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: lingering.probe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        let alpha = try await router.call(
+            .serverEnsure, EnsureParams(name: "alpha", project: env.project, timeoutSeconds: 10),
+            EnsureResult.self)
+        _ = try await router.call(
+            .serverEnsure, EnsureParams(name: "beta", project: env.project, timeoutSeconds: 10),
+            EnsureResult.self)
+        lingering.watch(pid: pid_t(try #require(alpha.server.pid)))
+        let before = try await status(router, project, name: "beta")
+        #expect(before.effectivePort == betaPort)
+        #expect(before.url == "http://127.0.0.1:\(betaPort)/")
+
+        let refused = try await router.attempt(
+            .serverRestart,
+            RestartParams(
+                names: ["alpha", "beta"], port: TestPorts.port(442), project: env.project,
+                timeoutSeconds: 10),
+            GroupResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("the restart went ahead beside a listener the stop did not remove")
+            return
+        }
+        #expect(error.code == .portHeld)
+        #expect(error.message.hasSuffix("after stopping 'alpha'; the new run was not started"))
+
+        let after = try await status(router, project, name: "beta")
+        #expect(after.phase == .running)
+        #expect(after.pid == before.pid)
+        #expect(after.declaredPort == before.declaredPort)
+        #expect(after.effectivePort == before.effectivePort)
+        #expect(after.url == before.url)
+        #expect(after.ports == before.ports)
+        #expect(after.portConflict == before.portConflict)
+        #expect(after.specStale == before.specStale)
+
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "beta", project: env.project), ServerResult.self)
+    }
+
+    /** The other order of the same rule: the refusal comes while preparing the
+        second entry (it declares a held lock), after the first was prepared
+        with the `--port` override. Nothing stopped, so `alpha` keeps reporting
+        the run it has, and its prepared port holds nothing against others. */
+    @Test func aMultiNameRestartRefusedAtALaterEntryLeavesAnEarlierLiveEntryReportingItsOwnRun() async throws {
+        let env = try makeRouterEnv(named: "restart")
+        let project = canonicalProjectPath(env.project)
+        let alphaPort = TestPorts.port(450)
+        let betaPort = TestPorts.port(451)
+        try writeTwoServerConfig(
+            first: alphaPort, project: env.project, second: betaPort, locksOnSecond: true)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        for name in ["alpha", "beta"] {
+            _ = try await router.call(
+                .serverEnsure, EnsureParams(name: name, project: env.project, timeoutSeconds: 10),
+                EnsureResult.self)
+        }
+        _ = try await router.call(
+            .lockAcquire,
+            LockParams(
+                holderPid: Int(getpid()), pause: false, project: env.project, resource: "data",
+                resumeTimeoutSeconds: 10), LockResult.self)
+        let before = try await status(router, project, name: "alpha")
+        #expect(before.url == "http://127.0.0.1:\(alphaPort)/")
+
+        let refused = try await router.attempt(
+            .serverRestart,
+            RestartParams(
+                names: ["alpha", "beta"], port: TestPorts.port(452), project: env.project,
+                timeoutSeconds: 10),
+            GroupResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("the restart went ahead under a held lock")
+            return
+        }
+        #expect(error.code == .resourceLocked)
+
+        let after = try await status(router, project, name: "alpha")
+        #expect(after.phase == .running)
+        #expect(after.pid == before.pid)
+        #expect(after.declaredPort == before.declaredPort)
+        #expect(after.effectivePort == before.effectivePort)
+        #expect(after.url == before.url)
+        #expect(after.specStale == before.specStale)
+
+        _ = try await router.call(
+            .lockRelease,
+            LockParams(
+                holderPid: Int(getpid()), project: env.project, resource: "data",
+                resumeTimeoutSeconds: 10), LockResult.self)
+        for name in ["alpha", "beta"] {
+            _ = try await router.call(
+                .serverStop, ServerTargetParams(name: name, project: env.project), ServerResult.self)
+        }
+    }
+
+    /** Two sessions ensuring one stopped server prepare it together. The one
+        that loses the single flight joins the run the other started, so the
+        spec it prepared never reaches a run; it must not stay pending, or the
+        server would ignore every config edit after that run ends. */
+    @Test func twoConcurrentEnsuresOfAStoppedServerLeaveItReadingLaterConfigEdits() async throws {
+        let env = try env(offset: 443)
+        let port = TestPorts.port(443)
+        let held = HeldSecondProbe()
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: held.probe, registry: registry)
+        let params = EnsureParams(name: "db", project: env.project, timeoutSeconds: 10)
+        async let first = router.call(.serverEnsure, params, EnsureResult.self)
+        async let second = router.call(.serverEnsure, params, EnsureResult.self)
+        defer { held.release() }
+
+        /** Read from the port itself: a status read of a stopped server
+            probes too, and would take the second caller's place. */
+        let started = try await eventually(within: .seconds(10)) {
+            await PortGuard.isListening(port: port)
+        }
+        try #require(started, "the first ensure never brought the server up")
+        held.release()
+        let results = try await [first, second]
+        #expect(results.map(\.reason) == [nil, nil])
+        #expect(Set(results.compactMap(\.server.pid)).count == 1)
+
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "db", project: env.project), ServerResult.self)
+        let heads = ["api": "http://api.localhost/"]
+        try writeConfig(heads: heads, port: port, project: env.project)
+        #expect(try await status(router, env.project, name: "db").heads == heads)
+    }
+
+    /** A process that was already listening on the claimed port before the
+        restart, and is not part of the run the stop tears down, is the shared
+        or foreign case the pre-check let through: it does not block the new
+        run. */
+    @Test func aRestartProceedsBesideAListenerThatWasThereBeforeTheStop() async throws {
+        let env = try env(offset: 444)
+        let lingering = LingeringListener(listensFromWatch: true, reports: .outsider)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: lingering.probe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        let first = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        let firstPid = try #require(first.server.pid)
+        lingering.watch(pid: pid_t(firstPid))
+
+        let restarted = try await router.call(
+            .serverRestart,
+            RestartParams(names: ["db"], project: env.project, timeoutSeconds: 10),
+            GroupResult.self)
+        let server = try #require(restarted.results.first?.server)
+        #expect(server.phase == .running)
+        #expect(server.pid != firstPid)
+        #expect(try await sysLines(router, env.project).filter { $0.hasPrefix("not starting") }.isEmpty)
+
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "db", project: env.project),
+            ServerResult.self)
+    }
+
+    /** The same listener already there before the stop, but it is the run's
+        own process outliving the stop: it still refuses the restart. */
+    @Test func aRestartIsRefusedWhenARunsOwnListenerOutlivesItsStop() async throws {
+        let env = try env(offset: 445)
+        let port = TestPorts.port(445)
+        let lingering = LingeringListener(listensFromWatch: true, reports: .stoppedRun)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: lingering.probe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        let first = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        lingering.watch(pid: pid_t(try #require(first.server.pid)))
+
+        let refused = try await router.attempt(
+            .serverRestart,
+            RestartParams(names: ["db"], project: env.project, timeoutSeconds: 10),
+            GroupResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("the restart went ahead beside the stopped run's own listener")
+            return
+        }
+        #expect(error.code == .portHeld)
+        #expect(
+            error.message
+                == "port \(port) is still held by pid \(lingering.reportedPid) (stand-in listener) after stopping 'db'; the new run was not started"
+        )
+        #expect(try await phase(router, env.project, "db") == .stopped)
+    }
+
+    // MARK: - ensure over an unhealthy run
+
+    private static let ensureRestartDetail = "restarted by ensure: unhealthy"
+
+    /** The `db` server again, with an HTTP healthcheck answered by `responder`
+        so a test turns the run unhealthy by changing the status code. The
+        fixture listens on `port`, which is declared as an absolute secondary
+        port: the claim the restart's port checks look at, without the primary
+        port that would rewrite the healthcheck URL onto it. */
+    private func writeHTTPHealthConfig(
+        heads: [String: String] = [:], port: Int, project: String, responder: TestHTTPResponder,
+        unhealthyAfter: Int
+    ) throws {
+        let fixture = try #require(fixtureServerExecutable())
+        let headsField =
+            heads.isEmpty
+            ? ""
+            : ",\n          \"heads\": {"
+                + heads.sorted { $0.key < $1.key }.map { "\"\($0.key)\": \"\($0.value)\"" }
+                .joined(separator: ", ") + "}"
+        let body = """
+            {
+              "servers": {
+                "db": {
+                  "command": ["\(fixture)", "--listen-tcp", "\(port)"],
+                  "healthcheck": {
+                    "intervalMs": 50, "timeoutMs": 1000, "type": "http",
+                    "unhealthyAfter": \(unhealthyAfter),
+                    "url": "http://127.0.0.1:\(responder.port)/health"
+                  },
+                  "ports": { "listener": { "port": \(port) } }\(headsField)
+                }
+              },
+              "version": 1
+            }
+            """
+        try Data(body.utf8)
+            .write(to: URL(fileURLWithPath: project).appending(path: "devservers.json"))
+    }
+
+    private func status(_ router: Router, _ project: String) async throws -> ServerStatus {
+        try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: "db", project: project), ServerListResult.self
+            ).servers.first)
+    }
+
+    /** A router over a `db` run that has passed its healthcheck, then had
+        the responder switched to 500 until `failing` holds. */
+    private func failingRun(
+        offset: Int, portProbe: PortProbe = .live, responder: TestHTTPResponder,
+        unhealthyAfter: Int, failing: (ServerStatus) -> Bool
+    ) async throws -> (env: RouterEnv, pid: Int, router: Router) {
+        let env = try makeRouterEnv(named: "restart")
+        try writeHTTPHealthConfig(
+            port: TestPorts.port(offset), project: env.project, responder: responder,
+            unhealthyAfter: unhealthyAfter)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: portProbe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        let first = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        #expect(first.server.phase == .running)
+        let pid = try #require(first.server.pid)
+
+        responder.respond(with: 500)
+        let reached = try await eventually(within: .seconds(5)) {
+            failing(try await status(router, env.project))
+        }
+        try #require(reached, "the run never reached the failing state")
+        return (env: env, pid: pid, router: router)
+    }
+
+    /** Lets the replacement run pass its healthcheck once ensure has stopped
+        the old one: the run being replaced fails until then, so it cannot
+        recover on its own before ensure reaches it. */
+    private func recoverAfterTheStop(
+        _ router: Router, project: String, responder: TestHTTPResponder
+    ) -> Task<Void, Never> {
+        Task {
+            let stopped = try? await awaitStoppedEvents(
+                router, project: project, detail: Self.ensureRestartDetail, within: .seconds(20))
+            if stopped != nil { responder.respond(with: 200) }
+        }
+    }
+
+    @Test func ensureRestartsAnUnhealthyServerAndWaitsForTheNewRun() async throws {
+        let responder = try TestHTTPResponder()
+        defer { responder.stop() }
+        let run = try await failingRun(
+            offset: 431, responder: responder, unhealthyAfter: 2, failing: { $0.phase == .unhealthy })
+        let recover = recoverAfterTheStop(run.router, project: run.env.project, responder: responder)
+        defer { recover.cancel() }
+
+        let ensured = try await run.router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: run.env.project, timeoutSeconds: 15),
+            EnsureResult.self)
+        #expect(ensured.reason == nil)
+        #expect(ensured.server.phase == .running)
+        #expect(ensured.server.pid != run.pid)
+        #expect(ensured.server.lastHealthCheck?.passed == true)
+
+        let events = try await run.router.call(
+            .eventsQuery, EventsQueryParams(project: run.env.project), EventsQueryResult.self)
+        let stopped = events.events.filter { $0.kind == .stopped }
+        #expect(stopped.map(\.detail) == [Self.ensureRestartDetail])
+        #expect(try await sysLines(run.router, run.env.project).contains("stopping: \(Self.ensureRestartDetail)"))
+
+        _ = try await run.router.call(
+            .serverStop, ServerTargetParams(name: "db", project: run.env.project),
+            ServerResult.self)
+    }
+
+    /** Two sessions ensuring one broken server is the ordinary case: the
+        second joins the restart the first started, so one process is stopped
+        and one is spawned. */
+    @Test func twoConcurrentEnsuresOfAnUnhealthyServerRestartItOnce() async throws {
+        let responder = try TestHTTPResponder()
+        defer { responder.stop() }
+        let run = try await failingRun(
+            offset: 432, responder: responder, unhealthyAfter: 2, failing: { $0.phase == .unhealthy })
+        let recover = recoverAfterTheStop(run.router, project: run.env.project, responder: responder)
+        defer { recover.cancel() }
+
+        let params = EnsureParams(name: "db", project: run.env.project, timeoutSeconds: 15)
+        async let first = run.router.call(.serverEnsure, params, EnsureResult.self)
+        async let second = run.router.call(.serverEnsure, params, EnsureResult.self)
+        let results = try await [first, second]
+
+        #expect(results.map(\.reason) == [nil, nil])
+        #expect(results.map(\.server.phase) == [.running, .running])
+        let pids = Set(results.compactMap(\.server.pid))
+        #expect(pids.count == 1)
+        #expect(!pids.contains(run.pid))
+
+        let events = try await run.router.call(
+            .eventsQuery, EventsQueryParams(project: run.env.project), EventsQueryResult.self)
+        #expect(events.events.filter { $0.kind == .stopped }.map(\.detail) == [Self.ensureRestartDetail])
+        #expect(events.events.filter { $0.kind == .started }.count == 2)
+
+        _ = try await run.router.call(
+            .serverStop, ServerTargetParams(name: "db", project: run.env.project),
+            ServerResult.self)
+    }
+
+    /** The ensure-restart bookkeeping is per server: forgetting the project
+        takes the server out of the daemon, and its entries go with it. */
+    @Test func forgettingAProjectDropsItsEnsureRestartBookkeeping() async throws {
+        let responder = try TestHTTPResponder()
+        defer { responder.stop() }
+        let run = try await failingRun(
+            offset: 435, responder: responder, unhealthyAfter: 2, failing: { $0.phase == .unhealthy })
+        let recover = recoverAfterTheStop(run.router, project: run.env.project, responder: responder)
+        defer { recover.cancel() }
+        let ensured = try await run.router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: run.env.project, timeoutSeconds: 15),
+            EnsureResult.self)
+        #expect(ensured.reason == nil)
+        #expect(await run.router.ensureRestartRecordCount == 1)
+
+        let project = canonicalProjectPath(run.env.project)
+        try FileManager.default.removeItem(atPath: run.env.project)
+        _ = try await run.router.call(
+            .projectForget, ProjectOnlyParams(project: project), ProjectForgetResult.self)
+        #expect(await run.router.ensureRestartRecordCount == 0)
+    }
+
+    /** The restart's port re-check applies to ensure: a listener that outlives
+        the stop refuses the transition, leaves the server stopped, and
+        releases the spec the ensure prepared. */
+    @Test func ensureOfAnUnhealthyServerIsRefusedWhileAListenerOutlivesTheStop() async throws {
+        let responder = try TestHTTPResponder()
+        defer { responder.stop() }
+        let lingering = LingeringListener(reports: .outsider)
+        let run = try await failingRun(
+            offset: 433, portProbe: lingering.probe, responder: responder, unhealthyAfter: 2,
+            failing: { $0.phase == .unhealthy })
+        lingering.watch(pid: pid_t(run.pid))
+        let port = TestPorts.port(433)
+
+        let refused = try await run.router.attempt(
+            .serverEnsure,
+            EnsureParams(name: "db", project: run.env.project, timeoutSeconds: 10),
+            EnsureResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("ensure went ahead beside a listener the stop did not remove")
+            return
+        }
+        #expect(error.code == .portHeld)
+        #expect(
+            error.message
+                == "port \(port) is still held by pid \(lingering.reportedPid) (stand-in listener) after stopping 'db'; the new run was not started"
+        )
+        #expect(error.hint == whyHint(run.env.project))
+
+        let stopped = try await status(run.router, run.env.project)
+        #expect(stopped.phase == .stopped)
+        #expect(stopped.pid == nil)
+
+        let heads = ["api": "http://api.localhost/"]
+        try writeHTTPHealthConfig(
+            heads: heads, port: port, project: run.env.project, responder: responder,
+            unhealthyAfter: 2)
+        #expect(try await status(run.router, run.env.project).heads == heads)
+    }
+
+    /** `running` with a failing latest check is not `unhealthy`: ensure waits
+        for it, as for any run still proving itself, and does not restart. */
+    @Test func ensureOfARunningServerWithAFailingCheckWaitsWithoutRestarting() async throws {
+        let responder = try TestHTTPResponder()
+        defer { responder.stop() }
+        let run = try await failingRun(
+            offset: 434, responder: responder, unhealthyAfter: 200,
+            failing: { $0.phase == .running && ($0.lastHealthCheck?.failures ?? 0) >= 2 })
+
+        let ensured = try await run.router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: run.env.project, timeoutSeconds: 1),
+            EnsureResult.self)
+        #expect(ensured.reason == .timeout)
+        #expect(ensured.server.phase == .running)
+        #expect(ensured.server.pid == run.pid)
+
+        let events = try await run.router.call(
+            .eventsQuery, EventsQueryParams(project: run.env.project), EventsQueryResult.self)
+        #expect(events.events.filter { $0.kind == .stopped }.isEmpty)
+
+        _ = try await run.router.call(
+            .serverStop, ServerTargetParams(name: "db", project: run.env.project),
+            ServerResult.self)
+    }
+
+    /** A server whose command only works once the router has substituted its
+        port: the raw committed command carries the literal `{port}`, which the
+        fixture refuses, and the injected `PORT` is written to a file so the
+        spawn's environment is observable. */
+    private func writePortSensitiveConfig(port: Int, project: String) throws -> String {
+        let fixture = try #require(fixtureServerExecutable())
+        let envFile = URL(fileURLWithPath: project).appending(path: "spawn-env.txt").path
+        let script = "echo $PORT > '\(envFile)'; exec '\(fixture)' --listen-tcp {port}"
+        let body = """
+            {
+              "servers": {
+                "db": {
+                  "command": ["/bin/sh", "-c", "\(script)"],
+                  "healthcheck": { "type": "tcp", "port": \(port) },
+                  "port": \(port)
+                }
+              },
+              "version": 1
+            }
+            """
+        try Data(body.utf8)
+            .write(to: URL(fileURLWithPath: project).appending(path: "devservers.json"))
+        return envFile
+    }
+
+    /** A status read lands in the gap between the restart's stop and its
+        spawn (the port probe between them fires one). It must not replace the
+        spec the restart prepared: the new run spawns with the injected port,
+        and is not reported as running a stale config. */
+    @Test func aStatusReadBetweenTheStopAndTheSpawnLeavesThePreparedSpecAlone() async throws {
+        let env = try makeRouterEnv(named: "restart")
+        let port = TestPorts.port(424)
+        let envFile = try writePortSensitiveConfig(port: port, project: env.project)
+        let reader = StatusReadingProbe()
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: reader.probe,
+            registry: registry)
+        reader.attach(router: router, project: env.project)
+        let first = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        #expect(first.server.phase == .running)
+        try FileManager.default.removeItem(atPath: envFile)
+        reader.arm()
+
+        let restarted = try await router.call(
+            .serverRestart,
+            RestartParams(names: ["db"], project: env.project, timeoutSeconds: 5),
+            GroupResult.self)
+        let server = try #require(restarted.results.first?.server)
+        #expect(reader.reads >= 2, "no status read landed between the stop and the spawn")
+        #expect(server.phase == .running)
+        #expect(server.specStale != true)
+        #expect(try String(contentsOfFile: envFile, encoding: .utf8) == "\(port)\n")
+
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "db", project: env.project),
+            ServerResult.self)
+    }
+
+    /** The same race at its natural timing: status reads fired back to back
+        through several restarts never leave a run reading as stale. */
+    @Test func statusReadsDuringRestartsNeverLeaveARunStale() async throws {
+        let env = try makeRouterEnv(named: "restart")
+        let port = TestPorts.port(425)
+        _ = try writePortSensitiveConfig(port: port, project: env.project)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        _ = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+
+        let reads = Task {
+            var stale = 0
+            while !Task.isCancelled {
+                let list = try await router.call(
+                    .serverStatus, ProjectParams(name: "db", project: env.project),
+                    ServerListResult.self)
+                if list.servers.first?.specStale == true { stale += 1 }
+            }
+            return stale
+        }
+        var phases: [ServerPhase] = []
+        for _ in 0..<5 {
+            let restarted = try await router.call(
+                .serverRestart,
+                RestartParams(names: ["db"], project: env.project, timeoutSeconds: 5),
+                GroupResult.self)
+            phases.append(try #require(restarted.results.first?.server.phase))
+        }
+        reads.cancel()
+        let staleReads = try await reads.value
+        #expect(phases == Array(repeating: .running, count: 5))
+        #expect(staleReads == 0)
+        let settled = try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: "db", project: env.project),
+                ServerListResult.self
+            ).servers.first)
+        #expect(settled.specStale != true)
+
+        _ = try await router.call(
+            .serverStop, ServerTargetParams(name: "db", project: env.project),
+            ServerResult.self)
+    }
+}
+
+/** A port probe that reports every port free and fires one status read through
+    the router per probe, so a read lands exactly where the probe is asked: in
+    a restart, between the stop and the spawn. A read's own probes (latent
+    conflict checks) do not fire another. */
+final class StatusReadingProbe: Sendable {
+    private struct State {
+        var armed = false
+        var project = ""
+        var reading = false
+        var reads = 0
+        var router: Router?
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    var reads: Int { state.withLock { $0.reads } }
+
+    var probe: PortProbe {
+        PortProbe(isListening: { [self] _ in
+            await readStatus()
+            return false
+        })
+    }
+
+    func arm() {
+        state.withLock { $0.armed = true }
+    }
+
+    func attach(router: Router, project: String) {
+        state.withLock {
+            $0.project = project
+            $0.router = router
+        }
+    }
+
+    private func readStatus() async {
+        let target = state.withLock { state -> (Router, String)? in
+            guard state.armed, !state.reading, let router = state.router else { return nil }
+            state.reading = true
+            return (router, state.project)
+        }
+        guard let (router, project) = target else { return }
+        do {
+            _ = try await router.call(
+                .serverStatus, ProjectParams(name: "db", project: project), ServerListResult.self)
+        } catch {
+            Issue.record("the status read in the stopped gap failed: \(error)")
+        }
+        state.withLock {
+            $0.reading = false
+            $0.reads += 1
+        }
+    }
+}
+
+/** A port probe that answers like the real one, except that its second
+    caller waits until `release`: of two concurrent ensures, the second sits in
+    its prepare while the first brings the server up, then resumes and finds a
+    run to join. */
+final class HeldSecondProbe: Sendable {
+    private let calls = OSAllocatedUnfairLock(initialState: 0)
+    private let gate = Latch<Void>()
+
+    var probe: PortProbe {
+        PortProbe(
+            isListening: { [self] port in
+                let call = calls.withLock { count -> Int in
+                    count += 1
+                    return count
+                }
+                if call == 2 { await gate.wait() }
+                return await PortGuard.isListening(port: port)
+            },
+            listenerInfo: { await PortGuard.listenerInfo(port: $0) })
+    }
+
+    func release() {
+        gate.open()
+    }
+}
+
+/** The port probe of a stop-then-spawn test, scripted around the first run's
+    process: while that process is alive the ports read free (the pre-checks
+    pass), and once it is gone a stand-in listener holds them for
+    `pollsBeforeLeaving` probes (forever by default). `listenerInfo` names
+    the stand-in: the first run's own pid or a pid outside it. With
+    `listensFromWatch` the stand-in listens from the moment `watch` names the
+    first run, so it is already there before any stop: the shape of a process
+    that shares the port with the run. */
+final class LingeringListener: Sendable {
+    enum Reported { case outsider, stoppedRun }
+
+    private struct State {
+        var firstRun: pid_t?
+        var polls = 0
+    }
+
+    private let listensFromWatch: Bool
+    private let pollsBeforeLeaving: Int
+    private let reports: Reported
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    init(listensFromWatch: Bool = false, pollsBeforeLeaving: Int = .max, reports: Reported) {
+        self.listensFromWatch = listensFromWatch
+        self.pollsBeforeLeaving = pollsBeforeLeaving
+        self.reports = reports
+    }
+
+    /** Probes answered while the stand-in held the ports. */
+    var polls: Int { state.withLock { $0.polls } }
+
+    var probe: PortProbe {
+        PortProbe(
+            isListening: { [self] _ in listening() },
+            listenerInfo: { [self] _ in (pid: Int(reportedPid), command: "stand-in listener") })
+    }
+
+    var reportedPid: pid_t {
+        switch reports {
+        case .outsider: getpid()
+        case .stoppedRun: state.withLock { $0.firstRun } ?? 0
+        }
+    }
+
+    func watch(pid: pid_t) {
+        state.withLock { $0.firstRun = pid }
+    }
+
+    private func listening() -> Bool {
+        state.withLock { state in
+            guard let pid = state.firstRun else { return false }
+            if listensFromWatch { return true }
+            guard kill(pid, 0) != 0 else { return false }
+            state.polls += 1
+            return state.polls <= pollsBeforeLeaving
+        }
     }
 }

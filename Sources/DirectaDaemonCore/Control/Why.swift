@@ -68,6 +68,7 @@ enum WhyEngine {
         case .unhealthy:
             let since = status.lastHealthAt.map { JSONCoding.formatISO8601($0) } ?? "startup"
             summary = "healthcheck failing; last healthy \(since)"
+            if let note = status.lastHealthCheck?.failureNote { summary += "; \(note)" }
         case .starting:
             summary = "still starting; healthcheck (\(status.healthcheck.rawValue)) has not passed yet"
         case .stopped:
@@ -87,7 +88,13 @@ enum WhyEngine {
         case .stopping:
             summary = "shutting down"
         case .running:
-            summary = "running and healthy"
+            /** `running` holds until enough checks fail to turn the server
+                unhealthy, so only a passing latest check earns "healthy". */
+            if let note = status.lastHealthCheck?.failureNote {
+                summary = "running; \(note)"
+            } else {
+                summary = "running and healthy"
+            }
         }
         switch status.phase {
         case .crashed, .failed, .unhealthy, .starting:

@@ -263,6 +263,80 @@ import Testing
         #expect(LockResource.declarers(resource: "d1", specs: specs) == ["api", "web"])
     }
 
+    /** A lock is named by its project's canonical path, so `/tmp` and
+        `/private/tmp` spellings of one checkout are one lock. */
+    @Test func aLockKeyIsTheCanonicalProjectPathAndTheResource() {
+        #expect(
+            LockResource.key(project: "/tmp", resource: "d1") == "\(canonicalProjectPath("/tmp"))::d1")
+        #expect(
+            LockResource.key(project: "/tmp", resource: "d1")
+                == LockResource.key(project: "/private/tmp", resource: "d1"))
+    }
+
+    @Test func exportedLocksAppendToWhatTheCallerInherited() {
+        #expect(LockResource.exportedValue(inherited: nil, held: "/p::d1") == "/p::d1")
+        #expect(LockResource.exportedValue(inherited: "", held: "/p::d1") == "/p::d1")
+        #expect(LockResource.exportedValue(inherited: "/q::c", held: "/p::d1") == "/q::c,/p::d1")
+        #expect(
+            LockResource.exportedValue(inherited: "/q::c,/r::e", held: "/p::d1")
+                == "/q::c,/r::e,/p::d1")
+    }
+
+    /** The list `DIRECTA_LOCKS` carries is comma-joined, and a project path may
+        itself hold a comma, so membership is matched on the whole key between
+        separators rather than by splitting. */
+    @Test func aKeyIsHeldOnlyWhenTheInheritedListNamesItWhole() {
+        let key = "/p::d1"
+        #expect(LockResource.isHeld(inherited: "/p::d1", key: key))
+        #expect(LockResource.isHeld(inherited: "/q::c,/p::d1", key: key))
+        #expect(LockResource.isHeld(inherited: "/p::d1,/q::c", key: key))
+        #expect(LockResource.isHeld(inherited: "/q::c,/p::d1,/r::e", key: key))
+        #expect(LockResource.isHeld(inherited: "/a,b::d1,/a,b::d2", key: "/a,b::d2"))
+        #expect(!LockResource.isHeld(inherited: nil, key: key))
+        #expect(!LockResource.isHeld(inherited: "", key: key))
+        #expect(!LockResource.isHeld(inherited: "/p::d10", key: key))
+        #expect(!LockResource.isHeld(inherited: "/xp::d1", key: key))
+        #expect(!LockResource.isHeld(inherited: "/q::c", key: key))
+    }
+
+    /** A resource name is joined into `DIRECTA_LOCKS` next to a path, so `,`
+        and `::` would make the list impossible to split back apart. */
+    @Test func aResourceNameThatBreaksTheLockListIsRefused() throws {
+        #expect(LockResource.nameError("d1") == nil)
+        #expect(LockResource.nameError("data-v3.cache_x") == nil)
+        for name in ["a,b", "a::b", ",", "::", "x:y,z"] {
+            let error = try #require(LockResource.nameError(name), "\(name) was accepted")
+            #expect(error.code == .usage)
+            #expect(error.message.contains("'\(name)'"))
+        }
+        #expect(
+            LockResource.nameError("a,b")?.hint == "run: directa lock a-b -- <command>")
+        #expect(
+            LockResource.nameError("db::main")?.hint == "run: directa lock db-main -- <command>")
+        #expect(
+            LockResource.nameError("my db,x")?.hint == "run: directa lock 'my db-x' -- <command>")
+    }
+
+    /** A committed lock name that breaks the list is refused by config check
+        and by the register path, not only when a command asks for it. */
+    @Test func aLockNameThatBreaksTheLockListIsAConfigError() {
+        let file = ProjectFileConfig(
+            servers: ["web": ProjectFileServer(command: ["x"], locks: [LockDeclaration(name: "a,b")])])
+        #expect(
+            ProjectConfigLoader.validate(config: file, project: "/p").errors == [
+                "server 'web': lock resource name 'a,b' cannot contain ',' or '::', because the list of held locks (DIRECTA_LOCKS) joins keys with them and could not be split back apart; rename the resource in devservers.json and here"
+            ])
+        let registered = ServerSpec(
+            command: ["x"], locks: [LockDeclaration(name: "db::main")], name: "web")
+        #expect(
+            registered.validationErrors() == [
+                "server 'web': lock resource name 'db::main' cannot contain ',' or '::', because the list of held locks (DIRECTA_LOCKS) joins keys with them and could not be split back apart; rename the resource in devservers.json and here"
+            ])
+        #expect(
+            ServerSpec(command: ["x"], locks: [LockDeclaration(name: "data")], name: "web")
+                .validationErrors().isEmpty)
+    }
+
     /** A lock's state path is documented as project-relative, so it is enforced
         rather than trusted: a committed config must not be able to aim the
         fingerprint at somewhere outside the project. */

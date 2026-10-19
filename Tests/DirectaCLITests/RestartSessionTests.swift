@@ -1,4 +1,5 @@
 import DirectaKit
+import DirectaTestSupport
 import Foundation
 import Testing
 import os
@@ -36,6 +37,9 @@ import os
         test bug and fails loudly. Every call is logged. */
     private actor FakeDaemon: RestartRequesting {
         var calls: [String] = []
+        /** The response deadline of each machine-wide status read (empty
+            project), in call order. */
+        var lookupDeadlines: [Double?] = []
         var ensures: [Result<EnsureResult, WireError>] = []
         var restarts: [Result<GroupResult, WireError>] = []
         var statuses: [Result<ServerListResult, WireError>] = []
@@ -69,6 +73,7 @@ import os
 
         func status(_ params: ProjectParams, responseTimeoutSeconds: Double?) async throws -> ServerListResult {
             calls.append("status \(params.name ?? "--all")")
+            if params.project.isEmpty { lookupDeadlines.append(responseTimeoutSeconds) }
             if case .failure(RestartSessionTests.wedged)? = statuses.first, let wedgeClock {
                 await wedgeClock.advance(
                     by: min(
@@ -377,17 +382,42 @@ import os
         #expect(await harness.daemon.calls == ["restart web"])
     }
 
-    @Test func aServerGoneAfterTheDropIsNotFound() async throws {
-        let harness = Harness(
-            daemon: FakeDaemon(
-                restarts: [.failure(Self.closed)],
-                statuses: [.success(Self.list())]))
-
-        let error = await #expect(throws: WireError.self) {
-            _ = try await harness.session.run(before: Self.list(Self.status("web", phase: .running, pid: 10)))
+    /** The not-found looks for the name in the other registered projects with
+        one machine-wide read (the name only, project ""), and a failed read
+        leaves the plain refusal. */
+    @Test(.temporaryTree) func aServerGoneAfterTheDropIsNotFoundAndNamesTheProjectsThatDefineIt() async throws {
+        func other(_ project: String) -> ServerStatus {
+            ServerStatus(logPath: "", phase: .stopped, project: project, server: "web")
         }
+        let elsewhere = try TemporaryTree.directory(named: "other").path
+        let gone = try TemporaryTree.path(named: "gone").path
+        let cases: [(lookup: Result<ServerListResult, WireError>, hint: String, message: String)] = [
+            (
+                .success(Self.list(Self.status("web", phase: .stopped), other(elsewhere))),
+                "run: directa status web --project '\(elsewhere)'",
+                "no server named 'web' in /code/app, but the registered project \(elsewhere) defines it; pass --project with that path"
+            ),
+            (
+                .success(Self.list(other(gone))), "run: directa status --all",
+                "no server named 'web' in /code/app"
+            ),
+            (.success(Self.list()), "run: directa status --all", "no server named 'web' in /code/app"),
+            (.failure(Self.closed), "run: directa status --all", "no server named 'web' in /code/app"),
+        ]
+        for scripted in cases {
+            let harness = Harness(
+                daemon: FakeDaemon(
+                    restarts: [.failure(Self.closed)],
+                    statuses: [.success(Self.list()), scripted.lookup]))
 
-        #expect(error?.code == .notFound)
+            let error = await #expect(throws: WireError.self) {
+                _ = try await harness.session.run(before: Self.list(Self.status("web", phase: .running, pid: 10)))
+            }
+
+            #expect(error == WireError(code: .notFound, hint: scripted.hint, message: scripted.message))
+            #expect(await harness.daemon.calls == ["restart web", "status web", "status web"])
+            #expect(await harness.daemon.lookupDeadlines == [ProjectConfigLoader.notFoundLookupSeconds])
+        }
     }
 
     @Test func aNamedRestartScopesStatusToThatServer() {

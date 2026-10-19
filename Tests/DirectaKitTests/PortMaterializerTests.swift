@@ -358,19 +358,91 @@ import Testing
                     hint: "run: directa status --project '\(main)'",
                     message:
                         "no server named 'web' in \(worktree): this linked worktree has no devservers.json, and its main checkout \(main) declares 'web'; "
-                        + "commit or copy devservers.json into this worktree, or pass --project with the main checkout's path"
+                        + "commit or copy devservers.json into this worktree to run its own server, "
+                        + "or pass --project with the main checkout's path to act on the main checkout's server instead"
                 ))
         #expect(
             ProjectConfigLoader.serverNotFound(name: "api", project: worktree)
                 == WireError(
-                    code: .notFound, hint: "run: directa status --json", message: "no server named 'api' in \(worktree)"))
+                    code: .notFound, hint: "run: directa status --all", message: "no server named 'api' in \(worktree)"))
         #expect(
             ProjectConfigLoader.serverNotFound(name: "web", project: main)
-                == WireError(code: .notFound, hint: "run: directa status --json", message: "no server named 'web' in \(main)"))
+                == WireError(code: .notFound, hint: "run: directa status --all", message: "no server named 'web' in \(main)"))
 
         try JSONCoding.fileEncoder().encode(ProjectFileConfig(servers: [:]))
             .write(to: layout.worktree.appending(path: "devservers.json"))
-        #expect(ProjectConfigLoader.serverNotFound(name: "web", project: worktree).hint == "run: directa status --json")
+        #expect(ProjectConfigLoader.serverNotFound(name: "web", project: worktree).hint == "run: directa status --all")
+    }
+
+    /** A name the project lacks is looked for in the other registered
+        projects: none, one, or several define it. The project asked about is
+        never listed as another project, and a duplicate path counts once. */
+    @Test func serverNotFoundNamesTheOtherProjectsThatDefineTheName() {
+        #expect(
+            ProjectConfigLoader.serverNotFound(name: "pirl", project: "/tmp", elsewhere: [])
+                == WireError(
+                    code: .notFound, hint: "run: directa status --all", message: "no server named 'pirl' in /tmp"))
+        #expect(
+            ProjectConfigLoader.serverNotFound(name: "pirl", project: "/tmp", elsewhere: ["/tmp"])
+                == ProjectConfigLoader.serverNotFound(name: "pirl", project: "/tmp"))
+        #expect(
+            ProjectConfigLoader.serverNotFound(name: "pirl", project: "/tmp", elsewhere: ["/code/pirl", "/code/pirl"])
+                == WireError(
+                    code: .notFound,
+                    hint: "run: directa status pirl --project '/code/pirl'",
+                    message:
+                        "no server named 'pirl' in /tmp, but the registered project /code/pirl defines it; pass --project with that path"
+                ))
+        #expect(
+            ProjectConfigLoader.serverNotFound(name: "pirl", project: "/tmp", elsewhere: ["/code/b", "/code/a"])
+                == WireError(
+                    code: .notFound,
+                    hint: "run: directa status --all pirl",
+                    message:
+                        "no server named 'pirl' in /tmp, but these registered projects define it: /code/a, /code/b; "
+                        + "pass --project with the one you mean"
+                ))
+    }
+
+    /** Both a name and a path reach a pasted hint through ShellWord. */
+    @Test func serverNotFoundQuotesTheNameAndPathInEveryHint() {
+        let single = ProjectConfigLoader.serverNotFound(
+            name: "a b", project: "/tmp", elsewhere: ["/code/it's here"])
+        #expect(single.hint == #"run: directa status 'a b' --project '/code/it'\''s here'"#)
+        let several = ProjectConfigLoader.serverNotFound(
+            name: "$(x)", project: "/tmp", elsewhere: ["/code/a", "/code/b"])
+        #expect(several.hint == "run: directa status --all '$(x)'")
+    }
+
+    @Test(.temporaryTree) func projectsDefiningANameAreDistinctAndSorted() throws {
+        func status(_ server: String, _ project: String) -> ServerStatus {
+            ServerStatus(logPath: "", phase: .stopped, project: project, server: server)
+        }
+        let a = try TemporaryTree.directory(named: "a").path
+        let b = try TemporaryTree.directory(named: "b").path
+        let c = try TemporaryTree.directory(named: "c").path
+        let servers = [status("pirl", b), status("web", c), status("pirl", a), status("pirl", b)]
+        #expect(ProjectConfigLoader.projects(defining: "pirl", among: servers) == [a, b].sorted())
+        #expect(ProjectConfigLoader.projects(defining: "api", among: servers) == [])
+    }
+
+    /** The daemon's own lookup skips a registered project whose checkout is
+        gone, so a client reading the machine-wide status must not name one
+        either: it would point at a path `--project` cannot use. */
+    @Test(.temporaryTree) func projectsDefiningANameLeaveOutCheckoutsThatAreGone() throws {
+        func status(_ project: String) -> ServerStatus {
+            ServerStatus(logPath: "", phase: .stopped, project: project, server: "pirl")
+        }
+        let live = try TemporaryTree.directory(named: "live").path
+        let gone = try TemporaryTree.path(named: "gone").path
+        #expect(!FileManager.default.fileExists(atPath: gone))
+        #expect(ProjectConfigLoader.projects(defining: "pirl", among: [status(gone), status(live)]) == [live])
+        #expect(ProjectConfigLoader.projects(defining: "pirl", among: [status(gone)]) == [])
+    }
+
+    /** One short deadline for every not-found lookup, whichever command asks. */
+    @Test func theNotFoundLookupDeadlineIsShort() {
+        #expect(ProjectConfigLoader.notFoundLookupSeconds == 5)
     }
 
     /** The hint is a command a reader pastes, so a main checkout path with a

@@ -113,6 +113,44 @@ import Testing
         await stop(router, env.project)
     }
 
+    /** A watch restart whose new run is refused because a listener outlived the
+        stop leaves the server down with nobody asking for that. The `stopped`
+        event it records names the held port, so status, events, and the hooks
+        say why. */
+    @Test func aWatchRestartRefusedForAHeldPortRecordsAStoppedEventNamingThePort() async throws {
+        let env = try env(offset: 446, watch: "app.config.json")
+        let port = TestPorts.port(446)
+        let lingering = LingeringListener(reports: .outsider)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: lingering.probe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        let first = try await start(router, env.project)
+        lingering.watch(pid: pid_t(try #require(first.pid)))
+        let now = Date()
+        _ = await router.sweepWatches(now: now.addingTimeInterval(3))
+        try Data("v2\n".utf8)
+            .write(to: URL(fileURLWithPath: env.project).appending(path: "app.config.json"))
+
+        #expect(await settle(router, from: now).isEmpty)
+
+        let events = try await router.call(
+            .eventsQuery, EventsQueryParams(project: env.project), EventsQueryResult.self)
+        let stopped = events.events.filter { $0.kind == .stopped }.map(\.detail)
+        #expect(
+            stopped == [
+                "watch change in app.config.json",
+                "restart refused: port \(port) is still held by pid \(lingering.reportedPid) (stand-in listener) after stopping 'web'; the new run was not started",
+            ])
+        let after = try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: "web", project: env.project), ServerListResult.self
+            ).servers.first)
+        #expect(after.phase == .stopped)
+    }
+
     /** The baseline is taken after the settle window, so a write that lands
         while the server is still booting (very often the server generating its
         own config) is folded into the baseline instead of bouncing it. */

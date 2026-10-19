@@ -6,6 +6,9 @@ import Foundation
     the whole decode, since the payload belongs to a harness directa does not
     control. `parse` answers nil for anything that is not a JSON object. */
 public struct HookPayload: Decodable, Equatable {
+    /** Claude Code's `agent_id`, present only inside a subagent, whose
+        `session_id` is its parent's. */
+    public var agentId: String?
     /** Antigravity's conversation, stable across the messages inside it. */
     public var conversationId: String?
     /** Cursor's conversation, the `conversation_id` field. */
@@ -33,6 +36,7 @@ public struct HookPayload: Decodable, Equatable {
     public var workspaceRoots: [String]?
 
     private enum CodingKeys: String, CodingKey {
+        case agentId = "agent_id"
         case conversationId
         case cursorConversationId = "conversation_id"
         case cursorVersion = "cursor_version"
@@ -56,6 +60,7 @@ public struct HookPayload: Decodable, Equatable {
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        agentId = try? container.decodeIfPresent(String.self, forKey: .agentId)
         conversationId = try? container.decodeIfPresent(String.self, forKey: .conversationId)
         cursorConversationId = try? container.decodeIfPresent(String.self, forKey: .cursorConversationId)
         cwd = try? container.decodeIfPresent(String.self, forKey: .cwd)

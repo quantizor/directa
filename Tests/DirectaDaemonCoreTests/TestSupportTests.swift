@@ -73,6 +73,86 @@ import os
                 binaryName: binary, ports: block) == false)
     }
 
+    /** No fixture binary was built, so the fixture rule has nothing to match. */
+    @Test func refusesEverythingWhenNoFixtureBinaryIsNamed() {
+        #expect(
+            shouldReapStray(
+                command: "/Users/x/directa/.build/debug/fixture-server --listen-tcp 45411", parent: 1,
+                binaryName: nil, ports: block) == false)
+    }
+
+    /** A shell a killed run left behind: its argv names a tree under that run's
+        root, and the run's owner is gone. */
+    @Test func reapsATreeShellOfADeadRun() {
+        #expect(
+            shouldReapStray(
+                command: "/bin/sh -c trap 'exit 0' TERM; : > /var/folders/T/directa-run.Ab3dEf/directa-test-sup-1234/ready",
+                parent: 1, binaryName: binary, ports: block, deadRunRoots: ["directa-run.Ab3dEf"]))
+    }
+
+    /** A tree shell whose parent still lives belongs to that live parent. */
+    @Test func refusesATreeShellWithALiveParent() {
+        #expect(
+            shouldReapStray(
+                command: "/bin/sh -c : > /var/folders/T/directa-run.Ab3dEf/directa-test-sup-1234/ready",
+                parent: 40100, binaryName: binary, ports: block, deadRunRoots: ["directa-run.Ab3dEf"])
+                == false)
+    }
+
+    /** A run whose owner may be alive is not in the dead set, so its orphans stay. */
+    @Test func refusesATreeShellOfALiveRun() {
+        #expect(
+            shouldReapStray(
+                command: "/bin/sh -c : > /var/folders/T/directa-run.Ab3dEf/directa-test-sup-1234/ready",
+                parent: 1, binaryName: binary, ports: block) == false)
+    }
+
+    /** A dead run's root is matched by whole name, never as a prefix of a longer one. */
+    @Test func refusesATreeShellUnderALongerRunName() {
+        #expect(
+            shouldReapStray(
+                command: "/bin/sh -c : > /var/folders/T/directa-run.Ab3dEfX/directa-test-sup-1234/ready",
+                parent: 1, binaryName: binary, ports: block, deadRunRoots: ["directa-run.Ab3dEf"])
+                == false)
+    }
+
+    /** Under a dead run's root, only a tree the test temporary tree prefix names is reaped. */
+    @Test func refusesANonTreePathUnderADeadRun() {
+        #expect(
+            shouldReapStray(
+                command: "/bin/sh -c : > /var/folders/T/directa-run.Ab3dEf/other-thing/ready",
+                parent: 1, binaryName: binary, ports: block, deadRunRoots: ["directa-run.Ab3dEf"])
+                == false)
+    }
+
+    /** A tree under the default temporary directory has no run root, so nothing proves its owner gone. */
+    @Test func refusesADefaultTemporaryTreeShell() {
+        #expect(
+            shouldReapStray(
+                command: "/bin/sh -c : > /var/folders/T/directa-test-sup-1234/ready", parent: 1,
+                binaryName: binary, ports: block, deadRunRoots: ["directa-run.Ab3dEf"]) == false)
+    }
+
+    /** A process that names a dead run's root but is no test tree, here a path in a user's own folder. */
+    @Test func refusesAProcessOutsideTheTemporaryRoots() {
+        #expect(
+            shouldReapStray(
+                command: "/usr/bin/vim /Users/x/notes/directa-run.Ab3dEf/directa-test-sup-1234/todo.md",
+                parent: 1, binaryName: binary, ports: block, deadRunRoots: ["directa-run.Ab3dEf"])
+                == false)
+    }
+
+    /** runName(of:) extracts the run root's name from a tree path, or nil for anything else. */
+    @Test func namesTheRunRootOfATreePath() {
+        #expect(
+            runName(of: "/bin/sh -c : > /var/folders/T/directa-run.Ab3dEf/directa-test-sup-1234/ready")
+                == "directa-run.Ab3dEf")
+        #expect(runName(of: "/var/folders/T/directa-test-sup-1234/ready") == nil)
+        #expect(runName(of: "/var/folders/T/directa-runner.Ab3dEf/directa-test-sup-1234") == nil)
+        #expect(runName(of: "/Users/x/directa-run.Ab3dEf/other/directa-test-sup-1234") == nil)
+        #expect(runName(of: "/usr/bin/sleep 300") == nil)
+    }
+
     /** A bare spawn that inherits a pipe's write end keeps that pipe open for
         its whole life, so a reader elsewhere in the run (every supervisor's
         git call drains to end of file) waits on the child instead of on the

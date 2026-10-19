@@ -104,6 +104,34 @@ import Testing
         #expect(GlobalOptions.resolveProject(from: deep.path) == main.path)
     }
 
+    /** A removed worktree makes `currentDirectoryPath` answer "". Resolution
+        answers nil at once (no walk over a relative URL, which never reaches
+        the root), and a command turns the nil into the usage refusal. */
+    @Test func aGoneCurrentDirectoryResolvesToNothing() throws {
+        let base = try makeBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let removed = try directory(base.appending(path: "removed"))
+        try FileManager.default.removeItem(at: removed)
+        let file = base.appending(path: "file")
+        try Data().write(to: file)
+        #expect(GlobalOptions.resolveProject(from: "") == nil)
+        #expect(GlobalOptions.resolveProject(from: ".") == nil)
+        #expect(GlobalOptions.resolveProject(from: "relative/dir") == nil)
+        #expect(GlobalOptions.resolveProject(from: removed.path) == nil)
+        #expect(GlobalOptions.resolveProject(from: file.path) == nil)
+    }
+
+    @Test func theGoneCurrentDirectoryRefusalIsAUsageErrorNamingTheFix() {
+        #expect(
+            GlobalOptions.goneWorkingDirectory
+                == WireError(
+                    code: .usage, hint: "run: directa status --all",
+                    message:
+                        "the current directory no longer exists (was a worktree removed?), so directa cannot tell which project you mean; "
+                        + "change into an existing project directory, or pass --project with its path"))
+        #expect(CLIRunner.exitStatus(for: GlobalOptions.goneWorkingDirectory.code) == 2)
+    }
+
     @Test func withNoConfigAndNoGitTheWorkingDirectoryWins() throws {
         let base = try makeBase()
         defer { try? FileManager.default.removeItem(at: base) }

@@ -177,7 +177,7 @@ enum SetupPerformer: Sendable {
         if !relocated {
             do {
                 if migration {
-                    try await AgentService.reregister()
+                    try await AgentService.reregister(because: .upgradeInstall, paths: paths)
                 } else {
                     try await AgentService.register()
                 }

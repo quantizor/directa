@@ -34,7 +34,7 @@ public struct SpawnCapture: Sendable {
     }
 }
 
-/** Seam isolating swift-subprocess (pre-1.0) from the supervisor. The fallback,
+/** Seam isolating swift-subprocess from the supervisor. The fallback,
     if the API churns, is posix_spawn with POSIX_SPAWN_SETSID, its exit watched
     through `ExitWatcher` exactly as `LaunchdJobLauncher`'s children are; the
     protocol is shaped so that swap stays invisible to callers. */

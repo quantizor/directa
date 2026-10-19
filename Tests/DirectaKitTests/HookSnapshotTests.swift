@@ -1,8 +1,9 @@
+import DirectaTestSupport
 import Foundation
 import Testing
 @testable import DirectaKit
 
-@Suite struct HookSnapshotTests {
+@Suite(.temporaryTree) struct HookSnapshotTests {
     private func server(
         conflict: PortConflictState? = nil,
         errorCount: Int = 0,
@@ -41,16 +42,32 @@ import Testing
             list: ServerListResult(servers: servers, trusted: true), harness: .neutral)
     }
 
+    private func record(
+        _ servers: [ServerStatus],
+        project: String = "/proj",
+        antigravity: AntigravityConversation? = nil,
+        shownErrorLines: [String: [String]]? = nil
+    ) -> HookConversationRecord {
+        HookConversationRecord(
+            antigravity: antigravity,
+            projects: [
+                project: HookProjectRecord(
+                    picture: HookChange.picture(of: servers), shownErrorLines: shownErrorLines)
+            ])
+    }
+
     private func outcome(
         from before: [ServerStatus]?,
         to after: [ServerStatus],
+        project: String = "/proj",
         stored: HookConversationRecord? = nil,
         errorLines: [String: [String]] = [:],
         boundary: Bool = false
     ) -> HookChangeOutcome {
-        let storedRecord = stored ?? before.map { HookConversationRecord(picture: HookChange.picture(of: $0)) }
+        let storedRecord = stored ?? before.map { record($0, project: project) }
         return HookChange.outcome(
             stored: storedRecord,
+            project: project,
             picture: HookChange.picture(of: after),
             errorLines: errorLines,
             summary: summary(for: after),
@@ -63,7 +80,7 @@ import Testing
 
     @Test func anUnchangedPictureStaysQuiet() {
         let servers = [server()]
-        let stored = HookConversationRecord(picture: HookChange.picture(of: servers))
+        let stored = record(servers)
         let result = outcome(from: nil, to: servers, stored: stored)
         #expect(result.text == nil)
         #expect(!result.newErrorLines)
@@ -71,7 +88,7 @@ import Testing
     }
 
     @Test func errorGrowthOnARunningServerStaysQuiet() {
-        let stored = HookConversationRecord(picture: HookChange.picture(of: [server(errorCount: 2)]))
+        let stored = record([server(errorCount: 2)])
         let result = outcome(
             from: nil, to: [server(errorCount: 40)], stored: stored,
             errorLines: ["web": ["warn a", "warn b"]])
@@ -128,7 +145,8 @@ import Testing
                     "web: crashed (was running); exit 1; run: directa why web",
                     "  err: l3", "  err: l4", "  err: l5", "  err: l6", "  err: l7"))
         #expect(result.newErrorLines)
-        #expect(result.record.shownErrorLines == ["web": ["l3", "l4", "l5", "l6", "l7"]])
+        #expect(
+            result.record.projects?["/proj"]?.shownErrorLines == ["web": ["l3", "l4", "l5", "l6", "l7"]])
     }
 
     @Test func aShiftedWindowQuotesOnlyTheLinesNotYetShown() {
@@ -163,7 +181,7 @@ import Testing
 
     @Test func errorLinesOfAServerThatDidNotEnterABadStateAreIgnored() {
         let crashed = [server(exitCode: 1, phase: .crashed)]
-        let stored = HookConversationRecord(picture: HookChange.picture(of: crashed))
+        let stored = record(crashed)
         let result = outcome(
             from: nil, to: [server(exitCode: 1, phase: .crashed, port: 3001)], stored: stored,
             errorLines: ["web": ["fresh"]])
@@ -205,10 +223,9 @@ import Testing
 
     @Test func aBoundarySpeaksTheFullSummaryAndKeepsWhatWasShown() {
         let servers = [server(exitCode: 1, phase: .failed)]
-        let picture = HookChange.picture(of: servers)
-        let stored = HookConversationRecord(
-            antigravity: AntigravityConversation(lastInitialNumSteps: 4, pullBacks: 2),
-            picture: picture, shownErrorLines: ["web": ["boom"]])
+        let stored = record(
+            servers, antigravity: AntigravityConversation(lastInitialNumSteps: 4, pullBacks: 2),
+            shownErrorLines: ["web": ["boom"]])
         let result = outcome(from: nil, to: servers, stored: stored, errorLines: ["web": ["boom"]], boundary: true)
         #expect(result.text == summary(for: servers))
         #expect(!result.newErrorLines)
@@ -219,13 +236,13 @@ import Testing
         let servers = [server()]
         let result = outcome(from: nil, to: servers)
         #expect(result.text == summary(for: servers))
-        #expect(result.record.picture == HookChange.picture(of: servers))
+        #expect(result.record == record(servers))
     }
 
     @Test func anEmptyProjectStillRecordsTheConversation() {
         let result = outcome(from: nil, to: [])
         #expect(result.text == nil)
-        #expect(result.record.picture.rows.isEmpty)
+        #expect(result.record == record([]))
     }
 
     @Test func aClockChangeIsNotAPictureChange() {
@@ -233,6 +250,25 @@ import Testing
         var later = base
         later.lastHealthAt = Date(timeIntervalSince1970: 50)
         #expect(HookChange.picture(of: [base]) == HookChange.picture(of: [later]))
+    }
+
+    /** A health check lands every few seconds, each with a new time and a
+        higher failure count; none of that is a change a tool hook speaks about
+        (the phase moving to `unhealthy` is, and is its own field). */
+    @Test func aNewHealthCheckResultIsNotAChange() {
+        var before = server()
+        before.lastHealthCheck = HealthCheckResult(
+            at: Date(timeIntervalSince1970: 10), detail: "HTTP 500", failures: 1, passed: false)
+        var after = before
+        after.lastHealthCheck = HealthCheckResult(
+            at: Date(timeIntervalSince1970: 12), detail: "HTTP 503", failures: 2, passed: false)
+        #expect(HookChange.picture(of: [before]) == HookChange.picture(of: [after]))
+        #expect(outcome(from: [before], to: [after]).text == nil)
+
+        var recovered = after
+        recovered.lastHealthCheck = HealthCheckResult(
+            at: Date(timeIntervalSince1970: 14), failures: 0, passed: true)
+        #expect(outcome(from: [after], to: [recovered]).text == nil)
     }
 
     @Test func onlyAServerThatEnteredABadStateNeedsItsErrorLinesRead() {
@@ -249,19 +285,298 @@ import Testing
         #expect(HookChange.enteringBad(stored: nil, current: current).isEmpty)
     }
 
-    @Test func aSnapshotWrittenByAnOlderVersionStillLoads() throws {
+    /** A record written before pictures were kept per project holds one
+        project-less picture. It is dropped (no project to file it under), the
+        conversation's Antigravity counts survive, and the next call per project
+        speaks that project's full summary once. */
+    @Test func aRecordWrittenByAnOlderVersionStillLoads() throws {
         let json = """
-            {"picture":{"rows":[{"conflict":null,"errorCount":3,"errorLines":["old"],"exitCode":null,\
+            {"antigravity":{"lastInitialNumSteps":4,"pullBacks":1},\
+            "picture":{"rows":[{"conflict":null,"errorCount":3,"errorLines":["old"],"exitCode":null,\
             "exitSignal":null,"name":"web","phase":"running","port":3000,"specStale":false,\
-            "spawnErrno":null,"url":"http://web.localhost:3000","worktree":null}]}}
+            "spawnErrno":null,"url":"http://web.localhost:3000","worktree":null}]},\
+            "shownErrorLines":{"web":["old"]}}
             """
-        let record = try JSONCoding.decoder().decode(HookConversationRecord.self, from: Data(json.utf8))
-        #expect(record.picture == HookChange.picture(of: [server()]))
-        #expect(record.shownErrorLines == nil)
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        try AtomicFile.write(Data(json.utf8), to: directory.appending(path: "claude-old"))
+        let loaded = try #require(HookSnapshotStore.load(fileKey: "claude-old", directory: directory))
+        #expect(
+            loaded
+                == HookConversationRecord(
+                    antigravity: AntigravityConversation(lastInitialNumSteps: 4, pullBacks: 1)))
+        let servers = [server()]
+        let result = outcome(from: nil, to: servers, stored: loaded)
+        #expect(result.text == summary(for: servers))
+        #expect(result.record.antigravity == loaded.antigravity)
+        #expect(result.record.projects == record(servers).projects)
+    }
+
+    /** Both ids at their cap would make `claude-` + 128 + `+` + 128 characters,
+        past the 255-byte file name limit once the lock file's prefix and the
+        write's temp name are added, and a write that fails is dropped silently,
+        so the agent would be re-told the full summary on every call. */
+    @Test func maximumLengthIdsStillNameAFileThatCanBeWritten() throws {
+        let session = String(repeating: "s", count: 300)
+        let agent = String(repeating: "a", count: 300)
+        let key = HookSnapshotStore.fileKey(scope: "antigravity", session: session, agent: agent)
+        #expect(key.utf8.count <= HookSnapshotStore.maxFileKeyLength)
+        let longest = AtomicFile.tempName(for: URL(fileURLWithPath: "/d/\(key)"))
+        #expect(longest.utf8.count <= 255)
+        #expect(".lock-\(key)".utf8.count <= 255)
+
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let saved = record([server()])
+        HookSnapshotStore.save(saved, fileKey: key, directory: directory)
+        #expect(HookSnapshotStore.load(fileKey: key, directory: directory) == saved)
+    }
+
+    /** The agent part is hashed only to fit, so two agents that differ past
+        the id cap still get their own file, and a hashed key cannot equal one
+        built from ids in the filename alphabet. */
+    @Test func hashedKeysStayDistinctPerAgentAndFromPlainKeys() {
+        let session = String(repeating: "s", count: 128)
+        let first = HookSnapshotStore.fileKey(
+            scope: "claude", session: session, agent: String(repeating: "a", count: 200) + "1")
+        let second = HookSnapshotStore.fileKey(
+            scope: "claude", session: session, agent: String(repeating: "a", count: 200) + "2")
+        #expect(first != second)
+        #expect(
+            first
+                == HookSnapshotStore.fileKey(
+                    scope: "claude", session: session, agent: String(repeating: "a", count: 200) + "1"))
+        #expect(first.hasPrefix("claude-\(session)+"))
+        #expect(first.contains("+~"))
+    }
+
+    @Test func keysThatFitAreUnchanged() {
+        #expect(HookSnapshotStore.fileKey(scope: "claude", session: "s1", agent: "a1") == "claude-s1+a1")
+        let atCap = String(repeating: "a", count: HookSnapshotStore.maxKeyLength)
+        #expect(
+            HookSnapshotStore.fileKey(scope: "claude", session: "s1", agent: atCap)
+                == "claude-s1+\(atCap)")
+    }
+
+    private func claudeKey(_ json: String) -> String {
+        ClaudeCodeAdapter.conversationFileKey(
+            payload: HookPayload.parse(Data(json.utf8)), environment: [:])
+    }
+
+    /** The daemon as a hook sees it: one scripted status list, optionally slow
+        to answer. */
+    private struct ScriptedReads: HookDaemonReading {
+        var delay: Duration?
+        var errorLines: [String: [String]] = [:]
+        var servers: [ServerStatus]
+        var trusted = true
+
+        func status(project: String) async -> ServerListResult? {
+            if let delay { try? await Task.sleep(for: delay) }
+            return ServerListResult(servers: servers, trusted: trusted)
+        }
+
+        func errorLines(project: String, server: String) async -> [String]? {
+            errorLines[server]
+        }
+    }
+
+    private struct SilentDaemon: HookDaemonReading {
+        func status(project: String) async -> ServerListResult? { nil }
+        func errorLines(project: String, server: String) async -> [String]? { nil }
+    }
+
+    /** One hook call as `directa hook claude-post-tool` makes it, through the
+        same `HookSpeaker` the CLI runs. */
+    private func call(
+        _ payload: String, project: String, servers: [ServerStatus], directory: URL,
+        boundary: Bool = false
+    ) async -> String? {
+        let answer = await HookSpeaker.speak(
+            HookSpeaker.Request(
+                directory: directory, fileKey: claudeKey(payload), harness: .neutral, project: project),
+            reads: ScriptedReads(servers: servers), boundary: { _ in boundary })
+        return answer.text
+    }
+
+    @Test func aParentAndItsSubagentEachSpeakOnceNoMatterTheCheckout() async throws {
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let servers = [server(name: "pirl")]
+        let parent = #"{"session_id":"s1"}"#
+        let child = #"{"session_id":"s1","agent_id":"a1"}"#
+        var answers: [String?] = []
+        for _ in 0..<3 {
+            answers.append(await call(parent, project: "/main", servers: servers, directory: directory))
+            answers.append(
+                await call(
+                    child, project: "/main/.claude/worktrees/a1", servers: servers, directory: directory))
+        }
+        let full = summary(for: servers)
+        #expect(answers == [full, full, nil, nil, nil, nil])
+    }
+
+    @Test func aSubagentInTheParentsCheckoutStillKeepsItsOwnRecord() async throws {
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let servers = [server()]
+        let parent = #"{"session_id":"s1"}"#
+        let child = #"{"session_id":"s1","agent_id":"a1"}"#
+        let other = #"{"session_id":"s1","agent_id":"a2"}"#
+        var answers: [String?] = []
+        for payload in [parent, child, other, child] {
+            answers.append(await call(payload, project: "/proj", servers: servers, directory: directory))
+        }
+        let full = summary(for: servers)
+        #expect(answers == [full, full, full, nil])
+    }
+
+    @Test func oneAgentAlternatingBetweenCheckoutsSpeaksOnlyEachFirstSummary() async throws {
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let main = [server(name: "native"), server(name: "sandbox", port: 3001)]
+        let branch = [server(name: "pirl", port: 4000)]
+        let payload = #"{"session_id":"s1"}"#
+        var answers: [String?] = []
+        for _ in 0..<3 {
+            answers.append(await call(payload, project: "/main", servers: main, directory: directory))
+            answers.append(await call(payload, project: "/branch", servers: branch, directory: directory))
+        }
+        #expect(answers == [summary(for: main), summary(for: branch), nil, nil, nil, nil])
+    }
+
+    /** The boundary rule end to end: a session start in `/a` forgets `/b`, so
+        `/b` speaks its full summary on the next call although nothing in it
+        changed. */
+    @Test func aBoundaryInOneCheckoutMakesTheNextCheckoutSpeakItsFullSummary() async throws {
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let a = [server()]
+        let b = [server(name: "api", port: 4000)]
+        let payload = #"{"session_id":"s1"}"#
+        var answers: [String?] = []
+        answers.append(await call(payload, project: "/a", servers: a, directory: directory))
+        answers.append(await call(payload, project: "/b", servers: b, directory: directory))
+        answers.append(await call(payload, project: "/b", servers: b, directory: directory))
+        answers.append(
+            await call(payload, project: "/a", servers: a, directory: directory, boundary: true))
+        answers.append(await call(payload, project: "/b", servers: b, directory: directory))
+        #expect(answers == [summary(for: a), summary(for: b), nil, summary(for: a), summary(for: b)])
+    }
+
+    @Test func aSilentDaemonStoresNothingAndSaysNothing() async throws {
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let key = claudeKey(#"{"session_id":"s1"}"#)
+        let answer = await HookSpeaker.speak(
+            HookSpeaker.Request(directory: directory, fileKey: key, harness: .neutral, project: "/a"),
+            reads: SilentDaemon(), boundary: { _ in true })
+        #expect(answer == HookSpeaker.Answer(newErrorLines: false, text: nil))
+        #expect(HookSnapshotStore.load(fileKey: key, directory: directory) == nil)
+    }
+
+    @Test func anUntrustedProjectReadsAsEmptyUntilTrustIsRecorded() async throws {
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let key = claudeKey(#"{"session_id":"s1"}"#)
+        let request = HookSpeaker.Request(
+            directory: directory, fileKey: key, harness: .neutral, project: "/a")
+        let untrusted = await HookSpeaker.speak(
+            request, reads: ScriptedReads(servers: [server()], trusted: false), boundary: { _ in false })
+        #expect(untrusted.text == nil)
+        #expect(HookSnapshotStore.load(fileKey: key, directory: directory) == record([], project: "/a"))
+        let trusted = await HookSpeaker.speak(
+            request, reads: ScriptedReads(servers: [server()]), boundary: { _ in false })
+        #expect(trusted.text == fenced("web: new, running; url http://web.localhost:3000"))
+    }
+
+    /** A crash quotes the err lines the daemon reports, and the amend hook sees
+        the answer and boundary flag before the record is saved. */
+    @Test func aCrashQuotesFetchedLinesAndAmendRunsBeforeTheSave() async throws {
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let key = claudeKey(#"{"session_id":"s1"}"#)
+        let request = HookSpeaker.Request(
+            directory: directory, fileKey: key, harness: .neutral, project: "/a")
+        _ = await HookSpeaker.speak(
+            request, reads: ScriptedReads(servers: [server()]), boundary: { _ in false })
+        let counts = AntigravityConversation(lastInitialNumSteps: 3, pullBacks: 0)
+        let crashed = await HookSpeaker.speak(
+            request,
+            reads: ScriptedReads(
+                errorLines: ["web": ["boom"]], servers: [server(exitCode: 1, phase: .crashed)]),
+            boundary: { _ in false },
+            amend: { record, answer, boundary in
+                #expect(answer.newErrorLines)
+                #expect(!boundary)
+                record.antigravity = counts
+            })
+        #expect(
+            crashed.text
+                == fenced("web: crashed (was running); exit 1; run: directa why web", "  err: boom"))
+        #expect(crashed.newErrorLines)
+        let saved = try #require(HookSnapshotStore.load(fileKey: key, directory: directory))
+        #expect(saved.antigravity == counts)
+        #expect(saved.projects?["/a"]?.shownErrorLines == ["web": ["boom"]])
+    }
+
+    @Test func eachCheckoutIsComparedWithItsOwnLastPicture() {
+        let first = outcome(from: nil, to: [server()], project: "/a")
+        let elsewhere = outcome(
+            from: nil, to: [server(name: "api", port: 4000)], project: "/b", stored: first.record)
+        let back = outcome(
+            from: nil, to: [server(phase: .starting)], project: "/a", stored: elsewhere.record)
+        #expect(back.text == fenced("web: starting (was running)"))
+        #expect(Set(back.record.projects?.keys ?? [:].keys) == ["/a", "/b"])
+        #expect(
+            back.record.projects?["/b"]?.picture == HookChange.picture(of: [server(name: "api", port: 4000)]))
+    }
+
+    /** A session boundary (a new or compacted conversation) forgets what the
+        agent was shown about every other checkout, so coming back to one of
+        them speaks its full summary rather than a diff against a stale picture. */
+    @Test func aBoundaryDropsThePicturesOfEveryOtherProject() {
+        let counts = AntigravityConversation(lastInitialNumSteps: 7, pullBacks: 2)
+        let elsewhere = outcome(from: nil, to: [server(name: "api", port: 4000)], project: "/b")
+        let stored = HookConversationRecord(antigravity: counts, projects: elsewhere.record.projects)
+        let boundary = outcome(from: nil, to: [server()], project: "/a", stored: stored, boundary: true)
+        #expect(boundary.text == summary(for: [server()]))
+        #expect(Set(boundary.record.projects?.keys ?? [:].keys) == ["/a"])
+        #expect(boundary.record.antigravity == counts)
+        let back = outcome(
+            from: nil, to: [server(name: "api", port: 4000)], project: "/b", stored: boundary.record)
+        #expect(back.text == summary(for: [server(name: "api", port: 4000)]))
+    }
+
+    @Test func aNewCheckoutKeepsTheAntigravityCounts() {
+        let counts = AntigravityConversation(lastInitialNumSteps: 7, pullBacks: 2)
+        let stored = record([server()], project: "/a", antigravity: counts)
+        let result = outcome(from: nil, to: [server()], project: "/b", stored: stored)
+        #expect(result.record.antigravity == counts)
+        #expect(result.record.projects?["/a"] == stored.projects?["/a"])
+    }
+
+    @Test func concurrentCallsOnOneRecordSpeakExactlyOnce() async throws {
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        /** The slow status answer widens the window a second caller would
+            load the same stored record in. */
+        let reads = ScriptedReads(delay: .milliseconds(25), servers: [server()])
+        let request = HookSpeaker.Request(
+            directory: directory, fileKey: "claude-s1", harness: .neutral, project: "/proj")
+        let spoke = await withTaskGroup(of: Bool.self) { group in
+            for _ in 0..<8 {
+                group.addTask {
+                    await HookSpeaker.speak(request, reads: reads, boundary: { _ in false }).text != nil
+                }
+            }
+            return await group.reduce(0) { $0 + ($1 ? 1 : 0) }
+        }
+        #expect(spoke == 1)
+    }
+
+    @Test func aHeldRecordLockGivesWayAfterItsTimeoutRatherThanHangingTheHook() async throws {
+        let directory = try TemporaryTree.directory(named: "snapshots")
+        let ran = await HookSnapshotStore.exclusively(fileKey: "claude-s1", directory: directory) {
+            await HookSnapshotStore.exclusively(
+                fileKey: "claude-s1", directory: directory, timeout: .milliseconds(50)
+            ) { "inner" }
+        }
+        #expect(ran == "inner")
     }
 
     @Test func antigravityNotesStepsAndStopsPullingBack() {
-        var record = HookConversationRecord(picture: HookChange.picture(of: [server()]))
+        var record = HookConversationRecord()
         let first = HookPayload.parse(Data(#"{"initialNumSteps":1}"#.utf8))
         #expect(AntigravityAdapter.isBoundary(payload: first, prior: nil))
         #expect(

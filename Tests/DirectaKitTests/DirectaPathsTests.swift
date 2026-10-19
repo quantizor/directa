@@ -129,6 +129,33 @@ import Testing
         #expect(canonicalProjectPath(recorded) == recorded)
     }
 
+    /** A removed worktree makes `currentDirectoryPath` answer "": a relative
+        path then has no absolute spelling, and the ancestor walk over a
+        relative URL never reaches "/". It comes back as written instead. The
+        gone directory is passed in, since a test cannot remove the process's
+        own. */
+    @Test func aRelativePathFromAGoneCurrentDirectoryTerminatesAsWritten() {
+        #expect(canonicalProjectPath(".", currentDirectory: "") == ".")
+        #expect(canonicalProjectPath("", currentDirectory: "") == "")
+        #expect(canonicalProjectPath("../a/b", currentDirectory: "") == "../a/b")
+    }
+
+    @Test func aRelativePathResolvesAgainstTheCurrentDirectory() throws {
+        let base = try TemporaryTree.directory(named: "canonical-relative")
+        let project = base.appending(path: "proj")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let recorded = canonicalProjectPath(project.path)
+        #expect(canonicalProjectPath(".", currentDirectory: recorded) == recorded)
+        #expect(canonicalProjectPath("", currentDirectory: recorded) == recorded)
+        #expect(canonicalProjectPath("gone/..", currentDirectory: recorded) == recorded)
+        #expect(canonicalProjectPath("gone/deep", currentDirectory: recorded) == recorded + "/gone/deep")
+    }
+
+    @Test func theLiveCurrentDirectoryStillTerminates() {
+        #expect(canonicalProjectPath(".").hasPrefix("/"))
+        #expect(canonicalProjectPath("").hasPrefix("/"))
+    }
+
     @Test func aPathWithNoExistingAncestorBelowTheRootStaysAsWritten() {
         let path = "/directa-nonexistent-\(UUID().uuidString)/a/b"
         #expect(canonicalProjectPath(path) == path)

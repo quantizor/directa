@@ -156,6 +156,17 @@ struct RestartSession: Sendable {
         throw Self.gaveUp(lastLoss)
     }
 
+    /** The `not-found` for a target the daemon no longer reports, naming the
+        other registered projects that define it when one machine-wide read
+        answers. */
+    private func notFound(_ name: String) async -> WireError {
+        let everywhere = try? await requester.status(
+            ProjectParams(name: name, project: ""),
+            responseTimeoutSeconds: ProjectConfigLoader.notFoundLookupSeconds)
+        return ProjectConfigLoader.serverNotFound(
+            name: name, project: params.project, everywhere: everywhere)
+    }
+
     private func act(after: ServerListResult, livePids: [String: Int], targets: [String]) async throws
         -> GroupResult
     {
@@ -164,7 +175,8 @@ struct RestartSession: Sendable {
         var results: [EnsureResult] = []
         for name in targets {
             guard let status = byName[name] else {
-                throw ProjectConfigLoader.serverNotFound(name: name, project: params.project)
+                let failure = await notFound(name)
+                throw failure
             }
             switch Self.action(before: livePids[name], after: status) {
             case .restartAgain:

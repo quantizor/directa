@@ -4,6 +4,48 @@ import Foundation
     one place so the pause loop, the lock gate, and the identity check cannot
     disagree about which servers declare a resource or where its state lives. */
 public enum LockResource {
+    /** The environment variable a guarded command reads to learn which locks
+        already serialize it. */
+    public static let environmentKey = "DIRECTA_LOCKS"
+
+    /** The identity of one lock: the project's canonical path and the resource,
+        the form the daemon keys its holds on and `DIRECTA_LOCKS` lists. */
+    public static func key(project: String, resource: String) -> String {
+        "\(canonicalProjectPath(project))::\(resource)"
+    }
+
+    /** The `DIRECTA_LOCKS` value for a command run under `held`: any value the
+        caller inherited (a lock this run already sits inside) followed by
+        `held`, comma-joined. */
+    public static func exportedValue(inherited: String?, held: String) -> String {
+        guard let inherited, !inherited.isEmpty else { return held }
+        return "\(inherited),\(held)"
+    }
+
+    /** Whether `inherited` (a `DIRECTA_LOCKS` value) already lists `key`. A
+        project path may hold a comma, so the key is matched whole between the
+        separators rather than by splitting the list. */
+    public static func isHeld(inherited: String?, key: String) -> Bool {
+        guard let inherited, !inherited.isEmpty else { return false }
+        return inherited == key || inherited.hasPrefix("\(key),") || inherited.hasSuffix(",\(key)")
+            || inherited.contains(",\(key),")
+    }
+
+    /** The refusal for a resource name the `DIRECTA_LOCKS` list could not hold:
+        keys are joined with `,` and a key joins path and name with `::`, so a
+        name carrying either could not be split back apart. The hint is the
+        same command with those characters replaced by `-`. */
+    public static func nameError(_ resource: String) -> WireError? {
+        guard resource.contains(",") || resource.contains("::") else { return nil }
+        let suggested = resource.replacingOccurrences(of: "::", with: "-")
+            .replacingOccurrences(of: ",", with: "-")
+        return WireError(
+            code: .usage,
+            hint: "run: directa lock \(ShellWord.argument(suggested)) -- <command>",
+            message:
+                "lock resource name '\(resource)' cannot contain ',' or '::', because the list of held locks (DIRECTA_LOCKS) joins keys with them and could not be split back apart; rename the resource in devservers.json and here")
+    }
+
     public static func declares(resource: String, spec: ServerSpec) -> Bool {
         (spec.locks ?? []).contains { $0.name == resource }
     }

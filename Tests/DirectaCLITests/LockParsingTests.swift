@@ -85,4 +85,16 @@ import Testing
     @Test func aPresentCommandProducesNoUsageError() {
         #expect(Lock.usageError(command: ["true"], resource: "d1") == nil)
     }
+
+    /** `DIRECTA_LOCKS` joins keys with `,` and a key joins path and name with
+        `::`, so a name holding either is refused before anything is asked of
+        the daemon, with a corrected name as the hint's command. */
+    @Test func aResourceNameThatCannotBeListedIsAUsageError() throws {
+        let comma = try #require(Lock.usageError(command: ["true"], resource: "a,b"))
+        #expect(comma.code == .usage)
+        #expect(comma.hint == "run: directa lock a-b -- <command>")
+        let colons = try #require(Lock.usageError(command: ["true"], resource: "a::b"))
+        #expect(colons.hint == "run: directa lock a-b -- <command>")
+        #expect(colons.message.contains("'a::b'"))
+    }
 }

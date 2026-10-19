@@ -43,77 +43,194 @@ public enum EffectiveHealthcheck: Equatable, Sendable {
 /** Seam for tests: the supervisor's health loop asks this, and unit tests inject
     a scripted prober instead of a real network. */
 public protocol HealthProber: Sendable {
-    func probe(_ check: EffectiveHealthcheck) async -> Bool
+    func probe(_ check: EffectiveHealthcheck) async -> HealthProbeOutcome
+}
+
+/** One probe's answer: whether it passed and, when it did not, a short plain
+    reason in directa's own words (never text the server sent). */
+public struct HealthProbeOutcome: Equatable, Sendable {
+    public var detail: String?
+    public var passed: Bool
+
+    public init(detail: String? = nil, passed: Bool) {
+        self.detail = detail
+        self.passed = passed
+    }
+
+    public static let pass = HealthProbeOutcome(passed: true)
+
+    public static func fail(_ detail: String) -> HealthProbeOutcome {
+        HealthProbeOutcome(detail: detail, passed: false)
+    }
 }
 
 public struct NetworkHealthProber: HealthProber {
     /** Dedicated ephemeral session so probes do not share URLSession.shared
-        caches or the default 60s resource timeout. */
-    private static let session: URLSession = {
+        caches. Its timeouts sit at the ceiling `timeoutMs` may take, because
+        a session-wide resource timeout caps every request below whatever its
+        own `timeoutInterval` asks (a 10s `timeoutMs` once failed at 5s);
+        `probe` enforces the configured bound itself.
+        The session keeps no HTTP cache and every request ignores cached
+        answers. A cached 200 would answer the probe without a connect, which
+        reports a server healthy when nothing is listening on its port. */
+    static let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 5
-        config.timeoutIntervalForResource = 5
+        let ceiling = Double(HealthCheckSpec.durationRange.upperBound) / 1000
+        config.timeoutIntervalForRequest = ceiling
+        config.timeoutIntervalForResource = ceiling
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.waitsForConnectivity = false
         return URLSession(configuration: config, delegate: RedirectStopper.shared, delegateQueue: nil)
     }()
 
-    public init() {}
+    /** Where the TCP connect waits, so a slow healthcheck never queues ahead
+        of the `system` lane's launchctl, lsof, and ps calls. */
+    let lane: BlockingLane
 
-    public func probe(_ check: EffectiveHealthcheck) async -> Bool {
+    public init() {
+        self.init(lane: .health)
+    }
+
+    init(lane: BlockingLane) {
+        self.lane = lane
+    }
+
+    public func probe(_ check: EffectiveHealthcheck) async -> HealthProbeOutcome {
         switch check {
         case .none:
             /** Stabilization timing lives in the monitor loop; the probe itself
                 only answers "is the process still the thing we care about", which
                 the supervisor already knows. */
-            return true
+            return .pass
         case .http(let url, let timeoutMs):
-            guard let parsed = URL(string: url) else { return false }
-            var request = URLRequest(url: parsed)
-            request.timeoutInterval = Double(timeoutMs) / 1000
-            /** *.localhost hosts resolve in browsers but not reliably in the
-                system resolver; probe loopback directly and carry the Host header
-                so vhost-aware dev servers still route. The bind stack is not
-                knowable ahead (Vite 5+ binds `::1` only), so IPv6 loopback is
-                retried when IPv4 refuses. */
-            let originalHost = parsed.host
-            if let host = originalHost, host.hasSuffix(".localhost"),
-                var components = URLComponents(url: parsed, resolvingAgainstBaseURL: false)
-            {
-                components.host = "127.0.0.1"
-                if let rewritten = components.url {
-                    request.url = rewritten
-                    request.setValue(host, forHTTPHeaderField: "Host")
-                }
-            }
-            do {
-                return try await Self.httpResponds(request)
-            } catch {
-                /** IPv4 failed; retry over IPv6 loopback carrying the same Host. */
-                guard let host = originalHost, host.hasSuffix(".localhost"),
-                    var components = URLComponents(url: parsed, resolvingAgainstBaseURL: false)
-                else { return false }
-                components.host = "[::1]"
-                guard let rewritten = components.url else { return false }
-                var v6 = URLRequest(url: rewritten)
-                v6.timeoutInterval = request.timeoutInterval
-                v6.setValue(host, forHTTPHeaderField: "Host")
-                return (try? await Self.httpResponds(v6)) ?? false
-            }
+            return await httpProbe(url: url, timeoutMs: Self.bounded(timeoutMs))
         case .tcp(let port, let timeoutMs):
             /** The connect waits in `poll(2)` for up to the configured timeout. */
-            return await BlockingLane.system.run {
-                LoopbackProbe.isListening(port: port, timeoutMs: timeoutMs)
+            let bounded = Self.bounded(timeoutMs)
+            let outcome = await lane.run {
+                LoopbackProbe.probe(port: port, timeoutMs: bounded)
             }
+            switch outcome {
+            case .listening: return .pass
+            case .refused: return .fail(Self.refusedDetail)
+            case .timedOut: return .fail(Self.timedOutDetail(timeoutMs: bounded))
+            case .failed: return .fail(Self.unreachableDetail)
+            }
+        }
+    }
+
+    private static let refusedDetail = "connection refused"
+    private static let unreachableDetail = "could not connect"
+    private static let noAnswerDetail = "no valid answer"
+
+    /** Config validation keeps `timeoutMs` inside `HealthCheckSpec.durationRange`;
+        a spec that skipped it is held to the same range here. */
+    private static func bounded(_ timeoutMs: Int) -> Int {
+        min(max(timeoutMs, HealthCheckSpec.durationRange.lowerBound), HealthCheckSpec.durationRange.upperBound)
+    }
+
+    /** "10s" for whole seconds, "0.5s" otherwise. */
+    private static func timedOutDetail(timeoutMs: Int) -> String {
+        let seconds = timeoutMs.isMultiple(of: 1000) ? "\(timeoutMs / 1000)" : "\(Double(timeoutMs) / 1000)"
+        return "timed out after \(seconds)s"
+    }
+
+    private func httpProbe(url: String, timeoutMs: Int) async -> HealthProbeOutcome {
+        guard let parsed = URL(string: url) else { return .fail("invalid URL") }
+        let clock = ContinuousClock()
+        let began = clock.now
+        var request = URLRequest(url: parsed)
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        /** `*.localhost` is probed at loopback because App Transport Security
+            refuses plain http to `*.localhost` (error -1022), with or without an
+            embedded Info.plist, while it allows the literal loopback addresses and
+            bare `localhost`. The Host header keeps vhost-aware dev servers
+            routing. The bind stack is not
+            knowable ahead (Vite 5+ binds `::1` only), so IPv6 loopback is
+            tried when IPv4 refuses the connection, and only then. */
+        let localhostName = parsed.host.flatMap { $0.hasSuffix(".localhost") ? $0 : nil }
+        if let localhostName, let rewritten = Self.rewrite(parsed, host: "127.0.0.1") {
+            request.url = rewritten
+            request.setValue(localhostName, forHTTPHeaderField: "Host")
+        }
+        let first = await Self.send(request, timeoutMs: timeoutMs)
+        guard case .refused = first, let localhostName, let rewritten = Self.rewrite(parsed, host: "[::1]")
+        else { return Self.outcome(first, timeoutMs: timeoutMs) }
+        /** One bound for the whole probe: the retry gets what the first
+            attempt left. */
+        let (seconds, attoseconds) = began.duration(to: clock.now).components
+        let spentMs = Int(seconds) * 1000 + Int(attoseconds / 1_000_000_000_000_000)
+        var v6 = URLRequest(url: rewritten)
+        v6.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        v6.setValue(localhostName, forHTTPHeaderField: "Host")
+        let second = await Self.send(v6, timeoutMs: max(1, timeoutMs - spentMs))
+        return Self.outcome(second, timeoutMs: timeoutMs)
+    }
+
+    private static func rewrite(_ url: URL, host: String) -> URL? {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        components.host = host
+        return components.url
+    }
+
+    private enum Answer {
+        case answered(status: Int)
+        case failed
+        case noValidAnswer
+        case refused
+        case timedOut
+    }
+
+    private static func outcome(_ answer: Answer, timeoutMs: Int) -> HealthProbeOutcome {
+        switch answer {
+        case .answered(let status): (200..<400).contains(status) ? .pass : .fail("HTTP \(status)")
+        case .failed: .fail(unreachableDetail)
+        case .noValidAnswer: .fail(noAnswerDetail)
+        case .refused: .fail(refusedDetail)
+        case .timedOut: .fail(timedOutDetail(timeoutMs: timeoutMs))
+        }
+    }
+
+    /** One request raced against the whole-probe deadline. The request's own
+        timeout only bounds the wait between bytes, so a server trickling its
+        answer could outlast `timeoutMs`; the race ends the probe at the
+        deadline whatever the connection is doing. */
+    private static func send(_ request: URLRequest, timeoutMs: Int) async -> Answer {
+        var timed = request
+        timed.timeoutInterval = Double(timeoutMs) / 1000
+        let prepared = timed
+        return await withTaskGroup(of: Answer.self) { group in
+            group.addTask { await answer(to: prepared) }
+            group.addTask {
+                guard (try? await Task.sleep(for: .milliseconds(timeoutMs))) != nil else { return .failed }
+                return .timedOut
+            }
+            let first = await group.next() ?? .failed
+            group.cancelAll()
+            return first
         }
     }
 
     /** A 3xx IS a healthy answer (login redirects abound in dev apps);
         following it would re-enter hostname resolution the loopback rewrite
         just avoided, so redirects never get followed. */
-    private static func httpResponds(_ request: URLRequest) async throws -> Bool {
-        let (_, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else { return false }
-        return (200..<400).contains(http.statusCode)
+    private static func answer(to request: URLRequest) async -> Answer {
+        do {
+            let (_, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return .noValidAnswer }
+            return .answered(status: http.statusCode)
+        } catch let error as URLError {
+            switch error.code {
+            case .cannotConnectToHost: return .refused
+            case .timedOut: return .timedOut
+            case .badServerResponse, .cannotParseResponse, .networkConnectionLost, .zeroByteResource:
+                return .noValidAnswer
+            default: return .failed
+            }
+        } catch {
+            return .failed
+        }
     }
 
     /** Refuses redirect-following so the probe judges the first response. */
@@ -149,14 +266,7 @@ public enum PortGuard {
         Reading only the first pid reports a single owner for that case and hides
         the ambiguity that makes a health signal untrustworthy. */
     public static func listenerPids(port: Int) -> [Int] {
-        guard let output = shell("/usr/sbin/lsof", ["-nP", "-tiTCP:\(port)", "-sTCP:LISTEN"])
-        else { return [] }
-        var pids: [Int] = []
-        for line in output.split(separator: "\n") {
-            guard let pid = Int(line.trimmingCharacters(in: .whitespaces)) else { continue }
-            if !pids.contains(pid) { pids.append(pid) }
-        }
-        return pids
+        answeredListenerPids(port: port) ?? []
     }
 
     /** The command behind a pid, for naming a holder in an error. */

@@ -65,8 +65,20 @@ struct GlobalOptions: ParsableArguments {
             }
             return canonicalProjectPath(project)
         }
-        return Self.resolveProject(from: FileManager.default.currentDirectoryPath)
+        guard let resolved = Self.resolveProject(from: FileManager.default.currentDirectoryPath) else {
+            CLIRunner.fail(Self.goneWorkingDirectory, json: json)
+        }
+        return resolved
     }
+
+    /** `FileManager.currentDirectoryPath` answers "" once the current
+        directory is removed (a deleted worktree), and no project can be named
+        from nowhere. */
+    static let goneWorkingDirectory = WireError(
+        code: .usage, hint: "run: directa status --all",
+        message:
+            "the current directory no longer exists (was a worktree removed?), so directa cannot tell which project you mean; "
+            + "change into an existing project directory, or pass --project with its path")
 
     /** A timeout option's seconds, or the usage failure for a bad value. */
     func seconds(_ option: TimeoutOption, flag: String = "--timeout") -> Double {
@@ -80,12 +92,19 @@ struct GlobalOptions: ParsableArguments {
 
     /** One walk up from `cwd`: it answers the first directory holding a
         devservers.json or rooting a linked worktree, and remembers the nearest
-        `.git` on the way for when neither turns up. */
-    static func resolveProject(from cwd: String) -> String {
+        `.git` on the way for when neither turns up. Nil when `cwd` is not an
+        existing absolute directory (a gone current directory reads as ""):
+        a relative URL never reaches the root, so the walk would spin. The
+        walk is also bounded by `cwd`'s own depth. A hook takes the nil as
+        its cue to stay silent. */
+    static func resolveProject(from cwd: String) -> String? {
         let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard cwd.hasPrefix("/"), fm.fileExists(atPath: cwd, isDirectory: &isDirectory), isDirectory.boolValue
+        else { return nil }
         var nearestGitRoot: URL?
         var probe = URL(fileURLWithPath: cwd)
-        while true {
+        for _ in 0...probe.pathComponents.count {
             if fm.fileExists(atPath: probe.appending(path: "devservers.json").path)
                 || CheckoutIdentity.linkedWorktreeGitDir(of: probe.path) != nil
             {
@@ -107,6 +126,17 @@ struct GlobalOptions: ParsableArguments {
 enum CLIRunner {
     static func client() -> DaemonClient {
         DaemonClient(socketPath: DirectaPaths.fromEnvironment().socketPath)
+    }
+
+    /** The `not-found` for a name `project` lacks, with the other registered
+        projects that define it read in one machine-wide status query. The
+        lookup only sharpens the hint, so a failed one answers as if no other
+        project had the name rather than hiding the not-found. */
+    static func serverNotFound(name: String, project: String) async -> WireError {
+        let everywhere = try? await client().request(
+            .serverStatus, params: ProjectParams(name: name, project: ""), expecting: ServerListResult.self,
+            responseTimeoutSeconds: ProjectConfigLoader.notFoundLookupSeconds)
+        return ProjectConfigLoader.serverNotFound(name: name, project: project, everywhere: everywhere)
     }
 
     static func stdinData() -> Data {
@@ -236,23 +266,50 @@ enum CLIRunner {
     static let restoreWaitBudget = Duration.seconds(30)
     static let restorePollInterval = Duration.milliseconds(250)
 
-    private static func awaitingRestore<R: Codable & Sendable>(
+    /** `daemon-starting` is also how the daemon refuses a request for one
+        server whose surviving process it has not yet decided about, long
+        after restore finished. Only a daemon that says it is still restoring
+        is waited on: `daemon.info` answers while restoring, so a daemon that
+        answers without the restoring flag is serving, the refusal is about
+        one server, and waiting would only turn its message into a bare
+        "unreachable". An unanswered `daemon.info` keeps the wait. */
+    static func refusalIsPerServer(info: DaemonInfo?) -> Bool {
+        guard let info else { return false }
+        return info.restoring != true
+    }
+
+    private static func liveDaemonInfo() async -> DaemonInfo? {
+        try? await client().request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
+    }
+
+    static func awaitingRestore<R: Codable & Sendable>(
+        budget: Duration = restoreWaitBudget,
+        pollInterval: Duration = restorePollInterval,
+        readInfo: (() async -> DaemonInfo?)? = nil,
         _ body: (DaemonClient) async throws -> R
     ) async throws -> R {
-        let deadline = ContinuousClock.now.advanced(by: restoreWaitBudget)
+        let readInfo = readInfo ?? liveDaemonInfo
+        let deadline = ContinuousClock.now.advanced(by: budget)
         var announced = false
         while true {
             do {
                 return try await body(client())
             } catch let error as WireError where error.code == .daemonStarting {
                 guard ContinuousClock.now < deadline else { throw error }
+                let info = await readInfo()
+                if refusalIsPerServer(info: info) {
+                    /** Restore may have finished between the refusal and the
+                        info read, in which case the same request now goes
+                        through; one immediate retry tells the two apart. */
+                    return try await body(client())
+                }
                 if !announced {
                     announced = true
                     notice(CLINotice.daemonRestoring)
                 }
                 /** A cancelled sleep just re-checks the deadline on the next
                     pass, so the loop still terminates and nothing is lost. */
-                try? await Task.sleep(for: restorePollInterval)
+                try? await Task.sleep(for: pollInterval)
             }
         }
     }
@@ -280,17 +337,35 @@ enum CLIRunner {
         if let spawn = status.spawnError {
             parts.append("spawn failed: \(spawn.message)")
         }
+        /** The phase can read `running` while the latest checks fail, so the
+            failing check is named beside it. */
+        if let note = status.lastHealthCheck?.failureNote {
+            parts.append(note)
+        }
         parts.append("log \(status.logPath)")
         return parts.joined(separator: "  ·  ")
     }
 
+    /** What a timeout that caught the server still starting says: it is not
+        failed, and the command that keeps waiting. Nil for every other
+        outcome. */
+    static func stillStartingNote(_ result: EnsureResult, name: String) -> String? {
+        guard result.reason == .timeout, result.server.phase == .starting else { return nil }
+        return "still starting, not failed; to keep waiting: directa wait \(ShellWord.argument(name)) --timeout <seconds>"
+    }
+
     /** One line per server of a group result (`up`, `restart`, `switch`): the
         server's line, with a `FELL SHORT` suffix naming the reason when the
-        server did not reach the asked state. */
+        server did not reach the asked state, and the still-starting note after
+        a timeout that caught it mid-start. */
     static func describeGroup(_ results: [EnsureResult]) -> String {
         results.map { entry in
-            entry.reason.map { "\(describe(entry.server))  ·  FELL SHORT (\($0.rawValue))" }
-                ?? describe(entry.server)
+            guard let reason = entry.reason else { return describe(entry.server) }
+            var line = "\(describe(entry.server))  ·  FELL SHORT (\(reason.rawValue))"
+            if let note = stillStartingNote(entry, name: entry.server.server) {
+                line += "  ·  \(note)"
+            }
+            return line
         }.joined(separator: "\n")
     }
 }
@@ -393,14 +468,21 @@ struct Ensure: AsyncParsableCommand {
                 .serverEnsure, params: params, expecting: EnsureResult.self,
                 operationTimeoutSeconds: timeout)
         }
-        CLIRunner.emit(result, json: global.json) { r in
-            var text = CLIRunner.describe(r.server)
-            if let reason = r.reason { text = "ensure fell short (\(reason.rawValue))\n" + text }
-            return text
-        }
+        CLIRunner.emit(result, json: global.json) { Self.humanText($0, name: name) }
         if result.reason != nil {
             Foundation.exit(1)
         }
+    }
+
+    /** The server's line, led by the falls-short line and followed by the
+        still-starting note when a timeout caught the server mid-start. */
+    static func humanText(_ result: EnsureResult, name: String) -> String {
+        guard let reason = result.reason else { return CLIRunner.describe(result.server) }
+        var text = "ensure fell short (\(reason.rawValue))\n" + CLIRunner.describe(result.server)
+        if let note = CLIRunner.stillStartingNote(result, name: name) {
+            text += "\nhint: \(note)"
+        }
+        return text
     }
 }
 
@@ -438,13 +520,22 @@ struct Wait: AsyncParsableCommand {
         }
     }
 
-    /** The falls-short line, the server, and, when a `--healthy` wait ended
-        on a crash or a stop, the command that brings the server back. */
+    /** The falls-short line, the server, and the command that moves it on: a
+        `--healthy` wait that ended on a crash or a stop names `ensure`, one
+        that timed out with the server still starting names the wait that
+        keeps waiting, and a `--stopped` wait that timed out on a failed run
+        whose process is still alive names `stop`. */
     static func humanText(_ result: EnsureResult, condition: WaitCondition, name: String) -> String {
         guard let reason = result.reason else { return CLIRunner.describe(result.server) }
         var text = "wait fell short (\(reason.rawValue))\n" + CLIRunner.describe(result.server)
         if condition == .healthy, reason == .crashed || reason == .stopped {
             text += "\nhint: directa ensure \(ShellWord.argument(name))"
+        }
+        if condition == .healthy, let note = CLIRunner.stillStartingNote(result, name: name) {
+            text += "\nhint: \(note)"
+        }
+        if condition == .stopped, reason == .timeout, result.server.phase == .failed, result.server.hasLiveRun {
+            text += "\nhint: directa stop \(ShellWord.argument(name))"
         }
         return text
     }
@@ -551,13 +642,13 @@ struct Status: AsyncParsableCommand {
             try await client.request(.serverStatus, params: params, expecting: ServerListResult.self)
         }
         if let name, result.servers.isEmpty {
-            CLIRunner.fail(
+            let failure =
                 all
-                    ? WireError(
-                        code: .notFound, hint: "run: directa status --all --json",
-                        message: "no server named '\(name)' is registered on this machine")
-                    : ProjectConfigLoader.serverNotFound(name: name, project: project),
-                json: global.json)
+                ? WireError(
+                    code: .notFound, hint: "run: directa status --all --json",
+                    message: "no server named '\(name)' is registered on this machine")
+                : await CLIRunner.serverNotFound(name: name, project: project)
+            CLIRunner.fail(failure, json: global.json)
         }
         /** Human mode on the empty scoped path only: one machine-wide read tells
             an empty project from an empty machine. The lookup is a hint, so a
@@ -589,7 +680,7 @@ struct Status: AsyncParsableCommand {
     after the server is already down. */
 struct Restart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Stop and re-ensure a server as one transition.")
+        abstract: "Stop a server and start it again as one step.")
 
     @Flag(help: "Restart every server in the project.")
     var all = false
@@ -1121,6 +1212,15 @@ struct HookInstall: AsyncParsableCommand {
         return .success(targets)
     }
 
+    /** The hint is the install with an absolute path in the spot the relative
+        one was, using the usual Homebrew shim path as the example. */
+    static func relativeCliPathError(_ override: String) -> WireError {
+        WireError(
+            code: .usage,
+            hint: "run: directa hook install --cli-path /opt/homebrew/bin/directa",
+            message: "--cli-path must be absolute, got '\(override)'")
+    }
+
     func run() async throws {
         let targets: Targets
         switch Self.resolveTargets(harness: harness, adapters: harnessAdapters()) {
@@ -1130,12 +1230,7 @@ struct HookInstall: AsyncParsableCommand {
             targets = resolved
         }
         if let override = cliPath, !override.hasPrefix("/") {
-            CLIRunner.fail(
-                WireError(
-                    code: .usage,
-                    hint: "pass an absolute path, e.g. --cli-path /opt/homebrew/bin/directa",
-                    message: "--cli-path must be absolute, got '\(override)'"),
-                json: global.json)
+            CLIRunner.fail(Self.relativeCliPathError(override), json: global.json)
         }
         let cliPath = cliPath ?? CLISelf.path
         let result = HarnessBatch.run(targets.install) { try $0.install(cliPath: cliPath) }
@@ -1274,8 +1369,14 @@ private func deliverAntigravity(continueOnNewErrors: Bool) async throws {
     let payload = HookPayload.parse(CLIRunner.stdinData())
     let environment = ProcessInfo.processInfo.environment
     var pull = false
+    guard let project = GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)) else {
+        /** A gone session directory names no project: the harness still
+            reads an envelope from this hook, so it gets an empty one. */
+        HookOutput.write(HookOutput.Antigravity(injectSteps: [], terminationBehavior: nil))
+        return
+    }
     await HookSpeak.deliver(
-        project: GlobalOptions.resolveProject(from: HookSessionCwd.resolve(payload)),
+        project: project,
         harness: .antigravity,
         fileKey: AntigravityAdapter.conversationFileKey(payload: payload),
         environment: environment,
@@ -1305,9 +1406,12 @@ private func deliverClaude(event: String, boundary: Bool) async throws {
         HookPayloadGate.claudeHookShouldEmit(
             payload, cursorHookInstalled: { CursorAdapter().hookState().isLive })
     else { return }
+    guard
+        let project = GlobalOptions.resolveProject(
+            from: HookSessionCwd.resolve(payload, environment: environment))
+    else { return }
     await HookSpeak.deliver(
-        project: GlobalOptions.resolveProject(
-            from: HookSessionCwd.resolve(payload, environment: environment)),
+        project: project,
         harness: .claude,
         fileKey: ClaudeCodeAdapter.conversationFileKey(payload: payload, environment: environment),
         environment: environment,
@@ -1323,9 +1427,12 @@ private func deliverClaude(event: String, boundary: Bool) async throws {
 private func deliverCursor(boundary: Bool) async throws {
     let payload = HookPayload.parse(CLIRunner.stdinData())
     let environment = ProcessInfo.processInfo.environment
+    guard
+        let project = GlobalOptions.resolveProject(
+            from: HookSessionCwd.resolve(payload, environment: environment))
+    else { return }
     await HookSpeak.deliver(
-        project: GlobalOptions.resolveProject(
-            from: HookSessionCwd.resolve(payload, environment: environment)),
+        project: project,
         harness: .cursor,
         fileKey: CursorAdapter.conversationFileKey(payload: payload),
         environment: environment,
@@ -1340,9 +1447,12 @@ private func deliverGrok() async throws {
     let environment = ProcessInfo.processInfo.environment
     guard GrokHookEvent.parse(environment["GROK_HOOK_EVENT"]).deliversContext else { return }
     let payload = HookPayload.parse(CLIRunner.stdinData())
+    guard
+        let project = GlobalOptions.resolveProject(
+            from: HookSessionCwd.resolve(payload, environment: environment))
+    else { return }
     await HookSpeak.deliver(
-        project: GlobalOptions.resolveProject(
-            from: HookSessionCwd.resolve(payload, environment: environment)),
+        project: project,
         harness: .grok,
         fileKey: GrokAdapter.conversationFileKey(payload: payload, environment: environment),
         environment: environment,
@@ -1364,7 +1474,7 @@ struct Statusline: AsyncParsableCommand {
     func run() async throws {
         let payload = HookPayload.parse(CLIRunner.stdinData())
         let cwd = payload?.workspaceCurrentDir ?? payload?.cwd ?? FileManager.default.currentDirectoryPath
-        let project = GlobalOptions.resolveProject(from: cwd)
+        guard let project = GlobalOptions.resolveProject(from: cwd) else { return }
         let client = CLIRunner.client()
         guard
             let list = try? await client.request(
@@ -1522,29 +1632,18 @@ struct Open: AsyncParsableCommand {
             try await client.request(.serverStatus, params: params, expecting: ServerListResult.self)
         }
         guard let server = result.servers.first else {
-            CLIRunner.fail(
-                ProjectConfigLoader.serverNotFound(name: name, project: params.project), json: global.json)
+            let failure = await CLIRunner.serverNotFound(name: name, project: params.project)
+            CLIRunner.fail(failure, json: global.json)
         }
         var target = server.url
         if let head {
             guard let headURL = server.heads?[head] else {
-                let known = (server.heads ?? [:]).keys.sorted().joined(separator: ", ")
-                CLIRunner.fail(
-                    WireError(
-                        code: .notFound,
-                        hint: known.isEmpty ? "this server declares no heads" : "known heads: \(known)",
-                        message: "no head named '\(head)' on \(name)"),
-                    json: global.json)
+                CLIRunner.fail(OpenFailure.headNotFound(head: head, server: server), json: global.json)
             }
             target = headURL
         }
         guard let url = target else {
-            CLIRunner.fail(
-                WireError(
-                    code: .usage,
-                    hint: "add a port, url, or heads to \(name) in devservers.json",
-                    message: "\(name) has no URL (no port declared and no url configured)"),
-                json: global.json)
+            CLIRunner.fail(OpenFailure.noURL(server: server, code: .usage), json: global.json)
         }
         await LaunchdAdmin.shell("/usr/bin/open", [url])
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in "opened \(url)" }
@@ -1567,14 +1666,20 @@ struct Link: AsyncParsableCommand {
 
     @OptionGroup var global: GlobalOptions
 
+    /** The hint is the same command with a verb that exists; the message names
+        every verb. */
+    static func unknownVerbError(verb: String, name: String) -> WireError {
+        WireError(
+            code: .usage,
+            hint: "run: directa link \(DeepLinkVerb.open.rawValue) \(ShellWord.argument(name))",
+            message:
+                "unknown verb '\(verb)' (verbs: \(DeepLinkVerb.allCases.map(\.rawValue).sorted().joined(separator: ", ")))"
+        )
+    }
+
     func run() async throws {
         guard let deepVerb = DeepLinkVerb(rawValue: verb.lowercased()) else {
-            CLIRunner.fail(
-                WireError(
-                    code: .usage,
-                    hint: "verbs: \(DeepLinkVerb.allCases.map(\.rawValue).sorted().joined(separator: ", "))",
-                    message: "unknown verb '\(verb)'"),
-                json: global.json)
+            CLIRunner.fail(Self.unknownVerbError(verb: verb, name: name), json: global.json)
         }
         if head != nil, deepVerb != .open {
             CLIRunner.fail(
@@ -2438,7 +2543,7 @@ struct DaemonStop: AsyncParsableCommand {
 
     func run() async throws {
         let client = CLIRunner.client()
-        _ = try? await client.request(.daemonShutdown, params: WireEmpty(), expecting: WireEmpty.self)
+        _ = try? await client.request(.daemonShutdown, params: ShutdownParams(), expecting: WireEmpty.self)
         CLIRunner.emit(WireEmpty(), json: global.json) { _ in
             "the daemon is stopping (servers drained; directa daemon start to bring it back)"
         }
@@ -2448,7 +2553,7 @@ struct DaemonStop: AsyncParsableCommand {
 struct DaemonRestart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "restart",
-        abstract: "Drain, relaunch the daemon, and re-ensure the servers that were running.")
+        abstract: "Relaunch the daemon; running servers keep running, and any it cannot pick back up are started again.")
 
     @OptionGroup var global: GlobalOptions
 
@@ -2552,12 +2657,7 @@ struct Switch: AsyncParsableCommand {
                 json: global.json)
         }
         guard dirty.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            CLIRunner.fail(
-                WireError(
-                    code: .usage,
-                    hint: "commit your work first (directa never stashes or discards changes)",
-                    message: "the working tree has uncommitted changes"),
-                json: global.json)
+            CLIRunner.fail(Self.dirtyTreeError(project: project), json: global.json)
         }
         if !noFetch {
             print("fetching…")
@@ -2648,10 +2748,7 @@ struct Switch: AsyncParsableCommand {
             process.waitUntilExit()
             guard process.terminationStatus == 0 else {
                 CLIRunner.fail(
-                    WireError(
-                        code: .internalError,
-                        hint: "fix the failure, then run: directa up",
-                        message: "lifecycle command failed (\(process.terminationStatus)): \(argv.joined(separator: " "))"),
+                    Self.lifecycleFailureError(status: process.terminationStatus, argv: argv),
                     json: global.json)
             }
         }
@@ -2671,6 +2768,28 @@ struct Switch: AsyncParsableCommand {
         if result.results.contains(where: { $0.reason != nil }) {
             Foundation.exit(1)
         }
+    }
+
+    /** Refuses a dirty tree. The hint shows what is dirty; the message says
+        what to do about it, since no single command commits the right work. */
+    static func dirtyTreeError(project: String) -> WireError {
+        WireError(
+            code: .usage,
+            hint: "run: git -C \(ShellWord.singleQuoted(project)) status",
+            message:
+                "the working tree has uncommitted changes; commit your work first (directa never stashes or discards changes)"
+        )
+    }
+
+    /** A lifecycle command failed: the playbook stops, and `directa up` is the
+        resume once the cause is fixed. */
+    static func lifecycleFailureError(status: Int32, argv: [String]) -> WireError {
+        WireError(
+            code: .internalError,
+            hint: "run: directa up",
+            message:
+                "lifecycle command failed (\(status)): \(argv.joined(separator: " ")); fix the failure, then bring the servers up"
+        )
     }
 
     static func git(_ arguments: [String], in project: String) -> (status: Int32, output: String) {
@@ -2698,11 +2817,136 @@ struct LockAcquireSchedule: Equatable, Sendable {
         elapsed < budgetSeconds
     }
 
+    /** Whether a `resource-locked` answer is worth waiting out, given the
+        holder lookup made right after it. No answer (an older daemon without
+        lock.status, or no lookup made) keeps waiting. An answer naming nobody
+        means the holder just released or the daemon refused for another reason
+        (a `--pause` whose declarer would not stop completely), which no wait
+        clears. */
+    static func refusalIsContention(lookup: LockStatusResult?) -> Bool {
+        guard let lookup else { return true }
+        return lookup.holder != nil
+    }
+
     func shouldAnnounceStillWaiting(atElapsed elapsed: Double, lastAnnouncedElapsed: Double?)
         -> Bool
     {
         guard let last = lastAnnouncedElapsed else { return false }
         return elapsed - last >= Self.announceIntervalSeconds
+    }
+}
+
+/** The daemon calls `directa lock` makes while it waits for a resource, behind
+    a protocol so a fake can script a holder that releases between them. */
+protocol LockRequesting: Sendable {
+    func acquire() async throws -> LockResult
+    /** Nil when the daemon cannot answer (an older daemon without lock.status). */
+    func status() async -> LockStatusResult?
+}
+
+protocol LockClock: Sendable {
+    func now() async -> Date
+    func sleep(seconds: Double) async
+}
+
+struct SystemLockClock: LockClock {
+    func now() async -> Date { Date() }
+
+    func sleep(seconds: Double) async {
+        /** A cancelled sleep only shortens one retry step; the budget still
+            ends the loop. */
+        try? await Task.sleep(for: .seconds(seconds))
+    }
+}
+
+struct DaemonClientLockRequester: LockRequesting {
+    let client: DaemonClient
+    let holderPid: Int
+    let pause: Bool
+    let project: String
+    let resource: String
+    let resumeTimeoutSeconds: Double
+
+    func acquire() async throws -> LockResult {
+        try await client.request(
+            .lockAcquire,
+            params: LockParams(
+                holderPid: holderPid, pause: pause, project: project, resource: resource,
+                resumeTimeoutSeconds: resumeTimeoutSeconds),
+            expecting: LockResult.self)
+    }
+
+    func status() async -> LockStatusResult? {
+        try? await client.request(
+            .lockStatus,
+            params: LockStatusParams(project: project, resource: resource),
+            expecting: LockStatusResult.self)
+    }
+}
+
+/** The acquire wait: retry a `resource-locked` refusal until the budget runs
+    out, saying who holds the resource while it waits. */
+struct LockAcquirer: Sendable {
+    let budgetSeconds: Double
+    let clock: any LockClock
+    let notice: @Sendable (String) -> Void
+    let requester: any LockRequesting
+    let resource: String
+
+    /** Throws the last `resource-locked` refusal when the budget runs out. Any
+        other failure propagates at once. */
+    func acquire() async throws -> LockResult {
+        let schedule = LockAcquireSchedule(budgetSeconds: budgetSeconds)
+        let started = await clock.now()
+        var announcedAt: Double?
+        /** Set after a refusal that found no holder: the holder may have
+            released between the refused acquire and the lookup, so the next
+            acquire goes out at once, and a second holderless refusal ends it. */
+        var retriedHolderless = false
+        while true {
+            do {
+                return try await requester.acquire()
+            } catch let error as WireError where error.code == .resourceLocked {
+                let now = await clock.now()
+                let elapsed = now.timeIntervalSince(started)
+                let first = announcedAt == nil
+                let due =
+                    first
+                    || schedule.shouldAnnounceStillWaiting(
+                        atElapsed: elapsed, lastAnnouncedElapsed: announcedAt)
+                /** The holder is looked up only when a notice is due or to
+                    judge the retry above, not on every one-second retry. An
+                    older daemon without lock.status answers nil, which keeps
+                    the wait going in silence. */
+                var lookup: LockStatusResult?
+                if due || retriedHolderless { lookup = await requester.status() }
+                if !LockAcquireSchedule.refusalIsContention(lookup: lookup) {
+                    /** Nobody holds it, so this is no contention: either the
+                        holder just released, or it is a `--pause` whose declarer
+                        would not stop completely, which no wait clears. */
+                    guard !retriedHolderless else { throw error }
+                    retriedHolderless = true
+                    continue
+                }
+                retriedHolderless = false
+                if due, let holder = lookup?.holder {
+                    notice(
+                        first
+                            ? LockNotice.contended(
+                                budgetSeconds: budgetSeconds, holder: holder, now: now, resource: resource)
+                            : LockNotice.stillWaiting(
+                                elapsedSeconds: elapsed, holder: holder,
+                                remainingSeconds: max(budgetSeconds - elapsed, 0), resource: resource))
+                    announcedAt = elapsed
+                }
+                guard schedule.shouldRetry(afterElapsed: elapsed) else { throw error }
+                await clock.sleep(seconds: LockAcquireSchedule.retryIntervalSeconds)
+                let resumed = await clock.now()
+                guard schedule.shouldRetry(afterElapsed: resumed.timeIntervalSince(started)) else {
+                    throw error
+                }
+            }
+        }
     }
 }
 
@@ -2896,6 +3140,7 @@ struct Lock: AsyncParsableCommand {
 
     /** Pure so the exact message is asserted without spawning the CLI. */
     static func usageError(command: [String], resource: String) -> WireError? {
+        if let refused = LockResource.nameError(resource) { return refused }
         guard command.isEmpty else { return nil }
         return WireError(
             code: .usage,
@@ -2919,66 +3164,37 @@ struct Lock: AsyncParsableCommand {
             its own config by walking up from cwd, must see the same directory
             it would running unwrapped. */
         let callerCwd = FileManager.default.currentDirectoryPath
+        /** The guarded command has nowhere to run from a gone directory, even
+            with an explicit `--project`; refused before the resource is taken. */
+        guard callerCwd.hasPrefix("/") else {
+            CLIRunner.fail(GlobalOptions.goneWorkingDirectory, json: global.json)
+        }
         let project = global.resolvedProject()
+        let inheritedEnvironment = ProcessInfo.processInfo.environment
+        /** Already inside this lock's hold (a guarded script locking the same
+            resource again): the parent holds it, so the command runs at once
+            and no second acquire waits on the parent. */
+        if Self.isReentrant(inherited: inheritedEnvironment, project: project, resource: resource) {
+            Foundation.exit(
+                Self.runGuardedCommand(
+                    command, run: GuardedRun(cwd: callerCwd, environment: inheritedEnvironment)))
+        }
         let holderPid = Int(getpid())
         let client = CLIRunner.client()
         /** Acquire with patience: another harness may hold it. The daemon owns
             pause/resume of declaring servers; this CLI just runs the command. */
-        let schedule = LockAcquireSchedule(budgetSeconds: acquireTimeout)
-        let started = Date()
-        var acquired: LockResult?
-        var announcedAt: Double?
-        var lastError: WireError?
-        repeat {
-            do {
-                acquired = try await client.request(
-                    .lockAcquire,
-                    params: LockParams(
-                        holderPid: holderPid, pause: pause, project: project, resource: resource,
-                        resumeTimeoutSeconds: timeout),
-                    expecting: LockResult.self)
-                break
-            } catch let error as WireError where error.code == .resourceLocked {
-                lastError = error
-                let elapsed = Date().timeIntervalSince(started)
-                /** Only look the holder up when there is something to say. The
-                    notice fires once on first contention and then on an interval,
-                    so querying every retry would spend hundreds of round trips
-                    over a long wait to print nothing. */
-                let first = announcedAt == nil
-                let due =
-                    first
-                    || schedule.shouldAnnounceStillWaiting(
-                        atElapsed: elapsed, lastAnnouncedElapsed: announcedAt)
-                if due {
-                    /** An older daemon without lock.status degrades to silence
-                        here rather than failing the acquire. */
-                    let holder = try? await client.request(
-                        .lockStatus,
-                        params: LockStatusParams(project: project, resource: resource),
-                        expecting: LockStatusResult.self
-                    ).holder
-                    if let holder {
-                        CLIRunner.note(
-                            first
-                                ? LockNotice.contended(
-                                    budgetSeconds: acquireTimeout, holder: holder, now: Date(),
-                                    resource: resource)
-                                : LockNotice.stillWaiting(
-                                    elapsedSeconds: elapsed, holder: holder,
-                                    remainingSeconds: max(acquireTimeout - elapsed, 0),
-                                    resource: resource))
-                        announcedAt = elapsed
-                    }
-                }
-                guard schedule.shouldRetry(afterElapsed: elapsed) else { break }
-                try? await Task.sleep(for: .seconds(LockAcquireSchedule.retryIntervalSeconds))
-            }
-        } while schedule.shouldRetry(afterElapsed: Date().timeIntervalSince(started))
-        guard let acquired else {
-            CLIRunner.fail(
-                lastError ?? WireError(code: .resourceLocked, message: "could not acquire '\(resource)'"),
-                json: global.json)
+        let acquirer = LockAcquirer(
+            budgetSeconds: acquireTimeout, clock: SystemLockClock(),
+            notice: { CLIRunner.note($0) },
+            requester: DaemonClientLockRequester(
+                client: client, holderPid: holderPid, pause: pause, project: project,
+                resource: resource, resumeTimeoutSeconds: timeout),
+            resource: resource)
+        let acquired: LockResult
+        do {
+            acquired = try await acquirer.acquire()
+        } catch let error as WireError where error.code == .resourceLocked {
+            CLIRunner.fail(error, json: global.json)
         }
         /** Progress chatter is stderr: stdout belongs to the guarded command, and
             --json governs stdout schemas. */
@@ -2993,7 +3209,13 @@ struct Lock: AsyncParsableCommand {
         /** Identity is taken before the command and again before release, so a
             resumed server's first writes are never blamed on the command. */
         let before = acquired.statePath.map(ResourceFingerprint.capture(path:))
-        let commandStatus = Self.runGuardedCommand(command, cwd: callerCwd)
+        let commandStatus = Self.runGuardedCommand(
+            command,
+            run: GuardedRun(
+                cwd: callerCwd,
+                environment: Self.guardedEnvironment(
+                    inherited: inheritedEnvironment, project: project,
+                    resource: resource)))
         var verdict = LockIdentityVerdict.silent
         if let statePath = acquired.statePath, let before {
             verdict = LockIdentityVerdict.of(
@@ -3024,14 +3246,47 @@ struct Lock: AsyncParsableCommand {
         Foundation.exit(commandStatus)
     }
 
-    /** Spawns the guarded command with inherited stdio in `cwd`, so a test can
-        assert what directory a real child process observes without acquiring a
-        resource or a live daemon. */
-    static func runGuardedCommand(_ command: [String], cwd: String) -> Int32 {
+    /** Whether the environment this run inherited already lists the lock it
+        asks for: it sits inside its own parent's hold, and acquiring again
+        would wait on that parent. */
+    static func isReentrant(inherited: [String: String], project: String, resource: String) -> Bool {
+        LockResource.isHeld(
+            inherited: inherited[LockResource.environmentKey],
+            key: LockResource.key(project: project, resource: resource))
+    }
+
+    /** Where and with what environment the guarded command runs. */
+    struct GuardedRun {
+        let cwd: String
+        let environment: [String: String]
+    }
+
+    /** The caller's environment plus `DIRECTA_LOCKS`: this lock's key appended
+        to any value already inherited, so a tool with a lock of its own for the
+        same resource can tell it is already serialized. A key the inherited
+        value already lists stays listed once. */
+    static func guardedEnvironment(
+        inherited: [String: String], project: String, resource: String
+    ) -> [String: String] {
+        guard !isReentrant(inherited: inherited, project: project, resource: resource) else {
+            return inherited
+        }
+        var environment = inherited
+        environment[LockResource.environmentKey] = LockResource.exportedValue(
+            inherited: inherited[LockResource.environmentKey],
+            held: LockResource.key(project: project, resource: resource))
+        return environment
+    }
+
+    /** Spawns the guarded command with inherited stdio in `run.cwd` and
+        `run.environment`, so a test can assert what a real child process
+        observes without acquiring a resource or a live daemon. */
+    static func runGuardedCommand(_ command: [String], run: GuardedRun) -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = command
-        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+        process.currentDirectoryURL = URL(fileURLWithPath: run.cwd)
+        process.environment = run.environment
         do {
             try process.run()
         } catch {

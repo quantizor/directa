@@ -320,10 +320,17 @@ import Testing
         let registry = Registry(paths: env.paths)
         try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
         let gate = AdoptGate()
+        /** The re-registered run waits on its own gate: sharing the first
+            run's, which stays open once signalled, would let the new run exit
+            at once and race the row read below. */
+        let freshRunGate = AdoptGate()
         let router = Router(
-            launcher: StuckRunLauncher(gate: gate), paths: env.paths, registry: registry,
-            stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
-        defer { gate.signal(.exitedStatusUnknown) }
+            launcher: StuckRunLauncher(gate: gate, laterRunsGate: freshRunGate), paths: env.paths,
+            registry: registry, stopTiming: StopTiming(graceSeconds: 0.05, overtimeSeconds: 0.1))
+        defer {
+            gate.signal(.exitedStatusUnknown)
+            freshRunGate.signal(.exitedStatusUnknown)
+        }
         let id = serverID(project: env.project, name: "web")
         let target = ServerTargetParams(name: "web", project: env.project)
 
@@ -343,6 +350,13 @@ import Testing
         #expect(row.pid == pid)
         #expect(row.resumeOnBoot == true)
         _ = try await router.attempt(.serverStop, target, ServerResult.self)
+        /** The new run's exit writes its row; waiting for it keeps that
+            write inside the test's tree. */
+        freshRunGate.signal(.signaled(signal: Int(SIGKILL)))
+        let exited = try await eventually(within: .seconds(5)) {
+            await registry.persistedState(serverID: id)?.pid == nil
+        }
+        #expect(exited, "the re-registered run never recorded its exit")
     }
 
     /** A retirement that cannot be saved (state.json refuses the write) is

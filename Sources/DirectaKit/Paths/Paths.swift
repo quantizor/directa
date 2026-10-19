@@ -264,13 +264,27 @@ public func projectSlug(_ path: String) -> String {
     vanished rest as written, so it still names the key recorded while it
     existed: Foundation resolves no link in a missing path, and even strips a
     leading `/private`, so resolving it whole would turn a recorded
-    `/private/var/...` into `/var/...`. */
+    `/private/var/...` into `/var/...`.
+
+    A relative path is made absolute against `currentDirectory` first. When
+    that directory is gone (`currentDirectoryPath` answers "" for a removed
+    worktree) a relative path has no absolute spelling, so it comes back as
+    written: an ancestor walk over a relative URL never reaches "/" and would
+    spin. The walk is also bounded by the path's own depth. */
 public func canonicalProjectPath(_ path: String) -> String {
-    let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+    canonicalProjectPath(path, currentDirectory: FileManager.default.currentDirectoryPath)
+}
+
+/** `canonicalProjectPath(_:)` against an explicit current directory, which a
+    test passes in since it cannot remove its own. */
+public func canonicalProjectPath(_ path: String, currentDirectory: String) -> String {
+    let expanded = (path as NSString).expandingTildeInPath
+    guard let absolute = absoluteProjectPath(expanded, currentDirectory: currentDirectory) else { return expanded }
+    let url = URL(fileURLWithPath: absolute)
     if let canonical = existingCanonicalPath(url) { return canonical }
     var ancestor = url.standardizedFileURL
     var vanished: [String] = []
-    while ancestor.path != "/" {
+    for _ in 0..<ancestor.pathComponents.count where ancestor.path != "/" {
         vanished.insert(ancestor.lastPathComponent, at: 0)
         ancestor = ancestor.deletingLastPathComponent()
         if let canonical = existingCanonicalPath(ancestor) {
@@ -278,6 +292,15 @@ public func canonicalProjectPath(_ path: String) -> String {
         }
     }
     return url.resolvingSymlinksInPath().standardizedFileURL.path
+}
+
+/** `path` as an absolute path: itself when it starts with "/", else joined onto
+    `currentDirectory`, nil when that directory is gone and the path has no
+    absolute spelling. */
+private func absoluteProjectPath(_ path: String, currentDirectory: String) -> String? {
+    if path.hasPrefix("/") { return path }
+    guard currentDirectory.hasPrefix("/") else { return nil }
+    return path.isEmpty ? currentDirectory : (currentDirectory as NSString).appendingPathComponent(path)
 }
 
 /** The on-disk spelling of a path that exists, nil for one that does not. */

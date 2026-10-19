@@ -1,4 +1,5 @@
 import Darwin
+import DirectaKit
 import DirectaTestSupport
 import Foundation
 import Testing
@@ -37,11 +38,86 @@ import Testing
         try inScratchDir { dir in
             let marker = dir.appending(path: "pwd.txt")
             let status = Lock.runGuardedCommand(
-                ["/bin/sh", "-c", "pwd -P > '\(marker.path)'"], cwd: dir.path)
+                ["/bin/sh", "-c", "pwd -P > '\(marker.path)'"], run: inheriting(cwd: dir.path))
             #expect(status == 0)
             let seen = try String(contentsOf: marker, encoding: .utf8)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             #expect(seen == physicalPath(dir.path))
+        }
+    }
+
+    private func inheriting(cwd: String) -> Lock.GuardedRun {
+        Lock.GuardedRun(cwd: cwd, environment: ProcessInfo.processInfo.environment)
+    }
+
+    /** What a real child sees in `DIRECTA_LOCKS`, written to a marker file for
+        the same reason as the cwd above. A key is the project's canonical
+        path, so a project spelled through a symlink reads as the path the
+        daemon keys its holds on. */
+    private func locksSeenByChild(
+        in dir: URL, inherited: String?, project: String, resource: String
+    ) throws -> String {
+        var base = ProcessInfo.processInfo.environment
+        base[LockResource.environmentKey] = inherited
+        let marker = dir.appending(path: "locks.txt")
+        let status = Lock.runGuardedCommand(
+            ["/bin/sh", "-c", "printenv DIRECTA_LOCKS > '\(marker.path)'"],
+            run: Lock.GuardedRun(
+                cwd: dir.path,
+                environment: Lock.guardedEnvironment(
+                    inherited: base, project: project, resource: resource)))
+        #expect(status == 0)
+        return try String(contentsOf: marker, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @Test func theGuardedCommandSeesTheLockItIsHeldUnder() throws {
+        try inScratchDir { dir in
+            let seen = try locksSeenByChild(
+                in: dir, inherited: nil, project: dir.path, resource: "d1")
+            #expect(seen == "\(physicalPath(dir.path))::d1")
+        }
+    }
+
+    /** A lock already held around this run stays listed ahead of the new one,
+        and an inherited empty value adds no stray comma. */
+    @Test func theLockIsAppendedToAnInheritedValue() throws {
+        try inScratchDir { dir in
+            let seen = try locksSeenByChild(
+                in: dir, inherited: "/other/checkout::cache", project: dir.path, resource: "d1")
+            #expect(seen == "/other/checkout::cache,\(physicalPath(dir.path))::d1")
+            let fromEmpty = try locksSeenByChild(
+                in: dir, inherited: "", project: dir.path, resource: "d1")
+            #expect(fromEmpty == "\(physicalPath(dir.path))::d1")
+        }
+    }
+
+    /** A run already inside the lock it asks for is passed through: the key
+        stays listed once, so a chain of re-entrant locks does not grow the
+        variable. */
+    @Test func aLockAlreadyHeldIsNotListedTwice() throws {
+        try inScratchDir { dir in
+            let held = "\(physicalPath(dir.path))::d1"
+            let seen = try locksSeenByChild(
+                in: dir, inherited: "/other::c,\(held)", project: dir.path, resource: "d1")
+            #expect(seen == "/other::c,\(held)")
+        }
+    }
+
+    /** The decision `directa lock` makes before it contacts the daemon. */
+    @Test func aLockListedInTheEnvironmentIsReentrant() throws {
+        try inScratchDir { dir in
+            let held = "\(physicalPath(dir.path))::d1"
+            func reentrant(_ inherited: String?, resource: String = "d1") -> Bool {
+                Lock.isReentrant(
+                    inherited: [LockResource.environmentKey: inherited].compactMapValues { $0 },
+                    project: dir.path, resource: resource)
+            }
+            #expect(reentrant(held))
+            #expect(reentrant("/other::c,\(held)"))
+            #expect(!reentrant(nil))
+            #expect(!reentrant("/other::c"))
+            #expect(!reentrant(held, resource: "d2"))
         }
     }
 
@@ -50,7 +126,8 @@ import Testing
             let sub = dir.appending(path: "sub")
             try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
             let marker = dir.appending(path: "pwd.txt")
-            _ = Lock.runGuardedCommand(["/bin/sh", "-c", "pwd -P > '\(marker.path)'"], cwd: sub.path)
+            _ = Lock.runGuardedCommand(
+                ["/bin/sh", "-c", "pwd -P > '\(marker.path)'"], run: inheriting(cwd: sub.path))
             let seen = try String(contentsOf: marker, encoding: .utf8)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             #expect(seen == physicalPath(sub.path))
@@ -63,7 +140,8 @@ import Testing
         directory* is what actually fails the spawn (Foundation refuses to
         chdir into it), which is the path `runGuardedCommand`'s catch reports. */
     @Test func aNonexistentWorkingDirectoryFailsTheSpawnAndReturnsOne() {
-        let status = Lock.runGuardedCommand(["true"], cwd: "/no/such/directory/at/all")
+        let status = Lock.runGuardedCommand(
+            ["true"], run: inheriting(cwd: "/no/such/directory/at/all"))
         #expect(status == 1)
     }
 }

@@ -35,3 +35,29 @@ public struct AgentJobs: Sendable {
         bootOut: { job in await LaunchdJobs.bootOut(label: job.label) },
         listChildJobs: { await BlockingLane.system.run(LaunchdJobs.listChildJobs) })
 }
+
+/** How long and how often the daemon re-reads launchd's job list after boot
+    restore left a live survivor undecided because the list gave no answer.
+    The delay before the first re-read doubles after each unanswered read up
+    to `longestDelay`, and the reads stop once `window` has passed since the
+    first one was scheduled. */
+public struct DeferredSurvivorRetry: Sendable {
+    public var firstDelay: Duration
+    public var longestDelay: Duration
+    public var window: Duration
+
+    public init(firstDelay: Duration, longestDelay: Duration, window: Duration) {
+        self.firstDelay = firstDelay
+        self.longestDelay = longestDelay
+        self.window = window
+    }
+
+    /** `launchctl list` stalls while launchd is busy at login, which clears
+        within seconds to a minute or two, so the first re-read comes quickly
+        and later ones back off to a shared ceiling rather than hammering a
+        busy launchd. Five minutes bounds the daemon's patience: a launchd
+        that stays silent that long is broken in a way another read will not
+        fix, and the next boot is the better judge. */
+    public static let standard = DeferredSurvivorRetry(
+        firstDelay: .seconds(2), longestDelay: .seconds(30), window: .seconds(300))
+}

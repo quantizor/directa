@@ -98,6 +98,92 @@ private final class RecordingAgentJobs: Sendable {
     }
 }
 
+/** An adopting launcher that counts real spawns, so a test can prove a refused
+    start never reached the launcher. `adopt` is test-controlled through
+    `gate`, as `FakeAdoptLauncher`'s is. */
+private final class SpawnCountingLauncher: ProcessLauncher {
+    let gate: AdoptGate
+    private let inner: any ProcessLauncher = SubprocessLauncher()
+    private let runs = OSAllocatedUnfairLock(initialState: 0)
+
+    init(gate: AdoptGate) {
+        self.gate = gate
+    }
+
+    var runCount: Int { runs.withLock { $0 } }
+
+    func run(
+        argv: [String], capture: SpawnCapture, cwd: String?, environment: [String: String],
+        onExitedBeforeWatch: @escaping @Sendable (pid_t?) async -> Void,
+        onSpawn: @escaping @Sendable (pid_t) async -> Void
+    ) async -> ProcessOutcome {
+        runs.withLock { $0 += 1 }
+        return await inner.run(
+            argv: argv, capture: capture, cwd: cwd, environment: environment,
+            onExitedBeforeWatch: onExitedBeforeWatch, onSpawn: onSpawn)
+    }
+
+    func prepareAdopt(pid: pid_t) -> Bool { true }
+
+    func adopt(pid: pid_t, label: String) async -> ProcessOutcome {
+        await gate.outcome()
+    }
+}
+
+/** Re-reads fast enough that a test drives the whole retry window without
+    waiting on production delays. */
+private let quickRetry = DeferredSurvivorRetry(
+    firstDelay: .milliseconds(10), longestDelay: .milliseconds(20), window: .seconds(30))
+
+/** A trusted project declaring `serversJSON` whose `web` row records `survivor`
+    as a running pid with restore intent, the shape boot restore defers when
+    launchd's job list does not answer. */
+private func seedWebSurvivor(
+    _ env: RecoverEnv, registry: Registry, serversJSON: String, survivor: pid_t
+) async throws {
+    try writeDevservers(project: env.projectPath, serversJSON: serversJSON)
+    try await registry.setTrusted(project: env.projectPath)
+    let startedAt = Date()
+    try await registry.updateState(
+        serverID: serverID(project: env.projectPath, name: "web"), writer: .router
+    ) { entry in
+        entry.phase = .running
+        entry.pid = Int(survivor)
+        entry.resumeOnBoot = true
+        entry.startedAt = startedAt
+    }
+}
+
+private let sleepingWebJSON = """
+    {
+      "web": {
+        "command": ["/bin/sh", "-c", "sleep 30"]
+      }
+    }
+    """
+
+private func ensureResponse(
+    router: Router, project: String, name: String
+) async throws -> WireResponse<EnsureResult> {
+    let line = try NDJSON.encodeLine(
+        WireRequest(
+            id: "ensure", method: WireMethod.serverEnsure.rawValue,
+            params: EnsureParams(name: name, project: project, timeoutSeconds: 5)))
+    return try JSONCoding.decoder().decode(
+        WireResponse<EnsureResult>.self, from: await router.handle(line: line))
+}
+
+private func stopResponse(
+    router: Router, project: String, name: String
+) async throws -> WireResponse<ServerResult> {
+    let line = try NDJSON.encodeLine(
+        WireRequest(
+            id: "stop", method: WireMethod.serverStop.rawValue,
+            params: ServerTargetParams(name: name, project: project)))
+    return try JSONCoding.decoder().decode(
+        WireResponse<ServerResult>.self, from: await router.handle(line: line))
+}
+
 private func logTexts(router: Router, project: String, name: String) async throws -> [String] {
     let line = try NDJSON.encodeLine(
         WireRequest(
@@ -534,6 +620,467 @@ private func logTexts(router: Router, project: String, name: String) async throw
         #expect(row?.resumeOnBoot == true)
         let events = try await eventsList(router: router, project: env.projectPath)
         #expect(events.filter { $0.kind == .crashed || $0.kind == .started }.isEmpty)
+    }
+
+    /** While launchd's job list has not answered, a survivor restore could not
+        decide about still reads as the run it is: status shows its recorded
+        phase and pid, never `stopped` with no pid, and a read does not hand
+        the survivor to any supervisor to watch or signal. */
+    @Test func aDeferredSurvivorReportsItsRecordedPhaseAndPid() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        try await seedWebSurvivor(env, registry: registry, serversJSON: sleepingWebJSON, survivor: survivor)
+        let gate = AdoptGate()
+        let launcher = SpawnCountingLauncher(gate: gate)
+        let router = Router(
+            agentJobs: RecordingAgentJobs().agentJobs(answering: [.unavailable(reason: "launchctl list timed out")]),
+            launcher: launcher, paths: env.paths, registry: registry)
+        defer { gate.signal(.exitedStatusUnknown) }
+        await router.recoverAtStartup()
+
+        for _ in 0..<3 {
+            let web = try await statusList(router: router, project: env.projectPath)
+                .first { $0.server == "web" }
+            #expect(web?.phase == .running)
+            #expect(web?.pid == Int(survivor))
+            #expect(web?.uptimeSec != nil)
+        }
+        #expect(await gate.callCount == 0)
+        #expect(launcher.runCount == 0)
+        let signaled = try await eventually(within: .milliseconds(300)) { kill(survivor, 0) != 0 }
+        #expect(!signaled, "survivor \(survivor) was signaled by a status read")
+        let row = await registry.persistedState(serverID: serverID(project: env.projectPath, name: "web"))
+        #expect(row?.pid == Int(survivor))
+        #expect(row?.phase == .running)
+    }
+
+    /** Every request that would start, restart, or stop a deferred server is
+        refused with `daemon-starting`, naming the server and its pid: starting
+        spawns a second copy beside the survivor (or fails on the port it
+        holds), and stopping would signal a process the daemon has not yet
+        proven it may. Nothing reaches the launcher and the survivor lives. */
+    @Test func aDeferredSurvivorRefusesStartAndStopWithDaemonStarting() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        try await seedWebSurvivor(env, registry: registry, serversJSON: sleepingWebJSON, survivor: survivor)
+        let gate = AdoptGate()
+        let launcher = SpawnCountingLauncher(gate: gate)
+        let router = Router(
+            agentJobs: RecordingAgentJobs().agentJobs(answering: [.unavailable(reason: "launchctl list timed out")]),
+            launcher: launcher, paths: env.paths, registry: registry)
+        defer { gate.signal(.exitedStatusUnknown) }
+        await router.recoverAtStartup()
+        /** The status read that builds the server's supervisor, as the
+            menu bar's poll does; the refusals must hold afterward too. */
+        _ = try await statusList(router: router, project: env.projectPath)
+
+        let ensure = try await ensureResponse(router: router, project: env.projectPath, name: "web")
+        #expect(!ensure.ok)
+        #expect(ensure.error?.code == .daemonStarting)
+        #expect(ensure.error?.hint == "run: directa daemon status")
+        #expect(ensure.error?.message.contains("'web'") == true)
+        #expect(ensure.error?.message.contains("pid \(survivor)") == true)
+
+        let stop = try await stopResponse(router: router, project: env.projectPath, name: "web")
+        #expect(!stop.ok)
+        #expect(stop.error?.code == .daemonStarting)
+        #expect(stop.error?.message.contains("pid \(survivor)") == true)
+
+        #expect(launcher.runCount == 0)
+        #expect(await gate.callCount == 0)
+        let signaled = try await eventually(within: .milliseconds(300)) { kill(survivor, 0) != 0 }
+        #expect(!signaled, "survivor \(survivor) was signaled by a refused request")
+        let row = await registry.persistedState(serverID: serverID(project: env.projectPath, name: "web"))
+        #expect(row?.pid == Int(survivor))
+    }
+
+    /** A deferred survivor still holds its port: another server declaring the
+        same port is refused with `port-held` naming the deferred server, even
+        after a status read built the survivor's supervisor (which reads
+        `stopped` and would otherwise hide the hold). */
+    @Test func aDeferredSurvivorStillHoldsItsPortAgainstAnotherServer() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let port = TestPorts.port(495)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        try await seedWebSurvivor(
+            env, registry: registry,
+            serversJSON: """
+                {
+                  "other": {
+                    "command": ["/bin/sh", "-c", "sleep 30"],
+                    "port": \(port)
+                  },
+                  "web": {
+                    "command": ["/bin/sh", "-c", "sleep 30"],
+                    "port": \(port)
+                  }
+                }
+                """,
+            survivor: survivor)
+        let gate = AdoptGate()
+        let launcher = SpawnCountingLauncher(gate: gate)
+        let router = Router(
+            agentJobs: RecordingAgentJobs().agentJobs(answering: [.unavailable(reason: "launchctl list timed out")]),
+            launcher: launcher, paths: env.paths, registry: registry)
+        defer { gate.signal(.exitedStatusUnknown) }
+        await router.recoverAtStartup()
+        _ = try await statusList(router: router, project: env.projectPath)
+
+        let ensure = try await ensureResponse(router: router, project: env.projectPath, name: "other")
+        #expect(!ensure.ok)
+        #expect(ensure.error?.code == .portHeld)
+        #expect(
+            ensure.error?.message
+                == "port \(port) is held by managed server 'web' in \(canonicalProjectPath(env.projectPath))")
+        #expect(launcher.runCount == 0)
+    }
+
+    /** Once launchd answers after restore, the survivor is decided the way
+        restore would have: a listed child job is adopted with its pid
+        unchanged (no spawn, no signal), re-read on a requeued timer through
+        answers that do not come, and the refusals lift. */
+    @Test func aDeferredSurvivorIsAdoptedWhenALaterJobListNamesIt() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        try await seedWebSurvivor(env, registry: registry, serversJSON: sleepingWebJSON, survivor: survivor)
+        let recorder = RecordingAgentJobs()
+        let gate = AdoptGate()
+        let launcher = SpawnCountingLauncher(gate: gate)
+        let unavailable = LaunchdJobs.ChildJobListing.unavailable(reason: "launchctl list timed out")
+        let router = Router(
+            agentJobs: recorder.agentJobs(answering: [
+                unavailable, unavailable, unavailable,
+                .listed([LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-deferred", pid: survivor)]),
+            ]),
+            deferredSurvivorRetry: quickRetry,
+            launcher: launcher, paths: env.paths, registry: registry)
+        defer { gate.signal(.exitedStatusUnknown) }
+        await router.recoverAtStartup()
+        #expect(recorder.listingCount == 2)
+        #expect(await gate.callCount == 0)
+
+        await router.settleDeferredSurvivors()
+
+        #expect(recorder.listingCount == 4)
+        #expect(await gate.callCount == 1)
+        #expect(launcher.runCount == 0)
+        var web = try await statusList(router: router, project: env.projectPath).first { $0.server == "web" }
+        #expect(web?.pid == Int(survivor))
+        let running = try await eventually(within: .seconds(5), every: .milliseconds(50)) {
+            web = try await statusList(router: router, project: env.projectPath).first { $0.server == "web" }
+            return web?.phase == .running
+        }
+        #expect(running, "the adopted survivor never read running")
+        #expect(web?.pid == Int(survivor))
+        #expect(kill(survivor, 0) == 0)
+        let events = try await eventsList(router: router, project: env.projectPath)
+        #expect(events.contains { $0.kind == .started && ($0.detail ?? "").contains("adopted pid") })
+        #expect(events.contains { $0.kind == .crashed } == false)
+
+        /** Adopted and healthy: a start-shaped request is the ordinary
+            no-op for a running server, not a refusal. */
+        let ensure = try await ensureResponse(router: router, project: env.projectPath, name: "web")
+        #expect(ensure.ok)
+        #expect(ensure.result?.server.pid == Int(survivor))
+        #expect(launcher.runCount == 0)
+
+        gate.signal(.signaled(signal: Int(SIGKILL)))
+        let exited = try await eventually(within: .seconds(5)) {
+            try await statusList(router: router, project: env.projectPath).first { $0.server == "web" }?.phase
+                == .crashed
+        }
+        #expect(exited, "the adopted run never recorded its exit")
+    }
+
+    /** A later job list that does not name the survivor says it is not a child
+        job directa can take back, so it takes the orphan path restore has: the
+        process is bounced and the server started fresh. */
+    @Test func aDeferredSurvivorAbsentFromALaterJobListIsBouncedAndRestarted() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        try await seedWebSurvivor(env, registry: registry, serversJSON: sleepingWebJSON, survivor: survivor)
+        let unavailable = LaunchdJobs.ChildJobListing.unavailable(reason: "launchctl list timed out")
+        let gate = AdoptGate()
+        let launcher = SpawnCountingLauncher(gate: gate)
+        let router = Router(
+            agentJobs: RecordingAgentJobs().agentJobs(answering: [unavailable, unavailable, .listed([])]),
+            deferredSurvivorRetry: quickRetry,
+            launcher: launcher, paths: env.paths, registry: registry)
+        defer { gate.signal(.exitedStatusUnknown) }
+        await router.recoverAtStartup()
+        #expect(launcher.runCount == 0)
+
+        await router.settleDeferredSurvivors()
+
+        #expect(await gate.callCount == 0)
+        let gone = try await awaitExit(survivor, within: .seconds(5))
+        #expect(gone, "survivor \(survivor) outside launchd's job list was left running")
+        let web = try await statusList(router: router, project: env.projectPath).first { $0.server == "web" }
+        #expect(web?.pid != nil)
+        #expect(web?.pid != Int(survivor))
+        #expect(web?.phase == .starting || web?.phase == .running)
+        #expect(launcher.runCount == 1)
+        let events = try await eventsList(router: router, project: env.projectPath)
+        #expect(
+            events.filter { $0.kind == .crashed }.map(\.detail)
+                == [DaemonRestartDetail.orphanBounced(pid: survivor)])
+        await stopServer(router: router, project: env.projectPath, name: "web")
+    }
+
+    /** The survivor is proven again when the list finally answers: one that
+        died while deferred settles as gone (a `daemon-restart` crash, nothing
+        signaled) and the server is started fresh. */
+    @Test func aDeferredSurvivorThatDiedMeanwhileSettlesAsGone() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        try await seedWebSurvivor(env, registry: registry, serversJSON: sleepingWebJSON, survivor: survivor)
+        let gate = AdoptGate()
+        let launcher = SpawnCountingLauncher(gate: gate)
+        let router = Router(
+            agentJobs: RecordingAgentJobs().agentJobs(answering: [
+                .unavailable(reason: "launchctl list timed out"),
+                .unavailable(reason: "launchctl list timed out"),
+                .listed([LaunchdJobs.ChildJob(label: "dev.quantizor.directa.job.test-died", pid: survivor)]),
+            ]),
+            deferredSurvivorRetry: quickRetry,
+            launcher: launcher, paths: env.paths, registry: registry)
+        defer { gate.signal(.exitedStatusUnknown) }
+        await router.recoverAtStartup()
+        kill(survivor, SIGKILL)
+        let died = try await awaitExit(survivor, within: .seconds(5))
+        try #require(died)
+
+        await router.settleDeferredSurvivors()
+
+        #expect(await gate.callCount == 0)
+        let web = try await statusList(router: router, project: env.projectPath).first { $0.server == "web" }
+        #expect(web?.pid != nil)
+        #expect(web?.pid != Int(survivor))
+        let events = try await eventsList(router: router, project: env.projectPath)
+        #expect(events.filter { $0.kind == .crashed }.map(\.detail) == [DaemonRestartDetail.crashed])
+        await stopServer(router: router, project: env.projectPath, name: "web")
+    }
+
+    /** A job list that never answers inside the retry window leaves the
+        survivor deferred for the next boot: still reported, still refused,
+        row untouched, nothing signaled. */
+    @Test func aJobListThatNeverAnswersLeavesTheSurvivorDeferred() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        try await seedWebSurvivor(env, registry: registry, serversJSON: sleepingWebJSON, survivor: survivor)
+        let recorder = RecordingAgentJobs()
+        let gate = AdoptGate()
+        let launcher = SpawnCountingLauncher(gate: gate)
+        let router = Router(
+            agentJobs: recorder.agentJobs(answering: [.unavailable(reason: "launchctl list timed out")]),
+            deferredSurvivorRetry: DeferredSurvivorRetry(
+                firstDelay: .milliseconds(10), longestDelay: .milliseconds(20), window: .milliseconds(150)),
+            launcher: launcher, paths: env.paths, registry: registry)
+        defer { gate.signal(.exitedStatusUnknown) }
+        await router.recoverAtStartup()
+
+        await router.settleDeferredSurvivors()
+
+        #expect(recorder.listingCount > 3)
+        let web = try await statusList(router: router, project: env.projectPath).first { $0.server == "web" }
+        #expect(web?.phase == .running)
+        #expect(web?.pid == Int(survivor))
+        let ensure = try await ensureResponse(router: router, project: env.projectPath, name: "web")
+        #expect(ensure.error?.code == .daemonStarting)
+        #expect(launcher.runCount == 0)
+        #expect(kill(survivor, 0) == 0)
+        let row = await registry.persistedState(serverID: serverID(project: env.projectPath, name: "web"))
+        #expect(row?.pid == Int(survivor))
+    }
+
+    /** A deferred survivor whose process exits while the job list stays silent
+        is settled on the next retry tick without a job list: the run is gone,
+        so the server is restarted at once and the refusals lift. */
+    @Test func aDeferredSurvivorThatDiesWhileTheJobListIsSilentSettlesOnTheNextRetry() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        try await seedWebSurvivor(env, registry: registry, serversJSON: sleepingWebJSON, survivor: survivor)
+        let launcher = SpawnCountingLauncher(gate: AdoptGate())
+        let router = Router(
+            agentJobs: RecordingAgentJobs().agentJobs(answering: [.unavailable(reason: "launchctl list timed out")]),
+            deferredSurvivorRetry: DeferredSurvivorRetry(
+                firstDelay: .milliseconds(10), longestDelay: .milliseconds(20), window: .seconds(2)),
+            launcher: launcher, paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+        kill(survivor, SIGKILL)
+        let died = try await awaitExit(survivor, within: .seconds(5))
+        try #require(died)
+
+        await router.settleDeferredSurvivors()
+
+        let ensure = try await ensureResponse(router: router, project: env.projectPath, name: "web")
+        #expect(ensure.ok, "a dead survivor stayed refused: \(String(describing: ensure.error))")
+        #expect(ensure.result?.server.pid != Int(survivor))
+        #expect(launcher.runCount == 1)
+        let events = try await eventsList(router: router, project: env.projectPath)
+        #expect(events.filter { $0.kind == .crashed }.map(\.detail) == [DaemonRestartDetail.crashed])
+        await stopServer(router: router, project: env.projectPath, name: "web")
+    }
+
+    /** A request that hits the refusal for a survivor that has since died
+        settles it on the spot and goes through, with no retry tick involved. */
+    @Test func aRequestForADeferredSurvivorThatDiedMeanwhileSettlesItAndSucceeds() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        try await seedWebSurvivor(env, registry: registry, serversJSON: sleepingWebJSON, survivor: survivor)
+        let launcher = SpawnCountingLauncher(gate: AdoptGate())
+        let router = Router(
+            agentJobs: RecordingAgentJobs().agentJobs(answering: [.unavailable(reason: "launchctl list timed out")]),
+            launcher: launcher, paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+        kill(survivor, SIGKILL)
+        let died = try await awaitExit(survivor, within: .seconds(5))
+        try #require(died)
+
+        let ensure = try await ensureResponse(router: router, project: env.projectPath, name: "web")
+
+        #expect(ensure.ok, "a dead survivor stayed refused: \(String(describing: ensure.error))")
+        #expect(launcher.runCount == 1)
+        await stopServer(router: router, project: env.projectPath, name: "web")
+    }
+
+    /** Once the retry window gives up with the job list still silent, the
+        refusal says so and names the way out: a daemon restart reads the list
+        afresh. Until then it keeps pointing at `daemon status`. */
+    @Test func aRefusalAfterTheRetryWindowNamesADaemonRestart() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        try await seedWebSurvivor(env, registry: registry, serversJSON: sleepingWebJSON, survivor: survivor)
+        let router = Router(
+            agentJobs: RecordingAgentJobs().agentJobs(answering: [.unavailable(reason: "launchctl list timed out")]),
+            deferredSurvivorRetry: DeferredSurvivorRetry(
+                firstDelay: .milliseconds(10), longestDelay: .milliseconds(20), window: .milliseconds(150)),
+            launcher: SpawnCountingLauncher(gate: AdoptGate()), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+        let before = try await ensureResponse(router: router, project: env.projectPath, name: "web")
+        #expect(before.error?.hint == "run: directa daemon status")
+
+        await router.settleDeferredSurvivors()
+
+        let after = try await ensureResponse(router: router, project: env.projectPath, name: "web")
+        #expect(after.error?.code == .daemonStarting)
+        #expect(after.error?.hint == "run: directa daemon restart")
+        #expect(after.error?.message.contains("'web'") == true)
+        #expect(after.error?.message.contains("pid \(survivor)") == true)
+        #expect(after.error?.message.contains("job list never answered") == true)
+    }
+
+    /** `wait` on a deferred survivor is refused like the other requests: the
+        server's supervisor is idle, so answering from it would report a
+        stopped server beside a live process. */
+    @Test func waitOnADeferredSurvivorIsRefused() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        try await seedWebSurvivor(env, registry: registry, serversJSON: sleepingWebJSON, survivor: survivor)
+        let router = Router(
+            agentJobs: RecordingAgentJobs().agentJobs(answering: [.unavailable(reason: "launchctl list timed out")]),
+            launcher: SpawnCountingLauncher(gate: AdoptGate()), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+
+        let wait = try await router.response(
+            .serverWait,
+            WaitParams(condition: .stopped, name: "web", project: env.projectPath, timeoutSeconds: 5),
+            EnsureResult.self)
+
+        #expect(!wait.ok)
+        #expect(wait.error?.code == .daemonStarting)
+        #expect(wait.error?.message.contains("pid \(survivor)") == true)
+    }
+
+    /** A drain stops a deferred survivor too, through the identity-revalidated
+        teardown: the process goes, the row reads `stopped` with its restore
+        intent kept (a drain is not a deliberate stop), and nothing records a
+        crash or an orphan bounce. */
+    @Test func aDrainStopsADeferredSurvivorAndKeepsItsRestoreIntent() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let survivor = try spawnSurvivor()
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        try await seedWebSurvivor(env, registry: registry, serversJSON: sleepingWebJSON, survivor: survivor)
+        let router = Router(
+            agentJobs: RecordingAgentJobs().agentJobs(answering: [.unavailable(reason: "launchctl list timed out")]),
+            launcher: SpawnCountingLauncher(gate: AdoptGate()), paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+        try #require(kill(survivor, 0) == 0)
+
+        await router.drainAll()
+
+        let gone = try await awaitExit(survivor, within: .seconds(5))
+        #expect(gone, "the drain left deferred survivor \(survivor) running")
+        let row = await registry.persistedState(serverID: serverID(project: env.projectPath, name: "web"))
+        #expect(row?.phase == .stopped)
+        #expect(row?.pid == nil)
+        #expect(row?.resumeOnBoot == true)
+        let events = try await eventsList(router: router, project: env.projectPath)
+        #expect(events.filter { $0.kind == .crashed }.isEmpty)
+    }
+
+    /** A project forgotten while a settle is deciding its deferred survivor
+        takes the entry with it: the settle's decision, finished afterward, is
+        not acted on. The survivor ignores SIGTERM, so the settle's bounce is
+        still waiting out its grace when the checkout vanishes and is
+        forgotten; no supervisor may be left resident for the forgotten
+        project afterward (the daemon would keep claiming it). */
+    @Test func aSettleRacingAProjectForgetLeavesNoSupervisorForTheForgottenProject() async throws {
+        let env = try makeRecoverEnv()
+        let registry = Registry(paths: env.paths)
+        let survivor = try spawnReapedSessionLeader(["/bin/sh", "-c", "trap '' TERM; sleep 30"])
+        defer { if kill(survivor, 0) == 0 { kill(survivor, SIGKILL) } }
+        try await seedWebSurvivor(env, registry: registry, serversJSON: sleepingWebJSON, survivor: survivor)
+        let project = canonicalProjectPath(env.projectPath)
+        let recorder = RecordingAgentJobs()
+        let launcher = SpawnCountingLauncher(gate: AdoptGate())
+        let router = Router(
+            agentJobs: recorder.agentJobs(answering: [
+                .unavailable(reason: "launchctl list timed out"),
+                .unavailable(reason: "launchctl list timed out"),
+                .listed([]),
+            ]),
+            deferredSurvivorRetry: quickRetry,
+            launcher: launcher, paths: env.paths, registry: registry)
+        await router.recoverAtStartup()
+
+        async let settled: Void = router.settleDeferredSurvivors()
+        let answered = try await eventually(within: .seconds(5)) { recorder.listingCount >= 3 }
+        try #require(answered)
+        try FileManager.default.removeItem(atPath: env.projectPath)
+        let forget = try await router.response(
+            .projectForget, ProjectOnlyParams(project: project), ProjectForgetResult.self)
+        await settled
+
+        #expect(forget.ok, "\(String(describing: forget.error))")
+        let info = try await router.call(.daemonInfo, WireEmpty(), DaemonInfo.self)
+        #expect(
+            info.claimedProjects?.contains(project) != true,
+            "the settle left a supervisor resident for a forgotten project")
+        #expect(launcher.runCount == 0)
     }
 
     /** One unanswered `launchctl list` is retried, and a retry that answers

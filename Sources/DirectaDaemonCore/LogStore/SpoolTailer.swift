@@ -120,6 +120,9 @@ actor SpoolTailer {
     private var releaseRefused = false
     /** Everything below this offset is already released. */
     private var releasedThrough: UInt64 = 0
+    /** Where the daemon that handed this run over stopped reading; see
+        `init`. */
+    private let resumeFrom: SpoolPosition?
     /** Ingested raw bytes kept readable behind the read cursor; older ones
         are released (see `SpoolRelease`). */
     private let retainBytes: Int
@@ -145,17 +148,25 @@ actor SpoolTailer {
         tailing the file stay in the raw spool only, never reaching the
         structured log; the alternative, back-reading from offset 0, would
         duplicate every line the prior run's tailer already ingested. An
-        ordinary spawn leaves it false and ingests from the start. */
+        ordinary spawn leaves it false and ingests from the start.
+
+        `resumeFrom` (with `startAtEnd`) is the position a handing-over
+        daemon recorded: when the spool is still the same file (device and
+        inode) and at least that long, reading resumes there, so the lines the
+        child wrote during the bounce are ingested exactly once; otherwise the
+        seed is the end of the file as above. The catch-up cap applies to the
+        resumed backlog like any other. */
     init(
         intervalMs: Int = 100, maxCatchUpBytes: Int = 1_048_576, readChunkBytes: Int = 64 * 1024,
         releaseHole: @escaping @Sendable (String, Range<UInt64>) -> Int32 = SpoolRelease.punchHole,
-        retainBytes: Int = 1_048_576, startAtEnd: Bool = false, store: LogStore, stream: LogStream,
-        url: URL
+        resumeFrom: SpoolPosition? = nil, retainBytes: Int = 1_048_576, startAtEnd: Bool = false,
+        store: LogStore, stream: LogStream, url: URL
     ) {
         self.intervalMs = intervalMs
         self.maxCatchUpBytes = max(0, maxCatchUpBytes)
         self.readChunkBytes = max(1, readChunkBytes)
         self.releaseHole = releaseHole
+        self.resumeFrom = resumeFrom
         self.retainBytes = max(0, retainBytes)
         self.seedingAtEnd = startAtEnd
         self.store = store
@@ -189,6 +200,28 @@ actor SpoolTailer {
         spool = nil
     }
 
+    /** Ends polling for a handoff to the next daemon: ingests what the spool
+        holds at this moment, once (a child still writing is not chased, so a
+        flood cannot hold the exit; the catch-up cap bounds the rest), and
+        answers where the next daemon resumes. That is the start of the line
+        in progress, which stays unlogged here so the next daemon logs it
+        whole, not the offset read to. Nil when the spool cannot be read. */
+    func pause() async -> SpoolPosition? {
+        task?.cancel()
+        task = nil
+        if spool == nil {
+            let opened = open(url.path, O_RDONLY | O_CLOEXEC)
+            guard opened >= 0 else { return nil }
+            spool = opened
+        }
+        await drain(yieldsToCancellation: false, through: spoolSize())
+        await reportSkipped(skipReport.flush(now: .now))
+        guard let info = spoolStat() else { return nil }
+        return SpoolPosition(
+            bytesRead: offset - min(offset, UInt64(framer.pendingByteCount)), device: Int(info.st_dev),
+            inode: UInt64(info.st_ino))
+    }
+
     /** Reads the unread tail one chunk per pass, re-reading the size before
         each: a child that writes as fast as the tailer reads never lets a
         drain reach end of file, so the catch-up skip and the block release
@@ -200,14 +233,15 @@ actor SpoolTailer {
         passes `yieldsToCancellation` so it stops between chunks once `stop`
         cancels it; `stop` drains to the end, and the catch-up skip keeps
         that bounded. A spool that does not exist yet is retried next tick. */
-    private func drain(yieldsToCancellation: Bool) async {
+    private func drain(yieldsToCancellation: Bool, through limit: UInt64? = nil) async {
         if spool == nil {
             let opened = open(url.path, O_RDONLY | O_CLOEXEC)
             guard opened >= 0 else { return }
             spool = opened
         }
         while !(yieldsToCancellation && Task.isCancelled) {
-            guard let size = spoolSize() else { break }
+            guard let fileSize = spoolSize() else { break }
+            let size = limit.map { min($0, fileSize) } ?? fileSize
             let readable = await skipToReadable(size: size)
             guard readable, let chunk = readChunk(), !chunk.isEmpty else { break }
             offset += UInt64(chunk.count)
@@ -219,10 +253,24 @@ actor SpoolTailer {
     }
 
     private func spoolSize() -> UInt64? {
+        spoolStat().map { UInt64($0.st_size) }
+    }
+
+    private func spoolStat() -> stat? {
         guard let spool else { return nil }
         var info = stat()
         guard fstat(spool, &info) == 0 else { return nil }
-        return UInt64(info.st_size)
+        return info
+    }
+
+    /** The recorded offset when the open spool is the file it was recorded
+        for and is at least that long, else nil. */
+    private func resumableOffset(size: UInt64) -> UInt64? {
+        guard let resumeFrom, let info = spoolStat(),
+            Int(info.st_dev) == resumeFrom.device, UInt64(info.st_ino) == resumeFrom.inode,
+            size >= resumeFrom.bytesRead
+        else { return nil }
+        return resumeFrom.bytesRead
     }
 
     /** Up to `readChunkBytes` from `offset`; empty at end of file. */
@@ -244,7 +292,7 @@ actor SpoolTailer {
         answers whether unread bytes remain. */
     private func skipToReadable(size: UInt64) async -> Bool {
         if seedingAtEnd {
-            offset = size
+            offset = resumableOffset(size: size) ?? size
             framer.reset()
             seedingAtEnd = false
         }

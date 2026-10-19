@@ -298,6 +298,11 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         if name.contains("::") {
             errors.append("server '\(name)': name must not contain '::'")
         }
+        for lock in locks ?? [] {
+            if let refused = LockResource.nameError(lock.name) {
+                errors.append("server '\(name)': \(refused.message)")
+            }
+        }
         if command.isEmpty {
             errors.append("server '\(name)': command is empty")
         }
@@ -360,6 +365,32 @@ public struct ErrorSummary: Codable, Equatable, Sendable {
     }
 }
 
+/** The latest health check of the current run, in directa's own words.
+    `failures` counts the failed checks in a row ending at this one (0 when it
+    passed); `detail` says why it failed and is absent on a pass. */
+public struct HealthCheckResult: Codable, Equatable, Sendable {
+    public var at: Date
+    public var detail: String?
+    public var failures: Int
+    public var passed: Bool
+
+    public init(at: Date, detail: String? = nil, failures: Int, passed: Bool) {
+        self.at = at
+        self.detail = detail
+        self.failures = failures
+        self.passed = passed
+    }
+
+    /** The reader-facing line for a check that failed, or nil after a pass:
+        the one wording `why`, `status`, and the session context share. */
+    public var failureNote: String? {
+        guard !passed, failures > 0 else { return nil }
+        let count = failures == 1 ? "1 health check failed in a row" : "\(failures) health checks failed in a row"
+        guard let detail else { return count }
+        return "\(count) (\(detail))"
+    }
+}
+
 /** The core status schema agents consume; documented in docs/cli-contract.md. */
 public struct ServerStatus: Codable, Equatable, Sendable {
     /** Present when the last runs died the way an interactive credential prompt
@@ -375,6 +406,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
     public var icon: String?
     public var lastExit: LastExit?
     public var lastHealthAt: Date?
+    public var lastHealthCheck: HealthCheckResult?
     /** Resources this server holds while running, from its `locks` declaration.
         The machine-readable half of the hint `stop` prints: getting exclusive
         access to one of these is what `directa lock` is for, and stopping the
@@ -417,6 +449,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         icon: String? = nil,
         lastExit: LastExit? = nil,
         lastHealthAt: Date? = nil,
+        lastHealthCheck: HealthCheckResult? = nil,
         locks: [String]? = nil,
         logPath: String,
         mainProject: String? = nil,
@@ -444,6 +477,7 @@ public struct ServerStatus: Codable, Equatable, Sendable {
         self.icon = icon
         self.lastExit = lastExit
         self.lastHealthAt = lastHealthAt
+        self.lastHealthCheck = lastHealthCheck
         self.locks = locks
         self.logPath = logPath
         self.mainProject = mainProject
