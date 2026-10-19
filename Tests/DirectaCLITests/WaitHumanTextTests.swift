@@ -41,12 +41,31 @@ import Testing
                 .hasSuffix("\nhint: directa ensure 'my app;x'"))
     }
 
-    @Test func timeoutAndFailedCarryNoEnsureHint() {
+    @Test func timeoutMidStartSaysStillStartingAndNamesTheWaitCommand() {
         #expect(
             Wait.humanText(Self.result(.starting, reason: .timeout), condition: .healthy, name: "web")
                 == """
                 wait fell short (timeout)
                 web: starting  ·  log /logs/web/current.log
+                hint: still starting, not failed; to keep waiting: directa wait web --timeout <seconds>
+                """)
+        #expect(
+            Wait.humanText(Self.result(.starting, reason: .timeout), condition: .healthy, name: "my app;x")
+                .hasSuffix("\nhint: still starting, not failed; to keep waiting: directa wait 'my app;x' --timeout <seconds>"))
+    }
+
+    @Test func timeoutOfAStoppedWaitAndFailedCarryNoHint() {
+        #expect(
+            Wait.humanText(Self.result(.starting, reason: .timeout), condition: .stopped, name: "web")
+                == """
+                wait fell short (timeout)
+                web: starting  ·  log /logs/web/current.log
+                """)
+        #expect(
+            Wait.humanText(Self.result(.running, reason: .timeout), condition: .healthy, name: "web")
+                == """
+                wait fell short (timeout)
+                web: running  ·  log /logs/web/current.log
                 """)
         #expect(
             Wait.humanText(Self.result(.failed, reason: .failed), condition: .healthy, name: "web")

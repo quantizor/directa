@@ -311,17 +311,35 @@ enum CLIRunner {
         if let spawn = status.spawnError {
             parts.append("spawn failed: \(spawn.message)")
         }
+        /** The phase can read `running` while the latest checks fail, so the
+            failing check is named beside it. */
+        if let note = status.lastHealthCheck?.failureNote {
+            parts.append(note)
+        }
         parts.append("log \(status.logPath)")
         return parts.joined(separator: "  ·  ")
     }
 
+    /** What a timeout that caught the server still starting says: it is not
+        failed, and the command that keeps waiting. Nil for every other
+        outcome. */
+    static func stillStartingNote(_ result: EnsureResult, name: String) -> String? {
+        guard result.reason == .timeout, result.server.phase == .starting else { return nil }
+        return "still starting, not failed; to keep waiting: directa wait \(ShellWord.argument(name)) --timeout <seconds>"
+    }
+
     /** One line per server of a group result (`up`, `restart`, `switch`): the
         server's line, with a `FELL SHORT` suffix naming the reason when the
-        server did not reach the asked state. */
+        server did not reach the asked state, and the still-starting note after
+        a timeout that caught it mid-start. */
     static func describeGroup(_ results: [EnsureResult]) -> String {
         results.map { entry in
-            entry.reason.map { "\(describe(entry.server))  ·  FELL SHORT (\($0.rawValue))" }
-                ?? describe(entry.server)
+            guard let reason = entry.reason else { return describe(entry.server) }
+            var line = "\(describe(entry.server))  ·  FELL SHORT (\(reason.rawValue))"
+            if let note = stillStartingNote(entry, name: entry.server.server) {
+                line += "  ·  \(note)"
+            }
+            return line
         }.joined(separator: "\n")
     }
 }
@@ -424,14 +442,21 @@ struct Ensure: AsyncParsableCommand {
                 .serverEnsure, params: params, expecting: EnsureResult.self,
                 operationTimeoutSeconds: timeout)
         }
-        CLIRunner.emit(result, json: global.json) { r in
-            var text = CLIRunner.describe(r.server)
-            if let reason = r.reason { text = "ensure fell short (\(reason.rawValue))\n" + text }
-            return text
-        }
+        CLIRunner.emit(result, json: global.json) { Self.humanText($0, name: name) }
         if result.reason != nil {
             Foundation.exit(1)
         }
+    }
+
+    /** The server's line, led by the falls-short line and followed by the
+        still-starting note when a timeout caught the server mid-start. */
+    static func humanText(_ result: EnsureResult, name: String) -> String {
+        guard let reason = result.reason else { return CLIRunner.describe(result.server) }
+        var text = "ensure fell short (\(reason.rawValue))\n" + CLIRunner.describe(result.server)
+        if let note = CLIRunner.stillStartingNote(result, name: name) {
+            text += "\nhint: \(note)"
+        }
+        return text
     }
 }
 
@@ -470,14 +495,18 @@ struct Wait: AsyncParsableCommand {
     }
 
     /** The falls-short line, the server, and the command that moves it on: a
-        `--healthy` wait that ended on a crash or a stop names `ensure`, and a
-        `--stopped` wait that timed out on a failed run whose process is still
-        alive names `stop`. */
+        `--healthy` wait that ended on a crash or a stop names `ensure`, one
+        that timed out with the server still starting names the wait that
+        keeps waiting, and a `--stopped` wait that timed out on a failed run
+        whose process is still alive names `stop`. */
     static func humanText(_ result: EnsureResult, condition: WaitCondition, name: String) -> String {
         guard let reason = result.reason else { return CLIRunner.describe(result.server) }
         var text = "wait fell short (\(reason.rawValue))\n" + CLIRunner.describe(result.server)
         if condition == .healthy, reason == .crashed || reason == .stopped {
             text += "\nhint: directa ensure \(ShellWord.argument(name))"
+        }
+        if condition == .healthy, let note = CLIRunner.stillStartingNote(result, name: name) {
+            text += "\nhint: \(note)"
         }
         if condition == .stopped, reason == .timeout, result.server.phase == .failed, result.server.hasLiveRun {
             text += "\nhint: directa stop \(ShellWord.inertOr(name))"
