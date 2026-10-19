@@ -330,6 +330,13 @@ public actor ServerSupervisor {
         spawnSpecPrepared = true
     }
 
+    /** The prepared spec will not be used: the transition that prepared it
+        was refused or failed before any run started. Status reads resume
+        applying committed config to this server. */
+    public func abandonPreparedSpawn() {
+        spawnSpecPrepared = false
+    }
+
     /** A status read's committed spec for a server with no run: assigned only
         while nothing is alive and no prepared spawn spec is waiting for its
         run. The check and the assignment are this one actor turn, so a start

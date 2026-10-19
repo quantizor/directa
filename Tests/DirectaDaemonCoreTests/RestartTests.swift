@@ -21,7 +21,8 @@ import os
     }
 
     private func writeConfig(
-        flood: Bool = false, port: Int, project: String, waitFor: String? = nil
+        flood: Bool = false, heads: [String: String] = [:], port: Int, project: String,
+        waitFor: String? = nil
     ) throws {
         let fixture = try #require(fixtureServerExecutable())
         /** `--flood` composes with `--listen-tcp`: the fixture still binds and
@@ -31,6 +32,12 @@ import os
             wait. */
         let floodFlag = flood ? ", \"--flood\"" : ""
         let waitForField = waitFor.map { ",\n          \"waitFor\": \"\($0)\"" } ?? ""
+        let headsField =
+            heads.isEmpty
+            ? ""
+            : ",\n          \"heads\": {"
+                + heads.sorted { $0.key < $1.key }.map { "\"\($0.key)\": \"\($0.value)\"" }
+                .joined(separator: ", ") + "}"
         let body = """
             {
               "servers": {
@@ -38,7 +45,7 @@ import os
                   "command": ["\(fixture)", "--listen-tcp", "\(port)"\(floodFlag)],
                   "healthcheck": { "type": "tcp", "port": \(port) },
                   "locks": ["data"],
-                  "port": \(port)\(waitForField)
+                  "port": \(port)\(waitForField)\(headsField)
                 }
               },
               "version": 1
@@ -351,7 +358,7 @@ import os
             error.message
                 == "port \(port) is still held by pid \(reported) (stand-in listener) after stopping 'db'; the new run was not started"
         )
-        #expect(error.hint == "run: kill \(reported)  (verify first: ps -p \(reported))")
+        #expect(error.hint == "run: directa why db")
 
         let status = try #require(
             try await router.call(
@@ -364,6 +371,43 @@ import os
             try await sysLines(router, env.project).contains(
                 "not starting: port \(port) is still held by pid \(reported) (stand-in listener) after the stop; that process \(membership) part of the run just stopped (root and descendants recorded at stop)"
             ))
+    }
+
+    /** A restart that fails after its prepare abandons the prepared spec: the
+        server stays down, and a config edit made afterward shows in its status
+        rather than the spec the failed restart prepared. */
+    @Test func aRestartRefusedAfterItsStopLeavesTheServerReadingLaterConfigEdits() async throws {
+        let env = try env(offset: 426)
+        let port = TestPorts.port(426)
+        let lingering = LingeringListener(reports: .outsider)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(
+            launcher: SubprocessLauncher(), paths: env.paths, portProbe: lingering.probe,
+            registry: registry,
+            stopTiming: StopTiming(graceSeconds: 2, overtimeSeconds: 2, portClearSeconds: 0.3))
+        let first = try await router.call(
+            .serverEnsure,
+            EnsureParams(name: "db", project: env.project, timeoutSeconds: 10), EnsureResult.self)
+        lingering.watch(pid: pid_t(try #require(first.server.pid)))
+        let refused = try await router.attempt(
+            .serverRestart,
+            RestartParams(names: ["db"], project: env.project, timeoutSeconds: 10),
+            GroupResult.self)
+        guard case .failure(let error) = refused else {
+            Issue.record("restart went ahead beside a listener the stop did not remove")
+            return
+        }
+        #expect(error.code == .portHeld)
+
+        let heads = ["api": "http://api.localhost/"]
+        try writeConfig(heads: heads, port: port, project: env.project)
+        let status = try #require(
+            try await router.call(
+                .serverStatus, ProjectParams(name: "db", project: env.project), ServerListResult.self
+            ).servers.first)
+        #expect(status.phase == .stopped)
+        #expect(status.heads == heads)
     }
 
     /** A listener that is on its way out (the stop's SIGKILL pass has run and

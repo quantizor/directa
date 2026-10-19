@@ -1645,7 +1645,12 @@ public actor Router {
             let current = await supervisor.status()
             if current.phase == .failed, current.hasLiveRun {
                 _ = await supervisor.stop(deliberate: false, reason: "restarting after a port failure")
-                try await requirePortsClear(supervisor: supervisor, name: target.name)
+                do {
+                    try await requirePortsClear(supervisor: supervisor, name: target.name)
+                } catch {
+                    await supervisor.abandonPreparedSpawn()
+                    throw error
+                }
             }
         }
     }
@@ -1782,11 +1787,14 @@ public actor Router {
         guard let busy = await waitForClaimFree(claim: claim, budgetSeconds: stopTiming.portClearSeconds)
         else { return }
         let listener = await portProbe.listenerInfo(busy)
+        /** The server's log carries the pid and command; `why` reads them. */
+        let hint = "run: directa why \(ShellWord.inertOr(name))"
         guard let listener else {
             await supervisor.recordSys(
                 "not starting: port \(busy) is still held by a listener directa cannot name after the stop")
             throw WireError(
                 code: .portHeld,
+                hint: hint,
                 message:
                     "port \(busy) still has a listener that directa does not manage, after stopping '\(name)'; the new run was not started"
             )
@@ -1800,7 +1808,7 @@ public actor Router {
             "port-held \(busy) by pid \(listener.pid) after stopping \(name); new run not started")
         throw WireError(
             code: .portHeld,
-            hint: "run: kill \(listener.pid)  (verify first: ps -p \(listener.pid))",
+            hint: hint,
             message:
                 "port \(busy) is still held by pid \(listener.pid) (\(listener.command)) after stopping '\(name)'; the new run was not started"
         )
@@ -2380,14 +2388,19 @@ public actor Router {
             remove. `force` is needed because the servers are still up here, and
             prepareSpawn otherwise returns early for a running server. */
         for entry in prepared {
-            try await prepareSpawn(
-                target: ServerTargetParams(
-                    name: entry.spec.name, port: params.port, project: params.project),
-                supervisor: entry.supervisor, portOverride: params.port, force: true,
-                userInitiated: userInitiated)
+            do {
+                try await prepareSpawn(
+                    target: ServerTargetParams(
+                        name: entry.spec.name, port: params.port, project: params.project),
+                    supervisor: entry.supervisor, portOverride: params.port, force: true,
+                    userInitiated: userInitiated)
+            } catch {
+                await abandonPreparedSpawns(prepared.map(\.supervisor))
+                throw error
+            }
         }
         var results: [EnsureResult] = []
-        for entry in prepared {
+        for (index, entry) in prepared.enumerated() {
             /** Only an explicit restart re-arms the watch. Under the sweep the
                 pending stamp has to survive as far as `deferWatchRestart`, which
                 reads it, and clearing it here made that a no-op for every
@@ -2400,6 +2413,7 @@ public actor Router {
                 try await requirePortsClear(supervisor: entry.supervisor, name: entry.spec.name)
             } catch {
                 DaemonActivity.shared.end(activity, outcome: "port-held")
+                await abandonPreparedSpawns(prepared[index...].map(\.supervisor))
                 throw error
             }
             let restarted = await entry.supervisor.ensure(timeoutSeconds: params.timeoutSeconds)
@@ -2409,6 +2423,12 @@ public actor Router {
             DirectaLog.daemon.info("restart \(entry.spec.name)@\(params.project)")
         }
         return GroupResult(results: results.sorted { $0.server.server < $1.server.server })
+    }
+
+    /** Releases the spawn specs a refused or failed transition prepared for runs
+        that will not start, so status reads resume applying committed config. */
+    private func abandonPreparedSpawns(_ supervisors: [ServerSupervisor]) async {
+        for supervisor in supervisors { await supervisor.abandonPreparedSpawn() }
     }
 
     /** One watch sweep over the resident supervisors. `now` is a parameter and
@@ -2494,12 +2514,18 @@ public actor Router {
             let target = ServerTargetParams(
                 name: spec.name, port: params.port, project: params.project)
             let supervisor = await supervisor(project: params.project, spec: spec)
-            try await prepareSpawn(
-                target: target, supervisor: supervisor, portOverride: params.port,
-                userInitiated: true)
+            do {
+                try await prepareSpawn(
+                    target: target, supervisor: supervisor, portOverride: params.port,
+                    userInitiated: true)
+            } catch {
+                await abandonPreparedSpawns(Array(prepared.values))
+                throw error
+            }
             prepared[spec.name] = supervisor
         }
         guard case .success(let waves) = DependencyGraph.waves(specs: wanted) else {
+            await abandonPreparedSpawns(Array(prepared.values))
             throw WireError(
                 code: .configInvalid,
                 hint: "run: directa config check",
@@ -2508,8 +2534,10 @@ public actor Router {
         let specsByName = Dictionary(uniqueKeysWithValues: wanted.map { ($0.name, $0) })
         var results: [EnsureResult] = []
         var failed = false
+        var launched: Set<String> = []
         for wave in waves {
             if failed { break }
+            launched.formUnion(wave)
             let waveResults = await withTaskGroup(of: EnsureResult.self) { group in
                 for name in wave {
                     guard let spec = specsByName[name], let supervisor = prepared[name] else {
@@ -2534,6 +2562,9 @@ public actor Router {
                 failed = true
             }
         }
+        /** Waves a broken one cut short never start, so their prepared specs
+            are released. */
+        await abandonPreparedSpawns(prepared.filter { !launched.contains($0.key) }.map(\.value))
         return GroupResult(results: results)
     }
 
