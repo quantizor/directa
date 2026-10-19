@@ -1863,6 +1863,14 @@ public actor Router {
         "run: directa why \(ShellWord.inertOr(name)) --project \(ShellWord.singleQuoted(project))"
     }
 
+    /** The error an ensure-driven restart raises when the restart returned no
+        result for its server. */
+    static func restartGapError(name: String, project: String) -> WireError {
+        WireError(
+            code: .internalError, hint: whyHint(name: name, project: project),
+            message: "restarting '\(name)' returned no result")
+    }
+
     /** One port check's evidence: which of `claim`'s ports have a listener,
         then every managed hold. Probed before the ownership read, never
         after: every run has its phase set before it spawns, so a listener
@@ -2254,7 +2262,7 @@ public actor Router {
                 let completion = await supervisor.stopInFlightCompletion(), completion != .treeGone
             {
                 throw Self.pauseRefusal(
-                    server: spec.name, resource: params.resource,
+                    server: spec.name, project: params.project, resource: params.resource,
                     survivors: Self.survivors(of: completion))
             }
             guard status.hasLiveRun else { continue }
@@ -2279,7 +2287,7 @@ public actor Router {
                 DirectaLog.daemon.error(
                     "lock \(params.resource) refused: \(spec.name)@\(params.project) did not stop completely (\(stopped.completion))")
                 throw Self.pauseRefusal(
-                    server: spec.name, resource: params.resource,
+                    server: spec.name, project: params.project, resource: params.resource,
                     survivors: Self.survivors(of: stopped.completion))
             }
             paused.append(spec.name)
@@ -2315,7 +2323,9 @@ public actor Router {
     /** Why a `--pause` lock was not granted: one declarer's stop gave up or left
         processes running. The code is `resource-locked` because the resource
         is not free; the hint is the command that says what is left. */
-    static func pauseRefusal(server: String, resource: String, survivors: [Int]?) -> WireError {
+    static func pauseRefusal(
+        server: String, project: String, resource: String, survivors: [Int]?
+    ) -> WireError {
         let cause =
             if let survivors {
                 "stopped, but \(survivors.count == 1 ? "its process" : "its processes") \(survivors.map(String.init).joined(separator: ", ")) survived a forced kill"
@@ -2324,7 +2334,7 @@ public actor Router {
             }
         return WireError(
             code: .resourceLocked,
-            hint: "run: directa why \(ShellWord.inertOr(server))",
+            hint: whyHint(name: server, project: project),
             message:
                 "server '\(server)' \(cause) and may still hold resource '\(resource)' open; the lock was not granted and the command did not run, and any other server paused for it was resumed"
         )
@@ -2677,9 +2687,7 @@ public actor Router {
                     timeoutSeconds: params.timeoutSeconds),
                 reason: Self.unhealthyEnsureRestartReason, userInitiated: true)
             guard let result = group.results.first else {
-                throw WireError(
-                    code: .internalError, hint: "run: directa why \(ShellWord.inertOr(target.name))",
-                    message: "restarting '\(target.name)' returned no result")
+                throw Self.restartGapError(name: target.name, project: target.project)
             }
             return result
         }

@@ -578,28 +578,41 @@ private struct StuckOrRealLauncher: NeverAdopts {
     /** The hint is a command someone pastes, so a server name from committed
         config reaches it only when it is inert. */
     @Test func theRefusalNamesTheServerAndPointsAtWhy() {
-        let gaveUp = Router.pauseRefusal(server: "db", resource: "data", survivors: nil)
+        let gaveUp = Router.pauseRefusal(
+            server: "db", project: "/p/app", resource: "data", survivors: nil)
         #expect(gaveUp.code == .resourceLocked)
-        #expect(gaveUp.hint == "run: directa why db")
+        #expect(gaveUp.hint == "run: directa why db --project '/p/app'")
         #expect(
             gaveUp.message
                 == "server 'db' did not finish stopping and may still hold resource 'data' open; the lock was not granted and the command did not run, and any other server paused for it was resumed"
         )
 
-        let left = Router.pauseRefusal(server: "db", resource: "data", survivors: [41, 42])
+        let left = Router.pauseRefusal(
+            server: "db", project: "/p/app", resource: "data", survivors: [41, 42])
         #expect(
             left.message
                 == "server 'db' stopped, but its processes 41, 42 survived a forced kill and may still hold resource 'data' open; the lock was not granted and the command did not run, and any other server paused for it was resumed"
         )
 
-        let one = Router.pauseRefusal(server: "db", resource: "data", survivors: [41])
+        let one = Router.pauseRefusal(
+            server: "db", project: "/p/app", resource: "data", survivors: [41])
         #expect(
             one.message
                 == "server 'db' stopped, but its process 41 survived a forced kill and may still hold resource 'data' open; the lock was not granted and the command did not run, and any other server paused for it was resumed"
         )
 
-        let hostile = Router.pauseRefusal(server: "x; rm -rf ~", resource: "data", survivors: nil)
-        #expect(hostile.hint == "run: directa why <name>")
+        let hostile = Router.pauseRefusal(
+            server: "x; rm -rf ~", project: "/p/app", resource: "data", survivors: nil)
+        #expect(hostile.hint == "run: directa why <name> --project '/p/app'")
+    }
+
+    /** An ensure restart that comes back empty points at `why` with the project,
+        the same as every other refusal that names a server. */
+    @Test func aRestartWithNoResultNamesTheServerProjectAndWhy() {
+        let gap = Router.restartGapError(name: "db", project: "/p/app")
+        #expect(gap.code == .internalError)
+        #expect(gap.hint == "run: directa why db --project '/p/app'")
+        #expect(gap.message == "restarting 'db' returned no result")
     }
 
     /** A declarer whose stop never lands (its run reports no exit), declaring
@@ -667,7 +680,9 @@ private struct StuckOrRealLauncher: NeverAdopts {
             Issue.record("the pause was granted over a declarer whose stop never landed")
             return
         }
-        #expect(refusal.hint == "run: directa why db")
+        #expect(
+            refusal.hint
+                == "run: directa why db --project \(ShellWord.singleQuoted(canonicalProjectPath(env.project)))")
         let held = try await router.call(
             .lockStatus, LockStatusParams(project: env.project, resource: "data"), LockStatusResult.self)
         #expect(held.holder == nil)
@@ -726,7 +741,9 @@ private struct StuckOrRealLauncher: NeverAdopts {
             Issue.record("the pause was granted over a stop that never landed: \(attempt)")
             return
         }
-        #expect(refusal.hint == "run: directa why db")
+        #expect(
+            refusal.hint
+                == "run: directa why db --project \(ShellWord.singleQuoted(canonicalProjectPath(project)))")
         #expect(
             joinerEnded - stopEnded < .milliseconds(150),
             "the pause waited a bound of its own after the stop it joined gave up")
@@ -766,7 +783,9 @@ private struct StuckOrRealLauncher: NeverAdopts {
             return
         }
         #expect(refusal.code == .resourceLocked)
-        #expect(refusal.hint == "run: directa why db")
+        #expect(
+            refusal.hint
+                == "run: directa why db --project \(ShellWord.singleQuoted(canonicalProjectPath(env.project)))")
         #expect(refusal.message.contains("'db'"))
 
         let held = try await router.call(
