@@ -298,6 +298,11 @@ public struct ServerSpec: Codable, Equatable, Sendable {
         if name.contains("::") {
             errors.append("server '\(name)': name must not contain '::'")
         }
+        for lock in locks ?? [] {
+            if let refused = LockResource.nameError(lock.name) {
+                errors.append("server '\(name)': \(refused.message)")
+            }
+        }
         if command.isEmpty {
             errors.append("server '\(name)': command is empty")
         }

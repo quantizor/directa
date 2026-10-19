@@ -317,6 +317,26 @@ import Testing
             LockResource.nameError("my db,x")?.hint == "run: directa lock 'my db-x' -- <command>")
     }
 
+    /** A committed lock name that breaks the list is refused by config check
+        and by the register path, not only when a command asks for it. */
+    @Test func aLockNameThatBreaksTheLockListIsAConfigError() {
+        let file = ProjectFileConfig(
+            servers: ["web": ProjectFileServer(command: ["x"], locks: [LockDeclaration(name: "a,b")])])
+        #expect(
+            ProjectConfigLoader.validate(config: file, project: "/p").errors == [
+                "server 'web': lock resource name 'a,b' cannot contain ',' or '::', because the list of held locks (DIRECTA_LOCKS) joins keys with them and could not be split back apart; rename the resource in devservers.json and here"
+            ])
+        let registered = ServerSpec(
+            command: ["x"], locks: [LockDeclaration(name: "db::main")], name: "web")
+        #expect(
+            registered.validationErrors() == [
+                "server 'web': lock resource name 'db::main' cannot contain ',' or '::', because the list of held locks (DIRECTA_LOCKS) joins keys with them and could not be split back apart; rename the resource in devservers.json and here"
+            ])
+        #expect(
+            ServerSpec(command: ["x"], locks: [LockDeclaration(name: "data")], name: "web")
+                .validationErrors().isEmpty)
+    }
+
     /** A lock's state path is documented as project-relative, so it is enforced
         rather than trusted: a committed config must not be able to aim the
         fingerprint at somewhere outside the project. */
