@@ -1,5 +1,59 @@
 # Changelog
 
+## 3.1.0
+### Minor Changes
+
+
+
+- [#41](https://github.com/quantizor/directa/pull/41) [`e607c00`](https://github.com/quantizor/directa/commit/e607c0008de57dbee32a07687b87e3c1b336ba6a) - `directa daemon restart` and `directa daemon install` (an upgrade) no longer stop your running servers. The old daemon steps aside, leaving every server running, and the new daemon picks them up where they are, so open browser tabs, long builds, and in-memory state survive the swap. Any server the new daemon cannot pick up is started again by name, as before. `directa daemon stop`, `directa uninstall` in every form (including the Homebrew upgrade step), a logout, and a machine shutdown still stop every server first, because nothing would be watching them afterward. A daemon started by hand with `--foreground` also still stops its servers when it exits, since only servers run under the background agent can be picked up.
+
+
+
+- [#41](https://github.com/quantizor/directa/pull/41) [`e607c00`](https://github.com/quantizor/directa/commit/e607c0008de57dbee32a07687b87e3c1b336ba6a) - `directa lock --pause` now starts your command only once every paused server, and every process it started, has fully exited, so a worker that was slow to shut down can no longer still be holding the file your command is about to change. If a server's stop gives up with processes still running, the lock fails with `resource-locked`, names that server and points at `directa why <name>`, puts back any server it had already paused, and never runs your command.
+  
+  The command now also sees a `DIRECTA_LOCKS` environment variable listing the locks held around it (each as the project's full path, `::`, and the resource name, comma-separated, added after any value already set), so a tool with its own lock for the same resource can tell it is already protected. `directa lock` reads that variable itself: a command run under a lock that already lists the one it asks for runs at once, so a guarded script that locks the same resource again no longer waits on its own parent. A resource name containing `,` or `::` is refused with a usage error, since the list could not be split back apart.
+
+### Patch Changes
+
+
+
+- [#41](https://github.com/quantizor/directa/pull/41) [`e607c00`](https://github.com/quantizor/directa/commit/e607c0008de57dbee32a07687b87e3c1b336ba6a) - directa now states that it needs an Apple silicon Mac. Releases have only ever run on Apple silicon, but the Homebrew cask let an Intel Mac on macOS 26 install a copy that could not open. Homebrew now refuses the install on an Intel Mac with a clear message instead.
+
+
+
+- [#41](https://github.com/quantizor/directa/pull/41) [`e607c00`](https://github.com/quantizor/directa/commit/e607c0008de57dbee32a07687b87e3c1b336ba6a) - `directa ensure` now restarts a server whose status reads `unhealthy` (its health checks failed several times in a row after it had been healthy) and waits until the new run is healthy, instead of returning the broken server as it was. The restart is the same single step `directa restart` takes, including the check that no leftover process still holds the server's port, and the events log records it as a stop with the detail `restarted by ensure: unhealthy`. Two sessions ensuring the same unhealthy server at once cause one restart. A server that is `running` while its latest check is failing is still waited on, not restarted.
+
+
+
+- [#41](https://github.com/quantizor/directa/pull/41) [`e607c00`](https://github.com/quantizor/directa/commit/e607c0008de57dbee32a07687b87e3c1b336ba6a) - `directa wait --healthy` and the healthy status could report a server healthy right after a restart, before it was listening, when its health URL sent a short cache lifetime (`Cache-Control: max-age`). The health check reused the answer from the server's previous run instead of connecting. Every health check now reaches the server.
+
+
+
+- [#41](https://github.com/quantizor/directa/pull/41) [`e607c00`](https://github.com/quantizor/directa/commit/e607c0008de57dbee32a07687b87e3c1b336ba6a) - Health reporting now tells the truth about slow and failing servers. A health check's `timeoutMs` now covers the whole check: a server that answers after six or seven seconds passes when the limit is ten, where before every check gave up at five seconds whatever the config said, so a slow cold boot stayed "starting" and then timed out. A check that fails to connect over IPv4 now tries IPv6 only when the connection was refused, and a timeout is no longer retried (which doubled the wait).
+  
+  `directa status` and `directa why` no longer call a server "running and healthy" when its latest health check failed. A running server whose checks are failing is described as such, with how many failed in a row and why ("HTTP 500", "connection refused", "timed out after 10s"). The same information is in `status --json` as `lastHealthCheck` (absent when no healthcheck is configured), and the session context lists such a server first with a pointer to `directa why`.
+  
+  When `ensure`, `wait`, `up`, `restart`, or `switch` time out while a server is still starting, the output now says it is still starting, not failed, and names `directa wait <name> --timeout <seconds>` to keep waiting. The exit code is unchanged.
+
+
+- [#41](https://github.com/quantizor/directa/pull/41) [`e607c00`](https://github.com/quantizor/directa/commit/e607c0008de57dbee32a07687b87e3c1b336ba6a) - The after-tool hook no longer repeats a server summary it already gave. When Claude Code subagents run beside their parent, or an agent moves between a project's checkouts, each agent now remembers what it was last told about each checkout separately, so unchanged servers stay quiet instead of being announced as new or removed on every call. Two tool calls that finish at the same moment also take turns, so only one of them speaks. A new session or a compaction clears what the agent was told about its other checkouts, so each of them gets a full summary again when the agent returns to it.
+
+
+
+- [#41](https://github.com/quantizor/directa/pull/41) [`e607c00`](https://github.com/quantizor/directa/commit/e607c0008de57dbee32a07687b87e3c1b336ba6a) - Asking for a server a project does not have now points at where the name lives. When exactly one other registered project defines it, the error names that project and suggests `directa status <name> --project '<path>'`. When several do, it lists their paths and suggests `directa status --all <name>`. When none does, the hint is `directa status --all`, which lists every project. Before, the hint was `directa status --json`, which listed the servers of the project that was asked about but never pointed at the project that defines the name. This covers `status`, `open`, `monitor`, `restart`, and the commands that start, stop, or read logs for a server. A name is never resolved into another project on its own. In a linked worktree without its own `devservers.json`, the message now also says that `--project` with the main checkout's path acts on the main checkout's server.
+
+
+
+- [#41](https://github.com/quantizor/directa/pull/41) [`e607c00`](https://github.com/quantizor/directa/commit/e607c0008de57dbee32a07687b87e3c1b336ba6a) - Running a `directa` command from a directory that no longer exists (for example a removed worktree) now fails at once with a message saying the current directory is gone, and suggests `directa status --all` to list projects. Before, every command that works on a project spun at full CPU forever. Pass `--project` with a path to run a command that does not need the current directory from there. `directa lock` still needs a current directory to run its command in and refuses either way. Agent session hooks and the statusline stay silent in that case.
+
+
+
+- [#40](https://github.com/quantizor/directa/pull/40) [`434b032`](https://github.com/quantizor/directa/commit/434b032e612adb3ac2102adae0c124da38dea29e) - `directa wait --healthy` stays blocked until a health check has passed for the process that is up now. A check from the process it replaced no longer counts, so a restart that is still coming up is not reported ready, and a server whose latest check is failing is not treated as ready either. `directa ensure` waits in that same window instead of returning immediately. Status for the new process no longer shows the previous process's exit.
+
+
+
+- [#41](https://github.com/quantizor/directa/pull/41) [`e607c00`](https://github.com/quantizor/directa/commit/e607c0008de57dbee32a07687b87e3c1b336ba6a) - `directa wait <name> --stopped` now returns only once the server has no process left running. Before, a server whose port was taken by another server kept its process alive but reported as failed, and the wait returned early while that process was still up. If the wait times out on such a server, the message now names `directa stop <name>` as the next step.
+
 ## 3.0.1
 ### Patch Changes
 
