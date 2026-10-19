@@ -19,7 +19,7 @@ Docs
 Identity and stack
 - Apple silicon on macOS 26+ is the only compatibility constraint (Package.swift platforms, the bundle's LSMinimumSystemVersion, and the cask's depends_on move together); releases are arm64-only by decision, so no universal build. The toolchain is whatever Xcode builds for it (CI: the macos-26 runner's default); swift-tools-version 6.2, Swift 6 language mode with strict concurrency, single SPM package.
 - Isolation is set per target in Package.swift: .defaultIsolation(nil) everywhere except DirectaApp, which is .defaultIsolation(MainActor.self).
-- Deps (exactly two): swift-argument-parser (CLI only) and swift-subprocess (daemon only; pre-1.0, revision-pinned, isolated behind the ProcessLauncher protocol so a posix_spawn fallback can swap in without touching callers). The revision pin is load-bearing; do not loosen it.
+- Deps (exactly two): swift-argument-parser (CLI only) and swift-subprocess (daemon only; a 1.x semver range, isolated behind the ProcessLauncher protocol so a posix_spawn fallback can swap in without touching callers). A program named without a path resolves against the PATH in the child's environment, so a spec env that sets PATH must include the program's directory.
 - Three products, one daemon: ddirecta owns all server processes; directa (CLI) and directa.app (SwiftUI MenuBarExtra) are thin clients over a unix socket (default ~/Library/Application Support/directa/daemon.sock; DIRECTA_SOCKET overrides; /tmp fallback near the sun_path limit), NDJSON protocol. directa daemon install/uninstall/start/stop/restart manage the LaunchAgent (dev.quantizor.directa); tests and the smoke gate run ddirecta --foreground.
 
 Codebase map (depth: docs/architecture.md)
