@@ -267,23 +267,44 @@ enum CLIRunner {
     static let restoreWaitBudget = Duration.seconds(30)
     static let restorePollInterval = Duration.milliseconds(250)
 
-    private static func awaitingRestore<R: Codable & Sendable>(
+    /** `daemon-starting` is also how the daemon refuses a request for one
+        server whose surviving process it has not yet decided about, long
+        after restore finished. Only a daemon that says it is still restoring
+        is waited on: `daemon.info` answers while restoring, so a daemon that
+        answers without the restoring flag is serving, the refusal is about
+        one server, and waiting would only turn its message into a bare
+        "unreachable". An unanswered `daemon.info` keeps the wait. */
+    static func refusalIsPerServer(info: DaemonInfo?) -> Bool {
+        guard let info else { return false }
+        return info.restoring != true
+    }
+
+    private static func liveDaemonInfo() async -> DaemonInfo? {
+        try? await client().request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
+    }
+
+    static func awaitingRestore<R: Codable & Sendable>(
+        budget: Duration = restoreWaitBudget,
+        pollInterval: Duration = restorePollInterval,
+        readInfo: (() async -> DaemonInfo?)? = nil,
         _ body: (DaemonClient) async throws -> R
     ) async throws -> R {
-        let deadline = ContinuousClock.now.advanced(by: restoreWaitBudget)
+        let readInfo = readInfo ?? liveDaemonInfo
+        let deadline = ContinuousClock.now.advanced(by: budget)
         var announced = false
         while true {
             do {
                 return try await body(client())
             } catch let error as WireError where error.code == .daemonStarting {
                 guard ContinuousClock.now < deadline else { throw error }
+                if refusalIsPerServer(info: await readInfo()) { throw error }
                 if !announced {
                     announced = true
                     notice(CLINotice.daemonRestoring)
                 }
                 /** A cancelled sleep just re-checks the deadline on the next
                     pass, so the loop still terminates and nothing is lost. */
-                try? await Task.sleep(for: restorePollInterval)
+                try? await Task.sleep(for: pollInterval)
             }
         }
     }
