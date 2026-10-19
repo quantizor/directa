@@ -46,6 +46,16 @@ public actor Router {
         start-shaped and stop-shaped requests until `settleDeferredSurvivors`
         decides it; no supervisor owns the run in the meantime. */
     private var deferredSurvivors: [String: DeferredSurvivor] = [:]
+    /** Set once the retry window passed with launchd's job list still silent:
+        the refusal for a server still deferred then names a daemon restart as
+        the way out, since waiting longer will not settle it. */
+    private var deferredRetryGaveUp = false
+    /** Set when the drain begins: nothing settles a deferred survivor from
+        then on, since the drain stops them itself. */
+    private var drainingDeferredSurvivors = false
+    /** Deferred servers whose decision is being made right now, so a retry
+        tick and a request that both find a dead run settle it once. */
+    private var settlingDeferredSurvivors: Set<String> = []
 
     /** What the per-row restore decision needs, captured when the row was
         deferred. */
@@ -78,6 +88,7 @@ public actor Router {
     static let unhealthyEnsureRestartReason = "restarted by ensure: unhealthy"
     /** True once a `daemon.shutdown` with `handoff` was accepted: this daemon is
         leaving its servers running for the next one, so a SIGTERM that races
+    private static let daemonRestartHint = "run: directa daemon restart"
         the exit must not drain them. */
     private var handedOff = false
 
@@ -386,7 +397,7 @@ public actor Router {
                 let target = ServerTargetParams(
                     name: request.params.name, port: request.params.port,
                     project: canonicalProjectPath(request.params.project))
-                try refuseWhileDeferred(project: target.project, name: target.name)
+                try await refuseWhileDeferred(project: target.project, name: target.name)
                 let supervisor = try await resolvedSupervisor(target)
                 let stopped = await supervisor.stop(reason: "requested by stop")
                 DirectaLog.daemon.info("stop \(target.name)@\(target.project)")
@@ -410,6 +421,7 @@ public actor Router {
                 return try respond(
                     id: head.id,
                     result: EnsureResult(reason: reason, server: reported(await supervisor.status())))
+                try await refuseWhileDeferred(project: target.project, name: target.name)
             case .lockAcquire:
                 let request = try decoder.decode(WireRequest<LockParams>.self, from: line)
                 var params = request.params
@@ -557,7 +569,7 @@ public actor Router {
                         hint: "run: directa status --json",
                         message: "'\(name)' is not registered as an ad hoc server for \(project)")
                 }
-                try refuseWhileDeferred(project: project, name: name)
+                try await refuseWhileDeferred(project: project, name: name)
                 let id = serverID(project: project, name: name)
                 /** A server still running when it is unregistered must be
                     stopped through the normal stop path first, awaiting its
@@ -604,7 +616,9 @@ public actor Router {
     /** Drain-stops every supervisor in parallel: a serial drain of N servers at
         up to 7s grace each would blow through launchd's ExitTimeOut. The drain
         is not a deliberate stop: resume-on-boot intent survives so the next
-        boot restores what was running. */
+        boot restores what was running. A deferred survivor no supervisor owns
+        is stopped too (`drainDeferredSurvivor`), so a shutdown or uninstall
+        leaves no server running unsupervised. */
     public func drainAll() async {
         await withTaskGroup(of: Void.self) { group in
             for supervisor in supervisors.values {
@@ -612,6 +626,8 @@ public actor Router {
                     _ = await supervisor.stop(deliberate: false, reason: "daemon shutting down")
                 }
             }
+        drainingDeferredSurvivors = true
+        let deferredIDs = Array(deferredSurvivors.keys)
         }
     }
 
@@ -628,7 +644,32 @@ public actor Router {
     /** SIGTERM's drain, skipped after a handoff exit began: the bounce that
         follows a handoff terminates the old daemon, and draining then would
         stop the servers the handoff exists to keep. */
+            for id in deferredIDs {
+                group.addTask { await self.drainDeferredSurvivor(id: id) }
+            }
+        }
+    }
+
+    /** Stops the run a deferred survivor's row records, with the same teardown
+        a bounce uses: the process group and every live descendant, each
+        signaled only while it still names the identity recorded for it, and
+        only when the row's pid proves out by start time (a recycled number
+        is never signaled). The row keeps its restore intent and reads
+        `stopped`, as any supervised server's does after a drain. */
+    private func drainDeferredSurvivor(id: String) async {
+        guard let survivor = deferredSurvivors[id] else { return }
+        if let identity = ProcessTree.provenIdentity(
+            pid: survivor.persisted.pid, startedAt: survivor.persisted.startedAt)
+        {
+            if await terminateRun(identity, project: survivor.project, name: survivor.name) {
+                try? await registry.updateState(serverID: id, writer: .router) { entry in
+                    entry.phase = .stopped
+                    entry.pid = nil
+                    entry.startedAt = nil
+                }
+            }
     public func drainOnTermination() async {
+        deferredSurvivors[id] = nil
         guard !handedOff else { return }
         await drainAll()
     }
@@ -959,14 +1000,16 @@ public actor Router {
         the entries deferred and their rows untouched for the next boot. The
         leftover-job reap restore runs is not repeated here: this list was
         taken after servers started, so a job a supervisor is still
-        registering could read as stale. Returns at once when nothing is
-        deferred, so the daemon starts it unconditionally after restore. */
+        registering could read as stale. Each tick first settles every entry
+        whose recorded run is no longer live (`settleGoneDeferredSurvivors`),
+        which needs no job list. Returns at once when nothing is deferred, so
+        the daemon starts it unconditionally after restore. */
     public func settleDeferredSurvivors() async {
         guard let agentJobs, !deferredSurvivors.isEmpty else { return }
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: deferredSurvivorRetry.window)
         var delay = deferredSurvivorRetry.firstDelay
-        while !deferredSurvivors.isEmpty {
+        while !deferredSurvivors.isEmpty, !drainingDeferredSurvivors {
             let remaining = deadline - clock.now
             guard remaining > .zero else {
                 DirectaLog.daemon.error(
@@ -975,6 +1018,7 @@ public actor Router {
             }
             do {
                 try await Task.sleep(for: min(delay, remaining))
+                deferredRetryGaveUp = true
             } catch {
                 return
             }
@@ -984,6 +1028,8 @@ public actor Router {
                 return
             case .unavailable(let reason):
                 DirectaLog.daemon.error(
+            await settleGoneDeferredSurvivors()
+            guard !deferredSurvivors.isEmpty else { return }
                     "recover: launchd job list re-read failed, retrying in \(min(delay * 2, deferredSurvivorRetry.longestDelay)): \(reason)")
                 delay = min(delay * 2, deferredSurvivorRetry.longestDelay)
             }
@@ -994,39 +1040,79 @@ public actor Router {
         let adoptableChildJobs = Dictionary(
             jobs.compactMap { job in job.pid.map { ($0, job) } },
             uniquingKeysWith: { first, _ in first })
-        var toStart: [(project: String, spec: ServerSpec)] = []
-        for (id, survivor) in deferredSurvivors {
-            /** A project forgotten while this ran took its entries with it. */
-            guard deferredSurvivors[id] != nil else { continue }
-            /** The entry stays until the decision finishes, so a request
-                that lands while a bounce waits out its grace is still
-                refused rather than spawning beside the dying survivor. */
-            let decision = await decideRecoveredRow(
-                adoptableChildJobs: adoptableChildJobs, id: id, name: survivor.name,
-                persisted: survivor.persisted, project: survivor.project, spec: survivor.spec)
-            deferredSurvivors[id] = nil
-            DirectaLog.daemon.info(
-                "recover settle \(survivor.name)@\(survivor.project): \(decision)")
-            if decision == .restart {
-                toStart.append((project: survivor.project, spec: survivor.spec))
-            }
+        for id in Array(deferredSurvivors.keys) {
+            await settleDeferredSurvivor(id: id, adoptableChildJobs: adoptableChildJobs)
         }
-        await startRecovered(toStart)
     }
 
-    /** Refuses a request that would start, restart, or stop a server whose
-        surviving process is still undecided: a second copy would run beside
-        it (or fail on the port it holds), and a stop would signal a process
-        the daemon has not yet proven it may. */
-    private func refuseWhileDeferred(project: String, name: String) throws {
-        guard let pid = deferredSurvivors[serverID(project: project, name: name)]?.persisted.pid
+    /** Settles every deferred survivor whose recorded run is no longer live,
+        or no longer proves out by start time, the way restore settles a row
+        whose process is gone: no job list is needed to know a dead run is
+        not adoptable. `only` narrows the pass to one server (a request that
+        found it refused). */
+    private func settleGoneDeferredSurvivors(only id: String? = nil) async {
+        for (candidate, survivor) in deferredSurvivors where id == nil || candidate == id {
+            guard
+                ProcessTree.provenIdentity(
+                    pid: survivor.persisted.pid, startedAt: survivor.persisted.startedAt) == nil
+            else { continue }
+            await settleDeferredSurvivor(id: candidate, adoptableChildJobs: [:])
+        }
+    }
+
+    /** Decides one deferred survivor through `decideRecoveredRow`, then lifts
+        its refusals and starts it when the decision says to. Skipped while
+        another settle of the same server is deciding, and during the drain.
+        The entry stays until the decision finishes, so a request that lands
+        while a bounce waits out its grace is still refused rather than
+        spawning beside the dying survivor. A project forgotten while the
+        decision ran took its entry with it (`forgetMissingProject`), so the
+        decision is not acted on afterward. */
+    private func settleDeferredSurvivor(
+        id: String, adoptableChildJobs: [pid_t: LaunchdJobs.ChildJob]
+    ) async {
+        guard !drainingDeferredSurvivors, let survivor = deferredSurvivors[id],
+            settlingDeferredSurvivors.insert(id).inserted
         else { return }
         throw WireError(
             code: .daemonStarting,
             hint: Self.daemonStartingHint,
             message:
-                "'\(name)' in \(project) still has its process (pid \(pid)) from before the daemon restarted, and directa is waiting for launchd to say whether it can take that process back over. It cannot be started, restarted, or stopped until then; try again shortly.")
+                "'\(name)' in \(project) still has its process (pid \(pid)) from before the daemon restarted, and directa is waiting for launchd to say whether it can take that process back over. It cannot be started, restarted, waited on, or stopped until then; try again shortly.")
     }
+        defer { settlingDeferredSurvivors.remove(id) }
+        let decision = await decideRecoveredRow(
+            adoptableChildJobs: adoptableChildJobs, id: id, name: survivor.name,
+            persisted: survivor.persisted, project: survivor.project, spec: survivor.spec)
+        guard deferredSurvivors[id] != nil else { return }
+        deferredSurvivors[id] = nil
+        DirectaLog.daemon.info(
+            "recover settle \(survivor.name)@\(survivor.project): \(decision)")
+        if decision == .restart {
+            await startRecovered([(project: survivor.project, spec: survivor.spec)])
+        }
+    }
+
+    /** Refuses a request that would start, restart, wait on, or stop a server
+        whose surviving process is still undecided: a second copy would run
+        beside it (or fail on the port it holds), a stop would signal a
+        process the daemon has not yet proven it may, and a wait would answer
+        from a supervisor that does not own the run. A survivor whose run has
+        since exited is settled first (`settleGoneDeferredSurvivors`) and
+        passes. Once the retry window gave up, the refusal says the job list
+        never answered and names a daemon restart as the way out. */
+    private func refuseWhileDeferred(project: String, name: String) async throws {
+        let id = serverID(project: project, name: name)
+        guard deferredSurvivors[id] != nil else { return }
+        await settleGoneDeferredSurvivors(only: id)
+        guard let pid = deferredSurvivors[id]?.persisted.pid else { return }
+        if deferredRetryGaveUp {
+            throw WireError(
+                code: .daemonStarting,
+                hint: Self.daemonRestartHint,
+                message:
+                    "'\(name)' in \(project) still has its process (pid \(pid)) from before the daemon restarted, and launchd's job list never answered, so directa cannot tell whether it can take that process back over. It cannot be started, restarted, waited on, or stopped until the daemon restarts.")
+        }
 
     /** `status` as a client should read it: a deferred survivor shows the
         phase, pid, and uptime its row records, since no supervisor owns the
@@ -1115,7 +1201,20 @@ public actor Router {
         else {
             DirectaLog.daemon.info(
                 "orphan bounce skip \(name)@\(project): pid \(root.pid) gone or reused")
-            return
+            return false
+        guard await terminateRun(root, project: project, name: name) else { return }
+        await events.post(
+            kind: .crashed, project: project, server: name,
+            detail: DaemonRestartDetail.orphanBounced(pid: root.pid))
+    }
+
+    /** SIGTERM then SIGKILL over the run `root` names and every live
+        descendant, the teardown `bounceOrphan` and the drain of a deferred
+        survivor share. False, signaling nothing, when the pid no longer
+        names `root`. */
+    private func terminateRun(
+        _ root: ProcessIdentity, project: String, name: String
+    ) async -> Bool {
         }
         let pid = root.pid
         /** The shape of the supervisor's stop. A server is spawned as a
@@ -1148,9 +1247,7 @@ public actor Router {
             descendants: ProcessTree.liveDescendants(
                 rootPid: pid, rootIdentity: root, snapshot: [], priorCandidates: candidates),
             rootIdentity: root, signal: SIGKILL)
-        await events.post(
-            kind: .crashed, project: project, server: name,
-            detail: DaemonRestartDetail.orphanBounced(pid: pid))
+        return true
     }
 
     /** Stops a resident supervisor for removal and drops it from the pool,
@@ -1563,7 +1660,7 @@ public actor Router {
         target: ServerTargetParams, supervisor: ServerSupervisor, portOverride: Int? = nil,
         force: Bool = false, stopsPortFailedRun: Bool = true, userInitiated: Bool = false
     ) async throws {
-        try refuseWhileDeferred(project: target.project, name: target.name)
+        try await refuseWhileDeferred(project: target.project, name: target.name)
         if !force {
             /** Phase, not `hasLiveRun`: a live port-failed run still resolves
                 afresh, since `start` replaces it. */
@@ -2090,7 +2187,7 @@ public actor Router {
         if shouldPause {
             for spec in merged.specs
             where LockResource.declares(resource: params.resource, spec: spec) {
-                try refuseWhileDeferred(project: params.project, name: spec.name)
+                try await refuseWhileDeferred(project: params.project, name: spec.name)
             }
         }
         for spec in merged.specs
@@ -2772,7 +2869,7 @@ public actor Router {
         /** Before any wave stops, so a deferred survivor refuses the whole
             teardown rather than leaving half the project down. */
         for spec in merged.specs {
-            try refuseWhileDeferred(project: params.project, name: spec.name)
+            try await refuseWhileDeferred(project: params.project, name: spec.name)
         }
         var results: [EnsureResult] = []
         for wave in waves.reversed() {
