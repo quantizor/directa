@@ -1675,11 +1675,11 @@ private struct ExitsAtOnceAdoptLauncher: ProcessLauncher {
 }
 
 private struct AlwaysHealthyProber: HealthProber {
-    func probe(_ check: EffectiveHealthcheck) async -> Bool { true }
+    func probe(_ check: EffectiveHealthcheck) async -> HealthProbeOutcome { .pass }
 }
 
 private struct NeverHealthyProber: HealthProber {
-    func probe(_ check: EffectiveHealthcheck) async -> Bool { false }
+    func probe(_ check: EffectiveHealthcheck) async -> HealthProbeOutcome { .fail("test failure") }
 }
 
 @Suite(.temporaryTree) struct RegistryTests {

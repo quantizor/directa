@@ -13,22 +13,44 @@ public enum LoopbackProbe {
         tooling on `127.0.0.1` only, so both loopback families are tried and
         either answering counts as a live listener. */
     public static func isListening(port: Int, timeoutMs: Int = 300) -> Bool {
-        connects(port: port, timeoutMs: timeoutMs, family: AF_INET)
-            || connects(port: port, timeoutMs: timeoutMs, family: AF_INET6)
+        connect(port: port, timeoutMs: timeoutMs, family: AF_INET) == .listening
+            || connect(port: port, timeoutMs: timeoutMs, family: AF_INET6) == .listening
+    }
+
+    /** How one connect attempt ended. */
+    public enum Outcome: Equatable, Sendable {
+        /** Some other failure: an impossible port, no socket, an unreachable address. */
+        case failed
+        case listening
+        /** Nothing is listening: the kernel answered the attempt with a reset. */
+        case refused
+        /** No answer inside the deadline. */
+        case timedOut
+    }
+
+    /** The health probe's form: IPv4 first, and IPv6 only when IPv4 was
+        refused, since a refusal says the port is free on that stack and
+        another stack may hold the server. A timeout on IPv4 means something
+        answered the address and did not accept, so a second full wait on IPv6
+        would double the time `timeoutMs` promised the caller. */
+    public static func probe(port: Int, timeoutMs: Int) -> Outcome {
+        let v4 = connect(port: port, timeoutMs: timeoutMs, family: AF_INET)
+        guard v4 == .refused else { return v4 }
+        return connect(port: port, timeoutMs: timeoutMs, family: AF_INET6)
     }
 
     /** Non-blocking connect with a poll deadline, so an unreachable port cannot
         stall a status call for the kernel's full connect timeout. */
-    private static func connects(port: Int, timeoutMs: Int, family: Int32) -> Bool {
+    private static func connect(port: Int, timeoutMs: Int, family: Int32) -> Outcome {
         /** A port arrives from a repo's devservers.json, from `--port`, and from
             portSpan arithmetic that can run off the end of the range, and
             `UInt16(port)` traps on anything outside 0...65535. Under launchd
             KeepAlive that trap is a crash loop: boot restore re-reads the same
             config and dies again on every relaunch. Nothing can be listening on
             a port that does not exist, so answer that instead of trapping. */
-        guard let narrowed = UInt16(exactly: port), narrowed > 0 else { return false }
+        guard let narrowed = UInt16(exactly: port), narrowed > 0 else { return .failed }
         let sock = socket(family, SOCK_STREAM, 0)
-        guard sock >= 0 else { return false }
+        guard sock >= 0 else { return .failed }
         defer { close(sock) }
         let flags = fcntl(sock, F_GETFL)
         _ = fcntl(sock, F_SETFL, flags | O_NONBLOCK)
@@ -55,11 +77,12 @@ public enum LoopbackProbe {
         }
         let result = withUnsafePointer(to: &storage) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                connect(sock, sa, sockLen)
+                Darwin.connect(sock, sa, sockLen)
             }
         }
-        if result == 0 { return true }
-        guard errno == EINPROGRESS else { return false }
+        if result == 0 { return .listening }
+        if errno == ECONNREFUSED { return .refused }
+        guard errno == EINPROGRESS else { return .failed }
         var pollTarget = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
         /** The same hazard as the port above, on the value sitting beside it: a
             healthcheck's `timeoutMs` comes from a repo's devservers.json, and
@@ -69,10 +92,16 @@ public enum LoopbackProbe {
             a probe that cannot report inside its deadline is a probe reporting
             that nothing is listening. */
         let deadline = Int32(clamping: max(0, timeoutMs))
-        guard poll(&pollTarget, 1, deadline) == 1 else { return false }
+        let ready = poll(&pollTarget, 1, deadline)
+        if ready == 0 { return .timedOut }
+        guard ready == 1 else { return .failed }
         var soError: Int32 = 0
         var soLen = socklen_t(MemoryLayout<Int32>.size)
         getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &soLen)
-        return soError == 0
+        switch soError {
+        case 0: return .listening
+        case ECONNREFUSED: return .refused
+        default: return .failed
+        }
     }
 }

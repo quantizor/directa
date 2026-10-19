@@ -123,6 +123,7 @@ public actor ServerSupervisor {
     private var lastDescendantSnapshot: [ProcessIdentity] = []
     private var lastExit: LastExit?
     private var lastHealthAt: Date?
+    private var lastHealthCheck: HealthCheckResult?
     private let launcher: any ProcessLauncher
     private let logStore: LogStore
     private let mainProjectSlug: String?
@@ -824,6 +825,7 @@ public actor ServerSupervisor {
             icon: spec.icon,
             lastExit: lastExit,
             lastHealthAt: lastHealthAt,
+            lastHealthCheck: lastHealthCheck,
             locks: spec.locks.map { $0.map(\.name) },
             logPath: paths.structuredLogFile(project: projectPath, server: spec.name).path,
             mainProject: mainProjectSlug,
@@ -876,21 +878,21 @@ public actor ServerSupervisor {
                     and recording that pass would mark the new process healthy
                     while its port still refuses connections. */
                 guard let generation = await self?.runGeneration else { return }
-                let healthy = await prober.probe(check)
+                let outcome = await prober.probe(check)
                 guard !Task.isCancelled else { return }
                 /** Failures inside the wake grace window carry no signal: the
                     machine (and the server) just woke up. */
-                if case .ignoreFailures = policy, !healthy {
+                if case .ignoreFailures = policy, !outcome.passed {
                     try? await Task.sleep(for: .milliseconds(intervalMs))
                     continue
                 }
-                await self?.recordProbe(success: healthy, generation: generation)
+                await self?.recordProbe(outcome, generation: generation)
                 try? await Task.sleep(for: .milliseconds(intervalMs))
             }
         }
     }
 
-    private func recordProbe(success: Bool, generation: UInt64) async {
+    private func recordProbe(_ outcome: HealthProbeOutcome, generation: UInt64) async {
         /** A probe started under a run that has since ended or been replaced. */
         guard generation == runGeneration else { return }
         /** Probes landing after the process died must not resurrect state. */
@@ -900,6 +902,16 @@ public actor ServerSupervisor {
         }
         let healthyAfter = spec.healthcheck?.healthyAfter ?? 1
         let unhealthyAfter = spec.healthcheck?.unhealthyAfter ?? 3
+        let success = outcome.passed
+        /** With no healthcheck the probe answers "alive" by construction,
+            which says nothing about the server, so no result is kept. Recorded
+            before the first suspension below, which a run ending could
+            otherwise slip past. */
+        if EffectiveHealthcheck.resolve(spec: spec).kind != .none {
+            lastHealthCheck = HealthCheckResult(
+                at: Date(), detail: success ? nil : outcome.detail,
+                failures: success ? 0 : consecutiveFailures + 1, passed: success)
+        }
         if success {
             consecutiveSuccesses += 1
             consecutiveFailures = 0
@@ -1203,6 +1215,7 @@ public actor ServerSupervisor {
         consecutiveSuccesses = 0
         everHealthy = false
         lastHealthAt = nil
+        lastHealthCheck = nil
         passedProbeThisRun = false
     }
 
