@@ -62,6 +62,7 @@ test: sweep-test-temp sweep-swift-temp
 		echo "$$procs" >&2; \
 		for pid in $$(pgrep -f -- "$$root" || true); do kill -KILL "$$pid" 2>/dev/null || true; done; \
 		echo "fix: a test must stop every process it spawns before it returns; the processes above were killed" >&2; \
+		rm -rf "$$root"; \
 		exit 1; \
 	fi; \
 	left="$$(find "$$root" -mindepth 1 -maxdepth 1 ! -name .owner)"; \
