@@ -680,7 +680,7 @@ struct Status: AsyncParsableCommand {
     after the server is already down. */
 struct Restart: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Stop and re-ensure a server as one transition.")
+        abstract: "Stop a server and start it again as one step.")
 
     @Flag(help: "Restart every server in the project.")
     var all = false
