@@ -656,10 +656,17 @@ private func makeEnv() throws -> RouterEnv {
     @Test func stopGivesADescendantItsGraceAfterTheRootExits() async throws {
         let env = try makeEnv()
         let marker = URL(fileURLWithPath: env.project).appending(path: "cleaned")
+        let ready = URL(fileURLWithPath: env.project).appending(path: "ready")
+        /** Absolute paths in the script text keep the temporary tree's path in
+            the shell's argv, which is how `make test` finds a leftover shell
+            after a killed run. The loops end on their own after a minute, so
+            a killed run never leaves one spinning. */
         let spec = ServerSpec(
             command: [
                 "/bin/sh", "-c",
-                #"trap "exit 0" TERM; (trap "sleep 1; echo done > cleaned; exit 0" TERM; : > ready; while :; do sleep 0.1; done) & while :; do sleep 0.1; done"#,
+                """
+                trap "exit 0" TERM; (trap "sleep 1; echo done > '\(marker.path)'; exit 0" TERM; : > '\(ready.path)'; while [ $SECONDS -lt 60 ]; do sleep 0.1; done) & while [ $SECONDS -lt 60 ]; do sleep 0.1; done
+                """,
             ],
             name: "slow-worker")
         let supervisor = ServerSupervisor(
@@ -667,7 +674,6 @@ private func makeEnv() throws -> RouterEnv {
             registry: Registry(paths: env.paths), spec: spec)
         #expect(await supervisor.start().pid != nil)
         /** The subshell writes `ready` once its trap is installed. */
-        let ready = URL(fileURLWithPath: env.project).appending(path: "ready")
         try #require(
             try await eventually(within: .seconds(5)) { FileManager.default.fileExists(atPath: ready.path) },
             "the worker never installed its trap")
@@ -1196,7 +1202,7 @@ private func makeEnv() throws -> RouterEnv {
         let ready = URL(fileURLWithPath: env.project).appending(path: "ready")
         let survivor = try spawnReapedSessionLeader([
             "/bin/sh", "-c",
-            "trap 'sleep 0.5; echo done > \"\(marker.path)\"; exit 0' TERM; : > \"\(ready.path)\"; while :; do sleep 0.1; done",
+            "trap 'sleep 0.5; echo done > \"\(marker.path)\"; exit 0' TERM; : > \"\(ready.path)\"; while [ $SECONDS -lt 60 ]; do sleep 0.1; done",
         ])
         defer { kill(survivor, SIGKILL) }
         /** The survivor writes `ready` once its trap is installed. */

@@ -636,31 +636,37 @@ private func fixtureServerBinaryPath() -> String? {
     mechanism: the first suite to ask for the fixture pays for the sweep and
     every later one gets the cached value. */
 private let strayFixturesReaped: Bool = {
-    reapStrayFixtureServers()
+    reapStrayProcesses()
     return true
 }()
 
-/** Kills fixture-servers left holding a port in this run's leased block by a
-    run that was interrupted before it could stop them.
+/** Kills processes a run left behind when it was interrupted before it could
+    stop them: fixture-servers, and the shells and children a test spawned
+    inside its temporary tree.
 
     A supervised child outliving its daemon is deliberate product behavior, not
     a leak, so the cleanup belongs to whoever spawned it. When a run is killed
     part way that owner is gone, and the next run to lease the block fails
     somewhere unrelated with `port-held` naming a pid nothing is tracking.
 
-    Two conditions, both required, keep this from reaping a process it does
-    not own. The command line must name a port in the block this process
-    leased, and no other live run can be using a block this process holds the
-    lease on; smoke.sh's fixtures use their own ranges and are deliberately
-    orphaned by its daemon-kill assertions. And the parent must be gone
-    (`ppid == 1`), so a process some live parent still owns is left to it. */
-private func reapStrayFixtureServers() {
-    guard let binary = fixtureServerBinaryPath() else { return }
-    let name = (binary as NSString).lastPathComponent
+    Two rules, each requiring the parent to be gone (`ppid == 1`), so a process
+    some live parent still owns is left to it. A fixture is reaped when its
+    command line names a port in the block this process leased, and no other
+    live run can be using that block; smoke.sh's fixtures use their own ranges
+    and are deliberately orphaned by its daemon-kill assertions. A process is
+    reaped as run-tree leftover when its command line names a tree under a run
+    root whose owner is gone (see `runOwnerIsGone`). A live run's orphans, which
+    a test may orphan on purpose, are never in that set. */
+private func reapStrayProcesses() {
+    let processes = runningProcesses()
+    let binary = fixtureServerBinaryPath().map { ($0 as NSString).lastPathComponent }
+    let deadRuns = Set(processes.filter { $0.parent == 1 }.compactMap { runName(of: $0.command) })
+        .filter(runOwnerIsGone)
     var killed: [pid_t] = []
-    for candidate in runningProcesses()
+    for candidate in processes
     where shouldReapStray(
-        command: candidate.command, parent: candidate.parent, binaryName: name, ports: TestPorts.range)
+        command: candidate.command, parent: candidate.parent, binaryName: binary, ports: TestPorts.range,
+        deadRunRoots: deadRuns)
     {
         kill(candidate.pid, SIGKILL)
         killed.append(candidate.pid)
@@ -678,14 +684,75 @@ private func reapStrayFixtureServers() {
 
 /** The decision on its own, so both halves are testable without spawning
     anything: the ones it must kill and, more importantly, the ones it must
-    not. */
-func shouldReapStray(command: String, parent: pid_t, binaryName: String, ports: Range<Int>) -> Bool {
+    not. A nil `binaryName` means no fixture binary was built, so the fixture
+    rule matches nothing. `deadRunRoots` holds run-root names (see
+    `runName(of:)`) whose owner is gone. */
+func shouldReapStray(
+    command: String, parent: pid_t, binaryName: String?, ports: Range<Int>,
+    deadRunRoots: Set<String> = []
+) -> Bool {
+    guard parent == 1 else { return false }
+    return isStrayFixture(command: command, binaryName: binaryName, ports: ports)
+        || namesDeadRunTree(command: command, deadRunRoots: deadRunRoots)
+}
+
+private func isStrayFixture(command: String, binaryName: String?, ports: Range<Int>) -> Bool {
     /** Matched by name rather than by absolute path: a fixture launched
         through a relative path appears in `ps` exactly as invoked, so a
         full-path match would skip it without a sound. */
-    guard command.contains(binaryName) else { return false }
-    guard parent == 1 else { return false }
+    guard let binaryName, command.contains(binaryName) else { return false }
     return command.split(separator: " ").compactMap { Int($0) }.contains(where: ports.contains)
+}
+
+/** The name TemporaryTree gives every tree it creates. Mirrors the literal in
+    Tests/DirectaTestSupport/TemporaryTree.swift, which this file does not own. */
+private let temporaryTreePrefix = "directa-test-"
+
+/** The name `make test` gives each run's root (its `mktemp` template). */
+private let runRootPrefix = "directa-run."
+
+/** The file `make test` writes into a run's root with its own shell's pid. A
+    run whose pid is gone was killed, so its leftover processes are stray. */
+private let runOwnerFileName = ".owner"
+
+/** The name of the `make test` run root a tree path sits under, or nil for
+    anything else. The root must sit directly in the macOS per-user temporary
+    directory (its parent folder is `T`), so a look-alike folder in a user's own
+    files never matches. A tree under the default temporary directory (a run
+    without make) has no run root, so nothing proves its owner is gone, and it
+    is never reaped as a leftover. */
+func runName(of command: String) -> String? {
+    guard let treeStart = command.range(of: "/" + temporaryTreePrefix) else { return nil }
+    let components = command[..<treeStart.lowerBound].split(separator: "/")
+    guard components.count >= 2, components[components.count - 2] == "T",
+        let name = components.last, name.hasPrefix(runRootPrefix)
+    else { return nil }
+    return String(name)
+}
+
+private func namesDeadRunTree(command: String, deadRunRoots: Set<String>) -> Bool {
+    guard let name = runName(of: command) else { return false }
+    return deadRunRoots.contains(name)
+}
+
+/** True only when the run's owner pid names no live process. A missing or
+    unreadable owner file, or a pid this process may not signal, counts as
+    alive, so a run this check cannot prove dead is never reaped. */
+private func runOwnerIsGone(run name: String) -> Bool {
+    guard let userTemp = darwinUserTempDirectory() else { return false }
+    let file = URL(fileURLWithPath: userTemp, isDirectory: true).appending(path: name).appending(path: runOwnerFileName)
+    guard let text = try? String(contentsOf: file, encoding: .utf8),
+        let owner = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)), owner > 0
+    else { return false }
+    return kill(owner, 0) == -1 && errno == ESRCH
+}
+
+/** The per-user temporary directory `make test` creates its run roots under, read
+    from the same `confstr` value Foundation uses on Darwin. */
+private func darwinUserTempDirectory() -> String? {
+    var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+    guard confstr(_CS_DARWIN_USER_TEMP_DIR, &buffer, buffer.count) > 0 else { return nil }
+    return String(cString: buffer)
 }
 
 private struct RunningProcess {
@@ -701,7 +768,7 @@ private struct RunningProcess {
     first asks for the fixture. An empty list when `ps` cannot run, which only
     means nothing is reaped. */
 private func runningProcesses() -> [RunningProcess] {
-    guard let text = try? captureOutput(["/bin/ps", "-A", "-o", "pid=,ppid=,command="]) else { return [] }
+    guard let text = try? captureOutput(["/bin/ps", "-A", "-ww", "-o", "pid=,ppid=,command="]) else { return [] }
     return text.split(separator: "\n").compactMap { line in
         let fields = line.split(separator: " ", omittingEmptySubsequences: true)
         guard fields.count >= 3, let pid = pid_t(fields[0]), let parent = pid_t(fields[1])

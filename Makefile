@@ -53,9 +53,18 @@ TEST_PARALLEL_WIDTH := 16
 # returned.
 test: sweep-test-temp sweep-swift-temp
 	@root="$$(mktemp -d "$$(getconf DARWIN_USER_TEMP_DIR)directa-run.XXXXXX")" || exit 1; \
+	echo $$$$ > "$$root/.owner"; \
 	SWT_EXPERIMENTAL_MAXIMUM_PARALLELIZATION_WIDTH=$(TEST_PARALLEL_WIDTH) \
 	DIRECTA_TEST_TEMP_ROOT="$$root" swift test --disable-xctest; status=$$?; \
-	left="$$(find "$$root" -mindepth 1 -maxdepth 1)"; \
+	procs="$$(pgrep -fl -- "$$root" || true)"; \
+	if [ -n "$$procs" ]; then \
+		echo "error: the test run left processes running that name $$root:" >&2; \
+		echo "$$procs" >&2; \
+		for pid in $$(pgrep -f -- "$$root" || true); do kill -KILL "$$pid" 2>/dev/null || true; done; \
+		echo "fix: a test must stop every process it spawns before it returns; the processes above were killed" >&2; \
+		exit 1; \
+	fi; \
+	left="$$(find "$$root" -mindepth 1 -maxdepth 1 ! -name .owner)"; \
 	if [ -n "$$left" ]; then \
 		echo "error: the test run left temporary trees in $$root:" >&2; \
 		echo "$$left" >&2; \
