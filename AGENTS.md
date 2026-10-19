@@ -96,6 +96,7 @@ Testing
 - Read a file's existing tests before the first edit to it, and extend an existing suite before creating a new one.
 - A state machine (the server phase machine, ensure/stop/restart interleavings, lock pause and resume) is tested across every reachable transition, including unlikely ones.
 - Every test helper in docs/standards/testing.md is the one home for its job. Ports come from `TestPorts.port(offset)`, never a literal (a test enforces it); scratch directories come from `.temporaryTree`, never Foundation's temp directory (TemporaryTreeTests enforces it); a wait on timing the test does not control goes through Polling.swift, and a never-happens test asserts `!eventually(...)` over the whole window rather than sleeping.
+- A wait or delay, in product or test code, ends at a clock deadline, never after a count of sleeps: a throttled CI runner coalesces timers, and each short sleep overruns, so a counted loop runs several times longer than intended.
 - A gate a test holds a job on opens in a `defer` declared after the `async let` or Task that waits on it, so a failed `#require` cannot hang the run.
 
 Inputs and error handling
