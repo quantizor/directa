@@ -1980,15 +1980,15 @@ public actor Router {
     static func pauseRefusal(server: String, resource: String, survivors: [Int]?) -> WireError {
         let cause =
             if let survivors {
-                "stopped, but process \(survivors.map(String.init).joined(separator: ", ")) still run after SIGKILL"
+                "stopped, but \(survivors.count == 1 ? "its process" : "its processes") \(survivors.map(String.init).joined(separator: ", ")) survived a forced kill"
             } else {
-                "did not finish stopping, so it may still be running"
+                "did not finish stopping"
             }
         return WireError(
             code: .resourceLocked,
             hint: "run: directa why \(ShellWord.inertOr(server))",
             message:
-                "server '\(server)' \(cause) and may still hold resource '\(resource)' open; the lock was not granted, so the command did not run, and any server paused for it was resumed"
+                "server '\(server)' \(cause) and may still hold resource '\(resource)' open; the lock was not granted and the command did not run, and any other server paused for it was resumed"
         )
     }
 

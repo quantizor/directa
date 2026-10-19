@@ -559,13 +559,19 @@ private struct StuckOrRealLauncher: NeverAdopts {
         #expect(gaveUp.hint == "run: directa why db")
         #expect(
             gaveUp.message
-                == "server 'db' did not finish stopping, so it may still be running and may still hold resource 'data' open; the lock was not granted, so the command did not run, and any server paused for it was resumed"
+                == "server 'db' did not finish stopping and may still hold resource 'data' open; the lock was not granted and the command did not run, and any other server paused for it was resumed"
         )
 
         let left = Router.pauseRefusal(server: "db", resource: "data", survivors: [41, 42])
         #expect(
             left.message
-                == "server 'db' stopped, but process 41, 42 still run after SIGKILL and may still hold resource 'data' open; the lock was not granted, so the command did not run, and any server paused for it was resumed"
+                == "server 'db' stopped, but its processes 41, 42 survived a forced kill and may still hold resource 'data' open; the lock was not granted and the command did not run, and any other server paused for it was resumed"
+        )
+
+        let one = Router.pauseRefusal(server: "db", resource: "data", survivors: [41])
+        #expect(
+            one.message
+                == "server 'db' stopped, but its process 41 survived a forced kill and may still hold resource 'data' open; the lock was not granted and the command did not run, and any other server paused for it was resumed"
         )
 
         let hostile = Router.pauseRefusal(server: "x; rm -rf ~", resource: "data", survivors: nil)
