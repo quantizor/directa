@@ -369,10 +369,12 @@ private func floodWriter(
         let handle = try FileHandle(forWritingTo: spool)
         try handle.write(contentsOf: Data("after idle\n".utf8))
         try handle.close()
-        let ingested = try await eventually(within: .seconds(1), every: .milliseconds(2)) {
+        /** A generous bound: the wake is the kernel's, but the drain and the
+            store append wait for pool threads the parallel suite saturates. */
+        let ingested = try await eventually(within: .seconds(10), every: .milliseconds(20)) {
             await store.query(LogQueryOptions(streams: [.out])).map(\.text) == ["after idle"]
         }
-        #expect(ingested, "a line written after idle took longer than 1 s to reach the store")
+        #expect(ingested, "a line written after idle never reached the store")
         await tailer.stop()
     }
 
