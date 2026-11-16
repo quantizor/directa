@@ -59,5 +59,9 @@ jobs:
             exit 1
           fi
 
+      # A runtime abort in the shared test process names no test; the
+      # backtracer prints the crashing thread's frames instead.
       - name: Test
+        env:
+          SWIFT_BACKTRACE: enable=yes,interactive=no,threads=crashed
         run: make test
