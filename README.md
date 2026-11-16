@@ -27,6 +27,17 @@ brew install --cask quantizor/tap/directa
 
 The fully qualified `quantizor/tap/directa` trusts only this cask. `brew upgrade` keeps it current, and the in-app footer offers a one-click upgrade when a new version ships. To remove it later: `directa uninstall`, then `brew uninstall --cask --zap quantizor/tap/directa` if Homebrew installed the app.
 
+### Coming from devctl?
+
+directa is devctl's new name, and `brew upgrade` moves a devctl install over once you trust the renamed cask:
+
+```sh
+brew trust --cask quantizor/tap/directa
+brew upgrade
+```
+
+Your `devservers.json` files work unchanged. directa starts with an empty server list and picks up each project the first time you run a `directa` command in it. Run `directa hook install` to replace devctl's agent hooks.
+
 Prefer a direct download? Grab the latest DMG from [GitHub Releases](https://github.com/quantizor/directa/releases) and double-click `directa` inside it. Either way nothing changes until you confirm: the setup panel lists what it will do, then moves the app to Applications, installs the CLI and daemon (migrating any older `make install` copy), and offers agent hooks for Antigravity, Claude Code, Cursor, Grok Build, and OpenCode (checked by default when needed).
 
 Or build from source (your agent can do this for you):
