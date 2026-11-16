@@ -3,12 +3,22 @@ import Foundation
 import Observation
 import UserNotifications
 
-/** The app's one daemon connection. connect() short-circuits on a live fd and
-    reconnects on error, so every polling loop (the 2s status refresh, the log
-    and timeline panes) holds this instead of paying a full socket
-    create/connect/hello handshake per tick. */
+/** The app's daemon connections. connect() short-circuits on a live fd and
+    reconnects on error, so every loop (the status refresh, the log and
+    timeline panes) holds `client` instead of paying a full socket
+    create/connect/hello handshake per tick. A client serves one request at a
+    time, so the parked `server.awaitChange` request has `changeClient` to
+    itself, and each start, stop, or restart action (popover or deep link)
+    gets a fresh `makeClient()`: an action waits up to 60 s on the daemon, and
+    on `client` it would stall the status refresh its own phase change
+    triggers. */
 enum AppDaemon {
-    nonisolated static let client = DaemonClient(socketPath: DirectaPaths().socketPath)
+    nonisolated static let changeClient = makeClient()
+    nonisolated static let client = makeClient()
+
+    nonisolated static func makeClient() -> DaemonClient {
+        DaemonClient(socketPath: DirectaPaths().socketPath)
+    }
 }
 
 /** How the popover orders its project groups. Persisted in UserDefaults so the
@@ -84,12 +94,19 @@ final class ProjectAccessLog {
     }
 }
 
-/** The app's single source of truth: polls the daemon over the local socket
-    (2s; polling is restart-safe and deletes the reconnect problem a push
-    subscription would carry), groups servers by project, derives the presence
-    counts, and posts crash notifications from the event feed. */
+/** The app's single source of truth: follows the daemon over the local socket
+    by parking one `server.awaitChange` request and reading status only when it
+    reports a change, when a surface opens, or while recovering (the decisions
+    are `StatusFollowPolicy`'s; parking is restart-safe, since a restart fails
+    the parked request and the loop starts over). Groups servers by project,
+    derives the presence counts, and posts crash notifications from the event
+    feed. */
 @Observable
 final class DaemonModel {
+    /** Moves on every successful status read, so a view that mirrors daemon
+        state beyond `projects` (the timeline) reloads when the daemon reports
+        a change instead of polling. */
+    private(set) var changeCount = 0
     var daemonReachable = false
     /** True while the daemon answers but is still bringing supervised servers
         back, which is a busy daemon rather than a missing one. */
@@ -98,7 +115,7 @@ final class DaemonModel {
         a dead end. */
     var daemonRecoveryError: String?
     /** True while a bootstrap/kickstart is in flight, so the row can say so and
-        the poll does not stack attempts. */
+        the follow loop does not stack attempts. */
     var daemonRecovering = false
     /** macOS registered the background agent but is waiting for the user to
         switch it on. Nothing the app can retry, so the popover asks for the
@@ -108,6 +125,9 @@ final class DaemonModel {
         Start instead of resurrecting the daemon behind the user's back. */
     var daemonStoppedOnPurpose = false
     var projects: [ProjectGroup] = []
+    /** When `projects` was read: the anchor for drawing uptime without asking
+        the daemon again (fetch time minus `uptimeSec` is the start time). */
+    private(set) var statusFetchedAt = Date()
     /** Newest release when one is available, for the popover footer. Nil when up
         to date, unchecked, or the check is switched off in Settings. */
     var updateStatus: UpdateStatus?
@@ -178,15 +198,17 @@ final class DaemonModel {
 
     private var lastEventCheck = Date()
     private var notificationsReady = false
-    private var pollTask: Task<Void, Never>?
+    private var followTask: Task<Void, Never>?
+    private var inFlightRefresh: Task<StatusFollowPolicy.Outcome, Never>?
+    private var refreshDirty = false
 
     func start() {
-        guard pollTask == nil else { return }
+        guard followTask == nil else { return }
         requestNotificationPermission()
         /** Launch-time registration runs behind the same in-flight flag and
-            cooldown as recovery. Left outside them, the 2s poll sees the socket
-            still silent inside launchd's respawn throttle and fires a second
-            unregister + register on top of the first. */
+            cooldown as recovery. Left outside them, the follow loop sees the
+            socket still silent inside launchd's respawn throttle and fires a
+            second unregister + register on top of the first. */
         Task { [weak self] in
             guard let self else { return }
             daemonRecovering = true
@@ -195,11 +217,8 @@ final class DaemonModel {
             daemonRecovering = false
             await refresh()
         }
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.refresh()
-                try? await Task.sleep(for: .seconds(2))
-            }
+        followTask = Task { [weak self] in
+            await self?.follow()
         }
         /** Update polling on its own slow cadence, honoring the Settings toggle.
             The app owns the cadence; doctor reads the same cache. */
@@ -223,12 +242,70 @@ final class DaemonModel {
         updateStatus = (status?.updateAvailable == true) ? status : nil
     }
 
-    func refresh() async {
+    /** Performs each `StatusFollowPolicy` step and reports its outcome back. */
+    private func follow() async {
+        var step = StatusFollowPolicy.start
+        var token: String?
+        while !Task.isCancelled {
+            if step.delaySeconds > 0 {
+                try? await Task.sleep(for: .seconds(step.delaySeconds))
+                if Task.isCancelled { return }
+            }
+            let outcome: StatusFollowPolicy.Outcome
+            switch step.request {
+            case .takeToken, .park:
+                let timeoutSeconds = step.request == .park ? StatusFollowPolicy.parkTimeoutSeconds : 0
+                do {
+                    let result = try await AppDaemon.changeClient.request(
+                        .serverAwaitChange,
+                        params: AwaitChangeParams(
+                            after: step.request == .park ? token : nil, timeoutSeconds: timeoutSeconds),
+                        expecting: AwaitChangeResult.self,
+                        responseTimeoutSeconds: StatusFollowPolicy.responseTimeoutSeconds)
+                    token = result.token
+                    outcome = step.request == .park && !result.changed ? .deadline : .answered
+                } catch {
+                    outcome = StatusFollowPolicy.outcome(failure: error, request: step.request)
+                }
+            case .poll, .recover, .refresh:
+                outcome = await refresh()
+            }
+            step = StatusFollowPolicy.next(after: step.request, outcome: outcome)
+        }
+    }
+
+    /** One refresh in flight. A caller arriving meanwhile marks it dirty and
+        awaits it: the task reads again while dirty, so the outcome a waiting
+        caller gets is of a read that began after it arrived, and a burst costs
+        two reads. Code running inside a read sets `refreshDirty` instead of
+        calling this, which would await the task it runs in. */
+    @discardableResult
+    func refresh() async -> StatusFollowPolicy.Outcome {
+        if let inFlight = inFlightRefresh {
+            refreshDirty = true
+            return await inFlight.value
+        }
+        let task = Task {
+            var outcome: StatusFollowPolicy.Outcome
+            repeat {
+                refreshDirty = false
+                outcome = await readStatus()
+            } while refreshDirty
+            inFlightRefresh = nil
+            return outcome
+        }
+        inFlightRefresh = task
+        return await task.value
+    }
+
+    private func readStatus() async -> StatusFollowPolicy.Outcome {
         let client = AppDaemon.client
         do {
             let all = try await client.request(
                 .serverStatus, params: ProjectParams(project: ""), expecting: ServerListResult.self)
             daemonReachable = true
+            statusFetchedAt = Date()
+            changeCount += 1
             let grouped = Dictionary(grouping: all.servers, by: \.project)
             projects = grouped.keys.sorted().map { path in
                 let servers = (grouped[path] ?? []).sorted { $0.server < $1.server }
@@ -243,6 +320,7 @@ final class DaemonModel {
             lastRecoveryAttempt = nil
             daemonStoppedOnPurpose = false
             await surfaceCrashNotifications(client: client)
+            return .answered
         } catch let error as WireError where error.code == .daemonStarting {
             /** A restoring daemon is answering, so it is reachable: treating the
                 refusal as a dead socket emptied the popover and fired agent
@@ -252,37 +330,40 @@ final class DaemonModel {
             daemonReachable = true
             daemonRestoring = true
             daemonStoppedOnPurpose = false
+            return .daemonStarting
         } catch {
             daemonReachable = false
             daemonRestoring = false
             projects = []
             daemonStoppedOnPurpose = LaunchdAdmin.deliberatelyStopped()
-            await recoverDaemonIfNeeded()
+            if await recoverDaemonIfNeeded() { refreshDirty = true }
+            return .unreachable
         }
     }
 
     /** Bring the daemon back on its own after a crash or a failed relaunch.
         Skipped when the user stopped it on purpose (their intent wins) and
-        rate-limited so a permanently broken install does not spin. */
-    private func recoverDaemonIfNeeded() async {
+        rate-limited so a permanently broken install does not spin. Returns
+        whether it brought the daemon back. */
+    private func recoverDaemonIfNeeded() async -> Bool {
         let decision = DaemonRecoveryPolicy.decide(
             reachable: daemonReachable,
             stoppedOnPurpose: daemonStoppedOnPurpose,
             recovering: daemonRecovering,
             lastAttempt: lastRecoveryAttempt)
-        guard decision == .recover else { return }
+        guard decision == .recover else { return false }
         lastRecoveryAttempt = Date()
         daemonRecovering = true
         let recovered = await recoverAgent()
         daemonRecovering = false
         if recovered {
             daemonRecoveryError = nil
-            await refresh()
         } else if daemonNeedsApproval {
             daemonRecoveryError = AgentService.Failure.needsApproval.localizedDescription
         } else {
             daemonRecoveryError = "could not start the daemon automatically"
         }
+        return recovered
     }
 
     /** Prefer SMAppService inside this app process; fall back to the legacy home
@@ -348,44 +429,58 @@ final class DaemonModel {
         return [url]
     }
 
+    /** The start, stop, and restart actions do not refresh: the phase change
+        they cause wakes the parked `server.awaitChange`, which refreshes. Each
+        runs on its own client, so a slow action never holds up that refresh. */
     func startServer(_ server: ServerStatus) {
         ProjectAccessLog.shared.record(projectPath: server.project)
         Task {
-            let client = AppDaemon.client
-            _ = try? await client.request(
-                .serverEnsure,
-                params: EnsureParams(name: server.server, project: server.project, timeoutSeconds: 60),
-                expecting: EnsureResult.self)
-            await refresh()
+            do {
+                _ = try await AppDaemon.makeClient().request(
+                    .serverEnsure,
+                    params: EnsureParams(name: server.server, project: server.project, timeoutSeconds: 60),
+                    expecting: EnsureResult.self)
+            } catch {
+                Self.logActionFailure("start", server: server, error: error)
+            }
         }
     }
 
     func stopServer(_ server: ServerStatus) {
         ProjectAccessLog.shared.record(projectPath: server.project)
         Task {
-            let client = AppDaemon.client
-            _ = try? await client.request(
-                .serverStop,
-                params: ServerTargetParams(name: server.server, project: server.project),
-                expecting: ServerResult.self)
-            await refresh()
+            do {
+                _ = try await AppDaemon.makeClient().request(
+                    .serverStop,
+                    params: ServerTargetParams(name: server.server, project: server.project),
+                    expecting: ServerResult.self)
+            } catch {
+                Self.logActionFailure("stop", server: server, error: error)
+            }
         }
     }
 
     func restartServer(_ server: ServerStatus) {
         ProjectAccessLog.shared.record(projectPath: server.project)
         Task {
-            let client = AppDaemon.client
-            /** One request rather than a stop followed by an ensure: the pair
-                leaves the server down if the ensure is refused, and lets another
-                session's ensure land in between. */
-            _ = try? await client.request(
-                .serverRestart,
-                params: RestartParams(
-                    names: [server.server], project: server.project, timeoutSeconds: 60),
-                expecting: GroupResult.self)
-            await refresh()
+            do {
+                /** One request rather than a stop followed by an ensure: the pair
+                    leaves the server down if the ensure is refused, and lets another
+                    session's ensure land in between. */
+                _ = try await AppDaemon.makeClient().request(
+                    .serverRestart,
+                    params: RestartParams(
+                        names: [server.server], project: server.project, timeoutSeconds: 60),
+                    expecting: GroupResult.self)
+            } catch {
+                Self.logActionFailure("restart", server: server, error: error)
+            }
         }
+    }
+
+    private static func logActionFailure(_ action: String, server: ServerStatus, error: Error) {
+        DirectaLog.app.error(
+            "server action failed action=\(action) server=\(server.server) error=\(error.localizedDescription)")
     }
 
     private func requestNotificationPermission() {
@@ -398,7 +493,7 @@ final class DaemonModel {
     }
 
     /** Crash notifications ride the event feed so nothing is missed between
-        polls; lastEventCheck advances to the newest seen event. */
+        refreshes; lastEventCheck advances to the newest seen event. */
     private func surfaceCrashNotifications(client: DaemonClient) async {
         guard notificationsReady else { return }
         guard

@@ -46,7 +46,10 @@ struct DashboardView: View {
                     description: Text("Logs, timeline, and configuration live here."))
             }
         }
-        .onAppear { AppFocus.promote() }
+        .onAppear {
+            AppFocus.promote()
+            Task { await model.refresh() }
+        }
     }
 }
 
@@ -68,7 +71,7 @@ struct ServerDetail: View {
                     TallyDot(phase: server.phase)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(server.server).font(.headline)
-                        Text(statusLine)
+                        statusText
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -147,12 +150,27 @@ struct ServerDetail: View {
             case .logs:
                 LogsPane(server: server)
             case .timeline:
-                TimelinePane(project: server.project)
+                TimelinePane(changeCount: model.changeCount, project: server.project)
             }
         }
     }
 
-    private var statusLine: String {
+    /** Uptime ticks on screen with no daemon traffic: it is drawn from the
+        start time (status fetch time minus `uptimeSec`), so only a running or
+        unhealthy server with a known uptime needs the per-second timeline. */
+    @ViewBuilder
+    private var statusText: some View {
+        if let uptime = server.uptimeSec, server.phase == .running || server.phase == .unhealthy {
+            let startedAt = model.statusFetchedAt.addingTimeInterval(-Double(uptime))
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text(statusLine(uptimeSec: Int(max(0, context.date.timeIntervalSince(startedAt)))))
+            }
+        } else {
+            Text(statusLine(uptimeSec: nil))
+        }
+    }
+
+    private func statusLine(uptimeSec: Int?) -> String {
         var parts: [String] = [server.phase.rawValue]
         if let pid = server.pid {
             parts.append("pid \(pid)")
@@ -160,8 +178,8 @@ struct ServerDetail: View {
         if let port = server.displayPort {
             parts.append("port \(port)")
         }
-        if let uptime = server.uptimeSec, server.phase == .running || server.phase == .unhealthy {
-            parts.append(Self.formatUptime(uptime))
+        if let uptimeSec {
+            parts.append(Self.formatUptime(uptimeSec))
         }
         if server.specStale == true {
             parts.append("spec stale")
@@ -292,6 +310,8 @@ struct LogsPane: View {
 /** Event timeline: one lane per server, phase spans over the last window with
     mark pins; the event list below carries the exact records. */
 struct TimelinePane: View {
+    /** The model's change counter: a move means the daemon reported a change, so the events reload. */
+    let changeCount: Int
     let project: String
 
     @State private var events: [EventRecord] = []
@@ -336,16 +356,13 @@ struct TimelinePane: View {
                 .font(.system(size: 12))
             }
         }
-        .task(id: project) {
-            while !Task.isCancelled {
-                let client = AppDaemon.client
-                if let result = try? await client.request(
-                    .eventsQuery,
-                    params: EventsQueryParams(project: project, since: Date().addingTimeInterval(-window)),
-                    expecting: EventsQueryResult.self) {
-                    events = result.events
-                }
-                try? await Task.sleep(for: .seconds(2))
+        .task(id: "\(project)|\(changeCount)") {
+            let client = AppDaemon.client
+            if let result = try? await client.request(
+                .eventsQuery,
+                params: EventsQueryParams(project: project, since: Date().addingTimeInterval(-window)),
+                expecting: EventsQueryResult.self) {
+                events = result.events
             }
         }
     }
@@ -366,42 +383,54 @@ struct LaneView: View {
     let events: [EventRecord]
     let window: TimeInterval
 
+    /** About one pixel of the window at a typical lane width (450 px), so the
+        lane slides and an open span grows without a daemon change and without
+        redrawing more often than a pixel moves. */
+    private var redrawSeconds: TimeInterval { max(window / 450, 1) }
+
     var body: some View {
-        Canvas { context, size in
-            let now = Date()
-            let start = now.addingTimeInterval(-window)
-            func x(_ date: Date) -> CGFloat {
-                let fraction = date.timeIntervalSince(start) / window
-                return CGFloat(min(max(fraction, 0), 1)) * size.width
-            }
-            var spanStart: (Date, Color)?
-            func flush(to endDate: Date) {
-                guard let (from, color) = spanStart else { return }
-                let rect = CGRect(
-                    x: x(from), y: 3, width: max(x(endDate) - x(from), 1.5), height: size.height - 6)
-                context.fill(Path(roundedRect: rect, cornerRadius: 2), with: .color(color.opacity(0.75)))
-            }
-            for event in events.sorted(by: { $0.at < $1.at }) {
-                switch event.kind {
-                case .started, .healthy:
-                    if spanStart == nil { spanStart = (event.at, .green) }
-                case .unhealthy:
-                    flush(to: event.at)
-                    spanStart = (event.at, .orange)
-                case .crashed, .failed, .stopped:
-                    flush(to: event.at)
-                    spanStart = nil
-                    let color: Color = event.kind == .stopped ? .secondary : .red
-                    let mark = CGRect(x: x(event.at) - 1, y: 1, width: 2, height: size.height - 2)
-                    context.fill(Path(mark), with: .color(color))
-                case .marked:
-                    let pin = CGRect(x: x(event.at) - 0.75, y: 0, width: 1.5, height: size.height)
-                    context.fill(Path(pin), with: .color(.blue.opacity(0.9)))
-                case .registered, .unregistered, .unknown:
-                    break
+        TimelineView(.periodic(from: .now, by: redrawSeconds)) { timeline in
+            Canvas { context, size in
+                let now = timeline.date
+                let start = now.addingTimeInterval(-window)
+                func x(_ date: Date) -> CGFloat {
+                    let fraction = date.timeIntervalSince(start) / window
+                    return CGFloat(min(max(fraction, 0), 1)) * size.width
                 }
+                var spanStart: (Date, Color)?
+                /** A span that ended before the window began has slid off the lane. */
+                func flush(to endDate: Date) {
+                    guard let (from, color) = spanStart, endDate >= start else { return }
+                    let rect = CGRect(
+                        x: x(from), y: 3, width: max(x(endDate) - x(from), 1.5), height: size.height - 6)
+                    context.fill(Path(roundedRect: rect, cornerRadius: 2), with: .color(color.opacity(0.75)))
+                }
+                /** Events older than the window still decide which span is open, but draw no mark. */
+                for event in events.sorted(by: { $0.at < $1.at }) {
+                    let inWindow = event.at >= start
+                    switch event.kind {
+                    case .started, .healthy:
+                        if spanStart == nil { spanStart = (event.at, .green) }
+                    case .unhealthy:
+                        flush(to: event.at)
+                        spanStart = (event.at, .orange)
+                    case .crashed, .failed, .stopped:
+                        flush(to: event.at)
+                        spanStart = nil
+                        guard inWindow else { break }
+                        let color: Color = event.kind == .stopped ? .secondary : .red
+                        let mark = CGRect(x: x(event.at) - 1, y: 1, width: 2, height: size.height - 2)
+                        context.fill(Path(mark), with: .color(color))
+                    case .marked:
+                        guard inWindow else { break }
+                        let pin = CGRect(x: x(event.at) - 0.75, y: 0, width: 1.5, height: size.height)
+                        context.fill(Path(pin), with: .color(.blue.opacity(0.9)))
+                    case .registered, .unregistered, .unknown:
+                        break
+                    }
+                }
+                flush(to: now)
             }
-            flush(to: now)
         }
         .background(Color(nsColor: .quaternarySystemFill), in: RoundedRectangle(cornerRadius: 3))
     }

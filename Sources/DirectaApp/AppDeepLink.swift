@@ -96,7 +96,7 @@ enum AppDeepLinkDispatch {
     }
 
     private static func execute(_ link: DeepLink) async {
-        let client = AppDaemon.client
+        let client = AppDaemon.makeClient()
         do {
             try await client.connect()
             let result = try await DeepLinkRunner(client: client, effects: AppDeepLinkEffects()).run(link)

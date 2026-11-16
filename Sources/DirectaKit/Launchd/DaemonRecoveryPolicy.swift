@@ -2,10 +2,11 @@ import Foundation
 
 /** Whether an unreachable daemon should be resurrected without being asked.
 
-    Policy, not UI: the menu bar app polls every couple of seconds, so this has
-    to distinguish "died and should come back" from "the user stopped it" and
-    from "we just tried and it failed". Recovery shells out to launchctl, which
-    is why a failed attempt earns a cooldown instead of retrying every poll. */
+    Policy, not UI: the menu bar app retries a failed status read every couple of
+    seconds, so this has to distinguish "died and should come back" from "the
+    user stopped it" and from "we just tried and it failed". Recovery shells out
+    to launchctl, which is why a failed attempt earns a cooldown instead of
+    retrying every read. */
 public enum DaemonRecoveryPolicy {
     public enum Decision: Equatable, Sendable {
         /** Socket answered: nothing to do. */

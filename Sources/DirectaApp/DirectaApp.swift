@@ -455,6 +455,9 @@ struct InstallerRootView: View {
 struct MenuContent: View {
     @State private var contentHeight: CGFloat = 0
     @State private var filterText: String = ""
+    /** The popover's content stays alive while it is closed, so a starting
+        dot breathes only while the popover shows (see `TallyDot`). */
+    @State private var isShown = false
     @Environment(\.openWindow) private var openWindow
     var model: DaemonModel
     @State private var sortOrder: ProjectSortOrder = {
@@ -595,12 +598,18 @@ struct MenuContent: View {
             popover bled through and washed out the server rows. */
         .background(Color(nsColor: .windowBackgroundColor), ignoresSafeAreaEdges: .all)
         .background(SystemAppearancePin())
+        .environment(\.tallyDotBreathes, isShown)
         .onAppear {
+            isShown = true
             keyNav.daemon = model
             keyNav.installIfNeeded()
             keyNav.sync(projects: filteredProjects)
+            Task { await model.refresh() }
         }
-        .onDisappear { keyNav.tearDown() }
+        .onDisappear {
+            isShown = false
+            keyNav.tearDown()
+        }
         /** Re-sync on any tree change the nav model cares about: servers
             appearing, the filter narrowing, or a phase flip changing a row's
             action set (start vs restart+stop). */
@@ -848,7 +857,7 @@ struct PresenceLabel: View {
     var model: DaemonModel
 
     var body: some View {
-        /** Read counts so Observation re-renders when the poll updates them;
+        /** Read counts so Observation re-renders when a refresh updates them;
             scene-level label closures alone do not track the model. */
         let attention = model.attentionCount
         let busy = model.busyCount
@@ -1123,13 +1132,21 @@ struct HeadRow: View {
     }
 }
 
-/** The tally light: state as color, `starting` breathes. Never shouts. */
+extension EnvironmentValues {
+    /** False where the dot's host is hidden but still rendering (the closed
+        popover): a breath there redraws at display rate, a core-percent cost
+        for as long as a server stays starting. */
+    @Entry var tallyDotBreathes = true
+}
+
+/** The tally light: state as color, `starting` breathes while on screen. Never shouts. */
 struct TallyDot: View {
+    @Environment(\.tallyDotBreathes) private var breathes
     let phase: ServerPhase
 
     var body: some View {
         Group {
-            if phase == .starting {
+            if phase == .starting, breathes {
                 BreathingDot(color: color)
             } else {
                 Circle().fill(color)
