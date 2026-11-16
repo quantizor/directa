@@ -58,8 +58,10 @@ enum AgentService {
         unregister always waits for launchd + a BTM settle before register.
 
         `reason` is logged at error level first (see `AgentEscalation`). A
-        daemon that answers hands its servers to the next one before the
-        unregister, whose SIGTERM would otherwise drain (stop) every server. */
+        running daemon is handed off first (`LaunchdAdmin.handOffRunningDaemon`
+        has the cases). Its outcome is not read: a relaunch is not a
+        re-registration, which exists to drop the prior launch constraint and
+        load a changed helper, so unregister and register run either way. */
     nonisolated static func reregister(
         because reason: AgentEscalation, pollError: String? = nil,
         paths: DirectaPaths = DirectaPaths()
@@ -256,6 +258,17 @@ enum AgentService {
                 return
             }
             DirectaLog.app.info("agent spawn scheduled (launchd throttle); waiting")
+        } else {
+            /** Loaded with no spawn scheduled: a clean exit (a handoff, a
+                stop) that KeepAlive's SuccessfulExit rule leaves down, so no
+                wait starts it and the throttle escalation below would only
+                re-register late. A kickstart without -k leaves a running job
+                alone. */
+            let kickstart = await LaunchdAdmin.shell(
+                "/bin/launchctl", ["kickstart", "\(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)"])
+            if kickstart.status != 0 {
+                DirectaLog.app.error("agent kickstart failed status=\(kickstart.status) output=\(kickstart.output)")
+            }
         }
         guard let throttleMiss = await helloMiss(paths: paths, timeoutSeconds: 12) else {
             return

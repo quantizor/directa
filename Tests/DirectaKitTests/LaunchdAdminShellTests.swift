@@ -321,3 +321,210 @@ import os
         #expect(script.readCount >= 2)
     }
 }
+
+@Suite(.temporaryTree) struct LaunchdAdminHandoffTests {
+    /** Scripted launchd and daemon: `reads` is the sequence `daemon.info` answers
+        (the last repeats), and every effect lands in `journal`. The successor
+        wait defaults long, since the wait sleeps between reads and a throttled
+        runner overruns each sleep: a test that reaches a later answer must not
+        race the deadline. A test of the deadline itself passes `.deadline`. */
+    private final class Script: Sendable {
+        static let deadline = Duration.milliseconds(400)
+
+        let agentPid: Int?
+        let journal = OSAllocatedUnfairLock(initialState: [String]())
+        let killAccepted: Bool
+        let kickstartStatus: Int32
+        private let readTally = OSAllocatedUnfairLock(initialState: 0)
+        private let reads: [DaemonInfo?]
+        private let successorWait: Duration
+
+        var readCount: Int { readTally.withLock { $0 } }
+
+        init(
+            agentPid: Int? = nil, killAccepted: Bool = true, kickstartStatus: Int32 = 0, reads: [DaemonInfo?],
+            successorWait: Duration = .seconds(30)
+        ) {
+            self.agentPid = agentPid
+            self.killAccepted = killAccepted
+            self.kickstartStatus = kickstartStatus
+            self.reads = reads
+            self.successorWait = successorWait
+        }
+
+        /** Every launchctl call `restart` makes lands in `journal` as its arguments. */
+        var launchctl: LaunchdAdmin.Launchctl {
+            { [self] arguments in
+                journal.withLock { $0.append("launchctl " + arguments.joined(separator: " ")) }
+                return (status: kickstartStatus, output: "")
+            }
+        }
+
+        var effects: LaunchdAdmin.HandoffEffects {
+            LaunchdAdmin.HandoffEffects(
+                agentPid: { [self] in
+                    journal.withLock { $0.append("agent pid") }
+                    return agentPid
+                },
+                killAgent: { [self] in
+                    journal.withLock { $0.append("kill") }
+                    return killAccepted
+                },
+                readInfo: { [self] in
+                    let index = readTally.withLock { value -> Int in
+                        defer { value += 1 }
+                        return min(value, reads.count - 1)
+                    }
+                    return reads[index]
+                },
+                requestHandoff: { [self] in journal.withLock { $0.append("handoff") } },
+                successorWait: successorWait)
+        }
+    }
+
+    private static func info(pid: Int, version: String, restoring: Bool? = nil) -> DaemonInfo {
+        DaemonInfo(
+            dataDir: "/d", daemonVersion: version, logsDir: "/l", pid: pid, proto: 1, restoring: restoring,
+            socketPath: "/s")
+    }
+
+    @Test func noDaemonAnsweringAsksNothingOfLaunchd() async {
+        let script = Script(reads: [nil])
+        let outcome = await LaunchdAdmin.handOffRunningDaemon(effects: script.effects)
+        #expect(outcome == .nothingRunning)
+        #expect(script.journal.withLock { $0 } == [])
+    }
+
+    @Test func aDaemonThatHonorsTheFieldIsHandedOffWithoutAskingLaunchd() async {
+        let script = Script(agentPid: 7, reads: [Self.info(pid: 7, version: "3.1.0")])
+        let outcome = await LaunchdAdmin.handOffRunningDaemon(effects: script.effects)
+        #expect(outcome == .handedOff)
+        #expect(script.journal.withLock { $0 } == ["handoff"])
+    }
+
+    @Test func aPreHandoffAgentIsKilledAndItsNewerSuccessorHandedOff() async {
+        let script = Script(
+            agentPid: 7,
+            reads: [
+                Self.info(pid: 7, version: "3.0.0"), Self.info(pid: 7, version: "3.0.0"), nil,
+                Self.info(pid: 8, version: "3.1.0"),
+            ])
+        let outcome = await LaunchdAdmin.handOffRunningDaemon(effects: script.effects)
+        #expect(outcome == .handedOff)
+        #expect(script.journal.withLock { $0 } == ["agent pid", "kill", "handoff"])
+    }
+
+    @Test func aPreHandoffAgentRelaunchedAsTheSameOldBinaryWasRestartedByIt() async {
+        let script = Script(
+            agentPid: 7, reads: [Self.info(pid: 7, version: "3.0.0"), nil, Self.info(pid: 8, version: "3.0.0")])
+        let outcome = await LaunchdAdmin.handOffRunningDaemon(effects: script.effects)
+        #expect(outcome == .restartedByRelaunch)
+        #expect(script.journal.withLock { $0 } == ["agent pid", "kill"])
+    }
+
+    /** The successor answers `daemon.info` mid-restore; a handoff sent then
+        would exit it before its adoption finished. */
+    @Test func aSuccessorStillRestoringIsHandedOffOnlyOnceRestoreFinishes() async {
+        let script = Script(
+            agentPid: 7,
+            reads: [
+                Self.info(pid: 7, version: "3.0.0"), nil,
+                Self.info(pid: 8, version: "3.1.0", restoring: true),
+                Self.info(pid: 8, version: "3.1.0", restoring: true),
+                Self.info(pid: 8, version: "3.1.0"),
+            ])
+        let outcome = await LaunchdAdmin.handOffRunningDaemon(effects: script.effects)
+        #expect(outcome == .handedOff)
+        #expect(script.journal.withLock { $0 } == ["agent pid", "kill", "handoff"])
+        #expect(script.readCount == 5)
+    }
+
+    /** The wait ends at the clock deadline with no handoff sent. */
+    @Test func aSuccessorStillRestoringAtTheDeadlineIsHandedOffAnyway() async {
+        let script = Script(
+            agentPid: 7,
+            reads: [Self.info(pid: 7, version: "3.0.0"), Self.info(pid: 8, version: "3.1.0", restoring: true)],
+            successorWait: Script.deadline)
+        let outcome = await LaunchdAdmin.handOffRunningDaemon(effects: script.effects)
+        #expect(outcome == .handedOff)
+        #expect(script.journal.withLock { $0 } == ["agent pid", "kill", "handoff"])
+    }
+
+    @Test func aKilledAgentThatNeverComesBackLeavesNothingRunning() async {
+        let script = Script(agentPid: 7, reads: [Self.info(pid: 7, version: "3.0.0"), nil], successorWait: Script.deadline)
+        let outcome = await LaunchdAdmin.handOffRunningDaemon(effects: script.effects)
+        #expect(outcome == .nothingRunning)
+        #expect(script.journal.withLock { $0 } == ["agent pid", "kill"])
+    }
+
+    @Test func aKilledPidThatKeepsAnsweringIsNotASuccessor() async {
+        let script = Script(agentPid: 7, reads: [Self.info(pid: 7, version: "3.0.0")], successorWait: Script.deadline)
+        let outcome = await LaunchdAdmin.handOffRunningDaemon(effects: script.effects)
+        #expect(outcome == .nothingRunning)
+    }
+
+    @Test func aPreHandoffDaemonThatIsNotTheAgentGetsTheRequestNotAKill() async {
+        let script = Script(agentPid: 8, reads: [Self.info(pid: 7, version: "3.0.0")])
+        let outcome = await LaunchdAdmin.handOffRunningDaemon(effects: script.effects)
+        #expect(outcome == .handedOff)
+        #expect(script.journal.withLock { $0 } == ["agent pid", "handoff"])
+    }
+
+    @Test func anUnknownAgentPidIsNeverKilled() async {
+        let script = Script(agentPid: nil, reads: [Self.info(pid: 7, version: "3.0.0")])
+        let outcome = await LaunchdAdmin.handOffRunningDaemon(effects: script.effects)
+        #expect(outcome == .handedOff)
+        #expect(script.journal.withLock { $0 } == ["agent pid", "handoff"])
+    }
+
+    @Test func aKillLaunchctlRefusesFallsBackToTheRequest() async {
+        let script = Script(agentPid: 7, killAccepted: false, reads: [Self.info(pid: 7, version: "3.0.0")])
+        let outcome = await LaunchdAdmin.handOffRunningDaemon(effects: script.effects)
+        #expect(outcome == .handedOff)
+        #expect(script.journal.withLock { $0 } == ["agent pid", "kill", "handoff"])
+    }
+
+    @Test func aMalformedVersionOnTheAgentIsKilled() async {
+        let script = Script(
+            agentPid: 7, reads: [Self.info(pid: 7, version: "dev"), Self.info(pid: 8, version: "3.1.0")])
+        let outcome = await LaunchdAdmin.handOffRunningDaemon(effects: script.effects)
+        #expect(outcome == .handedOff)
+        #expect(script.journal.withLock { $0 } == ["agent pid", "kill", "handoff"])
+    }
+
+    private static let kickstart = "launchctl kickstart -k \(LaunchdJobs.guiDomain)/\(LaunchdAdmin.label)"
+
+    private func restart(_ script: Script) async throws {
+        let dir = try TemporaryTree.path(named: "restart")
+        let paths = DirectaPaths(dataDir: dir, logsDir: dir.appending(path: "logs"))
+        _ = try await LaunchdAdmin.restart(
+            paths: paths, effects: script.effects, launchctl: script.launchctl, awaitDaemon: {})
+    }
+
+    @Test func restartAfterAHandoffKickstartsTheJob() async throws {
+        let script = Script(agentPid: 7, reads: [Self.info(pid: 7, version: "3.1.0")])
+        try await restart(script)
+        #expect(script.journal.withLock { $0 } == ["handoff", Self.kickstart])
+    }
+
+    @Test func restartWithNoDaemonRunningKickstartsTheJob() async throws {
+        let script = Script(reads: [nil])
+        try await restart(script)
+        #expect(script.journal.withLock { $0 } == [Self.kickstart])
+    }
+
+    /** The killed daemon's relaunch was the restart; a `kickstart -k` now would
+        SIGTERM the relaunched daemon into a drain. */
+    @Test func restartAfterARelaunchOfTheSameOldBinaryRunsNoKickstart() async throws {
+        let script = Script(
+            agentPid: 7, reads: [Self.info(pid: 7, version: "3.0.0"), nil, Self.info(pid: 8, version: "3.0.0")])
+        try await restart(script)
+        #expect(script.journal.withLock { $0 } == ["agent pid", "kill"])
+    }
+
+    @Test func aRefusedKickstartFailsTheRestartWithTheInstallHint() async throws {
+        let script = Script(kickstartStatus: 113, reads: [nil])
+        let error = await #expect(throws: WireError.self) { try await restart(script) }
+        #expect(error?.hint == "run: directa daemon install")
+    }
+}

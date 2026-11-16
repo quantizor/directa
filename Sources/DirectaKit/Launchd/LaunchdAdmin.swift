@@ -258,10 +258,10 @@ public enum LaunchdAdmin {
     )] {
         let client = DaemonClient(socketPath: paths.socketPath)
         let runningServers = await captureActiveServers(client: client)
-        await handOffRunningDaemon(paths: paths)
-        try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
 
         if !forceLegacy, applicationsAppPresent() {
+            await handOffRunningDaemon(paths: paths)
+            try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
             try writeAgentPath(paths: paths)
             /** Leave any legacy home plist for the app to migrate on ensure. */
             _ = requestAppAgentEnsure()
@@ -291,6 +291,13 @@ public enum LaunchdAdmin {
         let plist = renderPlist(daemonPath: destination.path, paths: paths)
         try fm.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(plist.utf8).write(to: plistURL)
+        /** After the swap. A pre-handoff daemon running as this job's own agent
+            is killed and relaunched from the new binary, which can be handed
+            off. When the running agent is the app-registered job instead, its
+            relaunch is the old bundled binary, and the bootout below drains it
+            as before handoff existed. The outcome is not read because the
+            bootout runs either way, to load the plist. */
+        await handOffRunningDaemon(paths: paths)
         try? fm.removeItem(at: paths.stoppedIntentFile)
         _ = await shell("/bin/launchctl", ["bootout", "\(LaunchdJobs.guiDomain)/\(label)"])
         let bootstrap = await shell("/bin/launchctl", ["bootstrap", "\(LaunchdJobs.guiDomain)", plistURL.path])
@@ -352,23 +359,38 @@ public enum LaunchdAdmin {
         without stopping its servers (a daemon that cannot hand off drains them
         instead), the new one adopts what is still running, and the re-ensure
         starts whatever it could not. The stop marker is cleared after the old
-        daemon is gone, since a daemon that drained writes it on its way out. */
+        daemon is gone, since a daemon that drained writes it on its way out.
+        The `kickstart -k` is skipped when a killed pre-handoff daemon's
+        relaunch already restarted it (`DaemonHandoffOutcome.restartedByRelaunch`). */
     @discardableResult
     public static func restart(
-        paths: DirectaPaths, launchctl: Launchctl = LaunchdAdmin.liveLaunchctl
+        paths: DirectaPaths, launchctl: @escaping Launchctl = LaunchdAdmin.liveLaunchctl
+    ) async throws -> [(project: String, name: String)] {
+        try await restart(
+            paths: paths, effects: .live(paths: paths, launchctl: launchctl), launchctl: launchctl,
+            awaitDaemon: { try await pollHello(paths: paths) })
+    }
+
+    /** `effects` and `launchctl` carry every launchd call the bounce makes, so a
+        test scripts the whole command sequence. */
+    static func restart(
+        paths: DirectaPaths, effects: HandoffEffects, launchctl: Launchctl,
+        awaitDaemon: @Sendable () async throws -> Void
     ) async throws -> [(project: String, name: String)] {
         let client = DaemonClient(socketPath: paths.socketPath)
         let runningServers = await captureActiveServers(client: client)
-        await handOffRunningDaemon(paths: paths)
+        let outcome = await handOffRunningDaemon(effects: effects)
         try? FileManager.default.removeItem(at: paths.stoppedIntentFile)
-        let result = await launchctl(["kickstart", "-k", "\(LaunchdJobs.guiDomain)/\(label)"])
-        if result.status != 0 {
-            throw WireError(
-                code: .internalError,
-                hint: "run: directa daemon install",
-                message: "launchctl kickstart failed (\(result.status)): \(result.output)")
+        if outcome != .restartedByRelaunch {
+            let result = await launchctl(["kickstart", "-k", "\(LaunchdJobs.guiDomain)/\(label)"])
+            if result.status != 0 {
+                throw WireError(
+                    code: .internalError,
+                    hint: "run: directa daemon install",
+                    message: "launchctl kickstart failed (\(result.status)): \(result.output)")
+            }
         }
-        try await pollHello(paths: paths)
+        try await awaitDaemon()
         await reensure(runningServers, paths: paths)
         return runningServers
     }
@@ -385,25 +407,107 @@ public enum LaunchdAdmin {
             .map { (project: $0.project, name: $0.server) }
     }
 
+    /** The effects `handOffRunningDaemon` runs, so a test scripts the daemon
+        and launchd without a socket or a launchd domain. */
+    struct HandoffEffects: Sendable {
+        /** The pid launchd reports for the agent job, nil when it gave no answer. */
+        var agentPid: @Sendable () async -> Int?
+        /** `launchctl kill SIGKILL` on the agent job; true when launchctl accepted it. */
+        var killAgent: @Sendable () async -> Bool
+        var readInfo: @Sendable () async -> DaemonInfo?
+        /** Sends `daemon.shutdown {"handoff": true}` and waits (bounded) for the daemon to stop answering. */
+        var requestHandoff: @Sendable () async -> Void
+        /** How long a killed agent's successor gets to answer. */
+        var successorWait: Duration
+
+        /** Only the launchd effects (`agentPid`, `killAgent`) go through `launchctl`, so one seam covers them; the daemon effects use the socket. */
+        static func live(paths: DirectaPaths, launchctl: @escaping Launchctl = liveLaunchctl) -> HandoffEffects {
+            HandoffEffects(
+                agentPid: {
+                    let printed = await launchctl(["print", "\(LaunchdJobs.guiDomain)/\(label)"])
+                    guard printed.status == 0 else { return nil }
+                    return LaunchdJobs.parseJobPrint(printed.output).pid.map(Int.init)
+                },
+                killAgent: {
+                    await launchctl(["kill", "SIGKILL", "\(LaunchdJobs.guiDomain)/\(label)"]).status == 0
+                },
+                readInfo: { await readDaemonInfo(paths: paths) },
+                requestHandoff: {
+                    _ = try? await DaemonClient(socketPath: paths.socketPath).request(
+                        .daemonShutdown, params: ShutdownParams(handoff: true), expecting: WireEmpty.self)
+                    let goneBy = ContinuousClock.now + .seconds(5)
+                    while ContinuousClock.now < goneBy, FileManager.default.fileExists(atPath: paths.socketPath) {
+                        if await readDaemonInfo(paths: paths) == nil { break }
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                },
+                successorWait: killedAgentWait)
+        }
+    }
+
+    /** `daemon.info` on a fresh client, nil when nothing answers. */
+    private static func readDaemonInfo(paths: DirectaPaths) async -> DaemonInfo? {
+        try? await DaemonClient(socketPath: paths.socketPath)
+            .request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
+    }
+
+    /** launchd's respawn throttle (10 s) is the longest a killed agent waits to
+        be relaunched; the extra 5 s leaves the relaunched daemon time to start
+        and answer before the wait gives up. */
+    static let killedAgentWait = Duration.seconds(15)
+
     /** Asks the running daemon to hand its servers to the next one and exit,
         then waits (bounded) for it to stop answering. A daemon running as the
-        background agent stops nothing; any other daemon, and one that predates
-        the field, drains. Sent before the bounce because launchd's own kill can
-        outrun a SIGTERM drain and orphan server trees mid-escalation; after a
-        handoff the daemon also skips the drain that SIGTERM would start. No
-        daemon answering is not an error: the bounce then only starts one. */
-    public static func handOffRunningDaemon(paths: DirectaPaths) async {
-        let client = DaemonClient(socketPath: paths.socketPath)
-        _ = try? await client.request(
-            .daemonShutdown, params: ShutdownParams(handoff: true), expecting: WireEmpty.self)
-        let goneBy = ContinuousClock.now + .seconds(5)
-        while ContinuousClock.now < goneBy, FileManager.default.fileExists(atPath: paths.socketPath) {
-            if (try? await DaemonClient(socketPath: paths.socketPath)
-                .request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)) == nil
-            {
-                break
+        background agent stops nothing; a daemon that predates the field
+        (below `DaemonHandoffPolicy.firstVersion`) would drain on the request,
+        so a pre-handoff agent is SIGKILLed instead: its servers are launchd
+        child jobs the relaunched daemon adopts, and that daemon is handed off
+        in turn, once its restore finishes or the wait runs out, so the
+        caller's unregister or `kickstart -k` cannot SIGTERM it into a drain. A pre-handoff daemon that is not the agent drains.
+        Sent before the bounce because launchd's own kill can outrun a SIGTERM
+        drain and orphan server trees mid-escalation; after a handoff the
+        daemon also skips the drain that SIGTERM would start. No daemon
+        answering is not an error: the bounce then only starts one. */
+    @discardableResult
+    public static func handOffRunningDaemon(paths: DirectaPaths) async -> DaemonHandoffOutcome {
+        await handOffRunningDaemon(effects: .live(paths: paths))
+    }
+
+    static func handOffRunningDaemon(effects: HandoffEffects) async -> DaemonHandoffOutcome {
+        let first = await effects.readInfo().map(DaemonHandoffPolicy.Answer.init)
+        /** launchd is asked only when the version could need a kill. */
+        let needsAgentPid = first.map { !DaemonHandoffPolicy.supportsHandoff(version: $0.version) } ?? false
+        let agentPid = needsAgentPid ? await effects.agentPid() : nil
+        switch DaemonHandoffPolicy.step(answer: first, agentPid: agentPid) {
+        case .nothingRunning:
+            return .nothingRunning
+        case .requestHandoff:
+            await effects.requestHandoff()
+            return .handedOff
+        case .killAgent(let killedPid):
+            guard await effects.killAgent() else {
+                /** launchctl refused the kill: the plain request (which drains) is all that is left. */
+                await effects.requestHandoff()
+                return .handedOff
             }
-            try? await Task.sleep(for: .milliseconds(100))
+            let deadline = ContinuousClock.now.advanced(by: effects.successorWait)
+            var last = DaemonHandoffPolicy.Successor.none
+            while ContinuousClock.now < deadline {
+                let answer = await effects.readInfo().map(DaemonHandoffPolicy.Answer.init)
+                last = DaemonHandoffPolicy.successor(killedPid: killedPid, answer: answer)
+                switch last {
+                case .handOff:
+                    await effects.requestHandoff()
+                    return .handedOff
+                case .sameBinaryRelaunched:
+                    return .restartedByRelaunch
+                case .none, .restoring:
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+            }
+            guard DaemonHandoffPolicy.deadlineStep(last: last) == .requestHandoff else { return .nothingRunning }
+            await effects.requestHandoff()
+            return .handedOff
         }
     }
 
@@ -415,8 +519,7 @@ public enum LaunchdAdmin {
         paths: DirectaPaths, timeoutSeconds: Double = 30
     ) async {
         await awaitRestoreFinished(timeoutSeconds: timeoutSeconds, interval: .milliseconds(100)) {
-            try? await DaemonClient(socketPath: paths.socketPath)
-                .request(.daemonInfo, params: WireEmpty(), expecting: DaemonInfo.self)
+            await readDaemonInfo(paths: paths)
         }
     }
 
