@@ -121,6 +121,18 @@ public final class DaemonTelemetry: Sendable {
         incidentDone.wait(timeout: .now() + timeoutSeconds) == .success
     }
 
+    /** Registers the process-exit hook for an `exit` that does not go through
+        `exit(code:reason:)`; after one that does, the hook records nothing.
+        Registered here rather than in ddirecta's main.swift, whose top-level
+        closures are main-actor isolated: `exit` runs the hook on whichever
+        thread called it, and the runtime's isolation check traps (SIGTRAP)
+        when that is not the main thread. */
+    public static func recordExitAtProcessExit() {
+        atexit {
+            DaemonTelemetry.current?.recordExit(code: nil, reason: "exit")
+        }
+    }
+
     /** Records the exit with its code, then exits. An `exit` that skips this
         reaches only the process-exit hook, whose mark names no code and so
         reads as clean. */

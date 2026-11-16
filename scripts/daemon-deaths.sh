@@ -81,7 +81,14 @@ def summary($h):
        "  final 60s: peak \($peak.threads.total) threads (limit \($peak.threads.limit // "unknown")) at \($peak.time | clock), workqueue \($peak.threads.workqueue.total // "?") total / \($peak.threads.workqueue.blocked // "?") blocked / \($peak.threads.workqueue.running // "?") running, limits hit \($peak.threads.workqueue.limitsExceeded // [] | if length == 0 then "none" else join(",") end)",
        "    by name: \($peak.threads.byName | to_entries | sort_by(-.value) | map("\(.key)=\(.value)") | join(", "))",
        "    by state: \($peak.threads.byState | to_entries | map("\(.key)=\(.value)") | join(", "))",
-       "  final 60s memory: footprint peak \($final | map(.memory.footprint // 0) | max | mb) MB (last \($lastSnap.memory.footprint // 0 | mb) MB, lifetime peak \($lastSnap.memory.footprintLifetimePeak // 0 | mb) MB), compressed peak \($final | map(.memory.compressed // 0) | max | mb) MB, fds peak \($final | map(.fileDescriptors // 0) | max), pressure \($lastSnap.system.memoryPressure // "?")"
+       "  final 60s memory: footprint peak \($final | map(.memory.footprint // 0) | max | mb) MB (last \($lastSnap.memory.footprint // 0 | mb) MB, lifetime peak \($lastSnap.memory.footprintLifetimePeak // 0 | mb) MB), compressed peak \($final | map(.memory.compressed // 0) | max | mb) MB, fds peak \($final | map(.fileDescriptors // 0) | max), pressure \($lastSnap.system.memoryPressure // "?")",
+       ($final | map(select(.cpu != null))) as $cpu
+       | if ($cpu | length) < 2 then "  final 60s cpu: unknown (fewer than two snapshots carry cpu)"
+         else
+           ($cpu | first) as $a | ($cpu | last) as $z
+           | ($z.cpu.userSeconds - $a.cpu.userSeconds) as $user | ($z.cpu.systemSeconds - $a.cpu.systemSeconds) as $system
+           | "  final 60s cpu: \($user + $system | secs)s over \((($z.time | ts) - ($a.time | ts)) | secs)s (user \($user | secs)s, system \($system | secs)s)"
+         end
      end),
     ([$final[] | .lanes // [] | .[]] | group_by(.name)
      | if length == 0 then "  final 60s lanes: no lane data"

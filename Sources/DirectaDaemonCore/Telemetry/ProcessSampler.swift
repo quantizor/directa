@@ -14,6 +14,8 @@ final class ProcessSampler {
         when the search fails, and then threads are named by pthread name only. */
     private let queueLabelOffset: Int?
 
+    private static let timebase = readTimebase()
+
     init() {
         queueLabelOffset = Self.discoverQueueLabelOffset()
     }
@@ -63,12 +65,39 @@ final class ProcessSampler {
                 byName: byName, byState: byState, limit: limit, total: Int(count), workqueue: workqueue()))
     }
 
-    func memory() -> MemorySample? {
+    struct Resources {
+        var cpu: CPUSample?
+        var memory: MemorySample?
+    }
+
+    /** `ri_user_time` and `ri_system_time` are mach absolute time ticks on
+        Apple silicon (timebase 125/3, measured against `getrusage`), not
+        nanoseconds, so they go through `mach_timebase_info`. */
+    private static func cpuSeconds(ticks: UInt64, timebase: mach_timebase_info_data_t) -> Double {
+        Duration.seconds(Double(ticks) * Double(timebase.numer) / Double(timebase.denom) / 1e9).roundedSeconds
+    }
+
+    /** Nil when the kernel refuses the timebase, which then omits `cpu`. */
+    private static func readTimebase() -> mach_timebase_info_data_t? {
+        var timebase = mach_timebase_info_data_t()
+        guard mach_timebase_info(&timebase) == KERN_SUCCESS, timebase.denom != 0 else { return nil }
+        return timebase
+    }
+
+    /** CPU from `proc_pid_rusage`; memory from it plus `TASK_VM_INFO`. Each is
+        nil on its own failure, and both are nil when the rusage read fails. */
+    func resources() -> Resources {
         var usage = rusage_info_v6()
         let usageResult = withUnsafeMutablePointer(to: &usage) {
             $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
                 proc_pid_rusage(getpid(), RUSAGE_INFO_V6, $0)
             }
+        }
+        guard usageResult == 0 else { return Resources() }
+        let cpu = Self.timebase.map {
+            CPUSample(
+                systemSeconds: Self.cpuSeconds(ticks: usage.ri_system_time, timebase: $0),
+                userSeconds: Self.cpuSeconds(ticks: usage.ri_user_time, timebase: $0))
         }
         var vm = task_vm_info_data_t()
         var vmCount = mach_msg_type_number_t(
@@ -78,12 +107,15 @@ final class ProcessSampler {
                 task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &vmCount)
             }
         }
-        guard usageResult == 0, vmResult == KERN_SUCCESS else { return nil }
-        return MemorySample(
-            compressed: vm.compressed, compressedLifetime: vm.compressed_lifetime,
-            compressedPeak: vm.compressed_peak, footprint: usage.ri_phys_footprint,
-            footprintLifetimePeak: usage.ri_lifetime_max_phys_footprint, internal: vm.internal,
-            internalPeak: vm.internal_peak, resident: usage.ri_resident_size)
+        let memory =
+            vmResult == KERN_SUCCESS
+            ? MemorySample(
+                compressed: vm.compressed, compressedLifetime: vm.compressed_lifetime,
+                compressedPeak: vm.compressed_peak, footprint: usage.ri_phys_footprint,
+                footprintLifetimePeak: usage.ri_lifetime_max_phys_footprint, internal: vm.internal,
+                internalPeak: vm.internal_peak, resident: usage.ri_resident_size)
+            : nil
+        return Resources(cpu: cpu, memory: memory)
     }
 
     /** Open descriptors. The size-only call over-reports (it returns a

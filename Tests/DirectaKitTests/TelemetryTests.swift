@@ -138,7 +138,7 @@ private func decoded<T: Decodable>(_ lines: [String], as type: T.Type) throws ->
                 operations: [.stop: ActivityGroup(count: 1, oldestLabel: "/p::web: requested by restart", oldestSeconds: 12.5)],
                 requests: ["server.restart": ActivityGroup(count: 1, oldestLabel: nil, oldestSeconds: 12.6)],
                 serverPhases: [.stopping: 1]),
-            daemonPid: 4242, exitWatches: 3, fileDescriptors: 41,
+            cpu: nil, daemonPid: 4242, exitWatches: 3, fileDescriptors: 41,
             lanes: [
                 LanePressure(name: "repository", oldestQueuedSeconds: 4.25, queued: 3, running: 2, width: 2),
                 LanePressure(name: "system", oldestQueuedSeconds: 0, queued: 0, running: 1, width: 4),
@@ -166,7 +166,7 @@ private func decoded<T: Decodable>(_ lines: [String], as type: T.Type) throws ->
         let snapshot = TelemetrySnapshot(
             activity: ActivitySnapshot(
                 connectedClients: 0, longestRunning: [], operations: [:], requests: [:], serverPhases: [:]),
-            daemonPid: 1, exitWatches: 0, fileDescriptors: nil, lanes: [], memory: nil, reason: .interval,
+            cpu: nil, daemonPid: 1, exitWatches: 0, fileDescriptors: nil, lanes: [], memory: nil, reason: .interval,
             sampleMicroseconds: 1, system: SystemSample(loadAverage: [], memoryPressure: "unreadable"),
             threadDetail: [
                 ThreadDetail(cpuPercent: nil, name: "(unnamed)", state: .unknown, systemSeconds: nil, userSeconds: nil)
@@ -176,6 +176,28 @@ private func decoded<T: Decodable>(_ lines: [String], as type: T.Type) throws ->
             try encoded(snapshot)
                 == #"{"activity":{"connectedClients":0,"longestRunning":[],"operations":{},"requests":{},"serverPhases":{}},"daemonPid":1,"entry":"snapshot","exitWatches":0,"lanes":[],"reason":"interval","sampleMicroseconds":1,"system":{"loadAverage":[],"memoryPressure":"unreadable"},"threadDetail":[{"name":"(unnamed)","state":"unknown"}],"time":"2026-09-26T10:00:00.000Z","uptimeSeconds":0}"#
                 + "\n")
+    }
+
+    @Test func snapshotEncodesCumulativeCPU() throws {
+        let snapshot = TelemetrySnapshot(
+            activity: ActivitySnapshot(
+                connectedClients: 0, longestRunning: [], operations: [:], requests: [:], serverPhases: [:]),
+            cpu: CPUSample(systemSeconds: 0.25, userSeconds: 12.5),
+            daemonPid: 1, exitWatches: 0, fileDescriptors: nil, lanes: [], memory: nil, reason: .interval,
+            sampleMicroseconds: 1, system: SystemSample(loadAverage: [], memoryPressure: "unreadable"),
+            threadDetail: nil, threads: nil, time: try date("2026-09-26T10:00:00.000Z"), uptimeSeconds: 0)
+        #expect(
+            try encoded(snapshot)
+                == #"{"activity":{"connectedClients":0,"longestRunning":[],"operations":{},"requests":{},"serverPhases":{}},"cpu":{"systemSeconds":0.25,"userSeconds":12.5},"daemonPid":1,"entry":"snapshot","exitWatches":0,"lanes":[],"reason":"interval","sampleMicroseconds":1,"system":{"loadAverage":[],"memoryPressure":"unreadable"},"time":"2026-09-26T10:00:00.000Z","uptimeSeconds":0}"#
+                + "\n")
+    }
+
+    @Test func snapshotLineWithoutCPUStillDecodes() throws {
+        let line =
+            #"{"activity":{"connectedClients":0,"longestRunning":[],"operations":{},"requests":{},"serverPhases":{}},"daemonPid":1,"entry":"snapshot","exitWatches":0,"lanes":[],"reason":"interval","sampleMicroseconds":1,"system":{"loadAverage":[],"memoryPressure":"unreadable"},"time":"2026-09-26T10:00:00.000Z","uptimeSeconds":0}"#
+        let snapshot = try #require(try decoded([line], as: TelemetrySnapshot.self).first)
+        #expect(snapshot.cpu == nil)
+        #expect(snapshot.daemonPid == 1)
     }
 
     @Test func markEncoding() throws {

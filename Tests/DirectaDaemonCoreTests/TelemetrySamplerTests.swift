@@ -110,6 +110,10 @@ private let fastPolicy = TelemetryCadence.Policy(
             current value. */
         #expect(memory.footprintLifetimePeak > 0)
         #expect(try #require(first.fileDescriptors) >= 3)
+        /** The sampler thread and the suite have run for a measurable time by now. */
+        let cpu = try #require(first.cpu)
+        #expect(cpu.userSeconds > 0)
+        #expect(cpu.systemSeconds >= 0)
     }
 
     /** Starves the cooperative pool for a bounded window: twice as many

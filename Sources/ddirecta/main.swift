@@ -172,11 +172,7 @@ do {
     launchctl and `log show`) runs on its own background thread. */
 if DaemonTelemetry.isEnabled(environment: ProcessInfo.processInfo.environment) {
     DaemonTelemetry.start(paths: paths, runningAsAgent: LaunchdJobLauncher.runningAsAgent)
-    /** For an `exit` that does not go through `DaemonTelemetry.exit`; after
-        one that does, this records nothing. */
-    atexit {
-        DaemonTelemetry.current?.recordExit(code: nil, reason: "exit")
-    }
+    DaemonTelemetry.recordExitAtProcessExit()
 }
 
 let registry = Registry(paths: paths)

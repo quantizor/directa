@@ -138,14 +138,14 @@ public final class TelemetrySampler: Sendable {
         let activity = configuration.activity.snapshot(now: began)
         let exitWatches = configuration.exitWatches()
         let fileDescriptors = sampler.fileDescriptors()
-        let memory = sampler.memory()
+        let resources = sampler.resources()
         let system = sampler.system()
         let cost = began.duration(to: .now)
         let now = Date()
         let snapshot = TelemetrySnapshot(
-            activity: activity, daemonPid: loop.pid, exitWatches: exitWatches, fileDescriptors: fileDescriptors,
-            lanes: lanes, memory: memory, reason: decision.reason, sampleMicroseconds: cost.wholeMicroseconds,
-            system: system, threadDetail: decision.reason == .threshold ? threads?.detail : nil,
+            activity: activity, cpu: resources.cpu, daemonPid: loop.pid, exitWatches: exitWatches,
+            fileDescriptors: fileDescriptors, lanes: lanes, memory: resources.memory, reason: decision.reason,
+            sampleMicroseconds: cost.wholeMicroseconds, system: system, threadDetail: decision.reason == .threshold ? threads?.detail : nil,
             threads: threads?.sample, time: now,
             uptimeSeconds: Duration.seconds(now.timeIntervalSince(processStart)).roundedSeconds)
         configuration.log.append(snapshot)

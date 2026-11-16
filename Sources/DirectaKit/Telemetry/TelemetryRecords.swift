@@ -171,6 +171,19 @@ public struct MemorySample: Codable, Equatable, Sendable {
     }
 }
 
+/** The process's cumulative CPU time since it started, from
+    `proc_pid_rusage`. The difference between two snapshots is the CPU spent
+    between them. */
+public struct CPUSample: Codable, Equatable, Sendable {
+    public var systemSeconds: Double
+    public var userSeconds: Double
+
+    public init(systemSeconds: Double, userSeconds: Double) {
+        self.systemSeconds = systemSeconds
+        self.userSeconds = userSeconds
+    }
+}
+
 public struct SystemSample: Codable, Equatable, Sendable {
     /** 1, 5, and 15 minute load averages. */
     public var loadAverage: [Double]
@@ -199,6 +212,7 @@ public struct SystemSample: Codable, Equatable, Sendable {
     refused is nil rather than zero, so a zero always means zero. */
 public struct TelemetrySnapshot: TelemetryLine, Codable, Equatable {
     public var activity: ActivitySnapshot
+    public var cpu: CPUSample?
     public var daemonPid: Int32
     public var entry = TelemetryEntryKind.snapshot
     /** Exit watches armed in `ExitWatcher`. */
@@ -216,12 +230,13 @@ public struct TelemetrySnapshot: TelemetryLine, Codable, Equatable {
     public var uptimeSeconds: Double
 
     public init(
-        activity: ActivitySnapshot, daemonPid: Int32, exitWatches: Int, fileDescriptors: Int?,
+        activity: ActivitySnapshot, cpu: CPUSample?, daemonPid: Int32, exitWatches: Int, fileDescriptors: Int?,
         lanes: [LanePressure], memory: MemorySample?, reason: SampleReason, sampleMicroseconds: Int,
         system: SystemSample, threadDetail: [ThreadDetail]?, threads: ThreadSample?, time: Date,
         uptimeSeconds: Double
     ) {
         self.activity = activity
+        self.cpu = cpu
         self.daemonPid = daemonPid
         self.exitWatches = exitWatches
         self.fileDescriptors = fileDescriptors
