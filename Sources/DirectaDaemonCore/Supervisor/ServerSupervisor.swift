@@ -181,9 +181,12 @@ public actor ServerSupervisor {
     private var lastHealthAt: Date?
     private var lastHealthCheck: HealthCheckResult?
     private let launcher: any ProcessLauncher
-    /** The TCP ports the given pids listen on: `PortGuard`'s lsof read
-        outside tests, and a test's stand-in to hold the post-healthy scan. */
-    private let listeningPorts: @Sendable ([pid_t]) async -> [Int]
+    /** A test's stand-in for `PortGuard`'s lsof read of the TCP ports the
+        given pids listen on, run on the system lane like the read itself.
+        Sync, not a stored async closure: calling one from the scan's Task
+        aborts the Swift 6.3 task allocator ("freed pointer was not the last
+        allocation"). */
+    private let listeningPortsOverride: (@Sendable ([pid_t]) -> [Int])?
     /** Where this supervisor's structured log lives, built once: both
         `projectPath` and `spec.name` are fixed for a supervisor, and building
         the path canonicalizes the project on disk, which a status read per
@@ -334,7 +337,7 @@ public actor ServerSupervisor {
         descendantWatchWindow: Duration = .seconds(60),
         events: EventStore? = nil,
         launcher: any ProcessLauncher,
-        listeningPorts: @escaping @Sendable ([pid_t]) async -> [Int] = { await PortGuard.listeningPorts(pids: $0) },
+        listeningPortsOverride: (@Sendable ([pid_t]) -> [Int])? = nil,
         paths: DirectaPaths,
         prober: any HealthProber = NetworkHealthProber(),
         projectPath: String,
@@ -352,7 +355,7 @@ public actor ServerSupervisor {
         self.descendantWatchWindow = descendantWatchWindow
         self.events = events
         self.launcher = launcher
-        self.listeningPorts = listeningPorts
+        self.listeningPortsOverride = listeningPortsOverride
         let logFile = paths.structuredLogFile(project: project, server: spec.name)
         self.logFile = logFile
         self.logStore = LogStore(currentURL: logFile)
@@ -1238,8 +1241,13 @@ public actor ServerSupervisor {
         let pids = [rootPid] + lastDescendantSnapshot.map(\.pid)
         let expected = effectivePort ?? spec.port
         let generation = runGeneration
-        Task { [weak self, listeningPorts] in
-            let ports = await listeningPorts(pids)
+        Task { [weak self, listeningPortsOverride] in
+            let ports =
+                if let listeningPortsOverride {
+                    await BlockingLane.system.run { listeningPortsOverride(pids) }
+                } else {
+                    await PortGuard.listeningPorts(pids: pids)
+                }
             await self?.applyListenScan(
                 expected: expected, generation: generation, ours: pids.map(Int.init),
                 ports: ports)
@@ -1584,9 +1592,9 @@ public actor ServerSupervisor {
         spawned) records nothing. */
     func prepareHandoff() async {
         guard let out = outTailer, let err = errTailer else { return }
-        async let outPosition = out.pause()
-        async let errPosition = err.pause()
-        let positions = SpoolPositions(err: await errPosition, out: await outPosition)
+        let outPosition = await out.pause()
+        let errPosition = await err.pause()
+        let positions = SpoolPositions(err: errPosition, out: outPosition)
         guard positions.err != nil || positions.out != nil else { return }
         await registryUpdate { $0.spoolPositions = positions }
     }
@@ -1718,9 +1726,8 @@ public actor ServerSupervisor {
         whatever the tailers' timing. */
     private func catchUpTailers() async {
         guard let out = outTailer, let err = errTailer else { return }
-        async let outCaughtUp: Void = out.catchUp()
-        async let errCaughtUp: Void = err.catchUp()
-        _ = await (outCaughtUp, errCaughtUp)
+        await out.catchUp()
+        await err.catchUp()
     }
 
     /** Snapshot the err-stream tally for the run that just started at
