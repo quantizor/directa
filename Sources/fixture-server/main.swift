@@ -45,6 +45,10 @@ import Foundation
                            which is how a watch test proves the RESTARTED process
                            read the new file rather than only that a pid changed
     --touch-file PATH      rewrite PATH every 300ms (self-write loop fixture)
+    --quiet                print no heartbeats, for a test that writes the
+                           spool itself: the fixture's stdout keeps its own
+                           offset, so a heartbeat flushed later overwrites
+                           the test's bytes
     Default behavior: print a heartbeat line every 200ms. */
 
 var listenPort: UInt16?
@@ -61,6 +65,7 @@ var emitBinary = false
 var errLines = 0
 var flood = false
 var printFile: String?
+var quiet = false
 var touchFile: String?
 
 var argIterator = CommandLine.arguments.dropFirst().makeIterator()
@@ -96,6 +101,8 @@ while let arg = argIterator.next() {
         touchFile = argIterator.next()
     case "--flood":
         flood = true
+    case "--quiet":
+        quiet = true
     default:
         FileHandle.standardError.write(Data("fixture-server: unknown argument \(arg)\n".utf8))
         exit(2)
@@ -284,7 +291,9 @@ withExtendedLifetime(floodOwnerWatch) {
     var heartbeat = 0
     while true {
         heartbeat += 1
-        print("heartbeat \(heartbeat)")
+        if !quiet {
+            print("heartbeat \(heartbeat)")
+        }
         if !flood {
             usleep(200_000)
         }
