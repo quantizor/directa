@@ -76,6 +76,14 @@ struct SkipReport {
         return take(now: now)
     }
 
+    /** When the held total becomes reportable; nil with nothing held. A total
+        is only ever held after a report (`add` reports the first at once), so
+        `lastReported` is set whenever `pending` is. */
+    var dueAt: ContinuousClock.Instant? {
+        guard pending > 0, let lastReported else { return nil }
+        return lastReported + interval
+    }
+
     /** The unreported total regardless of the interval, for a final drain. */
     mutating func flush(now: ContinuousClock.Instant) -> UInt64? {
         guard pending > 0 else { return nil }
@@ -91,25 +99,47 @@ struct SkipReport {
 }
 
 /** Tails one raw spool file (the fd the child writes; survives daemon death)
-    into the structured LogStore. Polling keeps it simple and restart-safe.
-    The spool is opened once and held until `stop`, since it is never
-    truncated or renamed while its run lasts, so an idle tick costs one
-    `fstat`. */
+    into the structured LogStore. The spool is opened once and held until
+    `stop`, since it is never truncated or renamed while its run lasts. A
+    kernel vnode source on that descriptor wakes the tailer on every write
+    (a quiet server costs no wakeups); a wake is a hint to drain, never data,
+    so wakes coalesce and a spurious one (the tailer's own hole punch fires
+    one) finds nothing to read. A drain holds a lock for its whole run, so a
+    `catchUp` that returns has every complete line written before it in the
+    store (a partial line stays in the framer, and a backlog past the cap is
+    skipped and named). Once `stop` or `pause` is called the tailer never
+    reads again. */
 actor SpoolTailer {
-    /** Splits read bytes into lines. A line longer than 16 KB flushes in
-        segments of that size; after a catch-up skip, which lands mid-line,
-        the rest of that line is dropped rather than ingested as if it were
-        whole, however many chunks or drains it takes to reach its newline. */
-    private var framer = LineFramer(maxPartialBytes: 16 * 1024)
+    /** Answers a duplicate of the spool descriptor for the write watch, or a
+        negative value (errno set) when none can be had; a seam so a test can
+        stand in for descriptor exhaustion. */
+    private let armWatch: @Sendable (Int32) -> Int32
+    /** Whether a drain is running; drains never overlap, since one suspended
+        in a store append would otherwise let a later drain return before the
+        earlier one's lines are written. */
+    private var drainBusy = false
+    private var drainWaiters: [CheckedContinuation<Void, Never>] = []
+    /** Set by `stop` and `pause`, for good (a tailer serves one run): a
+        `catchUp` that reaches the actor by reentrancy afterward must neither
+        read past the position a pause recorded nor reopen the spool a stop
+        closed. */
+    private var finished = false
+    /** Splits read bytes into lines. A line longer than `maxPartialLineBytes`
+        flushes in segments of that size; after a catch-up skip, which lands
+        mid-line, the rest of that line is dropped rather than ingested as if
+        it were whole, however many chunks or drains it takes to reach its
+        newline. */
+    private var framer = LineFramer(maxPartialBytes: SpoolTailer.maxPartialLineBytes)
     /** Every spool byte before this offset has been ingested or skipped: the
         point the block release trails by `retainBytes`. */
     var ingestedThrough: UInt64 { offset }
-    private let intervalMs: Int
-    /** Unread bytes above this are skipped to the recent tail. Replaying a
-        flood into a rotating structured log (10 MB) is wasted work, and a
-        drain of that backlog would block `stop`. */
+    /** Unread bytes above this are skipped to the recent tail; 0 means no
+        cap. Replaying a flood into a rotating structured log (10 MB) is wasted
+        work, and a drain of that backlog would block `stop`. */
     private let maxCatchUpBytes: Int
     private var offset: UInt64 = 0
+    /** Called at the top of every drain, so a test can count wakeups. */
+    private let onDrain: (@Sendable () -> Void)?
     /** One drain never holds more than this plus the framer's partial line. */
     private let readChunkBytes: Int
     /** Returns 0 or an errno; a seam so a test can stand in for a volume
@@ -129,10 +159,14 @@ actor SpoolTailer {
     /** True until the first drain has run: gates the end-of-file seed so it
         applies once, at attach, and never again on a later drain. */
     private var seedingAtEnd: Bool
-    private var skipReport = SkipReport(interval: .seconds(1))
-    /** The open spool, read-only; nil until a drain opens it and after
-        `stop` closes it. Read afresh after every suspension, since `stop`
-        can close it while a polling drain is suspended. */
+    private var skipReport = SkipReport(interval: SpoolTailer.skipReportInterval)
+    /** The one pending wake at the due time of a held skip notice; drains
+        otherwise run only on writes, so a quiet server would hold the notice
+        until its next line. */
+    private var skipWake: Task<Void, Never>?
+    /** The open spool, read-only; nil until `start` or a drain opens it and
+        after `stop` closes it. Read afresh after every suspension, since
+        `stop` can close it while a drain is suspended. */
     private var spool: Int32?
     private let store: LogStore
     private let stream: LogStream
@@ -140,6 +174,14 @@ actor SpoolTailer {
     private let url: URL
     /** Read once, at the first release. */
     private var volumeBlockBytes: Int?
+    /** Feeds the following task; nil unless started. */
+    private var wake: AsyncStream<Void>.Continuation?
+    /** Set once the watch could not be armed, so a retry on every timed
+        pass logs the refusal once. */
+    private var watchRefused = false
+    /** The kernel write watch, on a duplicate of `spool` that its cancel
+        handler closes. */
+    private var watcher: DispatchSourceFileSystemObject?
 
     /** `startAtEnd` seeds `offset` to the file's current size before the first
         drain reads anything, so re-attaching to a spool a prior run already
@@ -157,13 +199,15 @@ actor SpoolTailer {
         seed is the end of the file as above. The catch-up cap applies to the
         resumed backlog like any other. */
     init(
-        intervalMs: Int = 100, maxCatchUpBytes: Int = 1_048_576, readChunkBytes: Int = 64 * 1024,
+        armWatch: @escaping @Sendable (Int32) -> Int32 = { fcntl($0, F_DUPFD_CLOEXEC, 0) },
+        maxCatchUpBytes: Int = 1_048_576, onDrain: (@Sendable () -> Void)? = nil, readChunkBytes: Int = 64 * 1024,
         releaseHole: @escaping @Sendable (String, Range<UInt64>) -> Int32 = SpoolRelease.punchHole,
         resumeFrom: SpoolPosition? = nil, retainBytes: Int = 1_048_576, startAtEnd: Bool = false,
         store: LogStore, stream: LogStream, url: URL
     ) {
-        self.intervalMs = intervalMs
+        self.armWatch = armWatch
         self.maxCatchUpBytes = max(0, maxCatchUpBytes)
+        self.onDrain = onDrain
         self.readChunkBytes = max(1, readChunkBytes)
         self.releaseHole = releaseHole
         self.resumeFrom = resumeFrom
@@ -178,43 +222,49 @@ actor SpoolTailer {
         if let spool { close(spool) }
     }
 
+    /** Starts following the spool: the watch is armed before the first drain,
+        so a write between the two still produces a wake. */
     func start() {
         guard task == nil else { return }
-        task = Task { [intervalMs] in
-            while !Task.isCancelled {
-                await self.drain(yieldsToCancellation: true)
-                try? await Task.sleep(for: .milliseconds(intervalMs))
-            }
-        }
+        let (wakes, signal) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
+        wake = signal
+        if openSpool() { watchSpool() }
+        task = Task { await self.follow(wakes) }
     }
 
-    /** Stops polling after a final drain so exit-time output is not lost,
-        even when the caller's own task is already cancelled. */
-    func stop() async {
-        task?.cancel()
-        task = nil
+    /** Ingests every complete line the spool holds at this moment (a child
+        still writing is not chased; a partial line stays in the framer; a
+        backlog past the catch-up cap is skipped and named) and answers once
+        it is in the store, leaving the tailer running. A caller that is about to read the log or place a mark
+        calls it first, so what the child wrote before is ordered before. */
+    func catchUp() async {
         await drain(yieldsToCancellation: false)
+    }
+
+    /** Stops following after a final drain so exit-time output is not lost,
+        even when the caller's own task is already cancelled. The drain reads
+        to the size the spool has when it begins, so an orphan still writing
+        cannot hold the caller. */
+    func stop() async {
+        detach()
+        finished = true
+        await drain(yieldsToCancellation: false, finalizing: true)
         await reportSkipped(skipReport.flush(now: .now))
         await flushPartial()
         if let spool { close(spool) }
         spool = nil
     }
 
-    /** Ends polling for a handoff to the next daemon: ingests what the spool
+    /** Ends following for a handoff to the next daemon: ingests what the spool
         holds at this moment, once (a child still writing is not chased, so a
         flood cannot hold the exit; the catch-up cap bounds the rest), and
         answers where the next daemon resumes. That is the start of the line
         in progress, which stays unlogged here so the next daemon logs it
         whole, not the offset read to. Nil when the spool cannot be read. */
     func pause() async -> SpoolPosition? {
-        task?.cancel()
-        task = nil
-        if spool == nil {
-            let opened = open(url.path, O_RDONLY | O_CLOEXEC)
-            guard opened >= 0 else { return nil }
-            spool = opened
-        }
-        await drain(yieldsToCancellation: false, through: spoolSize())
+        detach()
+        finished = true
+        await drain(yieldsToCancellation: false, finalizing: true)
         await reportSkipped(skipReport.flush(now: .now))
         guard let info = spoolStat() else { return nil }
         return SpoolPosition(
@@ -229,20 +279,25 @@ actor SpoolTailer {
         run under a sustained flood. Chunked reads, never the whole tail; the
         offset advances by bytes actually read, so a child that appends
         after a size read cannot leave the cursor behind data already
-        ingested (duplicate lines, doubled error tally). The polling task
+        ingested (duplicate lines, doubled error tally). The following task
         passes `yieldsToCancellation` so it stops between chunks once `stop`
-        cancels it; `stop` drains to the end, and the catch-up skip keeps
-        that bounded. A spool that does not exist yet is retried next tick. */
-    private func drain(yieldsToCancellation: Bool, through limit: UInt64? = nil) async {
-        if spool == nil {
-            let opened = open(url.path, O_RDONLY | O_CLOEXEC)
-            guard opened >= 0 else { return }
-            spool = opened
-        }
+        cancels it. A drain stops at the size the spool has when it begins: a
+        flood that never lets a chase reach end of file then still releases
+        the drain lock between wakes, so a `catchUp` or `stop` waits one
+        bounded drain, not the flood. `finalizing` marks the drain `stop` or
+        `pause` runs after setting `finished`; any other drain that finds
+        `finished` returns at once. */
+    private func drain(yieldsToCancellation: Bool, finalizing: Bool = false) async {
+        await acquireDrain()
+        defer { releaseDrain() }
+        if finished && !finalizing { return }
+        if yieldsToCancellation && Task.isCancelled { return }
+        onDrain?()
+        guard openSpool(), let limit = spoolSize() else { return }
         while !(yieldsToCancellation && Task.isCancelled) {
             guard let fileSize = spoolSize() else { break }
-            let size = limit.map { min($0, fileSize) } ?? fileSize
-            let readable = await skipToReadable(size: size)
+            let size = min(limit, fileSize)
+            let readable = await skipToReadable(size: size, fileSize: fileSize)
             guard readable, let chunk = readChunk(), !chunk.isEmpty else { break }
             offset += UInt64(chunk.count)
             await emit(lines: framer.feed(chunk))
@@ -250,6 +305,104 @@ actor SpoolTailer {
         }
         await releaseIngested()
         await reportSkipped(skipReport.due(now: .now))
+        scheduleHeldSkipReport()
+    }
+
+    /** One wake at the due time of a skip notice still held; `follow` drains
+        on it, spaced like any other drain. */
+    private func scheduleHeldSkipReport() {
+        guard skipWake == nil, !finished, let dueAt = skipReport.dueAt else { return }
+        skipWake = Task {
+            try? await Task.sleep(until: dueAt, clock: .continuous)
+            self.wakeForHeldSkipReport()
+        }
+    }
+
+    private func wakeForHeldSkipReport() {
+        skipWake = nil
+        guard !Task.isCancelled else { return }
+        wake?.yield()
+    }
+
+    private func acquireDrain() async {
+        while drainBusy {
+            await withCheckedContinuation { drainWaiters.append($0) }
+        }
+        drainBusy = true
+    }
+
+    private func releaseDrain() {
+        drainBusy = false
+        if !drainWaiters.isEmpty { drainWaiters.removeFirst().resume() }
+    }
+
+    /** Drains once now, then once per wake. Without a watch (the spool does
+        not exist yet, or descriptor exhaustion) the gap is the wait, and each
+        pass retries opening the spool and arming the watch. */
+    private func follow(_ wakes: AsyncStream<Void>) async {
+        var wakeIterator = wakes.makeAsyncIterator()
+        var lastDrainEnd = ContinuousClock.now - Self.minimumDrainGap
+        while !Task.isCancelled {
+            /** A flood leaves a wake buffered at every pass, so without a gap a
+                flooded tailer would drain back to back. The gap since the last
+                drain ended caps that at ten drains a second and costs a write
+                after a quiet spell nothing, since the gap is long past by then. */
+            try? await Task.sleep(until: lastDrainEnd + Self.minimumDrainGap, clock: .continuous)
+            if openSpool() { watchSpool() }
+            await drain(yieldsToCancellation: true)
+            lastDrainEnd = .now
+            if watcher != nil, await wakeIterator.next() == nil { break }
+        }
+    }
+
+    /** Also the period of a spool that has no watch. Under a flood this bounds
+        one stream's ingest at about 10 MB a second, and the catch-up skip
+        names the rest. */
+    private static let minimumDrainGap = Duration.milliseconds(100)
+
+    /** At most one skip notice a second, however often a flood skips. */
+    private static let skipReportInterval = Duration.seconds(1)
+
+    /** The framer's cap on a line held without its newline. */
+    private static let maxPartialLineBytes = 16 * 1024
+
+    private func detach() {
+        task?.cancel()
+        task = nil
+        skipWake?.cancel()
+        skipWake = nil
+        watcher?.cancel()
+        watcher = nil
+        wake?.finish()
+        wake = nil
+    }
+
+    private func openSpool() -> Bool {
+        if spool != nil { return true }
+        let opened = open(url.path, O_RDONLY | O_CLOEXEC)
+        guard opened >= 0 else { return false }
+        spool = opened
+        return true
+    }
+
+    /** Both events: an append is an extend plus a write, a hole punch a write alone. */
+    private func watchSpool() {
+        guard watcher == nil, let spool, let wake else { return }
+        let duplicate = armWatch(spool)
+        guard duplicate >= 0 else {
+            if !watchRefused {
+                watchRefused = true
+                DirectaLog.supervisor.error(
+                    "cannot watch \(url.path) for writes, polling every \(Self.minimumDrainGap) instead: \(String(cString: strerror(errno)))")
+            }
+            return
+        }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: duplicate, eventMask: [.extend, .write], queue: .global(qos: .utility))
+        source.setEventHandler { wake.yield() }
+        source.setCancelHandler { close(duplicate) }
+        source.resume()
+        watcher = source
     }
 
     private func spoolSize() -> UInt64? {
@@ -287,16 +440,19 @@ actor SpoolTailer {
         await store.append(stream: .sys, text: "spool catch-up skipped \(bytes) bytes")
     }
 
-    /** Settles `offset` against the file's current `size` (the attach seed, a
-        truncation by a fresh start, a backlog past the catch-up cap) and
-        answers whether unread bytes remain. */
-    private func skipToReadable(size: UInt64) async -> Bool {
+    /** Settles `offset` against `size`, how far this drain may read (the
+        attach seed, a backlog past the catch-up cap), and the file's real
+        `fileSize` (a truncation by a fresh start), and answers whether
+        unread bytes remain. A drain bounded below the file's size must not
+        read a chunk past its bound and then mistake that for a truncation,
+        which is why the two sizes are separate. */
+    private func skipToReadable(size: UInt64, fileSize: UInt64) async -> Bool {
         if seedingAtEnd {
             offset = resumableOffset(size: size) ?? size
             framer.reset()
             seedingAtEnd = false
         }
-        if size < offset {
+        if fileSize < offset {
             offset = 0
             framer.reset()
             releasedThrough = 0

@@ -9,14 +9,21 @@ import Foundation
 public actor LogStore {
     private let currentURL: URL
     private var handle: FileHandle?
-    private var lastTimestamp = Date.distantPast
+    private var clamp = TimestampClamp()
     private var markCounter = 0
     private let maxBytes: Int
+    private let now: @Sendable () -> Date
+    /** Set once an open failure is logged, so a store that cannot open its
+        file logs it once rather than per line. */
+    private var openFailureLogged = false
+    private var writeFailureLogged = false
     private var writtenBytes: UInt64 = 0
 
-    public init(currentURL: URL, maxBytes: Int = 10 * 1024 * 1024) {
+    /** `now` is the clock the clamp's skew rule reads; tests inject one. */
+    public init(currentURL: URL, maxBytes: Int = 10 * 1024 * 1024, now: @escaping @Sendable () -> Date = { Date() }) {
         self.currentURL = currentURL
         self.maxBytes = maxBytes
+        self.now = now
     }
 
     deinit {
@@ -24,8 +31,8 @@ public actor LogStore {
     }
 
     @discardableResult
-    public func append(stream: LogStream, text: String, at date: Date = Date()) -> LogRecord {
-        let record = LogRecord(at: clamped(date), stream: stream, text: text)
+    public func append(stream: LogStream, text: String, at date: Date? = nil) -> LogRecord {
+        let record = LogRecord(at: clamped(date ?? now()), stream: stream, text: text)
         write(Data((record.formatted() + "\n").utf8))
         return record
     }
@@ -35,7 +42,8 @@ public actor LogStore {
         once, and the lines up to a rotation boundary go out in one write;
         lines after a rotation take the clamp again, since the `rotated`
         line may have moved it. */
-    public func append(stream: LogStream, texts: [String], at date: Date = Date()) {
+    public func append(stream: LogStream, texts: [String], at date: Date? = nil) {
+        let date = date ?? now()
         var next = texts.startIndex
         while next < texts.endIndex {
             let prefix = Data("\(JSONCoding.formatISO8601(clamped(date)))\t\(stream.rawValue)\t".utf8)
@@ -53,19 +61,19 @@ public actor LogStore {
 
     /** Monotonic clamp: an NTP step or wake-time sync must never write a
         timestamp earlier than the previous line. Opening first resumes the
-        clamp from the file's last record before the first line is stamped. */
+        clamp from the file's last record before the first line is stamped;
+        the skew check then costs one comparison per call. */
     private func clamped(_ date: Date) -> Date {
         openIfNeeded()
-        let clamped = JSONCoding.canonicalMs(max(date, lastTimestamp))
-        lastTimestamp = clamped
-        return clamped
+        restartClampIfAhead()
+        return clamp.stamp(date)
     }
 
     /** A correlation marker; payload = `<id>\t<label>\t<text>` so queries can
         resolve `--since-mark` and attribute the mark to its requester. */
     public func appendMark(label: String, text: String) -> PlacedMark {
         markCounter += 1
-        let id = "m\(Int(Date().timeIntervalSince1970))-\(markCounter)"
+        let id = "m\(Int(now().timeIntervalSince1970))-\(markCounter)"
         let record = append(stream: .mark, text: "\(id)\t\(label)\t\(text)")
         return PlacedMark(at: record.at, id: id, server: currentURL.deletingLastPathComponent().lastPathComponent)
     }
@@ -88,20 +96,54 @@ public actor LogStore {
     private func openIfNeeded() {
         guard handle == nil else { return }
         let dir = currentURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: currentURL.path) {
-            FileManager.default.createFile(atPath: currentURL.path, contents: nil)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: currentURL.path) {
+                FileManager.default.createFile(atPath: currentURL.path, contents: nil)
+            }
+            let opened = try FileHandle(forWritingTo: currentURL)
+            writtenBytes = try opened.seekToEnd()
+            handle = opened
+        } catch {
+            writtenBytes = 0
+            if !openFailureLogged {
+                openFailureLogged = true
+                DirectaLog.daemon.error("log open failed path=\(currentURL.path) error=\(error)")
+            }
         }
-        handle = try? FileHandle(forWritingTo: currentURL)
-        writtenBytes = (try? handle?.seekToEnd()) ?? 0
         /** Resume the clamp from what is already on disk, or rotated files would
             let a clock step slip a regression into the family. */
         if let last = LogQuery.lastRecordDate(of: currentURL) {
-            lastTimestamp = max(lastTimestamp, last)
+            clamp.resume(at: last)
+        }
+    }
+
+    /** A clamp past `TimestampClamp`'s tolerance (found at open or after a
+        clock correction mid-run) rotates the file and restarts at now. A
+        rotation that cannot move the live file keeps the clamp, since the
+        future records stay in it and the file must stay sorted, and is not
+        retried this run. */
+    private func restartClampIfAhead() {
+        let current = now()
+        if clamp.settle(now: current, rotate: shiftFamily) {
+            startRotatedFile(at: current)
         }
     }
 
     private func rotate() {
+        _ = shiftFamily()
+        startRotatedFile(at: now())
+    }
+
+    private func startRotatedFile(at date: Date) {
+        openIfNeeded()
+        writtenBytes = 0
+        append(stream: .sys, text: SysLineText.rotated, at: date)
+    }
+
+    /** Moves the live file to `.1` and each rotation up one. False when the
+        live file could not move (logged). */
+    private func shiftFamily() -> Bool {
         try? handle?.close()
         handle = nil
         let fm = FileManager.default
@@ -114,16 +156,27 @@ public actor LogStore {
                 try? fm.moveItem(at: from, to: to)
             }
         }
-        try? fm.moveItem(at: currentURL, to: currentURL.appendingPathExtension("1"))
-        openIfNeeded()
-        writtenBytes = 0
-        append(stream: .sys, text: SysLineText.rotated)
+        do {
+            try fm.moveItem(at: currentURL, to: currentURL.appendingPathExtension("1"))
+            return true
+        } catch {
+            DirectaLog.daemon.error("log rotation failed path=\(currentURL.path) error=\(error)")
+            return false
+        }
     }
 
     private func write(_ data: Data) {
         openIfNeeded()
         guard let handle else { return }
-        try? handle.write(contentsOf: data)
+        do {
+            try handle.write(contentsOf: data)
+        } catch {
+            if !writeFailureLogged {
+                writeFailureLogged = true
+                DirectaLog.daemon.error("log write failed path=\(currentURL.path) error=\(error)")
+            }
+            return
+        }
         writtenBytes += UInt64(data.count)
         if writtenBytes > UInt64(maxBytes) {
             rotate()

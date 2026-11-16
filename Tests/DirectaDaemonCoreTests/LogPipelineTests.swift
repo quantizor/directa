@@ -10,7 +10,78 @@ private func tempDir() throws -> URL {
     try TemporaryTree.directory(named: "pipe")
 }
 
+/** A settable clock the stores' `now` seam reads. */
+private final class TestClock: Sendable {
+    private let state: OSAllocatedUnfairLock<Date>
+
+    init(_ start: Date) { state = OSAllocatedUnfairLock(initialState: start) }
+
+    var now: Date { state.withLock { $0 } }
+
+    func set(_ date: Date) { state.withLock { $0 = date } }
+}
+
+private let clockEpoch = Date(timeIntervalSince1970: 1_700_000_000)
+
 @Suite(.temporaryTree) struct LogStoreTests {
+    private func writeLog(_ records: [LogRecord], to url: URL) throws {
+        try Data(records.map { $0.formatted() + "\n" }.joined().utf8).write(to: url)
+    }
+
+    /** The clamp is far ahead of the clock when the store opens: the old file
+        rotates away and the new line is stamped now, not pinned to the future. */
+    @Test func aFarFutureLastLineRotatesAtOpenAndTheClampRestartsAtNow() async throws {
+        let current = try tempDir().appending(path: "current.log")
+        let skewed = clockEpoch.addingTimeInterval(86_400)
+        try writeLog(
+            [
+                LogRecord(at: clockEpoch.addingTimeInterval(-600), stream: .out, text: "old"),
+                LogRecord(at: skewed, stream: .out, text: "skewed"),
+            ], to: current)
+        let store = LogStore(currentURL: current, now: { clockEpoch })
+
+        await store.append(stream: .out, text: "new", at: clockEpoch)
+
+        let live = try String(contentsOf: current, encoding: .utf8)
+        #expect(LogQuery.lastRecordDate(of: current) == clockEpoch)
+        #expect(!live.contains("skewed"))
+        #expect(LogQuery.lastRecordDate(of: current.appendingPathExtension("1")) == skewed)
+        #expect(await store.query(LogQueryOptions(streams: [.out])).map(\.text) == ["old", "skewed", "new"])
+    }
+
+    /** The clock was ahead and is corrected back mid-run: the next append
+        rotates and stamps at the corrected time. */
+    @Test func aClockStepBackPastToleranceMidRunRotatesAndRestartsTheClamp() async throws {
+        let current = try tempDir().appending(path: "current.log")
+        let clock = TestClock(clockEpoch.addingTimeInterval(3_600))
+        let store = LogStore(currentURL: current, now: { clock.now })
+        await store.append(stream: .out, text: "ahead", at: clock.now)
+
+        clock.set(clockEpoch)
+        let record = await store.append(stream: .out, text: "corrected", at: clock.now)
+
+        #expect(record.at == clockEpoch)
+        #expect(LogQuery.lastRecordDate(of: current) == clockEpoch)
+        #expect(LogQuery.lastRecordDate(of: current.appendingPathExtension("1")) == clockEpoch.addingTimeInterval(3_600))
+    }
+
+    /** A rotation that cannot move the file leaves the future records in the
+        live file, so the clamp stays at them and the file stays sorted. */
+    @Test func aFailedSkewRotationKeepsTheClampAtTheNewestRecord() async throws {
+        let dir = try tempDir()
+        let current = dir.appending(path: "current.log")
+        let skewed = clockEpoch.addingTimeInterval(86_400)
+        try writeLog([LogRecord(at: skewed, stream: .out, text: "skewed")], to: current)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path) }
+        let store = LogStore(currentURL: current, now: { clockEpoch })
+
+        let record = await store.append(stream: .out, text: "new", at: clockEpoch)
+
+        #expect(record.at == skewed)
+        #expect(await store.query(LogQueryOptions(streams: [.out])).map(\.at) == [skewed, skewed])
+    }
+
     @Test func clampKeepsTimestampsMonotonic() async throws {
         let store = LogStore(currentURL: try tempDir().appending(path: "current.log"))
         let late = Date()
@@ -41,16 +112,16 @@ private func tempDir() throws -> URL {
         first append at or after that record, one line or a burst. */
     @Test func theFirstAppendResumesTheClampFromDisk() async throws {
         let dir = try tempDir()
-        let later = Date(timeIntervalSince1970: 4_102_444_800)
+        let later = clockEpoch.addingTimeInterval(30)
         for burst in [false, true] {
             let current = dir.appending(path: "current-\(burst).log")
             try Data((LogRecord(at: later, stream: .out, text: "from the last run").formatted() + "\n").utf8)
                 .write(to: current)
-            let store = LogStore(currentURL: current)
+            let store = LogStore(currentURL: current, now: { clockEpoch })
             if burst {
-                await store.append(stream: .out, texts: ["one", "two"])
+                await store.append(stream: .out, texts: ["one", "two"], at: clockEpoch)
             } else {
-                await store.append(stream: .out, text: "one")
+                await store.append(stream: .out, text: "one", at: clockEpoch)
             }
             let stamps = await store.query(LogQueryOptions()).map(\.at)
             #expect(stamps.count == (burst ? 3 : 2))
@@ -93,6 +164,84 @@ private func tempDir() throws -> URL {
         #expect(await store.resolveMark(mark.id) == mark.at)
         let since = await store.query(LogQueryOptions(since: mark.at, streams: [.out]))
         #expect(since.map(\.text) == ["after"])
+    }
+}
+
+@Suite struct TimestampClampTests {
+    private let day = TimeInterval(86_400)
+
+    @Test func aFreshClampIsNeverAhead() {
+        #expect(!TimestampClamp().isAhead(of: clockEpoch))
+    }
+
+    @Test func theClampIsAheadOnlyPastTheTolerance() {
+        var clamp = TimestampClamp()
+        clamp.resume(at: clockEpoch.addingTimeInterval(TimestampClamp.toleranceSeconds))
+        #expect(!clamp.isAhead(of: clockEpoch))
+
+        clamp.resume(at: clockEpoch.addingTimeInterval(TimestampClamp.toleranceSeconds + 1))
+        #expect(clamp.isAhead(of: clockEpoch))
+    }
+
+    @Test func resumeOnlyRaisesTheClamp() {
+        var clamp = TimestampClamp()
+        clamp.resume(at: clockEpoch.addingTimeInterval(10))
+        clamp.resume(at: clockEpoch)
+        #expect(clamp.stamp(clockEpoch) == clockEpoch.addingTimeInterval(10))
+    }
+
+    @Test func stampNeverGoesBackward() {
+        var clamp = TimestampClamp()
+        #expect(clamp.stamp(clockEpoch) == clockEpoch)
+        #expect(clamp.stamp(clockEpoch.addingTimeInterval(-5)) == clockEpoch)
+        #expect(clamp.stamp(clockEpoch.addingTimeInterval(5)) == clockEpoch.addingTimeInterval(5))
+    }
+
+    @Test func settleDoesNotRotateAClampWithinTheTolerance() {
+        var clamp = TimestampClamp()
+        clamp.resume(at: clockEpoch.addingTimeInterval(30))
+        var rotations = 0
+
+        let restarted = clamp.settle(now: clockEpoch) {
+            rotations += 1
+            return true
+        }
+
+        #expect(!restarted)
+        #expect(rotations == 0)
+        #expect(clamp.stamp(clockEpoch) == clockEpoch.addingTimeInterval(30))
+    }
+
+    @Test func settleRestartsAnAheadClampAtNowOnceTheRotationSucceeds() {
+        var clamp = TimestampClamp()
+        clamp.resume(at: clockEpoch.addingTimeInterval(day))
+
+        let restarted = clamp.settle(now: clockEpoch) { true }
+
+        #expect(restarted)
+        #expect(!clamp.isAhead(of: clockEpoch))
+        #expect(clamp.stamp(clockEpoch) == clockEpoch)
+    }
+
+    @Test func settleKeepsAnAheadClampAndRefusesEveryLaterRotationOnceOneFails() {
+        var clamp = TimestampClamp()
+        clamp.resume(at: clockEpoch.addingTimeInterval(day))
+        var rotations = 0
+
+        let first = clamp.settle(now: clockEpoch) {
+            rotations += 1
+            return false
+        }
+        let second = clamp.settle(now: clockEpoch) {
+            rotations += 1
+            return true
+        }
+
+        #expect(!first)
+        #expect(!second)
+        #expect(rotations == 1)
+        #expect(!clamp.isAhead(of: clockEpoch))
+        #expect(clamp.stamp(clockEpoch) == clockEpoch.addingTimeInterval(day))
     }
 }
 
@@ -151,13 +300,33 @@ private func tempDir() throws -> URL {
     }
 }
 
+/** A writer on a thread of its own that appends `linesPerWrite` 1000-byte
+    lines to `spool` every `pauseMicroseconds` until `writing` clears. */
+private func floodWriter(
+    to spool: URL, linesPerWrite: Int, pauseMicroseconds: UInt32, writing: OSAllocatedUnfairLock<Bool>
+) -> Task<Void, Never> {
+    Task {
+        await offPool {
+            let descriptor = open(spool.path, O_WRONLY | O_APPEND | O_CLOEXEC)
+            guard descriptor >= 0 else { return }
+            defer { close(descriptor) }
+            let line = [UInt8](repeating: 0x61, count: 999) + [0x0A]
+            let block = Array((0..<linesPerWrite).map { _ in line }.joined())
+            while writing.withLock({ $0 }) {
+                _ = write(descriptor, block, block.count)
+                usleep(pauseMicroseconds)
+            }
+        }
+    }
+}
+
 @Suite(.temporaryTree) struct SpoolTailerTests {
     @Test func tailsIncrementallyAndSanitizes() async throws {
         let dir = try tempDir()
         let spool = dir.appending(path: "out.spool")
         FileManager.default.createFile(atPath: spool.path, contents: nil)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
-        let tailer = SpoolTailer(intervalMs: 20, store: store, stream: .out, url: spool)
+        let tailer = SpoolTailer(store: store, stream: .out, url: spool)
         await tailer.start()
         let handle = try FileHandle(forWritingTo: spool)
         try handle.write(contentsOf: Data("plain line\n10%\r99%\rdone\n\u{1B}[32mgreen\u{1B}[0m\n".utf8))
@@ -178,13 +347,124 @@ private func tempDir() throws -> URL {
         #expect(texts.contains { $0.hasSuffix("tail") })
     }
 
+    /** A spool nobody writes to never wakes the tailer: after the attach
+        drain, no drain runs over the idle window. The write that ends the
+        window then wakes the tailer however long it was quiet: the line
+        lands in the store within a bound loose enough for a loaded runner. */
+    @Test func aQuietSpoolCostsNoDrainsAndAWriteAfterIdleWakesIt() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        FileManager.default.createFile(atPath: spool.path, contents: nil)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let drains = OSAllocatedUnfairLock(initialState: 0)
+        let tailer = SpoolTailer(onDrain: { drains.withLock { $0 += 1 } }, store: store, stream: .out, url: spool)
+        await tailer.start()
+        try await Task.sleep(for: .milliseconds(300))
+        let settled = drains.withLock { $0 }
+        let woke = try await eventually(within: .seconds(1), every: .milliseconds(50)) {
+            drains.withLock { $0 } != settled
+        }
+        #expect(!woke, "a quiet spool drained \(drains.withLock { $0 } - settled) more times")
+
+        let handle = try FileHandle(forWritingTo: spool)
+        try handle.write(contentsOf: Data("after idle\n".utf8))
+        try handle.close()
+        let ingested = try await eventually(within: .seconds(1), every: .milliseconds(2)) {
+            await store.query(LogQueryOptions(streams: [.out])).map(\.text) == ["after idle"]
+        }
+        #expect(ingested, "a line written after idle took longer than 1 s to reach the store")
+        await tailer.stop()
+    }
+
+    /** A spool that appears after `start` (an adopted run whose spool vanished
+        reaches this; the daemon creates both spools before any spawn) is
+        found and followed. */
+    @Test func aSpoolCreatedAfterStartIsFollowed() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(store: store, stream: .out, url: spool)
+        await tailer.start()
+        try await Task.sleep(for: .milliseconds(200))
+        try Data("first\n".utf8).write(to: spool)
+        let found = try await eventually(within: .seconds(3), every: .milliseconds(20)) {
+            await ingested(store) == ["first"]
+        }
+        #expect(found, "a spool created after start was never opened")
+        let handle = try FileHandle(forWritingTo: spool)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("second\n".utf8))
+        try handle.close()
+        let followed = try await eventually(within: .milliseconds(500), every: .milliseconds(5)) {
+            await ingested(store) == ["first", "second"]
+        }
+        #expect(followed, "a late spool was opened but never watched")
+        await tailer.stop()
+    }
+
+    /** `catchUp` is the ordering fence a mark relies on: a line written an
+        instant earlier is in the store when it returns, with no wait for the
+        tailer's own wakeup, and the tailer keeps running afterward. */
+    @Test func catchUpIngestsALineWrittenJustBeforeIt() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        FileManager.default.createFile(atPath: spool.path, contents: nil)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(store: store, stream: .out, url: spool)
+        await tailer.start()
+        try await Task.sleep(for: .milliseconds(300))
+        let handle = try FileHandle(forWritingTo: spool)
+        try handle.write(contentsOf: Data("just written\n".utf8))
+        await tailer.catchUp()
+        #expect(await ingested(store) == ["just written"])
+        try handle.write(contentsOf: Data("and then\n".utf8))
+        try handle.close()
+        let followed = try await eventually(within: .seconds(2), every: .milliseconds(5)) {
+            await ingested(store) == ["just written", "and then"]
+        }
+        let texts = await ingested(store)
+        #expect(followed, "the tailer stopped following after catchUp: \(texts)")
+        await tailer.stop()
+    }
+
+    /** The tailer's own block release writes to the spool, which wakes it
+        once; that drain finds nothing to release, so the wakeups end. */
+    @Test func releasingIngestedBlocksDoesNotKeepTheTailerWaking() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        let block = SpoolRelease.blockBytes(path: dir.path)
+        try Data(repeating: 0x61, count: 64 * block - 1).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let drains = OSAllocatedUnfairLock(initialState: 0)
+        let releases = OSAllocatedUnfairLock(initialState: 0)
+        let tailer = SpoolTailer(
+            onDrain: { drains.withLock { $0 += 1 } }, readChunkBytes: block,
+            releaseHole: { path, range in
+                releases.withLock { $0 += 1 }
+                return SpoolRelease.punchHole(path: path, range: range)
+            },
+            retainBytes: 2 * block, store: store, stream: .out, url: spool)
+        await tailer.start()
+        let released = try await eventually(within: .seconds(5), every: .milliseconds(10)) {
+            releases.withLock { $0 } > 0
+        }
+        #expect(released, "the tailer never released a block")
+        try await Task.sleep(for: .milliseconds(300))
+        let settled = drains.withLock { $0 }
+        let looped = try await eventually(within: .seconds(1), every: .milliseconds(50)) {
+            drains.withLock { $0 } != settled
+        }
+        #expect(!looped, "the tailer kept draining after its releases: \(drains.withLock { $0 } - settled) more")
+        await tailer.stop()
+    }
+
     @Test func assemblesALineTornAcrossReadChunks() async throws {
         let dir = try tempDir()
         let spool = dir.appending(path: "out.spool")
         try Data("hello world\nnext\n".utf8).write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         let tailer = SpoolTailer(
-            intervalMs: 20, readChunkBytes: 8, store: store, stream: .out, url: spool)
+            readChunkBytes: 8, store: store, stream: .out, url: spool)
         await tailer.start()
         await tailer.stop()
         let texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
@@ -196,12 +476,12 @@ private func tempDir() throws -> URL {
         let spool = dir.appending(path: "out.spool")
         try Data("first line\n".utf8).write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
-        let tailer = SpoolTailer(intervalMs: 20, store: store, stream: .out, url: spool)
+        let tailer = SpoolTailer(store: store, stream: .out, url: spool)
         await tailer.start()
-        await tailer.stop()
+        await tailer.catchUp()
         /** Shorter than the prior offset, which is the truncation signal. */
         try Data("new\n".utf8).write(to: spool)
-        await tailer.start()
+        await tailer.catchUp()
         await tailer.stop()
         let texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
         #expect(texts == ["first line", "new"])
@@ -214,7 +494,7 @@ private func tempDir() throws -> URL {
         let spool = dir.appending(path: "out.spool")
         try Data("last words\npartial".utf8).write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
-        let tailer = SpoolTailer(intervalMs: 20, store: store, stream: .out, url: spool)
+        let tailer = SpoolTailer(store: store, stream: .out, url: spool)
         let stopping = Task {
             withUnsafeCurrentTask { $0?.cancel() }
             await tailer.stop()
@@ -229,7 +509,7 @@ private func tempDir() throws -> URL {
         let spool = dir.appending(path: "out.spool")
         try Data("no newline".utf8).write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
-        let tailer = SpoolTailer(intervalMs: 20, store: store, stream: .out, url: spool)
+        let tailer = SpoolTailer(store: store, stream: .out, url: spool)
         await tailer.start()
         await tailer.stop()
         let texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
@@ -247,7 +527,7 @@ private func tempDir() throws -> URL {
         try payload.write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         let tailer = SpoolTailer(
-            intervalMs: 20, maxCatchUpBytes: 0, readChunkBytes: 64, store: store, stream: .out,
+            maxCatchUpBytes: 0, readChunkBytes: 64, store: store, stream: .out,
             url: spool)
         await tailer.start()
         await tailer.stop()
@@ -263,7 +543,7 @@ private func tempDir() throws -> URL {
         try Data(repeating: 0x61, count: 40 * 1024).write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         let tailer = SpoolTailer(
-            intervalMs: 20, maxCatchUpBytes: 0, store: store, stream: .out, url: spool)
+            maxCatchUpBytes: 0, store: store, stream: .out, url: spool)
         await tailer.start()
         await tailer.stop()
         let texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
@@ -282,7 +562,7 @@ private func tempDir() throws -> URL {
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         /** 30 bytes of tail: enough for the last few lines, not the head. */
         let tailer = SpoolTailer(
-            intervalMs: 20, maxCatchUpBytes: 30, store: store, stream: .out, url: spool)
+            maxCatchUpBytes: 30, store: store, stream: .out, url: spool)
         await tailer.start()
         await tailer.stop()
         let out = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
@@ -310,7 +590,7 @@ private func tempDir() throws -> URL {
         let releases = OSAllocatedUnfairLock<[Range<UInt64>]>(initialState: [])
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         let tailer = SpoolTailer(
-            intervalMs: 20, maxCatchUpBytes: cap, readChunkBytes: block,
+            maxCatchUpBytes: cap, readChunkBytes: block,
             releaseHole: { _, range in
                 releases.withLock { $0.append(range) }
                 return 0
@@ -334,16 +614,16 @@ private func tempDir() throws -> URL {
         try Data("preexisting line\n".utf8).write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         let tailer = SpoolTailer(
-            intervalMs: 20, startAtEnd: true, store: store, stream: .out, url: spool)
+            startAtEnd: true, store: store, stream: .out, url: spool)
         await tailer.start()
-        await tailer.stop()
+        await tailer.catchUp()
         var texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
         #expect(texts.isEmpty)
         let handle = try FileHandle(forWritingTo: spool)
         try handle.seekToEnd()
         try handle.write(contentsOf: Data("appended after attach\n".utf8))
         try handle.close()
-        await tailer.start()
+        await tailer.catchUp()
         await tailer.stop()
         texts = await store.query(LogQueryOptions(streams: [.out])).map(\.text)
         #expect(texts == ["appended after attach"])
@@ -368,7 +648,7 @@ private func tempDir() throws -> URL {
         let spool = dir.appending(path: "out.spool")
         try Data("one\ntwo\nthr".utf8).write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
-        let tailer = SpoolTailer(intervalMs: 20, store: store, stream: .out, url: spool)
+        let tailer = SpoolTailer(store: store, stream: .out, url: spool)
         await tailer.start()
 
         let paused = await tailer.pause()
@@ -392,7 +672,7 @@ private func tempDir() throws -> URL {
         try Data("old\nnew 1\nnew 2\n".utf8).write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         let tailer = SpoolTailer(
-            intervalMs: 20, resumeFrom: try position(of: spool, bytesRead: 4), startAtEnd: true, store: store,
+            resumeFrom: try position(of: spool, bytesRead: 4), startAtEnd: true, store: store,
             stream: .out, url: spool)
         await tailer.start()
         await tailer.stop()
@@ -412,16 +692,16 @@ private func tempDir() throws -> URL {
         try Data("old\nnew 1\nnew 2\n".utf8).write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         let tailer = SpoolTailer(
-            intervalMs: 20, resumeFrom: try position(of: spool, bytesRead: bytesRead, inodeShift: inodeShift),
+            resumeFrom: try position(of: spool, bytesRead: bytesRead, inodeShift: inodeShift),
             startAtEnd: true, store: store, stream: .out, url: spool)
         await tailer.start()
-        await tailer.stop()
+        await tailer.catchUp()
         #expect(await ingested(store).isEmpty)
         let handle = try FileHandle(forWritingTo: spool)
         try handle.seekToEnd()
         try handle.write(contentsOf: Data("after\n".utf8))
         try handle.close()
-        await tailer.start()
+        await tailer.catchUp()
         await tailer.stop()
         #expect(await ingested(store) == ["after"])
     }
@@ -438,7 +718,7 @@ private func tempDir() throws -> URL {
         try payload.write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         let tailer = SpoolTailer(
-            intervalMs: 20, maxCatchUpBytes: 30, resumeFrom: try position(of: spool, bytesRead: 0), startAtEnd: true,
+            maxCatchUpBytes: 30, resumeFrom: try position(of: spool, bytesRead: 0), startAtEnd: true,
             store: store, stream: .out, url: spool)
         await tailer.start()
         await tailer.stop()
@@ -455,28 +735,16 @@ private func tempDir() throws -> URL {
         let dir = try tempDir()
         let spool = dir.appending(path: "out.spool")
         try Data().write(to: spool)
-        /** A writer on a thread of its own that appends faster than one-byte
-            reads can follow, so a drain that chases end of file never reaches
-            it. The tailer releases what it ingests, which keeps the disk use
-            small however large the file grows. */
+        /** Appends faster than one-byte reads can follow, so a drain that
+            chases end of file never reaches it. The tailer releases what it
+            ingests, which keeps the disk use small however large the file
+            grows. */
         let writing = OSAllocatedUnfairLock(initialState: true)
-        let flood = Task {
-            await offPool {
-                let descriptor = open(spool.path, O_WRONLY | O_APPEND | O_CLOEXEC)
-                guard descriptor >= 0 else { return }
-                defer { close(descriptor) }
-                let line = [UInt8](repeating: 0x61, count: 999) + [0x0A]
-                let block = Array((0..<64).map { _ in line }.joined())
-                while writing.withLock({ $0 }) {
-                    _ = write(descriptor, block, block.count)
-                    usleep(200)
-                }
-            }
-        }
+        let flood = floodWriter(to: spool, linesPerWrite: 64, pauseMicroseconds: 200, writing: writing)
         defer { writing.withLock { $0 = false } }
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         let tailer = SpoolTailer(
-            intervalMs: 20, maxCatchUpBytes: 2048, readChunkBytes: 1, retainBytes: 16 * 1024, store: store,
+            maxCatchUpBytes: 2048, readChunkBytes: 1, retainBytes: 16 * 1024, store: store,
             stream: .out, url: spool)
         await tailer.start()
         _ = try await eventually(within: .seconds(20), every: .milliseconds(20)) {
@@ -497,6 +765,129 @@ private func tempDir() throws -> URL {
         let answer = await paused.value
         #expect((answer?.bytesRead ?? 0) > 0)
         #expect((answer?.bytesRead ?? .max) <= UInt64(try spoolSizes(spool).apparent))
+    }
+
+    /** The final drain reads to the size the spool has when it begins, so an
+        orphan still writing to an exited root's spool cannot hold `stop`. */
+    @Test func stopDoesNotChaseAFloodingOrphan() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data().write(to: spool)
+        /** Far more than one-byte reads cover between writes, so a drain that
+            chases end of file never reaches it. */
+        let writing = OSAllocatedUnfairLock(initialState: true)
+        let flood = floodWriter(to: spool, linesPerWrite: 256, pauseMicroseconds: 100, writing: writing)
+        defer { writing.withLock { $0 = false } }
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(
+            maxCatchUpBytes: 2048, readChunkBytes: 1, retainBytes: 16 * 1024, store: store,
+            stream: .out, url: spool)
+        await tailer.start()
+        _ = try await eventually(within: .seconds(20), every: .milliseconds(20)) {
+            try spoolSizes(spool).apparent >= 1_048_576
+        }
+        let finished = OSAllocatedUnfairLock(initialState: false)
+        let stopping = Task {
+            await tailer.stop()
+            finished.withLock { $0 = true }
+        }
+        let returned = try await eventually(within: .seconds(5), every: .milliseconds(20)) {
+            finished.withLock { $0 }
+        }
+        writing.withLock { $0 = false }
+        await flood.value
+        await stopping.value
+        #expect(returned, "stop was still chasing the orphan's writes after 5 seconds")
+    }
+
+    /** A catch-up that reaches a tailer through actor reentrancy after a
+        pause must not ingest past the position the pause recorded, or the
+        adopting daemon logs those lines twice. */
+    @Test func aPausedTailerNeverReadsAgain() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data("one\n".utf8).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(store: store, stream: .out, url: spool)
+        await tailer.start()
+        let paused = await tailer.pause()
+        let handle = try FileHandle(forWritingTo: spool)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("two\n".utf8))
+        try handle.close()
+        await tailer.catchUp()
+        #expect(paused == (try position(of: spool, bytesRead: 4)))
+        #expect(await ingested(store) == ["one"])
+    }
+
+    /** A catch-up after `stop` must not reopen the spool `stop` closed. */
+    @Test func aStoppedTailerNeverReadsAgain() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data("one\n".utf8).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(store: store, stream: .out, url: spool)
+        await tailer.start()
+        await tailer.stop()
+        let handle = try FileHandle(forWritingTo: spool)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("two\n".utf8))
+        try handle.close()
+        await tailer.catchUp()
+        #expect(await ingested(store) == ["one"])
+    }
+
+    /** A skip notice held inside its one-second window is released by a timed
+        drain, so the last skip of a flood is named though the server goes
+        quiet and no write drives another drain. */
+    @Test func aHeldSkipNoticeIsReportedWithoutAnotherWrite() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        let payload = Data((0..<1_000).flatMap { Array("line-\($0)\n".utf8) }.prefix(10 * 1024))
+        try payload.write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(maxCatchUpBytes: 1024, store: store, stream: .out, url: spool)
+        await tailer.start()
+        try await Task.sleep(for: .milliseconds(150))
+        let handle = try FileHandle(forWritingTo: spool)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: payload)
+        try handle.close()
+        let named = try await eventually(within: .seconds(3), every: .milliseconds(50)) {
+            await store.query(LogQueryOptions(streams: [.sys])).count == 2
+        }
+        let sys = await store.query(LogQueryOptions(streams: [.sys])).map(\.text)
+        #expect(named, "the held skip notice never reached the store: \(sys)")
+        await tailer.stop()
+    }
+
+    /** A spool whose write watch cannot be armed (descriptor exhaustion) is
+        still tailed, by a timed drain. */
+    @Test func aSpoolWhoseWatchCannotBeArmedIsStillTailed() async throws {
+        let dir = try tempDir()
+        let spool = dir.appending(path: "out.spool")
+        try Data("first\n".utf8).write(to: spool)
+        let store = LogStore(currentURL: dir.appending(path: "current.log"))
+        let tailer = SpoolTailer(
+            armWatch: { _ in
+                errno = EMFILE
+                return -1
+            }, store: store, stream: .out, url: spool)
+        await tailer.start()
+        let attached = try await eventually(within: .seconds(2), every: .milliseconds(10)) {
+            await ingested(store) == ["first"]
+        }
+        try #require(attached, "the attach drain never ran")
+        let handle = try FileHandle(forWritingTo: spool)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("second\n".utf8))
+        try handle.close()
+        let followed = try await eventually(within: .seconds(2), every: .milliseconds(20)) {
+            await ingested(store) == ["first", "second"]
+        }
+        let texts = await ingested(store)
+        #expect(followed, "an unwatched spool was never tailed: \(texts)")
+        await tailer.stop()
     }
 
     /** The two ways a child's spool descriptor is opened: the daemon's own
@@ -520,23 +911,15 @@ private func tempDir() throws -> URL {
         bound is measured against the tailer's own read point. */
     @Test(arguments: spoolOpenFlags)
     func aFloodingChildsSpoolStaysBoundedOnDisk(openFlags: Int32) async throws {
-        let fixture = try #require(fixtureServerExecutable(), "fixture-server is not built; run swift build")
         let dir = try tempDir()
         let spool = dir.appending(path: "out.spool")
-        let descriptor = open(spool.path, openFlags | O_CLOEXEC, 0o644)
-        try #require(descriptor >= 0)
-        let child = try spawnBare([fixture, "--flood"], stdoutFD: descriptor)
-        close(descriptor)
-        defer {
-            kill(child, SIGKILL)
-            var status: Int32 = 0
-            waitpid(child, &status, 0)
-        }
+        let child = try spawnFloodingFixture(into: spool, openFlags: openFlags)
+        defer { killAndReap(child) }
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         let retain = 16 * 1024
         let chunk = 64 * 1024
         let tailer = SpoolTailer(
-            intervalMs: 20, maxCatchUpBytes: 256 * 1024, readChunkBytes: chunk, retainBytes: retain, store: store,
+            maxCatchUpBytes: 256 * 1024, readChunkBytes: chunk, retainBytes: retain, store: store,
             stream: .out, url: spool)
         await tailer.start()
         let floodBytes: Int64 = 2 * 1024 * 1024
@@ -583,22 +966,14 @@ private func tempDir() throws -> URL {
     /** A flood that outruns the tailer is skipped chunk by chunk, but named
         in at most one sys line a second, never one per skip. */
     @Test func aFloodThatOutrunsTheTailerIsNamedAboutOnceASecond() async throws {
-        let fixture = try #require(fixtureServerExecutable(), "fixture-server is not built; run swift build")
         let dir = try tempDir()
         let spool = dir.appending(path: "out.spool")
-        let descriptor = open(spool.path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0o644)
-        try #require(descriptor >= 0)
-        let child = try spawnBare([fixture, "--flood"], stdoutFD: descriptor)
-        close(descriptor)
-        defer {
-            kill(child, SIGKILL)
-            var status: Int32 = 0
-            waitpid(child, &status, 0)
-        }
+        let child = try spawnFloodingFixture(into: spool, openFlags: Self.spoolOpenFlags[0])
+        defer { killAndReap(child) }
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         /** Sixteen-byte reads cannot keep up with the fixture's flood. */
         let tailer = SpoolTailer(
-            intervalMs: 20, maxCatchUpBytes: 2048, readChunkBytes: 16, retainBytes: 16 * 1024, store: store,
+            maxCatchUpBytes: 2048, readChunkBytes: 16, retainBytes: 16 * 1024, store: store,
             stream: .out, url: spool)
         let started = ContinuousClock.now
         await tailer.start()
@@ -625,7 +1000,7 @@ private func tempDir() throws -> URL {
         try Data(String(repeating: "earlier run line\n", count: 64 * 1024).utf8).write(to: spool)
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         let tailer = SpoolTailer(
-            intervalMs: 20, retainBytes: 32 * 1024, startAtEnd: true, store: store, stream: .out, url: spool)
+            retainBytes: 32 * 1024, startAtEnd: true, store: store, stream: .out, url: spool)
         await tailer.start()
         await tailer.stop()
         let sizes = try spoolSizes(spool)
@@ -643,7 +1018,7 @@ private func tempDir() throws -> URL {
         let store = LogStore(currentURL: dir.appending(path: "current.log"))
         let attempts = OSAllocatedUnfairLock<Int>(initialState: 0)
         let tailer = SpoolTailer(
-            intervalMs: 20, maxCatchUpBytes: 0,
+            maxCatchUpBytes: 0,
             releaseHole: { _, _ in
                 attempts.withLock { $0 += 1 }
                 return ENOTSUP
@@ -702,14 +1077,19 @@ private func tempDir() throws -> URL {
             .split(separator: "\n", omittingEmptySubsequences: true).last.map(String.init) ?? ""
     }
 
-    @Test func fileHandleReadUpToCountHonorsTheLimit() throws {
-        let dir = try tempDir()
-        let url = dir.appending(path: "blob")
-        try Data(repeating: 0x61, count: 1000).write(to: url)
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        let chunk = try handle.read(upToCount: 64)
-        #expect(chunk?.count == 64)
+    /** The fixture server flooding stdout into a fresh `spool` opened with `openFlags`. */
+    private func spawnFloodingFixture(into spool: URL, openFlags: Int32) throws -> pid_t {
+        let fixture = try #require(fixtureServerExecutable(), "fixture-server is not built; run swift build")
+        let descriptor = open(spool.path, openFlags | O_CLOEXEC, 0o644)
+        try #require(descriptor >= 0)
+        defer { close(descriptor) }
+        return try spawnBare([fixture, "--flood"], stdoutFD: descriptor)
+    }
+
+    private func killAndReap(_ child: pid_t) {
+        kill(child, SIGKILL)
+        var status: Int32 = 0
+        waitpid(child, &status, 0)
     }
 }
 
@@ -741,10 +1121,200 @@ private func tempDir() throws -> URL {
         #expect(all.last?.server == "web-79")
     }
 
+    private func record(_ offset: Int, project: String = "/p", detail: String? = nil) -> EventRecord {
+        EventRecord(
+            at: Date(timeIntervalSince1970: 1_700_000_000 + Double(offset)), detail: detail,
+            kind: .started, project: project, server: "web-\(offset)")
+    }
+
+    private func writeLines(_ records: [EventRecord], to url: URL) throws {
+        var data = Data()
+        for record in records { data.append(try NDJSON.encodeLine(record)) }
+        try data.write(to: url)
+    }
+
+    @Test func sinceReadsBackwardAcrossBlockBoundariesAndKeepsTheBoundaryRecords() async throws {
+        let url = try tempDir().appending(path: "events.log")
+        /** Long details put each line near 200 bytes, so 1,200 lines span
+            several 64 KiB blocks and a line straddles each boundary. */
+        let detail = String(repeating: "d", count: 100)
+        let all = (0..<1_200).map { record($0, project: $0 % 2 == 0 ? "/p" : "/q", detail: detail) }
+        try writeLines(all, to: url)
+        let store = EventStore(url: url)
+
+        let from = Date(timeIntervalSince1970: 1_700_000_000 + 300)
+        #expect(await store.query(since: from) == Array(all[300...]))
+        #expect(await store.query(project: "/q", since: from) == all[300...].filter { $0.project == "/q" })
+        #expect(await store.query(since: from, tail: 2) == Array(all.suffix(2)))
+        #expect(await store.query(since: Date(timeIntervalSince1970: 1_700_000_000 + 5_000)) == [])
+        #expect(await store.query(since: Date(timeIntervalSince1970: 0)) == all)
+    }
+
+    @Test func recordsSharingTheBoundaryMillisecondAreAllKept() async throws {
+        let url = try tempDir().appending(path: "events.log")
+        let tie = Date(timeIntervalSince1970: 1_700_000_100)
+        let all = [
+            EventRecord(at: tie.addingTimeInterval(-1), kind: .started, project: "/p", server: "before"),
+            EventRecord(at: tie, kind: .started, project: "/p", server: "first"),
+            EventRecord(at: tie, kind: .crashed, project: "/p", server: "second"),
+            EventRecord(at: tie.addingTimeInterval(1), kind: .started, project: "/p", server: "after"),
+        ]
+        try writeLines(all, to: url)
+        let events = await EventStore(url: url).query(since: tie)
+        #expect(events.map(\.server) == ["first", "second", "after"])
+    }
+
+    @Test func aSinceInsideTheLiveFileNeverReadsTheRotatedOne() async throws {
+        let url = try tempDir().appending(path: "events.log")
+        try Data("not json at all\n".utf8).write(to: url.appendingPathExtension("1"))
+        try writeLines((10..<20).map { record($0) }, to: url)
+        let events = await EventStore(url: url).query(since: Date(timeIntervalSince1970: 1_700_000_015))
+        #expect(events.map(\.server) == (15..<20).map { "web-\($0)" })
+    }
+
+    @Test func aSinceBeforeTheLiveFileContinuesIntoTheRotatedOneInOrder() async throws {
+        let url = try tempDir().appending(path: "events.log")
+        try writeLines((0..<10).map { record($0) }, to: url.appendingPathExtension("1"))
+        try writeLines((10..<20).map { record($0) }, to: url)
+        let store = EventStore(url: url)
+
+        let events = await store.query(since: Date(timeIntervalSince1970: 1_700_000_007))
+        #expect(events.map(\.server) == (7..<20).map { "web-\($0)" })
+        #expect(await store.query().map(\.server) == (0..<20).map { "web-\($0)" })
+        #expect(await store.query(tail: 3).map(\.server) == ["web-17", "web-18", "web-19"])
+    }
+
+    /** A clock that stepped back across a restart must not write a record
+        older than the file's last one, or a backward `since` read would stop
+        before it. */
+    @Test func aReopenedStoreNeverWritesBehindTheFilesLastRecord() async throws {
+        let url = try tempDir().appending(path: "events.log")
+        let future = Date().addingTimeInterval(30)
+        try writeLines(
+            [EventRecord(at: JSONCoding.canonicalMs(future), kind: .started, project: "/p", server: "old")],
+            to: url)
+        let store = EventStore(url: url)
+
+        await store.post(kind: .stopped, project: "/p", server: "new")
+        let events = await store.query(since: JSONCoding.canonicalMs(future))
+        #expect(events.map(\.server) == ["old", "new"])
+        #expect(try #require(events.last).at >= JSONCoding.canonicalMs(future))
+    }
+
+    @Test func aReopenedStoreSeedsFromTheRotatedFileWhenTheLiveOneIsEmpty() async throws {
+        let url = try tempDir().appending(path: "events.log")
+        let future = JSONCoding.canonicalMs(Date().addingTimeInterval(30))
+        try writeLines(
+            [EventRecord(at: future, kind: .started, project: "/p", server: "old")],
+            to: url.appendingPathExtension("1"))
+        try Data().write(to: url)
+        let store = EventStore(url: url)
+
+        await store.post(kind: .stopped, project: "/p", server: "new")
+        #expect(await store.query(since: future).map(\.server) == ["old", "new"])
+    }
+
+    /** One record stamped a day ahead (the clock was briefly wrong) must not
+        pin every later event's time to it, or the app's `at > lastEventCheck`
+        crash filter drops them. */
+    @Test func aFarFutureLastRecordRotatesAndTheNewPostIsStampedNow() async throws {
+        let url = try tempDir().appending(path: "events.log")
+        let dayAhead = JSONCoding.canonicalMs(Date().addingTimeInterval(86_400))
+        let past = JSONCoding.canonicalMs(Date().addingTimeInterval(-600))
+        try writeLines(
+            [
+                EventRecord(at: past, kind: .started, project: "/p", server: "old"),
+                EventRecord(at: dayAhead, kind: .started, project: "/p", server: "skewed"),
+            ], to: url)
+        let store = EventStore(url: url)
+
+        let before = Date()
+        await store.post(kind: .stopped, project: "/p", server: "new")
+        let posted = try #require(await store.query(since: before.addingTimeInterval(-1)).last)
+        #expect(posted.server == "new")
+        #expect(posted.at < before.addingTimeInterval(60))
+        #expect(FileManager.default.fileExists(atPath: url.appendingPathExtension("1").path))
+
+        #expect(await store.query(since: past).map(\.server) == ["old", "skewed", "new"])
+        /** The skewed record keeps its stamp in the rotated file until that file rotates away. */
+        #expect(await store.query(since: before.addingTimeInterval(-1)).map(\.server) == ["skewed", "new"])
+        #expect(await store.query(tail: 1).map(\.server) == ["new"])
+    }
+
+    /** The clock was ahead and is corrected back mid-run: later posts are
+        stamped at the corrected time, not the old future. */
+    @Test func aClockStepBackPastToleranceMidRunRotatesAndRestartsTheClamp() async throws {
+        let url = try tempDir().appending(path: "events.log")
+        let ahead = clockEpoch.addingTimeInterval(3_600)
+        let clock = TestClock(ahead)
+        let store = EventStore(url: url, now: { clock.now })
+        await store.post(kind: .started, project: "/p", server: "ahead")
+
+        clock.set(clockEpoch)
+        await store.post(kind: .stopped, project: "/p", server: "corrected")
+
+        #expect(await store.query(tail: 1).map(\.at) == [clockEpoch])
+        #expect(FileManager.default.fileExists(atPath: url.appendingPathExtension("1").path))
+        /** The ahead record keeps its stamp in the rotated file until that file rotates away. */
+        #expect(await store.query().map(\.at) == [ahead, clockEpoch])
+    }
+
+    /** A rotation that cannot move the file leaves the future records in the
+        live file, so the clamp stays at them and the file stays sorted. */
+    @Test func aFailedSkewRotationKeepsTheClampAtTheNewestRecord() async throws {
+        let dir = try tempDir()
+        let url = dir.appending(path: "events.log")
+        let skewed = clockEpoch.addingTimeInterval(86_400)
+        try writeLines([EventRecord(at: skewed, kind: .started, project: "/p", server: "skewed")], to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path) }
+        let store = EventStore(url: url, now: { clockEpoch })
+
+        await store.post(kind: .stopped, project: "/p", server: "new")
+
+        #expect(await store.query().map(\.at) == [skewed, skewed])
+    }
+
+    @Test func aPostThatCannotWriteStillWakesParkedClients() async throws {
+        let dir = try tempDir()
+        let blocker = dir.appending(path: "not-a-directory")
+        try Data().write(to: blocker)
+        let store = EventStore(url: blocker.appending(path: "events.log"))
+        let before = store.changes.token
+
+        await store.post(kind: .started, project: "/p", server: "web")
+        #expect(store.changes.token != before)
+    }
+
+    @Test func tailKeepsTheNewestMatchingRecordsWhenTheProjectFilterSkipsSome() async throws {
+        let url = try tempDir().appending(path: "events.log")
+        let all = (0..<400).map { record($0, project: $0 % 3 == 0 ? "/p" : "/q", detail: String(repeating: "d", count: 100)) }
+        try writeLines(all, to: url)
+        let store = EventStore(url: url)
+
+        #expect(await store.query(project: "/p", tail: 2) == all.filter { $0.project == "/p" }.suffix(2))
+        #expect(await store.query(tail: 0) == [])
+        #expect(await store.query(tail: -3) == [])
+        #expect(await store.query(tail: 1_000) == all)
+    }
+
+    @Test func missingEmptyAndUnterminatedFilesAnswerWhatTheyHold() async throws {
+        let dir = try tempDir()
+        let url = dir.appending(path: "events.log")
+        #expect(await EventStore(url: url).query(since: .distantPast) == [])
+
+        try Data().write(to: url)
+        #expect(await EventStore(url: url).query(since: .distantPast) == [])
+
+        var data = try NDJSON.encodeLine(record(1))
+        data.append(try NDJSON.encodeLine(record(2)).dropLast())
+        try data.write(to: url)
+        #expect(await EventStore(url: url).query(since: .distantPast).map(\.server) == ["web-1", "web-2"])
+    }
+
     @Test func aCapSizedFamilyStillAnswersSinceAndTail() async throws {
-        /** Pre-written NDJSON, not 5 MB of actor posts: the query path reads
-            both files whole, then tails, which is the same shape as a days-old
-            events.log at the 5 MB rotate cap. */
+        /** Pre-written NDJSON, not 5 MB of actor posts: the same shape as a
+            days-old events.log at the 5 MB rotate cap. */
         let dir = try tempDir()
         let current = dir.appending(path: "events.log")
         func event(_ offset: Int, project: String) throws -> Data {
