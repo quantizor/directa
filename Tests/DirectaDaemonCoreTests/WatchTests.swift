@@ -15,9 +15,17 @@ import Testing
     /** `offset` picks the port inside this run's block. */
     private func env(offset: Int, watch: String?, locks: Bool = false) throws -> RouterEnv {
         let env = try makeRouterEnv(named: "watch")
+        try Data("v1\n".utf8).write(
+            to: URL(fileURLWithPath: env.project).appending(path: "app.config.json"))
+        try writeConfig(env, offset: offset, watch: watch, locks: locks)
+        return env
+    }
+
+    private func writeConfig(_ env: RouterEnv, offset: Int, watch: String?, locks: Bool = false)
+        throws
+    {
         let project = URL(fileURLWithPath: env.project)
         let port = TestPorts.port(offset)
-        try Data("v1\n".utf8).write(to: project.appending(path: "app.config.json"))
         let fixture = try #require(fixtureServerExecutable())
         let watchKey = watch.map { "\"watch\": [\"\($0)\"]," } ?? ""
         let locksKey = locks ? "\"locks\": [\"data\"]," : ""
@@ -36,7 +44,6 @@ import Testing
             }
             """
         try Data(body.utf8).write(to: project.appending(path: "devservers.json"))
-        return env
     }
 
     private func start(_ router: Router, _ project: String) async throws -> ServerStatus {
@@ -60,6 +67,33 @@ import Testing
             restarted += await router.sweepWatches(now: from.addingTimeInterval(offset))
         }
         return restarted
+    }
+
+    /** The idle daemon sweeps every 500 ms, so a supervisor with nothing to
+        watch must cost the sweep nothing, and the answer must follow the
+        committed config as it changes. */
+    @Test func aSweepEvaluatesOnlyServersThatDeclareAWatch() async throws {
+        let env = try env(offset: 428, watch: nil)
+        let registry = Registry(paths: env.paths)
+        try await registry.setTrusted(project: env.project)
+        let router = Router(launcher: SubprocessLauncher(), paths: env.paths, registry: registry)
+        let params = ProjectParams(project: env.project)
+        let now = Date()
+
+        /** A status read registers the stopped supervisor, with no watch yet. */
+        _ = try await router.call(.serverStatus, params, ServerListResult.self)
+        _ = await router.sweepWatches(now: now)
+        #expect(await router.watchEvaluationCount == 0)
+
+        try writeConfig(env, offset: 428, watch: "app.config.json")
+        _ = try await router.call(.serverStatus, params, ServerListResult.self)
+        _ = await router.sweepWatches(now: now)
+        #expect(await router.watchEvaluationCount == 1)
+
+        try writeConfig(env, offset: 428, watch: nil)
+        _ = try await router.call(.serverStatus, params, ServerListResult.self)
+        _ = await router.sweepWatches(now: now)
+        #expect(await router.watchEvaluationCount == 1)
     }
 
     @Test func aWatchedFileChangeRestartsTheServer() async throws {

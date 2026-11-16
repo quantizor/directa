@@ -162,6 +162,20 @@ import Testing
         #expect(await registry.project(recorded) == nil)
     }
 
+    /** A `/var` spelling of a recorded `/private/var` project is not itself a
+        recorded key, so the one key every status read caches and looks up by
+        stays the canonical one. */
+    @Test func aVarSpellingOfARecordedProjectResolvesToTheCanonicalKey() async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        try await registry.register(project: env.project, spec: sleeperSpec(name: "web"))
+        let recorded = canonicalProjectPath(env.project)
+        try #require(recorded.hasPrefix("/private/var/"), "the temporary tree is not under /private/var: \(recorded)")
+
+        #expect(await registry.canonicalKey(String(recorded.dropFirst("/private".count))) == recorded)
+        #expect(await registry.canonicalKey(recorded) == recorded)
+    }
+
     /** A `project.forget` that lands while the automatic sweep is still
         tearing the same project down (suspended in its server's stop) runs no
         second teardown: the project's servers are stopped and unregistered

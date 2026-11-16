@@ -139,7 +139,16 @@ public actor Registry {
     }
 
     public func project(_ path: String) -> RegisteredProject? {
-        registry.projects[Self.normalize(path)]
+        registry.projects[canonicalKey(path)]
+    }
+
+    /** The canonical project key for `path`: itself when already a recorded
+        key (recorded keys are canonical, and canonicalizing reads the disk, so
+        a hit skips it), else canonicalized once, so a non-canonical spelling of
+        a recorded project (a `/var` link of `/private/var`) resolves to the
+        recorded key. */
+    public func canonicalKey(_ path: String) -> String {
+        registry.projects[path] != nil ? path : Self.normalize(path)
     }
 
     public func register(project: String, spec: ServerSpec) throws {
@@ -151,17 +160,17 @@ public actor Registry {
     }
 
     public func spec(project: String, name: String) -> ServerSpec? {
-        registry.projects[Self.normalize(project)]?.servers[name]
+        registry.projects[canonicalKey(project)]?.servers[name]
     }
 
     public func specs(project: String) -> [ServerSpec] {
-        (registry.projects[Self.normalize(project)]?.servers ?? [:]).values.sorted {
+        (registry.projects[canonicalKey(project)]?.servers ?? [:]).values.sorted {
             $0.name < $1.name
         }
     }
 
     public func isTrusted(project: String) -> Bool {
-        registry.projects[Self.normalize(project)]?.trusted ?? false
+        registry.projects[canonicalKey(project)]?.trusted ?? false
     }
 
     public func setTrusted(project: String) throws {

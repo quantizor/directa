@@ -231,6 +231,30 @@ public struct ShutdownParams: Codable, Equatable, Sendable {
     }
 }
 
+/** `server.awaitChange`'s params: the token the client last saw (absent on
+    the first call) and how long to hold the request, which the daemon clamps. */
+public struct AwaitChangeParams: Codable, Equatable, Sendable {
+    public var after: String?
+    public var timeoutSeconds: Double
+
+    public init(after: String? = nil, timeoutSeconds: Double) {
+        self.after = after
+        self.timeoutSeconds = timeoutSeconds
+    }
+}
+
+/** `server.awaitChange`'s result: whether status changed (or `after` was not
+    the current token) and the token to send next. The token is opaque. */
+public struct AwaitChangeResult: Codable, Equatable, Sendable {
+    public var changed: Bool
+    public var token: String
+
+    public init(changed: Bool, token: String) {
+        self.changed = changed
+        self.token = token
+    }
+}
+
 /** Method names; string-typed on the wire, enum-checked in code. */
 public enum WireMethod: String, CaseIterable, Sendable {
     case daemonInfo = "daemon.info"
@@ -249,6 +273,7 @@ public enum WireMethod: String, CaseIterable, Sendable {
     case projectInitConfig = "project.initConfig"
     case projectTrust = "project.trust"
     case projectWriteConfig = "project.writeConfig"
+    case serverAwaitChange = "server.awaitChange"
     case serverEnsure = "server.ensure"
     case serverRegister = "server.register"
     case serverRestart = "server.restart"

@@ -77,6 +77,7 @@ private func waitForProbe(after seen: Int, gate: ProbeGate) async throws {
 
 private func makeSupervisor(
     command: [String],
+    events: EventStore? = nil,
     healthcheck: HealthCheckSpec?,
     prober: any HealthProber,
     port: Int? = nil
@@ -87,7 +88,7 @@ private func makeSupervisor(
     let paths = DirectaPaths(dataDir: base.appending(path: "data"), logsDir: base.appending(path: "logs"))
     let spec = ServerSpec(command: command, healthcheck: healthcheck, name: "web", port: port)
     let supervisor = ServerSupervisor(
-        launcher: SubprocessLauncher(), paths: paths, prober: prober, projectPath: project.path,
+        events: events, launcher: SubprocessLauncher(), paths: paths, prober: prober, projectPath: project.path,
         registry: Registry(paths: paths), spec: spec)
     return (supervisor, paths, project.path)
 }
@@ -112,8 +113,10 @@ private func makeSupervisor(
         /** Pad failures past unhealthyAfter so the unhealthy phase lasts longer
             than a few polling intervals: a tight [true,F,F,F,true] script can
             recover before the assertion sees .unhealthy (flake on CI). */
+        let events = EventStore(url: try TemporaryTree.directory(named: "health-events").appending(path: "events.log"))
         let (supervisor, _, _) = try makeSupervisor(
             command: ["/bin/sh", "-c", "sleep 30"],
+            events: events,
             healthcheck: fastTCP,
             prober: ScriptedProber(
                 script: ProbeScript([true] + Array(repeating: false, count: 12) + [true])))
@@ -128,6 +131,12 @@ private func makeSupervisor(
 
         let failing = try await awaitPhase(supervisor, .unhealthy)
         #expect(failing.phase == .unhealthy)
+        /** The event says why, in the failing probe's own words. */
+        let unhealthyEvent = try #require(
+            try await firstAnswer(within: .seconds(5)) {
+                await events.query().first { $0.kind == .unhealthy }
+            })
+        #expect(unhealthyEvent.detail == "scripted failure")
         /** The count keeps growing while the run stays unhealthy, so only its
             floor is fixed: `unhealthyAfter` failures put it here. */
         let failed = try #require(failing.lastHealthCheck)

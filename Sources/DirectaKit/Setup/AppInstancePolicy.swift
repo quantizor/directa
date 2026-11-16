@@ -18,7 +18,7 @@ public struct AppInstance: Equatable, Sendable {
 /** Whether a launching copy of the app should quit because the same bundle is
     already running.
 
-    Two copies at the same path is always wrong: each polls the daemon, each
+    Two copies at the same path is always wrong: each parks a status wait on the daemon, each
     draws a menu bar item, and each posts its own crash notification, so the user
     sees doubled everything. Nothing prevented it, and `open -n` (which is what
     `NSWorkspace.OpenConfiguration.createsNewApplicationInstance` asks for, and

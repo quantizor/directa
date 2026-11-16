@@ -36,6 +36,9 @@ public actor Router {
         their server to stop bouncing right now. An init parameter so tests can
         set it without touching the environment. */
     private let watchEnabled: Bool
+    /** Supervisors a watch sweep has asked to evaluate; the measure of what an
+        idle sweep costs. */
+    public private(set) var watchEvaluationCount = 0
     /** True from before the listener accepts until boot restore has finished.
         Defaults to false so a directly constructed Router (every test, and any
         embedder) serves immediately; only the daemon's boot sequence raises it. */
@@ -226,6 +229,11 @@ public actor Router {
                     self.exitProcess("daemon.shutdown request")
                 }
                 return frame
+            case .serverAwaitChange:
+                let request = try decoder.decode(WireRequest<AwaitChangeParams>.self, from: line)
+                let result = await events.changes.wait(
+                    after: request.params.after, timeoutSeconds: request.params.timeoutSeconds)
+                return try respond(id: head.id, result: result)
             case .serverRegister:
                 let request = try decoder.decode(WireRequest<RegisterParams>.self, from: line)
                 let project = canonicalProjectPath(request.params.project)
@@ -278,6 +286,7 @@ public actor Router {
                 let request = try decoder.decode(WireRequest<ProjectOnlyParams>.self, from: line)
                 try await registry.setTrusted(
                     project: canonicalProjectPath(request.params.project))
+                events.changes.bump()
                 return try respond(id: head.id, result: WireEmpty())
             case .projectForget:
                 let request = try decoder.decode(WireRequest<ProjectOnlyParams>.self, from: line)
@@ -300,6 +309,7 @@ public actor Router {
                         message: "\(project) still exists on disk; forgetting it would drop trust for a live checkout")
                 }
                 let servers = await forgetMissingProject(project)
+                events.changes.bump()
                 return try respond(id: head.id, result: ProjectForgetResult(servers: servers))
             case .logsRemoveOrphan:
                 let request = try decoder.decode(WireRequest<LogsRemoveOrphanParams>.self, from: line)
@@ -338,7 +348,9 @@ public actor Router {
                 }
             case .projectInitConfig:
                 let request = try decoder.decode(WireRequest<InitConfigParams>.self, from: line)
-                return try respond(id: head.id, result: try await initConfig(request.params))
+                let result = try await initConfig(request.params)
+                events.changes.bump()
+                return try respond(id: head.id, result: result)
             case .projectWriteConfig:
                 let request = try decoder.decode(WireRequest<WriteConfigParams>.self, from: line)
                 let project = canonicalProjectPath(request.params.project)
@@ -386,6 +398,7 @@ public actor Router {
                 }
                 try AtomicFile.write(Data(request.params.content.utf8), to: url)
                 configCache[project] = nil
+                events.changes.bump()
                 return try respond(
                     id: head.id,
                     result: CheckResult(
@@ -685,8 +698,8 @@ public actor Router {
     /** How long a project's checkout path must be observed continuously
         missing before it is forgotten, and how often the daemon's timer sweep
         checks: one rule for every automatic trigger (boot restore, machine-wide
-        status, the timer sweep), so a fast poller (the app's machine-wide
-        status, every 2s) cannot forget a project any sooner than the timer
+        status, the timer sweep), so a frequent reader (the app's machine-wide
+        status, on every change and when a surface opens) cannot forget a project any sooner than the timer
         sweep would, and a network mount blip or a slow unmount never costs a
         project its trust and log history. */
     public static let missingProjectSweepIntervalSeconds: Double = 30
@@ -2126,7 +2139,9 @@ public actor Router {
     private func mergedSpecs(project: String) async throws -> (
         host: String?, specs: [ServerSpec], fileNames: Set<String>
     ) {
-        let project = canonicalProjectPath(project)
+        /** A recorded key is already canonical, so only another spelling pays
+            for canonicalizing (a disk read, once per status read otherwise). */
+        let project = await registry.canonicalKey(project)
         var specs: [String: ServerSpec] = [:]
         for spec in await registry.specs(project: project) {
             specs[spec.name] = spec
@@ -2797,7 +2812,8 @@ public actor Router {
     public func sweepWatches(now: Date = Date()) async -> [String] {
         guard watchEnabled else { return [] }
         var restarted: [String] = []
-        for (id, supervisor) in supervisors {
+        for (id, supervisor) in supervisors where supervisor.declaresWatch {
+            watchEvaluationCount += 1
             guard let changed = await supervisor.evaluateWatch(now: now), !changed.isEmpty else {
                 continue
             }
@@ -2980,9 +2996,18 @@ public actor Router {
     }
 
     private func supervisor(project: String, spec: ServerSpec) async -> ServerSupervisor {
-        let project = canonicalProjectPath(project)
-        let id = serverID(project: project, name: spec.name)
-        if let existing = supervisors[id] {
+        /** Supervisors are keyed by canonical path, so a caller's already
+            canonical path hits without the disk reads canonicalizing costs;
+            only a miss pays for them. */
+        var project = project
+        var id = serverID(project: project, name: spec.name)
+        var found = supervisors[id]
+        if found == nil {
+            project = canonicalProjectPath(project)
+            id = serverID(project: project, name: spec.name)
+            found = supervisors[id]
+        }
+        if let existing = found {
             /** A live run holds a materialized spawn spec (effective port, bound
                 secondary ports, rewritten url). Re-resolving committed config for
                 status must not clobber that, or agents see the committed port in
@@ -3192,11 +3217,15 @@ public final class ControlServer: Sendable {
                     /** Begun here, on the connection queue, so a request still
                         waiting for a pool thread is counted with its age. */
                     let head = try? JSONCoding.decoder().decode(WireRequestHead.self, from: line)
-                    let activity = DaemonActivity.shared.begin(.request, label: head?.method ?? "unparseable")
+                    /** A parked `server.awaitChange` is held on purpose for up to
+                        its cap, so counting it would top `longestRunning`. */
+                    let activity =
+                        head?.method == WireMethod.serverAwaitChange.rawValue
+                        ? nil : DaemonActivity.shared.begin(.request, label: head?.method ?? "unparseable")
                     Task {
                         let response = await router.handle(line: line, head: head)
                         connection.send(content: response, completion: .contentProcessed { _ in })
-                        DaemonActivity.shared.end(activity)
+                        if let activity { DaemonActivity.shared.end(activity) }
                     }
                 }
             }

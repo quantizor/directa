@@ -37,6 +37,30 @@ private func makeEnv() throws -> RouterEnv {
         }
     }
 
+    /** A mark placed the instant a child's line reaches its spool lands after
+        that line, however quiet the spool was before: the mark first drains
+        the spools to their current end. */
+    @Test func aMarkPlacedRightAfterAChildLineIsOrderedAfterIt() async throws {
+        let env = try makeEnv()
+        let paths = env.paths
+        let supervisor = ServerSupervisor(
+            launcher: SubprocessLauncher(), paths: paths, projectPath: env.project,
+            registry: Registry(paths: paths),
+            spec: ServerSpec(command: ["/bin/sh", "-c", "sleep 1.5; echo before the mark; sleep 30"], name: "web"))
+        _ = await supervisor.start()
+        let spool = paths.spoolOutFile(project: env.project, server: "web")
+        #expect(
+            try await eventually(within: .seconds(5), every: .milliseconds(1)) {
+                ((try? String(contentsOf: spool, encoding: .utf8)) ?? "").contains("before the mark")
+            })
+        let mark = await supervisor.placeMark(label: "test", text: "marked")
+        let lines = await supervisor.logQuery(LogQueryOptions(streams: [.out, .mark])).lines
+        #expect(lines.map(\.stream) == [.out, .mark], "\(lines.map(\.text))")
+        #expect(lines.first?.text == "before the mark")
+        #expect(lines.last?.text.hasPrefix(mark.id) == true)
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
+    }
+
     @Test func spawnFailureIsFailedNotCrashed() async throws {
         let env = try makeEnv()
         let paths = env.paths
@@ -940,6 +964,34 @@ private func makeEnv() throws -> RouterEnv {
         #expect(persisted?.errorSummary?.count == 2)
     }
 
+    /** A follower the status-change signal wakes on the transition to
+        `unhealthy` reads the tally of that episode, never the previous one's
+        (or none): the tally lands in the same step as the phase. */
+    @Test func aFollowerWokenByTheUnhealthyPhaseReadsItsErrorTally() async throws {
+        let env = try makeEnv()
+        let events = EventStore(url: env.paths.eventsFile)
+        let spec = ServerSpec(
+            command: ["/bin/sh", "-c", "echo boom >&2; sleep 30"],
+            healthcheck: HealthCheckSpec(
+                healthyAfter: 1, intervalMs: 30, port: 1, timeoutMs: 100, type: .tcp, unhealthyAfter: 3),
+            name: "web")
+        let supervisor = ServerSupervisor(
+            events: events, launcher: SubprocessLauncher(), paths: env.paths, prober: PassThenFailProber(),
+            projectPath: env.project, registry: Registry(paths: env.paths), spec: spec)
+        _ = await supervisor.start()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+        var seen = await supervisor.status()
+        while seen.phase != .unhealthy, ContinuousClock.now < deadline {
+            let token = events.changes.token
+            seen = await supervisor.status()
+            if seen.phase == .unhealthy { break }
+            _ = await events.changes.wait(after: token, timeoutSeconds: 3)
+        }
+        _ = await supervisor.stop(graceSeconds: 1, reason: "test cleanup")
+        #expect(seen.phase == .unhealthy, "the server never turned unhealthy")
+        #expect(seen.errorSummary?.count == 1)
+    }
+
     @Test func respawnClearsThePreviousRunsTally() async throws {
         let env = try makeEnv()
         let paths = env.paths
@@ -1173,7 +1225,7 @@ private func makeEnv() throws -> RouterEnv {
         try handle.seekToEnd()
         try handle.write(contentsOf: Data("written after a refused adopt\n".utf8))
         try handle.close()
-        /** A running tailer polls the spool well inside this window. */
+        /** A running tailer follows the spool well inside this window. */
         let ingested = try await eventually(within: .milliseconds(500)) {
             await !supervisor.logQuery(LogQueryOptions(streams: [.out, .sys])).lines.isEmpty
         }
@@ -1310,6 +1362,68 @@ private func makeEnv() throws -> RouterEnv {
             reaped,
             "grandchild \(child) survived group teardown after adopt (state: \(processState(of: child)))")
         if !reaped { kill(child, SIGKILL) }
+    }
+
+    /** A server with no healthcheck stays starting for the whole stabilization
+        window (two seconds), so over a shorter injected watch window the only
+        refresher is the fast watch, and its reads are the counter's whole
+        movement. */
+    private func countingDescendantReads() -> (reads: @Sendable (pid_t) -> DescendantsResult, count: @Sendable () -> Int) {
+        let count = OSAllocatedUnfairLock(initialState: 0)
+        return (
+            { pid in
+                count.withLock { $0 += 1 }
+                return ProcessTree.descendants(of: pid)
+            },
+            { count.withLock { $0 } }
+        )
+    }
+
+    enum WatchedRun: CaseIterable {
+        case adopted
+        case spawned
+    }
+
+    /** A spawned or an adopted run gets the same fast watch window: reads
+        keep landing inside it (the count rises past the start's own), and
+        none land once it has passed. */
+    @Test(arguments: WatchedRun.allCases)
+    func theFastDescendantWatchStopsRefreshingOncePastItsWindow(run: WatchedRun) async throws {
+        let env = try makeEnv()
+        let registry = Registry(paths: env.paths)
+        let spec = ServerSpec(command: ["/bin/sleep", "30"], name: "idle")
+        let counter = countingDescendantReads()
+        let supervisor: ServerSupervisor
+        /** Stands in for the prior daemon of an adoption, abandoned without a stop. */
+        var priorDaemon: ServerSupervisor?
+        switch run {
+        case .spawned:
+            supervisor = ServerSupervisor(
+                descendantWatchWindow: .milliseconds(300), launcher: SubprocessLauncher(), paths: env.paths,
+                projectPath: env.project, readDescendants: counter.reads, registry: registry, spec: spec)
+            _ = await supervisor.start()
+        case .adopted:
+            let prior = ServerSupervisor(
+                launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.project,
+                registry: registry, spec: spec)
+            priorDaemon = prior
+            let root = try #require(await prior.start().pid.flatMap { pid_t(exactly: $0) })
+            supervisor = ServerSupervisor(
+                descendantWatchWindow: .milliseconds(300), launcher: testLaunchdJobLauncher(), paths: env.paths,
+                projectPath: env.project, readDescendants: counter.reads, registry: registry, spec: spec)
+            #expect(
+                await supervisor.adopt(
+                    pid: root, label: "dev.quantizor.directa.job.watch-window-test", boundPort: nil,
+                    startedAt: nil))
+        }
+        /** At least one read after the start's own: the watch ran inside its window. */
+        #expect(try await eventually(within: .seconds(1)) { counter.count() >= 2 })
+        try await Task.sleep(for: .milliseconds(700))
+        #expect(await supervisor.status().phase == .starting)
+        let settled = counter.count()
+        #expect(!(try await eventually(within: .milliseconds(700)) { counter.count() > settled }))
+        _ = await supervisor.stop(graceSeconds: 2, reason: "test cleanup")
+        if let priorDaemon { _ = try await awaitPhase(priorDaemon, .stopped, within: .seconds(8)) }
     }
 
     /** A launchd job whose command exits instantly (a typo'd binary, a
@@ -1678,6 +1792,18 @@ private struct ExitsAtOnceAdoptLauncher: ProcessLauncher {
 
 private struct AlwaysHealthyProber: HealthProber {
     func probe(_ check: EffectiveHealthcheck) async -> HealthProbeOutcome { .pass }
+}
+
+/** Passes its first probe, then fails every one after it. */
+private struct PassThenFailProber: HealthProber {
+    private let passed = OSAllocatedUnfairLock(initialState: false)
+
+    func probe(_ check: EffectiveHealthcheck) async -> HealthProbeOutcome {
+        passed.withLock { served in
+            defer { served = true }
+            return served ? .fail("test failure") : .pass
+        }
+    }
 }
 
 private struct NeverHealthyProber: HealthProber {

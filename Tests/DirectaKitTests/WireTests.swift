@@ -345,6 +345,32 @@ import Testing
                 == ShutdownParams(handoff: true))
     }
 
+    /** `server.awaitChange`'s params: the first call omits `after`. */
+    @Test func awaitChangeParamsSchemaGolden() throws {
+        func encoded(_ params: AwaitChangeParams) throws -> String {
+            let data = try JSONCoding.encoder().encode(params)
+            return try #require(String(data: data, encoding: .utf8))
+        }
+        #expect(try encoded(AwaitChangeParams(timeoutSeconds: 25)) == #"{"timeoutSeconds":25}"#)
+        #expect(
+            try encoded(AwaitChangeParams(after: "0B5C2A6E-1F3D-4E8A-9C7B-2D4F6A8C0E1B-7", timeoutSeconds: 25))
+                == #"{"after":"0B5C2A6E-1F3D-4E8A-9C7B-2D4F6A8C0E1B-7","timeoutSeconds":25}"#)
+        #expect(
+            try JSONCoding.decoder().decode(AwaitChangeParams.self, from: Data(#"{"timeoutSeconds":1.5}"#.utf8))
+                == AwaitChangeParams(timeoutSeconds: 1.5))
+    }
+
+    @Test func awaitChangeResultSchemaGolden() throws {
+        let result = AwaitChangeResult(changed: true, token: "0B5C2A6E-1F3D-4E8A-9C7B-2D4F6A8C0E1B-8")
+        #expect(
+            String(data: try JSONCoding.encoder().encode(result), encoding: .utf8)
+                == #"{"changed":true,"token":"0B5C2A6E-1F3D-4E8A-9C7B-2D4F6A8C0E1B-8"}"#)
+        #expect(
+            try JSONCoding.decoder().decode(
+                AwaitChangeResult.self, from: Data(#"{"changed":false,"token":"x"}"#.utf8))
+                == AwaitChangeResult(changed: false, token: "x"))
+    }
+
     /** `project.forget`'s result names the servers it dropped along with the
         row, trust, and log directory: `doctor --fix` reports the count in its
         finding without a second query. */

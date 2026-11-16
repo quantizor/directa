@@ -1,5 +1,6 @@
 import DirectaKit
 import Foundation
+import os
 
 /** One registration in a `PhaseWaiterList`. `deadlineTask` is the sleeping
     task that expires this one waiter if the real transition never lands
@@ -160,7 +161,10 @@ public actor ServerSupervisor {
     /** Short enough that a worker forked a beat after startup is recorded before
         a crash can orphan it, and long enough that the sweeps cost nothing over
         a startup window. */
-    private let descendantWatchIntervalMs = 200
+    private let descendantWatchInterval = Duration.milliseconds(200)
+    /** How long after a spawn or adopt the fast watch keeps refreshing; see
+        startDescendantWatch. */
+    private let descendantWatchWindow: Duration
     /** What this run binds after override/rebind/materialization. */
     private var effectivePort: Int?
     private var errTailer: SpoolTailer?
@@ -177,6 +181,14 @@ public actor ServerSupervisor {
     private var lastHealthAt: Date?
     private var lastHealthCheck: HealthCheckResult?
     private let launcher: any ProcessLauncher
+    /** The TCP ports the given pids listen on: `PortGuard`'s lsof read
+        outside tests, and a test's stand-in to hold the post-healthy scan. */
+    private let listeningPorts: @Sendable ([pid_t]) async -> [Int]
+    /** Where this supervisor's structured log lives, built once: both
+        `projectPath` and `spec.name` are fixed for a supervisor, and building
+        the path canonicalizes the project on disk, which a status read per
+        server must not repeat. */
+    private let logFile: URL
     private let logStore: LogStore
     private let mainProjectSlug: String?
     /** Resolved named secondaries for this run (status.ports). */
@@ -212,6 +224,7 @@ public actor ServerSupervisor {
                 stoppingWaiters.settleAll()
             }
             DaemonActivity.shared.recordPhase(phase, key: writerID.uuidString)
+            if oldValue != phase { events?.changes.bump() }
         }
     }
     private var pid: pid_t?
@@ -219,6 +232,9 @@ public actor ServerSupervisor {
     private var portConflict: PortConflict?
     private let prober: any HealthProber
     public let projectPath: String
+    /** The process-table read behind every descendant snapshot: `ProcessTree`
+        outside tests, and a test's counting stand-in. */
+    private let readDescendants: @Sendable (pid_t) -> DescendantsResult
     /** `ProcessTree.identity(of:)` outside tests; a test injects a reader to
         stand in for a pid recycled between spawn and teardown. */
     private let readIdentity: @Sendable (pid_t) -> ProcessIdentity?
@@ -249,7 +265,18 @@ public actor ServerSupervisor {
     private var spawnError: SpawnError?
     /** Waiters for the spawn settling (a pid, or a terminal phase). */
     private var spawnWaiters = PhaseWaiterList()
-    private var spec: ServerSpec
+    private var spec: ServerSpec {
+        didSet {
+            let declares = Self.declaresWatch(spec)
+            declaresWatchFlag.withLock { $0 = declares }
+        }
+    }
+    private let declaresWatchFlag: OSAllocatedUnfairLock<Bool>
+
+    private static func declaresWatch(_ spec: ServerSpec) -> Bool {
+        spec.watch?.isEmpty == false
+    }
+
     /** Lifetime window a self-exit must land in to count toward the stall
         streak (see recordOutcome). Overridable so tests can use fast bounds. */
     private let stallBounds: (minSeconds: Int, maxSeconds: Int)
@@ -304,11 +331,14 @@ public actor ServerSupervisor {
     public nonisolated let writerID = UUID()
 
     public init(
+        descendantWatchWindow: Duration = .seconds(60),
         events: EventStore? = nil,
         launcher: any ProcessLauncher,
+        listeningPorts: @escaping @Sendable ([pid_t]) async -> [Int] = { await PortGuard.listeningPorts(pids: $0) },
         paths: DirectaPaths,
         prober: any HealthProber = NetworkHealthProber(),
         projectPath: String,
+        readDescendants: @escaping @Sendable (pid_t) -> DescendantsResult = { ProcessTree.descendants(of: $0) },
         readIdentity: @escaping @Sendable (pid_t) -> ProcessIdentity? = { ProcessTree.identity(of: $0) },
         registry: Registry,
         spec: ServerSpec,
@@ -319,17 +349,23 @@ public actor ServerSupervisor {
         /** Match Registry's normalized state keys (`/var` vs `/private/var`). */
         let project = canonicalProjectPath(projectPath)
         let id = DirectaKit.serverID(project: project, name: spec.name)
+        self.descendantWatchWindow = descendantWatchWindow
         self.events = events
         self.launcher = launcher
-        self.logStore = LogStore(currentURL: paths.structuredLogFile(project: project, server: spec.name))
+        self.listeningPorts = listeningPorts
+        let logFile = paths.structuredLogFile(project: project, server: spec.name)
+        self.logFile = logFile
+        self.logStore = LogStore(currentURL: logFile)
         self.mainProjectSlug = worktree?.mainProject
         self.paths = paths
         self.prober = prober
         self.projectPath = project
+        self.readDescendants = readDescendants
         self.readIdentity = readIdentity
         self.registry = registry
         self.serverID = id
         self.spec = spec
+        self.declaresWatchFlag = OSAllocatedUnfairLock(initialState: Self.declaresWatch(spec))
         self.stallBounds = stallBounds
         self.stopTiming = stopTiming
         self.worktreeLabel = worktree?.label
@@ -393,6 +429,14 @@ public actor ServerSupervisor {
     public func refreshIdleSpec(_ committed: ServerSpec) {
         guard !hasLiveRun, pendingSpawn == nil else { return }
         spec = committed
+    }
+
+    /** Whether the spec declares any `watch` entry. Readable without an actor
+        hop, so the Router's 500 ms sweep skips every supervisor with nothing to
+        watch; kept current by `spec`'s observer, the one place every spec
+        change (refresh, spawn, init) passes through. */
+    public nonisolated var declaresWatch: Bool {
+        declaresWatchFlag.withLock { $0 }
     }
 
     /** Absolute watched paths for this run, empty when the server declares no
@@ -1047,7 +1091,7 @@ public actor ServerSupervisor {
             lastHealthAt: lastHealthAt,
             lastHealthCheck: lastHealthCheck,
             locks: spec.locks.map { $0.map(\.name) },
-            logPath: paths.structuredLogFile(project: projectPath, server: spec.name).path,
+            logPath: logFile.path,
             mainProject: mainProjectSlug,
             observedPort: observedPort,
             phase: phase,
@@ -1164,14 +1208,21 @@ public actor ServerSupervisor {
             /** unhealthyAfter applies only after first-healthy: a slow boot is
                 `starting` until the deadline callers chose, never `unhealthy`. */
             if everHealthy, phase == .running, consecutiveFailures >= unhealthyAfter {
-                phase = .unhealthy
-                postHealthEvent(.unhealthy)
                 /** The process is still writing, so snapshot the err tally at the
                     moment it degrades; a later recovery to running clears nothing,
-                    so the count reflects the most recent unhealthy episode. */
+                    so the count reflects the most recent unhealthy episode. Read
+                    before the phase changes so a follower the change wakes finds
+                    the tally already set; the run may end during the read. */
                 let generation = runGeneration
                 let summary = await captureErrorSummary(since: startedAt)
-                if generation == runGeneration { errorSummary = summary }
+                /** A phase that moved off `.running` during the read (the run
+                    ended, or an overlapping probe already made the transition)
+                    drops this one on purpose; a run still failing retries on
+                    its next failed probe. */
+                guard generation == runGeneration, phase == .running else { return }
+                errorSummary = summary
+                phase = .unhealthy
+                postHealthEvent(.unhealthy, detail: outcome.detail)
             }
         }
     }
@@ -1187,8 +1238,8 @@ public actor ServerSupervisor {
         let pids = [rootPid] + lastDescendantSnapshot.map(\.pid)
         let expected = effectivePort ?? spec.port
         let generation = runGeneration
-        Task { [weak self] in
-            let ports = await PortGuard.listeningPorts(pids: pids)
+        Task { [weak self, listeningPorts] in
+            let ports = await listeningPorts(pids)
             await self?.applyListenScan(
                 expected: expected, generation: generation, ours: pids.map(Int.init),
                 ports: ports)
@@ -1323,6 +1374,8 @@ public actor ServerSupervisor {
         guard !ports.isEmpty else { return }
         let expected = effectivePort ?? spec.port
         let claimPorts = Set(portClaim?.allPorts ?? expected.map { [$0] } ?? [])
+        let previous = observedPort
+        defer { if observedPort != previous { events?.changes.bump() } }
         if let expected, ports.contains(expected) {
             observedPort = expected
         } else if let claimed = ports.first(where: { claimPorts.contains($0) }) {
@@ -1394,6 +1447,7 @@ public actor ServerSupervisor {
     }
 
     public func placeMark(label: String, text: String) async -> PlacedMark {
+        await catchUpTailers()
         let mark = await logStore.appendMark(label: label, text: text)
         await events?.post(kind: .marked, project: projectPath, server: spec.name, detail: "\(mark.id) \(text)")
         return PlacedMark(at: mark.at, id: mark.id, server: spec.name)
@@ -1403,9 +1457,9 @@ public actor ServerSupervisor {
         await logStore.resolveMark(markID)
     }
 
-    private func postHealthEvent(_ kind: EventKind) {
+    private func postHealthEvent(_ kind: EventKind, detail: String? = nil) {
         Task { [events, projectPath, name = spec.name] in
-            await events?.post(kind: kind, project: projectPath, server: name)
+            await events?.post(kind: kind, project: projectPath, server: name, detail: detail)
         }
     }
 
@@ -1525,7 +1579,7 @@ public actor ServerSupervisor {
     }
 
     /** A handoff exit's last act for this run: each tailer ingests what its
-        spool holds now and stops polling, then the positions are persisted
+        spool holds now and stops following, then the positions are persisted
         for the adopting daemon. A run with no tailers (stopped, or not yet
         spawned) records nothing. */
     func prepareHandoff() async {
@@ -1597,7 +1651,7 @@ public actor ServerSupervisor {
     private func refreshDescendantSnapshot() {
         guard let pid else { return }
         let fresh: [ProcessIdentity]
-        switch ProcessTree.descendants(of: pid) {
+        switch readDescendants(pid) {
         case .failed(let errno):
             DirectaLog.supervisor.error(
                 "\(spec.name)@\(projectPath) could not read the process table to record the descendants of pid \(pid) (errno \(errno)); keeping the earlier record")
@@ -1632,16 +1686,20 @@ public actor ServerSupervisor {
         probes take over afterward, which bounds staleness to the probe
         interval for the rest of the run.
 
-        The sweep is a whole-process-table sysctl measured at well under a
-        millisecond, and this runs only while the server is still starting, so
-        the cost is a handful of sweeps per run. */
+        Each sweep reads the whole process table, and a server whose
+        healthcheck never passes stays starting indefinitely, so the watch also
+        ends at a clock deadline `descendantWatchWindow` after the spawn or
+        adopt that began it. A worker forked after that is caught by the next
+        health probe's refresh instead, which bounds the cost to one window's
+        worth of sweeps per run. */
     private func startDescendantWatch() {
         descendantTask?.cancel()
-        let intervalMs = descendantWatchIntervalMs
+        let interval = descendantWatchInterval
+        let deadline = ContinuousClock.now + descendantWatchWindow
         descendantTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(intervalMs))
-                guard !Task.isCancelled, let self else { return }
+                try? await Task.sleep(for: interval)
+                guard !Task.isCancelled, ContinuousClock.now < deadline, let self else { return }
                 guard await self.refreshDescendantSnapshotWhileStarting() else { return }
             }
         }
@@ -1655,22 +1713,35 @@ public actor ServerSupervisor {
         return true
     }
 
+    /** Brings the log up to what the child has written, so a mark or a read
+        of the log for this run's own event is ordered after its output
+        whatever the tailers' timing. */
+    private func catchUpTailers() async {
+        guard let out = outTailer, let err = errTailer else { return }
+        async let outCaughtUp: Void = out.catchUp()
+        async let errCaughtUp: Void = err.catchUp()
+        _ = await (outCaughtUp, errCaughtUp)
+    }
+
     /** Snapshot the err-stream tally for the run that just started at
         `windowStart`. Reads only from that point forward, so a crash loop reports
         the current incarnation rather than the whole log history. The read runs
         on `BlockingLane.system`, off this actor, and every line it must count
         is already written: a tailer's append reaches the file before it
-        returns. */
+        returns once both tailers have caught up. */
     private func captureErrorSummary(since windowStart: Date?) async -> ErrorSummary? {
-        let current = paths.structuredLogFile(project: projectPath, server: spec.name)
+        await catchUpTailers()
+        let current = logFile
         return await BlockingLane.system.run {
             LogQuery.summarize(current: current, streams: [.err], since: windowStart)
         }
     }
 
     /** Last structured lines (out/err/sys), for crash/failure forensics, read
-        through the log store so the read is ordered against its appends. */
+        through the log store so the read is ordered against its appends, after
+        the tailers have caught up to what the child wrote. */
     private func readLogTail(lines: Int = 40) async -> [String]? {
+        await catchUpTailers()
         let records = await logStore.query(LogQueryOptions(streams: [.err, .out, .sys], tail: lines))
         return records.isEmpty ? nil : records.map(\.contextLine)
     }
