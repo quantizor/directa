@@ -55,10 +55,10 @@ public final class StatusChangeSignal: Sendable {
         }
         guard !released.isEmpty else { return }
 
-        let token = token(generation: generation)
+        let current = token(generation: generation)
         for waiter in released {
             waiter.timer.cancel()
-            waiter.continuation.resume(returning: AwaitChangeResult(changed: true, token: token))
+            waiter.continuation.resume(returning: AwaitChangeResult(changed: true, token: current))
         }
     }
 
@@ -88,10 +88,10 @@ public final class StatusChangeSignal: Sendable {
     }
 
     private func expire(waiter id: UInt64) {
-        let (waiter, token) = state.withLock { state in
-            (state.waiters.removeValue(forKey: id), token(generation: state.generation))
+        let (waiter, generation) = state.withLock { state -> (Waiter?, UInt64) in
+            (state.waiters.removeValue(forKey: id), state.generation)
         }
-        waiter?.continuation.resume(returning: AwaitChangeResult(changed: false, token: token))
+        waiter?.continuation.resume(returning: AwaitChangeResult(changed: false, token: token(generation: generation)))
     }
 
     private func token(generation: UInt64) -> String {
