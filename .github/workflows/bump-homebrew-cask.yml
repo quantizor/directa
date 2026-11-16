@@ -108,10 +108,12 @@ jobs:
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- Casks/directa.rb; then
+          # Staged, then compared: a working-tree diff ignores a file the tap
+          # has never had, which would skip the first publish.
+          git add Casks/directa.rb
+          if git diff --cached --quiet -- Casks/directa.rb; then
             echo "cask already at ${VERSION}; nothing to push"
             exit 0
           fi
-          git add Casks/directa.rb
           git commit -m "directa ${VERSION}"
           git push
