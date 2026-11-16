@@ -50,8 +50,10 @@ cd "$root" || exit 1
 
 toolchain_bin=$(dirname "$(xcrun --find swift)") || { echo "error: xcrun cannot find swift" >&2; exit 1 }
 helper="$toolchain_bin/../libexec/swift/pm/swiftpm-testing-helper"
-platform=$(xcrun --show-sdk-platform-path) || { echo "error: xcrun cannot find the macOS platform" >&2; exit 1 }
-sdk=$(xcrun --show-sdk-path) || { echo "error: xcrun cannot find the macOS SDK" >&2; exit 1 }
+# --sdk macosx: with Command Line Tools newer than the selected Xcode, a bare
+# lookup picks the tools' SDK, which has no platform directory.
+platform=$(xcrun --sdk macosx --show-sdk-platform-path) || { echo "error: xcrun cannot find the macOS platform; check xcode-select -p" >&2; exit 1 }
+sdk=$(xcrun --sdk macosx --show-sdk-path) || { echo "error: xcrun cannot find the macOS SDK; check xcode-select -p" >&2; exit 1 }
 [[ -x $helper ]] || { echo "error: no swiftpm-testing-helper at $helper; this toolchain runs tests differently" >&2; exit 1 }
 
 # The same parallel-width cap make test runs under (the why: Makefile,

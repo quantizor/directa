@@ -8,6 +8,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/.build/debug"
 WORK="$(mktemp -d /tmp/directa-smoke.XXXXXX)"
 export DIRECTA_SOCKET="$WORK/daemon.sock"
+# The scratch repos must not inherit the runner's git setup: a personal global
+# ignore (git reads ~/.config/git/ignore even with no global config file),
+# hooks, or commit signing would fail a `git add` or `git commit` here.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.excludesFile GIT_CONFIG_VALUE_0=/dev/null
 PROJECT="$WORK/project"
 mkdir -p "$PROJECT"
 
@@ -228,8 +233,12 @@ sys.exit(0 if json.loads(stream.readline()).get("ok") is True else 1)
 PY
 for i in {1..100}; do kill -0 "$DAEMON_PID" 2>/dev/null || break; sleep 0.1; done
 kill -0 "$DAEMON_PID" 2>/dev/null && fail "daemon did not exit after a handoff shutdown"
-wait "$DAEMON_PID" 2>/dev/null || true
+# A graceful exit is status 0: anything else (133 is a SIGTRAP in an exit-time
+# hook) makes launchd's KeepAlive relaunch a daemon that was told to stay down.
+EXIT_STATUS=0
+wait "$DAEMON_PID" || EXIT_STATUS=$?
 DAEMON_PID=""
+[[ $EXIT_STATUS -eq 0 ]] || fail "daemon exited with status $EXIT_STATUS after a handoff shutdown, not 0"
 for i in {1..100}; do kill -0 "$CHILD_PID" 2>/dev/null || break; sleep 0.1; done
 kill -0 "$CHILD_PID" 2>/dev/null && fail "a foreground daemon left the server running after a handoff shutdown"
 [[ -e "$WORK/data/stopped.intent" ]] || fail "a handoff shutdown to a foreground daemon wrote no stop marker"
