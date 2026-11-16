@@ -42,7 +42,7 @@ import os
             {
               "servers": {
                 "web": {
-                  "command": ["\(fixture)", "--listen-tcp", "\(port)"],
+                  "command": ["\(fixture)", "--listen-tcp", "\(port)", "--quiet"],
                   "healthcheck": { "type": "tcp", "port": \(port) },
                   "port": \(port)
                 }
