@@ -45,7 +45,8 @@ Snapshot line (`entry: snapshot`):
 - `memory`: `footprint` and `footprintLifetimePeak` (`proc_pid_rusage` v6), `resident`, and `TASK_VM_INFO` `compressed`, `compressedPeak`, `compressedLifetime`, `internal`, `internalPeak`. `compressed` is the process's own compressed memory, the figure to hold against a `killing largest compressed process` ledger number.
 - `fileDescriptors`: `PROC_PIDLISTFDS` count.
 - `system`: `kern.memorystatus_vm_pressure_level` by name, 1/5/15 minute load average.
-- `activity`: supervisors per phase, in-flight wire requests per method (count, oldest age), in-flight work per kind (count, oldest age, oldest label), the eight longest-running items, connected clients; plus `exitWatches` (pids armed in ExitWatcher).
+- `cpu`: the daemon's cumulative `userSeconds` and `systemSeconds` (the `proc_pid_rusage` v6 read `memory`'s footprint also comes from); the difference between two snapshots is the CPU spent between them.
+- `activity`: supervisors per phase, in-flight wire requests per method (count, oldest age; `server.awaitChange` is excluded, since a parked change wait is idle by design and would otherwise lead the longest-running list), in-flight work per kind (count, oldest age, oldest label), the eight longest-running items, connected clients; plus `exitWatches` (pids armed in ExitWatcher).
 - `lanes`: per BlockingLane (`repository`, `system`), its width, jobs running, jobs queued for a thread, and the oldest queued job's wait, read under the lane's own lock. A queued job is not yet in `activity`, since its blocking call has not begun, so a backlog shows only here.
 - `reason` (`interval`, `burst`, `threshold`), `sampleMicroseconds` (the sample's own cost: every read, up to building the line), `uptimeSeconds`, `daemonPid`.
 - A kernel read that fails is omitted, never written as zero.
@@ -73,7 +74,7 @@ Boot incident (written by a utility-QoS background thread, never delaying the so
 - `diagnostic-report` lines for JetsamEvent and `ddirecta` reports in `/Library/Logs/DiagnosticReports` and `~/Library/Logs/DiagnosticReports` modified in the window: the daemon's process entry from a JetsamEvent, else the report's first 16 KB.
 - A final `search-finished` line with the match count (every matching line, with `truncated` set when more matched than the file keeps) and report count, the window, the predicate, and the outcome (`finished`, `timed out`, `failed: ...`, `skipped: ...`), so an empty search is recorded rather than silent. A clean previous exit skips the search.
 
-Reading it: `scripts/daemon-deaths.sh [incidents-dir]` prints one summary per death (launchd fields, kernel lines, the last stop or restart and whether it ended, peak threads with their names and the workqueue in the final 60 s, memory in the final 60 s, peak lane queue depth and longest queue wait in the final 60 s, lane state and what was in flight at the last snapshot, the last marks). What the record can and cannot tell:
+Reading it: `scripts/daemon-deaths.sh [incidents-dir]` prints one summary per death (launchd fields, kernel lines, the last stop or restart and whether it ended, peak threads with their names and the workqueue in the final 60 s, memory in the final 60 s, CPU seconds spent in the final 60 s, peak lane queue depth and longest queue wait in the final 60 s, lane state and what was in flight at the last snapshot, the last marks). What the record can and cannot tell:
 
 - Thread exhaustion reads as a thread total near the limit with blocked workqueue threads named by queue label, and in-flight blocking work with its age.
 - A lane backlog (queued jobs and a growing oldest wait while every lane thread runs a blocking call) names which kind of blocking work stalled callers, since the lanes cap their own threads.
@@ -118,6 +119,7 @@ Known limits of the app agent, each needing a check on a signed build before it 
 - The constraint clears only when BTM invalidates the item, which xpcproxy triggers on the next spawn attempt rather than on a timed background sweep, and the item UUID changes when it does. Waiting longer for a spawn cannot help, because the job is killed on exec rather than running slowly.
 - Diagnose an upgrade that comes up slowly by reading the BTM item UUID and the crash report, never by timing alone.
 - DMG upgrades write `agent.rebind` and refuse to replace if the agent is still loaded. `AgentRebindPolicy` bounds how long the app waits before escalating; those waits only cover a job that is genuinely still spawning, not a constraint kill.
+- A loaded agent with no spawn scheduled exited cleanly (a handoff or a stop), and `KeepAlive SuccessfulExit=false` leaves it down for good: the app's ensure, after its short wait for a hello, kickstarts it (no `-k`) rather than waiting out the throttle window and re-registering, since `register()` is a no-op while the service stays registered.
 
 ## DMG and /Applications share a bundle id
 

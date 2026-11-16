@@ -4,7 +4,7 @@ Version and changelog for GitHub releases. This repo is a Swift product: the roo
 
 ## Workflow
 
-1. With a user-facing change, run `npm run changeset` (or `npx changeset`) and pick patch / minor / major. Internal-only work (CI, docs for agents, refactor with no behavior change) never gets a changeset. The body is changelog text for someone using directa: what changed for them, no internals, and a term of art gets a short plain-English gloss on first use.
+1. With a user-facing change, run `npm run changeset` (or `npx changeset`) and pick patch / minor / major. Internal-only work (CI, docs for agents, refactor with no behavior change) never gets a changeset. The body is changelog text for someone using directa: what changed for them, no internals, and a term of art gets a short plain-English gloss on first use. Keep it lean: one short paragraph per change a user would notice, leading with the measured improvement (before and after figures, with the conditions they were measured under) wherever one exists. Cut mechanism, internal-only fixes, and any claim not measured or observed; a figure comes from a recorded measurement, never an estimate.
 2. Merge the PR. On `main`, the Release workflow opens or updates a **Version Packages** PR.
 3. Merge that PR when ready. The workflow tags `vX.Y.Z` (matching historical releases) and creates the GitHub release from the changelog.
 

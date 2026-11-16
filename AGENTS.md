@@ -38,7 +38,8 @@ Codebase map (depth: docs/architecture.md)
   - Spotlight/SpotlightLabel; Net/: LoopbackProbe, PortClaim + PortMaterializer, SiblingRebind, PortCollision.
   - Config/: ProjectConfig (ProjectConfigLoader.serverNotFound is the one not-found message for a server name), ConfigProjection, EffectiveHost, LocalOverlay, LockResource, WatchPolicy + WatchPaths, MissingProjectPolicy (the one rule every automatic missing-project prune uses).
   - Resource/ResourceIdentity.swift: fingerprint of a lock resource's state.
-  - Launchd/: LaunchdAdmin, LaunchdJobs, DaemonRecoveryPolicy, AgentRebindPolicy, DaemonImagePolicy, AppAgentPolicy (docs/macos-lifecycle.md).
+  - Client/StatusFollowPolicy.swift: the one home for how the app follows status (park on `server.awaitChange`, read on change, fall back to polling an older daemon).
+  - Launchd/: LaunchdAdmin, LaunchdJobs, DaemonRecoveryPolicy, AgentRebindPolicy, DaemonImagePolicy, AppAgentPolicy, DaemonHandoffPolicy (the one home for whether a running daemon is handed off or killed, docs/design.md Handoff exit) (docs/macos-lifecycle.md).
   - DeepLink/; Update/: UpdateCheck, DirectaDistribution (the one home for the tap token, releases URL, and brew commands).
   - Logs/: LogFormat, LogQuery, LogScan, OrphanProjectLogs (removalRefusal is the one home for whether an orphan log directory may be deleted, run daemon-side only).
   - Log/DirectaLog.swift (OSLog facade); Events/: DaemonRestartBurstCounter, EventDetailFormats (the one home for event detail strings a reader interprets).
@@ -50,7 +51,8 @@ Codebase map (depth: docs/architecture.md)
   - Health/: HealthProber (EffectiveHealthcheck, PortGuard), PowerState.
   - Registry/Registry.swift: owner of registry.json and state.json. retireState with ServerSupervisor.stopForRemoval is the home for a removed server's row.
   - Control/: PortProbe (the seam every Router port check asks), ControlServer.swift (the Router; prepareSpawn is the one funnel every start-shaped path takes and the one home for the trust gate), AgentJobs (the one seam for launchd child jobs), Why.swift.
-  - Events/EventStore.swift, LogStore/ (LogStore + SpoolTailer), Telemetry/ (TelemetrySampler, ProcessSampler, DaemonTelemetry).
+  - Events/EventStore.swift; Events/StatusChangeSignal.swift, the one home for whether status changed (the token `server.awaitChange` parks on; a status-visible mutation bumps it).
+  - LogStore/ (LogStore + SpoolTailer; TimestampClamp is the one home for the monotonic clamp and its ahead-of-the-clock rotation rule, used by LogStore and EventStore), Telemetry/ (TelemetrySampler, ProcessSampler, DaemonTelemetry).
 - Sources/ddirecta: thin main, identical under launchd and --foreground; boot order and sweeps: docs/architecture.md.
 - Sources/directa: the CLI.
   - CLI.swift: every command as a struct. GlobalOptions.resolveProject is the one home for cwd-to-project resolution. Past the size where splitting is worth asking about.
@@ -71,6 +73,7 @@ Commands
 - scripts/smoke-cask.sh: the Homebrew cask gate, non-destructive by default (docs/releasing.md).
 - scripts/sweep-swift-temp.sh [--dry-run | --list]: removes the Swift driver's leftover temp folders; make build and make test run it first. Never contain the leak by pointing TMPDIR at a per-run directory.
 - scripts/daemon-deaths.sh [incidents-dir]: one summary per recorded daemon death.
+- scripts/idle-cpu.sh [seconds]: live CPU of ddirecta and directa-app over a window. Run before and after any change to what either does while idle.
 - make app / make dmg / make release-dmg / make install: docs/releasing.md.
 - Unified logging: `/usr/bin/log stream --predicate 'subsystem == "dev.quantizor.directa"' --level debug` (the full path, since zsh's `log` builtin shadows it). Only error level persists for `log show`; events.log is the durable history. Child output stays in spool files; OSLog is for directa's own behavior.
 - Deep links: directa://open|ensure|stop|why/<project-slug>/<server>[/<head>] (query form also accepted). directa://daemon/ensure, directa://daemon/unregister, and directa://daemon/unregister-all ask the app to own SMAppService registration. directa link prints; the app handles via Launch Services; directa x-url runs the same runner for smoke.
@@ -79,6 +82,7 @@ Rules
 
 Prose and communication
 - Prose (docs, PR bodies, changeset text, commit bodies): American English, no em-dashes (use a colon, comma, or period), plain language over jargon, no attribution footers or trailers anywhere. PR and changeset descriptions lead with user-facing impact, not mechanism. Changeset bodies are changelog text: no internals, and a term of art gets a short plain-English gloss on first use. "devservers" as one word is deliberate wherever it appears in the project's own description, echoing the devservers.json a user edits; do not correct it to two words. Elsewhere in prose, "dev server" is two words.
+- Changesets are lean and lead with a measured, user-facing improvement; no figure without a recorded measurement (.changeset/README.md).
 - Error messages assume the reader knows nothing of internals: what happened, where, and the exact fix; wire errors carry a stable code and a hint that is the literal command to run.
 
 Correctness and types
@@ -133,7 +137,7 @@ Persistence (no database, no migrations)
 
 Process and platform invariants
 - Output capture is spool-file fds, never pipes: children must survive daemon death without SIGPIPE. Do not introduce pipe-based capture anywhere. A spool is never truncated or renamed while its child runs (the child's fd cannot be reopened or repositioned); the tailer bounds its disk use by punching holes behind what it has ingested (docs/design.md, output capture).
-- Teardown signals the process group and every live descendant through signalRun over ProcessTree.liveDescendants, the union of four sources: a parent-chain snapshot, its 200ms refreshes while starting (merged in, never replacing it), a session sweep keyed on the root pid as session id (never read back with getsid), and a kernel unique-id lineage walk. Each descendant is signaled only while its pid still names the identity recorded (start time and unique id); the root's group only while its pid names the root identity recorded at spawn or adopt; the crash path withholds the group signal. The sweeps refuse the daemon's own session, unique id, and ancestors. Keep the union and the revalidation when touching stop() or the crash exit path. Mechanism: docs/design.md (Daemon internals) and docs/architecture.md.
+- Teardown signals the process group and every live descendant through signalRun over ProcessTree.liveDescendants, the union of four sources: a parent-chain snapshot, its 200ms refreshes in the first minute of a start or adopt while still starting (health probes refresh it after; merged in, never replacing it), a session sweep keyed on the root pid as session id (never read back with getsid), and a kernel unique-id lineage walk. Each descendant is signaled only while its pid still names the identity recorded (start time and unique id); the root's group only while its pid names the root identity recorded at spawn or adopt; the crash path withholds the group signal. The sweeps refuse the daemon's own session, unique id, and ancestors. Keep the union and the revalidation when touching stop() or the crash exit path. Mechanism: docs/design.md (Daemon internals) and docs/architecture.md.
 - Nothing reachable from async code, product or test, blocks a cooperative-pool thread on a subprocess, socket, semaphore, pipe read, or sleep: product code goes through a BlockingLane, test code through offPool. A sync helper called inside an async function (including inside `#expect(...)`, whose closure is synchronous) escapes the async-overload guard; wrap it in a lane explicitly. Guardrail: scripts/test-narrow-pool.sh. Why: docs/architecture.md.
 - Binary upgrades stage and rename(2); never overwrite a running signed Mach-O.
 - The daemon never keeps its process image on a mounted volume: ddirecta checks its image path at boot and re-execs the canonical installed binary when it is under /Volumes. Keep that guard ahead of the single-instance flock and keep the sentinel + run-in-place fallback so it cannot loop under KeepAlive. Why: docs/macos-lifecycle.md (DMG and /Applications share a bundle id).
