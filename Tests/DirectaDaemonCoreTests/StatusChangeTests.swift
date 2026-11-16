@@ -120,7 +120,7 @@ struct StatusChangeSignalTests {
 
     private func supervisor(
         _ env: RouterEnv, events: EventStore, command: [String], port: Int? = nil,
-        listeningPorts: (@Sendable ([pid_t]) async -> [Int])? = nil
+        listeningPortsOverride: (@Sendable ([pid_t]) -> [Int])? = nil
     ) -> ServerSupervisor {
         let spec = ServerSpec(
             command: command,
@@ -128,14 +128,9 @@ struct StatusChangeSignalTests {
                 HealthCheckSpec(healthyAfter: 1, intervalMs: 30, port: $0, timeoutMs: 500, type: .tcp, unhealthyAfter: 3)
             },
             name: "web", port: port)
-        guard let listeningPorts else {
-            return ServerSupervisor(
-                events: events, launcher: SubprocessLauncher(), paths: env.paths, projectPath: env.project,
-                registry: Registry(paths: env.paths), spec: spec)
-        }
         return ServerSupervisor(
-            events: events, launcher: SubprocessLauncher(), listeningPorts: listeningPorts, paths: env.paths,
-            projectPath: env.project, registry: Registry(paths: env.paths), spec: spec)
+            events: events, launcher: SubprocessLauncher(), listeningPortsOverride: listeningPortsOverride,
+            paths: env.paths, projectPath: env.project, registry: Registry(paths: env.paths), spec: spec)
     }
 
     /** `.stopping` posts no event (the stopped event comes when the process is
@@ -173,16 +168,19 @@ struct StatusChangeSignalTests {
     @Test func aFirstObservedPortReleasesAParkedWaitWithNoNewEvent() async throws {
         let env = try makeRouterEnv(named: "changes-first-port")
         let events = EventStore(url: env.paths.eventsFile)
-        let scanned = Latch<Void>()
+        /** The override runs on a system lane thread, so it holds the scan
+            with a semaphore; the deadline frees the thread if the test fails
+            before opening it. */
+        let scanned = DispatchSemaphore(value: 0)
         let port = TestPorts.port(728)
         let supervisor = supervisor(
             env, events: events, command: ["/bin/sh", "-c", "sleep 30"],
-            listeningPorts: { _ in
-                await scanned.wait()
+            listeningPortsOverride: { _ in
+                _ = scanned.wait(timeout: .now() + 20)
                 return [port]
             })
         _ = await supervisor.start()
-        defer { scanned.open() }
+        defer { scanned.signal() }
         let healthy = try await eventually(within: .seconds(15)) {
             let kinds = await events.query().map(\.kind)
             return await supervisor.status().phase == .running && kinds.contains(.healthy)
@@ -193,7 +191,7 @@ struct StatusChangeSignalTests {
 
         let parked = ParkedWait(events.changes, after: events.changes.token)
         #expect(try await parked.staysParked(for: .milliseconds(200)))
-        scanned.open()
+        scanned.signal()
         let released = try await parked.settles(within: .seconds(5))
 
         #expect(released?.changed == true)
